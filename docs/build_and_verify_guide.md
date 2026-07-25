@@ -40,9 +40,11 @@
 | 4 | 同時起動した他 Compose サービスのログ表示 | (起動確認時に自動) |
 | 5 | コンテナ内ディレクトリツリー表示 | `--directory-tree-depth` ほか |
 | 6 | JBoss デプロイ構造・環境変数一覧の表示 | `--deployment-dir-env` / `--env-list-limit` |
-| 7 | 全量レポートのファイル保存 | `--report-dir` |
-| 8 | 起動後の対話操作 (bash / HTTP / ログ調査) | `--keep-container-mode` |
-| 9 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
+| 7 | Java の JVM パラメータ一覧表示 | (起動確認時に自動) |
+| 8 | OpenTelemetry 環境変数・JVM パラメータ一覧表示 | (起動確認時に自動) |
+| 9 | 全量レポートのファイル保存 | `--report-dir` |
+| 10 | 起動後の対話操作 (bash / HTTP / ログ調査) | `--keep-container-mode` |
+| 11 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -78,6 +80,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 中盤 | シークレット準備・一時ファイルコピー | `prepare_jboss_password` / `prepare_copy_files` |
 | 中盤 | 起動確認・ログ表示ヘルパ | ログ取得、ANSI 除去、色分け、companion ログ |
 | 中盤 | 環境変数・ツリー・デプロイ構造 | コンテナ内情報の収集と整形 |
+| 中盤 | JVM パラメータ・OpenTelemetry 設定 | `/proc/<pid>/cmdline` の走査、JVM オプションの分類、OpenTelemetry 設定の突き合わせ |
 | 中盤 | 対話操作 | bash / HTTP / logs モードと、healthcheck・MySQL・可観測性の各ヘルパ |
 | 後半 | Docker 完全クリーンアップ | 対象の集計、確認フレーズ、削除、検証 |
 | 後半 | 全量レポート | `write_build_report` |
@@ -95,6 +98,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | ログ表示 | `show_startup_logs` / `print_startup_logs_with_highlights` / `show_companion_service_logs` | 行数制御と重要ログの色分け |
 | URL 確認 | `verify_url` / `show_url_body` | curl のリトライと応答本文表示 |
 | 情報表示 | `show_verified_container_envs` / `..._directory_trees` / `..._deployment_structures` | 環境変数・ツリー・デプロイ構造 |
+| JVM / OTel | `show_verified_container_jvm_parameters` / `..._otel_settings` / `collect_container_java_processes` / `classify_jvm_option` / `is_otel_jvm_option` | Java プロセスの検出、JVM オプションの分類、OpenTelemetry 設定の集約 |
 | 対話操作 | `run_keep_container_interaction` / `run_interactive_compose_service_menu` ほか | bash / HTTP / logs モード |
 | healthcheck | `run_interactive_compose_healthcheck` / `run_healthcheck_http_probe` | healthcheck の設定・履歴・通信確認 |
 | 可観測性 | `render_cloudwatch_delivery_report` / `run_otel_jaeger_trace_helper` | cwagent / OTel のローカル送達診断 |
@@ -152,7 +156,9 @@ flowchart TD
     X -- あり --> Y[対話操作 bash / http / logs]
     X -- なし --> AA
     Y --> AA[環境変数一覧・ツリー・デプロイ構造を表示]
-    AA --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
+    AA --> AA2[JVM パラメータ一覧を表示<br/>/proc から Java プロセスを検出]
+    AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
+    AA3 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
 ```
 
@@ -432,8 +438,8 @@ services:
 | --- | --- |
 | ファイル名 | `build_and_verify_<YYYYMMDDHHMMSS>.txt` (同名があれば `_1`, `_2` … を付与) |
 | 保存タイミング | EXIT トラップの**最初**。コンテナ停止や Docker 削除より前に取得する |
-| 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) / [1] ビルド結果 / [2] 環境変数一覧 (全件) / ツリー (全深度・全ファイル名) / JBoss デプロイ構造 |
-| 失敗時 | 全 Compose サービスのログをサービス単位で全行追記 |
+| 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[7]` |
+| 失敗時 | `[7]` へ全 Compose サービスのログをサービス単位で全行追記 |
 | 画面表示との違い | 画面の表示上限 (`--env-list-limit` 等) にかかわらず**常に全量** |
 | `--dry-run` | ファイル出力はスキップ (予定のみ表示) |
 
@@ -490,7 +496,8 @@ services:
 ───────────────────────────────────────────────
 (同時起動サービスのログをサービス単位で順次表示)
 (URL 応答本文 先頭 20 行)
-(環境変数一覧 → ディレクトリツリー → JBoss デプロイ構造)
+(環境変数一覧 → ディレクトリツリー → JBoss デプロイ構造
+ → JVM パラメータ → OpenTelemetry 環境変数・JVM パラメータ)
 ```
 
 ### 6.2 出力ファイル
@@ -500,8 +507,104 @@ services:
 | `--env-list-file` のパス | 指定時 | 環境変数一覧 |
 | `--report-dir/build_and_verify_<日時>.txt` | 指定時 | 全量レポート |
 
+全量レポートのセクション構成は次のとおりです。
+
+| セクション | 内容 | コンテナ未起動時 |
+| --- | --- | --- |
+| `[1] ビルド結果` | 結果 / 詳細 / イメージ情報 / 保存ポリシー | 記録される |
+| `[2] 環境変数一覧 (全件)` | コンテナごとの環境変数を種別付きで全件 | 「未取得」と記録 |
+| `[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)` | `/` 起点のツリー | 「未取得」と記録 |
+| `[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)` | デプロイ先 / Web ルート / クラスパスルート | 「未取得」と記録 |
+| `[5] Java JVM パラメータ (全件)` | Java プロセスごとの JVM パラメータ (分類別) | 「未取得」と記録 |
+| `[6] OpenTelemetry 環境変数・JVM パラメータ (全件)` | OpenTelemetry 関連の環境変数と JVM パラメータ | 「未取得」と記録 |
+| `[7] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[7-1]`, `[7-2]` … と採番) | 定義済みサービスを見出しとして記録 |
+
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
+
+### 6.3 JVM パラメータ一覧
+
+起動確認を伴う実行では、専用オプションなしで自動表示されます。
+対象コンテナ内の `/proc/<pid>/cmdline` を走査し、実行ファイル名が `java` の
+プロセスを検出します。コンテナ側へ `ps` / `jcmd` / `jinfo` を要求しないため、
+JDK ツールを持たないランタイム専用イメージでも取得できます。
+
+```
+[Java プロセス 1] PID: 1
+実行ファイル     : /opt/java/openjdk/bin/java
+バージョン       : openjdk version "17.0.11" 2024-04-16 LTS
+起動対象         : -jar /opt/jboss-eap/jboss-modules.jar
+JVM パラメータ数 : 17 件
+起動対象への引数 : 4 件
+```
+
+JVM パラメータは次の分類で出力します (該当 0 件の分類は表示しません)。
+
+| 分類 | 判定するパラメータ |
+| --- | --- |
+| ヒープ・メモリ | `-Xms` / `-Xmx` / `-Xss` / `-Xmn` / `-XX:*Metaspace*` / `-XX:*Heap*` / `-XX:*RAM*` / `-XX:MaxDirectMemorySize` / `-XX:*CodeCache*` / `-XX:*CompressedOops*` |
+| GC (ガベージコレクション) | `-Xlog:gc*` / `-Xloggc:` / `-XX:*GC*` / `-XX:*SurvivorRatio*` / `-XX:*NewRatio*` / `-XX:*Tenuring*` |
+| Java エージェント | `-javaagent:` / `-agentlib:` / `-agentpath:` |
+| OpenTelemetry | `-Dotel.*` / `-Dio.opentelemetry.*` |
+| JBoss / WildFly | `-Djboss.*` / `-Dorg.jboss.*` / `-Dwildfly.*` / `-Dorg.wildfly.*` / `-Dlogging.configuration` / `-Dmodule.path` |
+| システムプロパティ (-D) | 上記に当てはまらない `-D` 指定 |
+| クラスパス・モジュール | `-cp` / `-classpath` / `--class-path` / `-p` / `--module-path` / `--add-opens` / `--add-exports` / `--add-modules` / `--add-reads` / `--patch-module` / `-Djava.class.path` / `-Djava.library.path` / `-Xbootclasspath*` |
+| その他 JVM オプション | `-server` など上記以外の JVM オプション |
+| 起動対象へ渡される引数 | `-jar` / 主クラス / `--module` より後ろの引数 |
+
+- 分類は上表の順に判定し、最初に一致した分類へ入ります。OpenTelemetry の
+  `-javaagent:` は「Java エージェント」へ入りますが、OpenTelemetry 一覧側でも
+  再掲されます。
+- `-cp` のように**値を次の引数として取る**書式は、次の引数を値として取り込みます。
+- `-Dkey=value` / `-XX:key=value` / `-javaagent:path` は名前と値に分けて桁揃えします。
+- 値を持たないオプション (`-server`、`-XX:+UseG1GC`、`-Xmx1024m` など) は名前だけを出します。
+- 名前に `PASSWORD` / `TOKEN` / `SECRET` / `HEADERS` などを含む場合は
+  値を `[REDACTED]` にします (`-Djboss.password=...` など)。
+- 次の環境変数は指定内容が起動コマンドラインに現れないため、
+  `[JVM オプションを渡す環境変数]` として別枠で表示します。
+
+  `JAVA_OPTS` / `JAVA_OPTS_APPEND` / `JAVA_TOOL_OPTIONS` / `JDK_JAVA_OPTIONS` /
+  `_JAVA_OPTIONS` / `JBOSS_JAVA_OPTS` / `JBOSS_JAVA_SIZING` / `JAVA_ARGS`
+
+- Java プロセスを検出できないコンテナ (DB、Collector など) では、その旨を表示して
+  次のコンテナへ進みます (失敗扱いにはしません)。
+
+### 6.4 OpenTelemetry 環境変数・JVM パラメータ一覧
+
+OpenTelemetry の設定は「環境変数」と「JVM システムプロパティ」の 2 経路で与えられます。
+どちらか一方だけでは実際の構成が判断できないため、両方を 1 つの一覧にまとめます。
+Java を実行しないコンテナ (OTel Collector など) でも環境変数側は同じ形式で確認できます。
+
+| 種別 | 判定条件 |
+| --- | --- |
+| OpenTelemetry 標準環境変数 (`OTEL_*`) | 名前が `OTEL_` で始まる環境変数すべて |
+| OpenTelemetry 関連環境変数 | `AWS_XRAY_DAEMON_ADDRESS` / `AWS_XRAY_CONTEXT_MISSING` / `AWS_XRAY_TRACING_NAME` / `AWS_LAMBDA_EXEC_WRAPPER` / `AOT_CONFIG_CONTENT`。加えて `JAVA_TOOL_OPTIONS` / `JDK_JAVA_OPTIONS` / `_JAVA_OPTIONS` / `JAVA_OPTS` / `JAVA_OPTS_APPEND` / `JBOSS_JAVA_OPTS` は、値が OpenTelemetry を参照している場合のみ |
+| OpenTelemetry 関連 JVM パラメータ (コマンドライン) | `-Dotel.*` / `-Dio.opentelemetry.*` / 値に `opentelemetry` を含むもの / `-javaagent:*otel*` などの各エージェント指定 |
+| OpenTelemetry 関連 JVM パラメータ (環境変数由来) | 上記の JVM オプション用環境変数の値に含まれる同じパラメータ (`<環境変数名>: <パラメータ名>` の形式で表示) |
+| 未設定の主要 OpenTelemetry 設定 | 主要設定のうち、環境変数と対応するシステムプロパティのどちらにも指定が無いもの |
+
+- `OTEL_` は OpenTelemetry 仕様が定める設定名の接頭辞です。接頭辞で判定するため、
+  `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_TRACES_EXPORTER` /
+  `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER` / `OTEL_EXPORTER_OTLP_*` /
+  `OTEL_PROPAGATORS` / `OTEL_TRACES_SAMPLER` / `OTEL_BSP_*` /
+  `OTEL_INSTRUMENTATION_*` / `OTEL_JAVAAGENT_*` / `OTEL_SDK_DISABLED` などを
+  個別に列挙しなくても検出でき、仕様追加で増えた設定名にも追随します。
+- 環境変数とシステムプロパティの対応は、Java エージェントの規則に合わせて
+  「小文字化して `_` を `.` へ置換」で求めます (`OTEL_SERVICE_NAME` ⇔ `otel.service.name`)。
+- 「未設定」の判定対象は次の 10 件です。トレースやメトリクスが届かないときに
+  「そもそも設定されていない」ケースを切り分けられます。
+
+  `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_TRACES_EXPORTER` /
+  `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER` / `OTEL_EXPORTER_OTLP_ENDPOINT` /
+  `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_PROPAGATORS` / `OTEL_TRACES_SAMPLER` /
+  `OTEL_SDK_DISABLED`
+
+- `OTEL_EXPORTER_OTLP_HEADERS` のように認証情報を載せやすい名前の値は
+  `[REDACTED]` で表示します。
+- 4 種別すべてが 0 件の場合は
+  「OpenTelemetry 関連の環境変数・JVM パラメータは検出されませんでした。」とだけ表示します。
+- Collector 側の稼働確認・送達確認は `--keep-container-mode logs` の
+  送達診断 (5.4 参照) を使います。この一覧は**設定値の確認**が目的です。
 
 ---
 
@@ -526,6 +629,19 @@ services:
 | `BUILDKIT_PROGRESS` | 既定 `plain`。tty の上書き表示でビルドログが欠落するのを防ぐ |
 | `<--jboss-password-env の値>` | BuildKit シークレットとして compose へ渡す |
 | `JBOSS_MASTER_PASSWORD` | 同梱 `compose.yml` 用に必ず定義 (未使用時は空文字) |
+
+### 7.3 コンテナ側で検出する環境変数
+
+7.1 / 7.2 はスクリプト自身が実行ホストで参照・設定する環境変数です。
+これとは別に、**起動したコンテナ内の環境変数**を収集して一覧表示します
+(スクリプトの動作は変えません)。
+
+| 用途 | 環境変数 | 出力先 |
+| --- | --- | --- |
+| JVM オプションの受け渡し | `JAVA_OPTS` / `JAVA_OPTS_APPEND` / `JAVA_TOOL_OPTIONS` / `JDK_JAVA_OPTIONS` / `_JAVA_OPTIONS` / `JBOSS_JAVA_OPTS` / `JBOSS_JAVA_SIZING` / `JAVA_ARGS` | JVM パラメータ一覧 (6.3) |
+| OpenTelemetry 標準設定 | `OTEL_` で始まる環境変数すべて | OpenTelemetry 一覧 (6.4) |
+| OpenTelemetry 関連設定 | `AWS_XRAY_DAEMON_ADDRESS` / `AWS_XRAY_CONTEXT_MISSING` / `AWS_XRAY_TRACING_NAME` / `AWS_LAMBDA_EXEC_WRAPPER` / `AOT_CONFIG_CONTENT` | OpenTelemetry 一覧 (6.4) |
+| ディレクトリ構造の起点 | `--deployment-dir-env` で指定した名前 | JBoss デプロイ構造 |
 
 ---
 
@@ -581,6 +697,7 @@ services:
 ./build_and_verify.sh --compose-service app,db,cwagent --keep-container-mode logs
 
 # 11) 全量レポートとコンテナ内ツリーを保存
+#     (JVM パラメータと OpenTelemetry 設定も同じレポートへ保存される)
 ./build_and_verify.sh --verify-startup \
     --report-dir ./reports --directory-tree-depth 3 --directory-file-limit 20
 
@@ -625,3 +742,6 @@ services:
 | `起動確認がタイムアウトしました` | 起動が遅い / パターン不一致 | `--startup-timeout` を延長、`--startup-log-pattern` を確認 |
 | `URL 応答の確認に失敗しました` | ポート・パス・期待ステータスの誤り | 表示された最後の応答コードと本文を確認 |
 | `全量ビルドレポートの出力先を作成できませんでした` | `--report-dir` の権限不足 | 書き込み可能なパスを指定 |
+| `Java プロセスを検出できませんでした。` | 対象コンテナが JVM を実行していない、または `/proc` / `/bin/sh` を読み取れない | JVM を持たないコンテナ (DB / Collector など) なら想定どおり。JBoss のコンテナで出る場合は起動状態と `docker exec <cid> /bin/sh` の可否を確認 |
+| `バージョン       : (取得できませんでした)` | `java -version` を実行できない (実行ファイルのパスを解決できない等) | JVM パラメータ自体は表示されるため情報表示のみの影響。必要なら `docker exec <cid> <java> -version` を直接確認 |
+| `OpenTelemetry 関連の環境変数・JVM パラメータは検出されませんでした。` | `OTEL_*` も `-Dotel.*` も javaagent も設定されていない | `compose.yml` の `environment` や `JAVA_TOOL_OPTIONS` の設定漏れを確認 |

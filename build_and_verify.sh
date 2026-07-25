@@ -21,9 +21,15 @@
 #                          通常ファイルはオプション指定時のみ出力する。
 #   (5) デプロイ構造表示    : JBoss デプロイ先、Web ルート、Java クラスパスルート、
 #                          指定環境変数のディレクトリを検出して階層表示する。
-#   (6) 全量レポート        : ビルド結果と全量の環境変数・ツリー・デプロイ構造を
-#                          日時付きテキストファイルへ保存する。
-#   (7) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
+#   (6) JVM パラメータ表示  : コンテナ内の Java プロセスを検出し、起動時の JVM
+#                          パラメータをヒープ・GC・エージェント・システム
+#                          プロパティ等へ分類して表示する。
+#   (7) OpenTelemetry 表示  : OTEL_* をはじめとする OpenTelemetry 関連の環境変数と
+#                          JVM パラメータを 1 つの一覧にまとめて表示する。
+#   (8) 全量レポート        : ビルド結果と全量の環境変数・ツリー・デプロイ構造・
+#                          JVM パラメータ・OpenTelemetry 設定を日時付きテキスト
+#                          ファイルへ保存する。
+#   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
 #                          bash 接続するか、対話式の HTTP リクエスト、または
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
 #                          healthcheck 設定・実行履歴・HTTP 通信、および
@@ -231,6 +237,65 @@ DIRECTORY_TREE_HIDDEN_PATHS=(
   /usr/share/man
   /usr/share/osinfo
   /usr/share/zoneinfo
+)
+
+# ---- Java JVM パラメータ / OpenTelemetry 設定出力 -----------------------------
+# /proc/<pid>/cmdline は NUL 区切りのため、コンテナ内で US (0x1f) へ置き換えてから
+# ホスト側の Bash で分解する。JVM パラメータに 0x1f が現れることはない。
+JVM_FIELD_SEPARATOR=$'\037'
+# 名前と値を桁揃えして表示する際の名前欄の幅 (半角換算)。
+JVM_PARAM_NAME_WIDTH="44"
+# JVM オプションを渡す代表的な環境変数。ここで指定した内容は起動コマンドラインへ
+# 現れないため、/proc/<pid>/cmdline とは別に収集して表示する。
+JVM_OPTION_ENV_NAMES=(
+  JAVA_OPTS
+  JAVA_OPTS_APPEND
+  JAVA_TOOL_OPTIONS
+  JDK_JAVA_OPTIONS
+  _JAVA_OPTIONS
+  JBOSS_JAVA_OPTS
+  JBOSS_JAVA_SIZING
+  JAVA_ARGS
+)
+# OpenTelemetry の標準環境変数は接頭辞 OTEL_ で始まる (OpenTelemetry 仕様
+# "General SDK Configuration" / Java エージェントの設定名)。接頭辞で判定するため、
+# OTEL_SERVICE_NAME・OTEL_EXPORTER_OTLP_*・OTEL_INSTRUMENTATION_* などは
+# 個別に列挙しなくても検出できる。
+OTEL_ENV_NAME_PREFIX="OTEL_"
+# 接頭辞 OTEL_ を持たないが OpenTelemetry の構成に使われる環境変数。
+# 設定されていれば常に OpenTelemetry 関連として一覧へ出す。
+# OTEL_ で始まる名前は上の接頭辞判定で拾えるため、ここには入れない (二重表示になる)。
+OTEL_RELATED_ENV_NAMES=(
+  AWS_XRAY_DAEMON_ADDRESS       # ADOT / X-Ray デーモンの送信先
+  AWS_XRAY_CONTEXT_MISSING      # X-Ray のコンテキスト欠落時の挙動
+  AWS_XRAY_TRACING_NAME         # X-Ray のセグメント名
+  AWS_LAMBDA_EXEC_WRAPPER       # ADOT Lambda レイヤーの計装ラッパー
+  AOT_CONFIG_CONTENT            # ADOT Collector の設定内容 (YAML)
+)
+# JVM オプション用の環境変数は、値が OpenTelemetry を参照している場合のみ
+# OpenTelemetry 関連として扱う (JAVA_TOOL_OPTIONS で javaagent を注入する構成)。
+OTEL_JVM_OPTION_ENV_NAMES=(
+  JAVA_TOOL_OPTIONS
+  JDK_JAVA_OPTIONS
+  _JAVA_OPTIONS
+  JAVA_OPTS
+  JAVA_OPTS_APPEND
+  JBOSS_JAVA_OPTS
+)
+# 送達不良の切り分けでまず確認する主要設定。環境変数と、それに対応する
+# システムプロパティ (OTEL_SERVICE_NAME → -Dotel.service.name) の
+# どちらも無い場合に「未設定」として表示する。
+OTEL_KEY_ENV_NAMES=(
+  OTEL_SERVICE_NAME
+  OTEL_RESOURCE_ATTRIBUTES
+  OTEL_TRACES_EXPORTER
+  OTEL_METRICS_EXPORTER
+  OTEL_LOGS_EXPORTER
+  OTEL_EXPORTER_OTLP_ENDPOINT
+  OTEL_EXPORTER_OTLP_PROTOCOL
+  OTEL_PROPAGATORS
+  OTEL_TRACES_SAMPLER
+  OTEL_SDK_DISABLED
 )
 
 # ---- 全量ビルドレポート出力 --------------------------------------------------
@@ -462,8 +527,24 @@ JBoss マスターパスワード (BuildKit シークレット):
                            WEB-INF/classes と併せて、そのディレクトリ構造を表示する。
                            繰り返し指定またはカンマ区切りで複数指定できる
   --report-dir DIR         ビルド結果、環境変数一覧、コンテナ内ツリー、JBoss EAP
-                           デプロイ構造を DIR/build_and_verify_<日時>.txt へ保存する。
+                           デプロイ構造、JVM パラメータ、OpenTelemetry 設定を
+                           DIR/build_and_verify_<日時>.txt へ保存する。
                            保存内容は画面の制限にかかわらず全深度・全ファイル名となる
+
+  (オプション指定不要の自動表示)
+  Java JVM パラメータ一覧  動作確認したコンテナ内の Java プロセスを /proc から検出し、
+                           起動時の JVM パラメータをヒープ・メモリ / GC /
+                           Java エージェント / OpenTelemetry / JBoss /
+                           システムプロパティ / クラスパス・モジュール / その他へ
+                           分類して表示する。JAVA_OPTS・JAVA_TOOL_OPTIONS など、
+                           コマンドラインに現れない環境変数経由の指定も併記する。
+  OpenTelemetry 設定一覧   OTEL_ で始まる標準環境変数、AWS_XRAY_* などの関連環境変数、
+                           -Dotel.* や OpenTelemetry の -javaagent といった JVM
+                           パラメータを 1 つの一覧にまとめて表示する。
+                           主要設定が環境変数・システムプロパティのどちらにも
+                           無い場合は「未設定」として併せて表示する。
+                           ※ 値に認証情報を含みやすい名前 (PASSWORD / TOKEN /
+                             SECRET / HEADERS 等) は [REDACTED] で表示する
 
 URL 応答確認:
   --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
@@ -1299,6 +1380,20 @@ collect_container_image_env() {
   docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$image_id" 2>/dev/null || true
 }
 
+# 画面表示と全量レポートへ認証情報を平文で残さないための判定。名前だけは分類・
+# 設定漏れの確認に必要なため維持し、値の側を [REDACTED] へ置き換える。
+# 環境変数名にも JVM パラメータ名 (-Dxxx.password 等) にも同じ規則を適用する。
+# OTLP の *_HEADERS は認証ヘッダを載せる用途が多いため対象に含める。
+is_sensitive_setting_name() {
+  local upper="${1^^}"
+  case "$upper" in
+    *PASSWORD*|*PASSWD*|*TOKEN*|*SECRET*|*PRIVATE_KEY*|*ACCESS_KEY*|*API_KEY*|*CREDENTIAL*|*HEADERS*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 append_env_names_by_type() {
   local report_file="$1" type_label="$2"
   shift 2
@@ -1314,7 +1409,7 @@ append_env_names_by_type() {
 append_container_env_report() {
   local cid="$1" service_name="$2" container_name="$3" report_file="$4"
   local env_limit="${5:-$ENV_LIST_LIMIT}"
-  local line key value kv type_label shown_count total_count upper_key
+  local line key value kv type_label shown_count total_count
   local -a sorted_names=()
   local -a compose_names=() build_arg_names=() internal_names=() other_names=()
   declare -A process_env_values=()
@@ -1374,14 +1469,7 @@ append_container_env_report() {
       break
     fi
     value="${process_env_values[$key]}"
-    upper_key="${key^^}"
-    # 一覧と全量レポートへ認証情報を平文で残さない。名前は分類確認のため維持する。
-    case "$upper_key" in
-      *PASSWORD*|*PASSWD*|*TOKEN*|*SECRET*|*PRIVATE_KEY*|*ACCESS_KEY*|*API_KEY*|*CREDENTIAL*)
-        value="[REDACTED]"
-        ;;
-    esac
-    if [ "$key" = "$JBOSS_PASSWORD_ENV" ]; then
+    if is_sensitive_setting_name "$key" || [ "$key" = "$JBOSS_PASSWORD_ENV" ]; then
       value="[REDACTED]"
     fi
     kv="${key}=${value}"
@@ -1920,6 +2008,516 @@ show_verified_container_deployment_structures() {
     diag "$report_line"
   done < "$deployment_report_tmp"
   rm -f -- "$deployment_report_tmp"
+}
+
+# ---- Java JVM パラメータ / OpenTelemetry 設定の収集 ---------------------------
+# コンテナ内の全プロセスのコマンドラインを "PID<US>arg0<US>arg1<US>..." で返す。
+# ps / jcmd / jinfo をコンテナへ要求しないよう /proc/<pid>/cmdline を直接読み、
+# NUL 区切りを US (0x1f) へ置き換えてホスト側の Bash で分解する。
+# 引数中の空白をそのまま保てるため、-Dkey=値 に空白があっても壊れない。
+collect_container_process_cmdlines() {
+  local cid="$1"
+  docker exec "$cid" /bin/sh -c '
+for proc_dir in /proc/[0-9]*; do
+  [ -r "$proc_dir/cmdline" ] || continue
+  proc_cmdline=$(tr "\0" "\037" < "$proc_dir/cmdline" 2>/dev/null)
+  [ -n "$proc_cmdline" ] || continue
+  printf "%s\037%s\n" "${proc_dir#/proc/}" "$proc_cmdline"
+done
+' 2>/dev/null || true
+}
+
+# 上記のうち実行ファイル名が java のプロセス行だけを返す。
+collect_container_java_processes() {
+  local cid="$1" line rest first_arg
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rest="${line#*"$JVM_FIELD_SEPARATOR"}"
+    [ "$rest" != "$line" ] || continue
+    first_arg="${rest%%"$JVM_FIELD_SEPARATOR"*}"
+    case "${first_arg##*/}" in
+      java) printf '%s\n' "$line" ;;
+    esac
+  done < <(collect_container_process_cmdlines "$cid")
+}
+
+# java -version の出力 (stderr) を取得する。取得できない場合は空を返す。
+container_java_version_text() {
+  local cid="$1" java_bin="$2" version_output
+  case "$java_bin" in
+    /*|java) ;;
+    *) return 0 ;;
+  esac
+  if ! version_output="$(docker exec "$cid" "$java_bin" -version 2>&1)"; then
+    return 0
+  fi
+  printf '%s\n' "$version_output"
+}
+
+# JVM オプションを「名前」と「値」に分ける。-Dkey=value / -XX:key=value /
+# -javaagent:path のように区切り文字が異なるため、書式ごとに分解する。
+# 戻り値は関数呼び出しごとのフォークを避けるためグローバル変数へ格納する。
+JVM_OPTION_NAME=""
+JVM_OPTION_VALUE=""
+JVM_OPTION_HAS_VALUE="false"
+split_jvm_option_name_value() {
+  local option="$1"
+  JVM_OPTION_NAME="$option"
+  JVM_OPTION_VALUE=""
+  JVM_OPTION_HAS_VALUE="false"
+  case "$option" in
+    -javaagent:*|-agentlib:*|-agentpath:*|-Xbootclasspath*:*|-splash:*|-Xlog:*|-Xloggc:*)
+      JVM_OPTION_NAME="${option%%:*}"
+      JVM_OPTION_VALUE="${option#*:}"
+      JVM_OPTION_HAS_VALUE="true"
+      ;;
+    -D*=*|-XX:*=*|--*=*)
+      JVM_OPTION_NAME="${option%%=*}"
+      JVM_OPTION_VALUE="${option#*=}"
+      JVM_OPTION_HAS_VALUE="true"
+      ;;
+  esac
+}
+
+# JVM オプションを表示用の分類へ割り当てる。上から順に判定するため、
+# 複数に当てはまるオプション (例: -javaagent の OpenTelemetry エージェント) は
+# 先に一致した分類へ入る。OpenTelemetry の一覧は別途、全引数を横断して集める。
+JVM_OPTION_CATEGORY=""
+classify_jvm_option() {
+  local option="$1"
+  case "$option" in
+    -javaagent:*|-agentlib:*|-agentpath:*)
+      JVM_OPTION_CATEGORY="agent"; return 0 ;;
+    -Dotel.*|-Dio.opentelemetry.*)
+      JVM_OPTION_CATEGORY="otel"; return 0 ;;
+    -cp|-classpath|--class-path*|-p|--module-path*|--add-opens*|--add-exports*|--add-modules*|--add-reads*|--patch-module*|--upgrade-module-path*|--limit-modules*|-Djava.class.path=*|-Djava.library.path=*|-Xbootclasspath*)
+      JVM_OPTION_CATEGORY="module"; return 0 ;;
+    -Xms*|-Xmx*|-Xss*|-Xmn*|-XX:*Metaspace*|-XX:*Heap*|-XX:*RAM*|-XX:MaxDirectMemorySize*|-XX:*CodeCache*|-XX:*ThreadStackSize*|-XX:*CompressedOops*|-XX:*CompressedClassSpaceSize*)
+      JVM_OPTION_CATEGORY="memory"; return 0 ;;
+    -Xlog:gc*|-Xloggc:*|-XX:*GC*|-XX:*SurvivorRatio*|-XX:*NewRatio*|-XX:*Tenuring*)
+      JVM_OPTION_CATEGORY="gc"; return 0 ;;
+    -Djboss.*|-Dorg.jboss.*|-Dwildfly.*|-Dorg.wildfly.*|-Dlogging.configuration=*|-Dmodule.path=*)
+      JVM_OPTION_CATEGORY="jboss"; return 0 ;;
+    -D*)
+      JVM_OPTION_CATEGORY="sysprop"; return 0 ;;
+    -*)
+      JVM_OPTION_CATEGORY="other"; return 0 ;;
+  esac
+  JVM_OPTION_CATEGORY="other"
+  return 0
+}
+
+# JVM オプションが OpenTelemetry の設定かどうかを判定する。
+# 分類 (classify_jvm_option) と異なり、-javaagent の OpenTelemetry エージェントや
+# 起動対象へ渡される引数側の -Dotel.* も対象にする。
+is_otel_jvm_option() {
+  local lower="${1,,}"
+  case "$lower" in
+    -dotel.*|-dio.opentelemetry.*) return 0 ;;
+    *opentelemetry*) return 0 ;;
+    -javaagent:*otel*|-agentpath:*otel*|-agentlib:*otel*) return 0 ;;
+  esac
+  return 1
+}
+
+# 環境変数名から OpenTelemetry Java エージェントが参照するシステムプロパティ名を
+# 求める (OTEL_SERVICE_NAME → otel.service.name)。設定漏れ判定に使う。
+otel_env_name_to_property() {
+  local lower="${1,,}"
+  printf '%s\n' "${lower//_/.}"
+}
+
+# 分類ごとの JVM パラメータを report_file へ追記する。件数 0 の分類は
+# 読みにくくなるだけなので出力しない (OpenTelemetry 一覧側は未設定も表示する)。
+# 字下げは append_env_names_by_type と同じく、この関数側で付ける。
+append_jvm_option_entries() {
+  local report_file="$1" label="$2"
+  shift 2
+  [ $# -gt 0 ] || return 0
+  printf '[%s] %s 件\n' "$label" "$#" >> "$report_file"
+  printf '%s\n' "$@" | sed 's/^/  /' >> "$report_file"
+}
+
+# 名前と値を桁揃えした 1 行を JVM_PARAM_ENTRY へ格納する。値を持たない
+# オプション (-server, -XX:+UseG1GC 等) は名前だけを出力する。
+JVM_PARAM_ENTRY=""
+format_jvm_param_entry() {
+  local name="$1" value="$2" has_value="$3"
+  if is_sensitive_setting_name "$name"; then
+    value="[REDACTED]"
+  fi
+  if [ "$has_value" = "true" ]; then
+    printf -v JVM_PARAM_ENTRY '%-*s = %s' "$JVM_PARAM_NAME_WIDTH" "$name" "$value"
+  else
+    printf -v JVM_PARAM_ENTRY '%s' "$name"
+  fi
+}
+
+# 1 コンテナ内の Java プロセスごとに、JVM パラメータを分類して report_file へ
+# 追記する。JVM オプションは起動対象 (-jar / 主クラス / --module) の手前までで、
+# それ以降は起動対象へ渡される引数として分けて表示する。
+append_container_jvm_parameter_report() {
+  local cid="$1" service_name="$2" container_name="$3" report_file="$4"
+  local line option value name has_value pid java_bin main_target
+  local version_text version_line version_printed process_index=0 option_total app_arg_total
+  local arg_index arg_count parsing_jvm_options env_name env_value
+  local -a process_lines=() args=() app_args=() jvm_env_entries=()
+  local -a memory_entries=() gc_entries=() agent_entries=() otel_entries=()
+  local -a jboss_entries=() sysprop_entries=() module_entries=() other_entries=()
+  local -A process_env_values=()
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%=*}"
+    [ -n "$name" ] || continue
+    value=""
+    [ "$name" != "$line" ] && value="${line#*=}"
+    process_env_values["$name"]="$value"
+  done < <(collect_container_pid1_env "$cid")
+
+  mapfile -t process_lines < <(collect_container_java_processes "$cid")
+
+  printf '\n' >> "$report_file"
+  printf '===================================================================\n' >> "$report_file"
+  printf 'Java JVM パラメータ (サービス: %s, コンテナ: %s, Java プロセス: %s)\n' \
+      "$service_name" "$container_name" "${#process_lines[@]}" >> "$report_file"
+  printf '分類: ヒープ・メモリ / GC / Java エージェント / OpenTelemetry / JBoss / システムプロパティ / クラスパス・モジュール / その他\n' >> "$report_file"
+  printf '===================================================================\n' >> "$report_file"
+
+  if [ ${#process_lines[@]} -eq 0 ]; then
+    printf 'Java プロセスを検出できませんでした。\n' >> "$report_file"
+    printf '  (このコンテナが JVM を実行していないか、/proc または /bin/sh を読み取れません)\n' >> "$report_file"
+  fi
+
+  for line in "${process_lines[@]}"; do
+    process_index=$((process_index + 1))
+    # コマンドライン末尾の NUL 由来の空フィールドを落としてから分解する。
+    while [ "${line: -1}" = "$JVM_FIELD_SEPARATOR" ]; do
+      line="${line%"$JVM_FIELD_SEPARATOR"}"
+    done
+    args=()
+    IFS="$JVM_FIELD_SEPARATOR" read -r -a args <<< "$line"
+
+    pid="${args[0]:-(不明)}"
+    java_bin="${args[1]:-(不明)}"
+    main_target=""
+    app_args=()
+    memory_entries=(); gc_entries=(); agent_entries=(); otel_entries=()
+    jboss_entries=(); sysprop_entries=(); module_entries=(); other_entries=()
+    option_total=0
+    arg_count=${#args[@]}
+    arg_index=2
+    parsing_jvm_options="true"
+
+    while [ "$arg_index" -lt "$arg_count" ]; do
+      option="${args[$arg_index]}"
+      arg_index=$((arg_index + 1))
+      [ -n "$option" ] || continue
+
+      if [ "$parsing_jvm_options" != "true" ]; then
+        app_args+=("$option")
+        continue
+      fi
+
+      has_value="false"
+      value=""
+      name="$option"
+      case "$option" in
+        -jar)
+          main_target="-jar ${args[$arg_index]:-(不明)}"
+          arg_index=$((arg_index + 1))
+          parsing_jvm_options="false"
+          continue
+          ;;
+        -m|--module)
+          main_target="--module ${args[$arg_index]:-(不明)}"
+          arg_index=$((arg_index + 1))
+          parsing_jvm_options="false"
+          continue
+          ;;
+        -cp|-classpath|--class-path|-p|--module-path|--add-opens|--add-exports|--add-modules|--add-reads|--patch-module|--upgrade-module-path|--limit-modules)
+          # これらは次の引数を値として取る書式。値を巻き込んで表示する。
+          value="${args[$arg_index]:-}"
+          arg_index=$((arg_index + 1))
+          has_value="true"
+          ;;
+        -*)
+          split_jvm_option_name_value "$option"
+          name="$JVM_OPTION_NAME"
+          value="$JVM_OPTION_VALUE"
+          has_value="$JVM_OPTION_HAS_VALUE"
+          ;;
+        *)
+          # オプションでない最初の引数が起動する主クラス。以降は起動対象への引数。
+          main_target="$option"
+          parsing_jvm_options="false"
+          continue
+          ;;
+      esac
+
+      format_jvm_param_entry "$name" "$value" "$has_value"
+      classify_jvm_option "$option"
+      case "$JVM_OPTION_CATEGORY" in
+        memory)  memory_entries+=("$JVM_PARAM_ENTRY") ;;
+        gc)      gc_entries+=("$JVM_PARAM_ENTRY") ;;
+        agent)   agent_entries+=("$JVM_PARAM_ENTRY") ;;
+        otel)    otel_entries+=("$JVM_PARAM_ENTRY") ;;
+        jboss)   jboss_entries+=("$JVM_PARAM_ENTRY") ;;
+        module)  module_entries+=("$JVM_PARAM_ENTRY") ;;
+        sysprop) sysprop_entries+=("$JVM_PARAM_ENTRY") ;;
+        *)       other_entries+=("$JVM_PARAM_ENTRY") ;;
+      esac
+      option_total=$((option_total + 1))
+    done
+
+    app_arg_total=${#app_args[@]}
+    printf '\n' >> "$report_file"
+    printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
+    printf '[Java プロセス %s] PID: %s\n' "$process_index" "$pid" >> "$report_file"
+    printf '実行ファイル     : %s\n' "$java_bin" >> "$report_file"
+    version_text="$(container_java_version_text "$cid" "$java_bin")"
+    if [ -n "$version_text" ]; then
+      # java -version は複数行を返す。2 行目以降は見出しの幅だけ字下げして続ける。
+      version_printed="false"
+      while IFS= read -r version_line; do
+        [ -n "$version_line" ] || continue
+        if [ "$version_printed" = "true" ]; then
+          printf '                   %s\n' "$version_line" >> "$report_file"
+        else
+          printf 'バージョン       : %s\n' "$version_line" >> "$report_file"
+          version_printed="true"
+        fi
+      done <<< "$version_text"
+    else
+      printf 'バージョン       : (取得できませんでした)\n' >> "$report_file"
+    fi
+    printf '起動対象         : %s\n' "${main_target:-(検出できませんでした)}" >> "$report_file"
+    printf 'JVM パラメータ数 : %s 件\n' "$option_total" >> "$report_file"
+    printf '起動対象への引数 : %s 件\n' "$app_arg_total" >> "$report_file"
+    printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
+
+    if [ "$option_total" -eq 0 ]; then
+      printf 'JVM パラメータの指定はありません。\n' >> "$report_file"
+    else
+      append_jvm_option_entries "$report_file" "ヒープ・メモリ" ${memory_entries[@]+"${memory_entries[@]}"}
+      append_jvm_option_entries "$report_file" "GC (ガベージコレクション)" ${gc_entries[@]+"${gc_entries[@]}"}
+      append_jvm_option_entries "$report_file" "Java エージェント" ${agent_entries[@]+"${agent_entries[@]}"}
+      append_jvm_option_entries "$report_file" "OpenTelemetry" ${otel_entries[@]+"${otel_entries[@]}"}
+      append_jvm_option_entries "$report_file" "JBoss / WildFly" ${jboss_entries[@]+"${jboss_entries[@]}"}
+      append_jvm_option_entries "$report_file" "システムプロパティ (-D)" ${sysprop_entries[@]+"${sysprop_entries[@]}"}
+      append_jvm_option_entries "$report_file" "クラスパス・モジュール" ${module_entries[@]+"${module_entries[@]}"}
+      append_jvm_option_entries "$report_file" "その他 JVM オプション" ${other_entries[@]+"${other_entries[@]}"}
+    fi
+    append_jvm_option_entries "$report_file" "起動対象へ渡される引数" ${app_args[@]+"${app_args[@]}"}
+  done
+
+  # JAVA_OPTS などで渡した指定は JVM 起動時に追加されるため、
+  # /proc/<pid>/cmdline には現れない。取りこぼさないよう別枠で表示する。
+  for env_name in "${JVM_OPTION_ENV_NAMES[@]}"; do
+    [ -n "${process_env_values[$env_name]+_}" ] || continue
+    env_value="${process_env_values[$env_name]}"
+    [ -n "$env_value" ] || continue
+    format_jvm_param_entry "$env_name" "$env_value" "true"
+    jvm_env_entries+=("$JVM_PARAM_ENTRY")
+  done
+
+  printf '\n' >> "$report_file"
+  if [ ${#jvm_env_entries[@]} -eq 0 ]; then
+    printf '[JVM オプションを渡す環境変数] 0 件\n' >> "$report_file"
+    printf '  (なし)\n' >> "$report_file"
+  else
+    append_jvm_option_entries "$report_file" "JVM オプションを渡す環境変数" "${jvm_env_entries[@]}"
+    printf '※ 環境変数経由の指定は JVM 起動時に追加されるため、上記のコマンドライン一覧には現れません。\n' >> "$report_file"
+  fi
+}
+
+# 1 コンテナの OpenTelemetry 関連設定を、環境変数と JVM パラメータの双方から
+# 集めて report_file へ追記する。Java を実行しないコンテナ (Collector 等) でも
+# 環境変数側は同じ形式で確認できる。
+append_container_otel_report() {
+  local cid="$1" service_name="$2" container_name="$3" report_file="$4"
+  local line key value env_name property_name option token otel_token_found total_found=0
+  local -a process_lines=() args=() tokens=()
+  local -a standard_entries=() related_entries=() cmdline_entries=()
+  local -a env_option_entries=() missing_entries=()
+  local -A process_env_values=() defined_properties=()
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    key="${line%%=*}"
+    [ -n "$key" ] || continue
+    value=""
+    [ "$key" != "$line" ] && value="${line#*=}"
+    process_env_values["$key"]="$value"
+  done < <(collect_container_pid1_env "$cid")
+
+  # (1) 接頭辞 OTEL_ を持つ標準環境変数
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    case "$key" in
+      "$OTEL_ENV_NAME_PREFIX"*) ;;
+      *) continue ;;
+    esac
+    format_jvm_param_entry "$key" "${process_env_values[$key]}" "true"
+    standard_entries+=("$JVM_PARAM_ENTRY")
+  done < <(printf '%s\n' "${!process_env_values[@]}" | sort)
+
+  # (2) 接頭辞を持たない関連環境変数
+  for env_name in "${OTEL_RELATED_ENV_NAMES[@]}"; do
+    [ -n "${process_env_values[$env_name]+_}" ] || continue
+    format_jvm_param_entry "$env_name" "${process_env_values[$env_name]}" "true"
+    related_entries+=("$JVM_PARAM_ENTRY")
+  done
+  # JVM オプション用の環境変数は、OpenTelemetry を参照している場合だけ関連とみなす。
+  # 値には複数のオプションが空白区切りで並ぶため、個々のオプションごとに判定する。
+  for env_name in "${OTEL_JVM_OPTION_ENV_NAMES[@]}"; do
+    [ -n "${process_env_values[$env_name]+_}" ] || continue
+    value="${process_env_values[$env_name]}"
+    [ -n "$value" ] || continue
+    tokens=()
+    read -r -a tokens <<< "$value"
+    otel_token_found="false"
+    for token in ${tokens[@]+"${tokens[@]}"}; do
+      is_otel_jvm_option "$token" || continue
+      otel_token_found="true"
+      split_jvm_option_name_value "$token"
+      format_jvm_param_entry "${env_name}: ${JVM_OPTION_NAME}" "$JVM_OPTION_VALUE" "$JVM_OPTION_HAS_VALUE"
+      env_option_entries+=("$JVM_PARAM_ENTRY")
+      case "$JVM_OPTION_NAME" in
+        -D*) defined_properties["${JVM_OPTION_NAME#-D}"]=1 ;;
+      esac
+    done
+    [ "$otel_token_found" = "true" ] || continue
+    format_jvm_param_entry "$env_name" "$value" "true"
+    related_entries+=("$JVM_PARAM_ENTRY")
+  done
+
+  # (3) Java プロセスのコマンドライン全体 (起動対象への引数も含む)
+  mapfile -t process_lines < <(collect_container_java_processes "$cid")
+  for line in "${process_lines[@]}"; do
+    while [ "${line: -1}" = "$JVM_FIELD_SEPARATOR" ]; do
+      line="${line%"$JVM_FIELD_SEPARATOR"}"
+    done
+    args=()
+    IFS="$JVM_FIELD_SEPARATOR" read -r -a args <<< "$line"
+    for option in "${args[@]:2}"; do
+      [ -n "$option" ] || continue
+      is_otel_jvm_option "$option" || continue
+      split_jvm_option_name_value "$option"
+      format_jvm_param_entry "$JVM_OPTION_NAME" "$JVM_OPTION_VALUE" "$JVM_OPTION_HAS_VALUE"
+      cmdline_entries+=("$JVM_PARAM_ENTRY")
+      case "$JVM_OPTION_NAME" in
+        -D*) defined_properties["${JVM_OPTION_NAME#-D}"]=1 ;;
+      esac
+    done
+  done
+
+  total_found=$(( ${#standard_entries[@]} + ${#related_entries[@]} \
+      + ${#cmdline_entries[@]} + ${#env_option_entries[@]} ))
+
+  printf '\n' >> "$report_file"
+  printf '===================================================================\n' >> "$report_file"
+  printf 'OpenTelemetry 環境変数・JVM パラメータ一覧 (サービス: %s, コンテナ: %s)\n' \
+      "$service_name" "$container_name" >> "$report_file"
+  printf '種別: OTEL_ 標準環境変数 / 関連環境変数 / JVM パラメータ (コマンドライン・環境変数由来)\n' >> "$report_file"
+  printf '===================================================================\n' >> "$report_file"
+
+  if [ "$total_found" -eq 0 ]; then
+    printf 'OpenTelemetry 関連の環境変数・JVM パラメータは検出されませんでした。\n' >> "$report_file"
+    return 0
+  fi
+
+  append_env_names_by_type "$report_file" "OpenTelemetry 標準環境変数 (${OTEL_ENV_NAME_PREFIX}*)" \
+      ${standard_entries[@]+"${standard_entries[@]}"}
+  append_env_names_by_type "$report_file" "OpenTelemetry 関連環境変数" \
+      ${related_entries[@]+"${related_entries[@]}"}
+  append_env_names_by_type "$report_file" "OpenTelemetry 関連 JVM パラメータ (コマンドライン)" \
+      ${cmdline_entries[@]+"${cmdline_entries[@]}"}
+  append_env_names_by_type "$report_file" "OpenTelemetry 関連 JVM パラメータ (環境変数由来)" \
+      ${env_option_entries[@]+"${env_option_entries[@]}"}
+
+  # 環境変数とシステムプロパティのどちらでも指定されていない主要設定を挙げ、
+  # 送達不良時に「そもそも設定されていない」ケースを切り分けやすくする。
+  for env_name in "${OTEL_KEY_ENV_NAMES[@]}"; do
+    [ -z "${process_env_values[$env_name]+_}" ] || continue
+    property_name="$(otel_env_name_to_property "$env_name")"
+    [ -z "${defined_properties[$property_name]+_}" ] || continue
+    missing_entries+=("${env_name} (システムプロパティ -D${property_name} も未設定)")
+  done
+  append_env_names_by_type "$report_file" "未設定の主要 OpenTelemetry 設定" \
+      ${missing_entries[@]+"${missing_entries[@]}"}
+}
+
+# append_env_names_by_type / append_jvm_option_entries は既に整形済みの行を
+# 受け取るため、画面表示用のラッパーは環境変数一覧・ツリーと同じ流れで書ける。
+show_verified_container_jvm_parameters() {
+  [ "$DRY_RUN" = "true" ] && {
+    log "[DRY-RUN] JBoss EAP デプロイ構造の後に Java JVM パラメータ一覧をプレビューします。"
+    return 0
+  }
+
+  local report_line cid service_name container_name jvm_report_tmp
+  local -a target_container_ids=()
+  mapfile -t target_container_ids < <(verification_target_container_ids)
+
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    warn "Java JVM パラメータ一覧を出力できませんでした。対象コンテナが見つかりません。"
+    return 0
+  fi
+  if ! jvm_report_tmp="$(mktemp 2>/dev/null)"; then
+    warn "Java JVM パラメータ一覧出力用の一時ファイルを作成できませんでした。"
+    return 0
+  fi
+  : > "$jvm_report_tmp"
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+    container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    append_container_jvm_parameter_report "$cid" "$service_name" "$container_name" "$jvm_report_tmp"
+  done
+
+  diag ""
+  while IFS= read -r report_line; do
+    diag "$report_line"
+  done < "$jvm_report_tmp"
+  rm -f -- "$jvm_report_tmp"
+}
+
+show_verified_container_otel_settings() {
+  [ "$DRY_RUN" = "true" ] && {
+    log "[DRY-RUN] JVM パラメータの後に OpenTelemetry 環境変数・JVM パラメータ一覧をプレビューします。"
+    return 0
+  }
+
+  local report_line cid service_name container_name otel_report_tmp
+  local -a target_container_ids=()
+  mapfile -t target_container_ids < <(verification_target_container_ids)
+
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    warn "OpenTelemetry 設定一覧を出力できませんでした。対象コンテナが見つかりません。"
+    return 0
+  fi
+  if ! otel_report_tmp="$(mktemp 2>/dev/null)"; then
+    warn "OpenTelemetry 設定一覧出力用の一時ファイルを作成できませんでした。"
+    return 0
+  fi
+  : > "$otel_report_tmp"
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+    container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    append_container_otel_report "$cid" "$service_name" "$container_name" "$otel_report_tmp"
+  done
+
+  diag ""
+  while IFS= read -r report_line; do
+    diag "$report_line"
+  done < "$otel_report_tmp"
+  rm -f -- "$otel_report_tmp"
 }
 
 # 対象コンテナがすべて実行中か確認する (途中停止 = 起動失敗の早期検知用)。
@@ -5032,7 +5630,7 @@ append_compose_service_logs_report() {
 
     printf '\n' >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
-    printf '[5-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
+    printf '[7-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
     printf 'コンテナ      : %s\n' "$containers" >> "$report_file"
     printf 'ログ行数      : %s 行\n' "$line_count" >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
@@ -5109,6 +5707,7 @@ write_build_report() {
     printf '詳細          : %s\n' "${BUILD_RESULT_DETAIL:-(なし)}"
     printf 'イメージ      : %s\n' "${BUILD_IMAGE_INFO:-(未確認)}"
     printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
+    printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
@@ -5126,6 +5725,10 @@ write_build_report() {
       printf '\n[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)\n'
       printf '対象コンテナが起動していないため取得していません。\n'
       printf '\n[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)\n'
+      printf '対象コンテナが起動していないため取得していません。\n'
+      printf '\n[5] Java JVM パラメータ (全件)\n'
+      printf '対象コンテナが起動していないため取得していません。\n'
+      printf '\n[6] OpenTelemetry 環境変数・JVM パラメータ (全件)\n'
       printf '対象コンテナが起動していないため取得していません。\n'
     } >> "$report_tmp"
   else
@@ -5158,11 +5761,29 @@ write_build_report() {
       append_container_deployment_structure_report "$cid" "$service_name" "$container_name" \
           "$report_tmp" "all" "all"
     done
+
+    printf '\n[5] Java JVM パラメータ (全件)\n' >> "$report_tmp"
+    for cid in "${target_container_ids[@]}"; do
+      [ -n "$cid" ] || continue
+      service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+      [ -n "$service_name" ] || service_name="(unknown)"
+      container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+      append_container_jvm_parameter_report "$cid" "$service_name" "$container_name" "$report_tmp"
+    done
+
+    printf '\n[6] OpenTelemetry 環境変数・JVM パラメータ (全件)\n' >> "$report_tmp"
+    for cid in "${target_container_ids[@]}"; do
+      [ -n "$cid" ] || continue
+      service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+      [ -n "$service_name" ] || service_name="(unknown)"
+      container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+      append_container_otel_report "$cid" "$service_name" "$container_name" "$report_tmp"
+    done
   fi
 
   # 失敗時は原因調査に必要なため全サービスのログ全文を残す。成功時は同じ内容が
   # 画面へ出ており、レポートを不必要に肥大化させるだけなので省略する。
-  printf '\n[5] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
+  printf '\n[7] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
   if [ "$exit_status" -eq 0 ]; then
     printf '処理が成功したため、Compose サービス別ログの全文出力は省略しました。\n' >> "$report_tmp"
   else
@@ -5348,7 +5969,7 @@ if [ "$NEED_CONTAINER" != "true" ]; then
     warn "ファイル表示切替と JBoss EAP デプロイ構造はコンテナ起動を伴う動作確認時のみ画面表示されます。--verify-startup または --verify-url を併用してください。"
   fi
   if [ "$BUILD_REPORT_DIR_SET" = "true" ]; then
-    warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造は、コンテナ未起動のため未取得として記録します。"
+    warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
   if [ "$DRY_RUN" = "true" ]; then
     log "[DRY-RUN] ビルドのみが完了しました (実際のビルドは行われていません)。"
@@ -5390,6 +6011,8 @@ fi
 show_verified_container_envs
 show_verified_container_directory_trees
 show_verified_container_deployment_structures
+show_verified_container_jvm_parameters
+show_verified_container_otel_settings
 
 if [ "$DRY_RUN" = "true" ]; then
   log "DRY-RUN が完了しました (実際の変更は行われていません)。"

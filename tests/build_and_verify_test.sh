@@ -165,8 +165,51 @@ assert_not_contains "$success_output" "public/"
 assert_not_contains "$success_output" "[ファイル] readme.txt"
 assert_not_contains "$success_output" "zoneinfo.txt"
 assert_not_contains "$success_output" "usr-local-hidden"
+assert_contains "$success_output" "Java JVM パラメータ (サービス: app, コンテナ: test-app-1, Java プロセス: 1)"
+assert_contains "$success_output" "[Java プロセス 1] PID: 1"
+assert_contains "$success_output" "実行ファイル     : /opt/java/openjdk/bin/java"
+assert_contains "$success_output" 'バージョン       : openjdk version "17.0.11" 2024-04-16 LTS'
+assert_contains "$success_output" "起動対象         : -jar /opt/jboss-eap/jboss-modules.jar"
+assert_contains "$success_output" "[ヒープ・メモリ] 4 件"
+assert_contains "$success_output" "  -Xmx1024m"
+assert_contains "$success_output" "  -XX:MaxMetaspaceSize                         = 256m"
+assert_contains "$success_output" "[GC (ガベージコレクション)] 2 件"
+assert_contains "$success_output" "  -XX:+UseG1GC"
+assert_contains "$success_output" "[Java エージェント] 1 件"
+assert_contains "$success_output" "  -javaagent                                   = /opt/otel/opentelemetry-javaagent.jar"
+assert_contains "$success_output" "[JBoss / WildFly] 2 件"
+assert_contains "$success_output" "[システムプロパティ (-D)] 2 件"
+assert_contains "$success_output" "[クラスパス・モジュール] 2 件"
+assert_contains "$success_output" "  --add-exports                                = java.base/sun.nio.ch=ALL-UNNAMED"
+assert_contains "$success_output" "[その他 JVM オプション] 1 件"
+assert_contains "$success_output" "[起動対象へ渡される引数] 4 件"
+assert_contains "$success_output" "  org.jboss.as.standalone"
+assert_contains "$success_output" "[JVM オプションを渡す環境変数] 1 件"
+assert_contains "$success_output" "  JAVA_TOOL_OPTIONS                            = -javaagent:/opt/otel/opentelemetry-javaagent.jar"
+# JVM パラメータ側の認証情報も環境変数一覧と同じく値だけを伏せる。
+assert_contains "$success_output" "  -Djboss.password                             = [REDACTED]"
+assert_not_contains "$success_output" "do-not-log-this-jvm-value"
+assert_contains "$success_output" "OpenTelemetry 環境変数・JVM パラメータ一覧 (サービス: app, コンテナ: test-app-1)"
+assert_contains "$success_output" "[OpenTelemetry 標準環境変数 (OTEL_*)] 4 件"
+assert_contains "$success_output" "  OTEL_SERVICE_NAME                            = orders-app"
+assert_contains "$success_output" "  OTEL_EXPORTER_OTLP_ENDPOINT                  = http://adot-collector:4317"
+# OTLP ヘッダは認証情報を載せる用途が多いため値を伏せる。
+assert_contains "$success_output" "  OTEL_EXPORTER_OTLP_HEADERS                   = [REDACTED]"
+assert_not_contains "$success_output" "do-not-log-this-header"
+assert_contains "$success_output" "[OpenTelemetry 関連環境変数] 1 件"
+assert_contains "$success_output" "[OpenTelemetry 関連 JVM パラメータ (コマンドライン)] 4 件"
+assert_contains "$success_output" "  -Dotel.exporter.otlp.endpoint                = http://adot-collector:4317"
+assert_contains "$success_output" "[OpenTelemetry 関連 JVM パラメータ (環境変数由来)] 1 件"
+assert_contains "$success_output" "  JAVA_TOOL_OPTIONS: -javaagent                = /opt/otel/opentelemetry-javaagent.jar"
+assert_contains "$success_output" "[未設定の主要 OpenTelemetry 設定] 7 件"
+assert_contains "$success_output" "  OTEL_PROPAGATORS (システムプロパティ -Dotel.propagators も未設定)"
+# 環境変数・システムプロパティのどちらかで設定済みの項目は未設定側へ出さない。
+assert_not_contains "$success_output" "OTEL_SERVICE_NAME (システムプロパティ"
+assert_not_contains "$success_output" "OTEL_TRACES_EXPORTER (システムプロパティ"
 assert_before "$success_output" "環境変数一覧 (サービス: app" "コンテナ内ディレクトリツリー (サービス: app"
 assert_before "$success_output" "コンテナ内ディレクトリツリー (サービス: app" "JBoss EAP デプロイ済み Web アプリケーションのディレクトリ構造"
+assert_before "$success_output" "JBoss EAP デプロイ済み Web アプリケーションのディレクトリ構造" "Java JVM パラメータ (サービス: app"
+assert_before "$success_output" "Java JVM パラメータ (サービス: app" "OpenTelemetry 環境変数・JVM パラメータ一覧 (サービス: app"
 assert_matches "$FAKE_DOCKER_CALLS" 'compose -f compose\.yml logs --no-color --since [^ ]+ app'
 assert_matches "$FAKE_DOCKER_CALLS" 'exec cid-app find / .* -path /afs .* -path /local/aws-cli .* -path /opt/jboss-eap/modules/system/layers/base .* -path /usr/share .* -path /usr/share/X11 .* -path /usr/share/doc .* -path /usr/share/icons .* -path /usr/share/licenses .* -path /usr/share/man .* -path /usr/share/osinfo .* -path /usr/share/zoneinfo .* -path /usr/lib64 .* -path /usr/local .* -prune -print0 -o -type d -print0'
 assert_matches "$FAKE_DOCKER_CALLS" 'exec cid-app find / .* -path /afs .* -path /local/aws-cli .* -path /opt/jboss-eap/modules/system/layers/base .* -path /usr/share .* -path /usr/share/X11 .* -path /usr/share/doc .* -path /usr/share/icons .* -path /usr/share/licenses .* -path /usr/share/man .* -path /usr/share/osinfo .* -path /usr/share/zoneinfo .* -path /usr/lib64 .* -path /usr/local .* -prune -o -type f -print0'
@@ -185,10 +228,22 @@ assert_contains "$full_report" "[1] ビルド結果"
 assert_contains "$full_report" "[2] 環境変数一覧 (全件)"
 assert_contains "$full_report" "[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)"
 assert_contains "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)"
-assert_contains "$full_report" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "$full_report" "[5] Java JVM パラメータ (全件)"
+assert_contains "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
+assert_contains "$full_report" "[7] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "処理が成功したため、Compose サービス別ログの全文出力は省略しました。"
 assert_contains "$full_report" "API_TOKEN=[REDACTED]"
 assert_not_contains "$full_report" "do-not-log-this-value"
+assert_contains "$full_report" "[Java プロセス 1] PID: 1"
+assert_contains "$full_report" "  -Djboss.password                             = [REDACTED]"
+assert_not_contains "$full_report" "do-not-log-this-jvm-value"
+assert_contains "$full_report" "  OTEL_EXPORTER_OTLP_HEADERS                   = [REDACTED]"
+assert_not_contains "$full_report" "do-not-log-this-header"
+assert_contains "$full_report" "  OTEL_SERVICE_NAME                            = orders-app"
+assert_contains "$full_report" "[未設定の主要 OpenTelemetry 設定] 7 件"
+assert_before "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)" "[5] Java JVM パラメータ (全件)"
+assert_before "$full_report" "[5] Java JVM パラメータ (全件)" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
+assert_before "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)" "[7] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "application.yaml"
 assert_contains "$full_report" "deep.json"
 assert_contains "$full_report" "Order01.class"
@@ -424,12 +479,12 @@ assert_contains "${failure_report_files[0]}" "全体結果     : 失敗 (exit=1)
 assert_contains "${failure_report_files[0]}" "結果          : 成功"
 # 失敗レポートには、起動確認対象・サイドカーを問わず全 Compose サービスのログを
 # サービス単位に区切って残す。
-assert_contains "${failure_report_files[0]}" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${failure_report_files[0]}" "[7] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${failure_report_files[0]}" "対象サービス  : base app adot-collector cache (4 サービス)"
-assert_contains "${failure_report_files[0]}" "[5-1] Compose サービス: base"
-assert_contains "${failure_report_files[0]}" "[5-2] Compose サービス: app"
-assert_contains "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector"
-assert_contains "${failure_report_files[0]}" "[5-4] Compose サービス: cache"
+assert_contains "${failure_report_files[0]}" "[7-1] Compose サービス: base"
+assert_contains "${failure_report_files[0]}" "[7-2] Compose サービス: app"
+assert_contains "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector"
+assert_contains "${failure_report_files[0]}" "[7-4] Compose サービス: cache"
 assert_contains "${failure_report_files[0]}" "コンテナ      : test-app-1 (状態: running)"
 assert_contains "${failure_report_files[0]}" "コンテナ      : adot-collector (状態: exited, 終了コード: 1)"
 assert_contains "${failure_report_files[0]}" "ログ行数      : 5 行"
@@ -438,11 +493,11 @@ assert_contains "${failure_report_files[0]}" "ログ行数      : 2 行"
 assert_contains "${failure_report_files[0]}" "WFLYSRV0026"
 assert_contains "${failure_report_files[0]}" "adot-collector  | TracesExporter resource spans: 2, spans: 4"
 assert_contains "${failure_report_files[0]}" "cache-1  | CACHE001: cache ready"
-assert_before "${failure_report_files[0]}" "[5-1] Compose サービス: base" "[5-2] Compose サービス: app"
-assert_before "${failure_report_files[0]}" "[5-2] Compose サービス: app" "[5-3] Compose サービス: adot-collector"
-assert_before "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector" "[5-4] Compose サービス: cache"
-assert_before "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector" "TracesExporter resource spans"
-assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[5-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[7-1] Compose サービス: base" "[7-2] Compose サービス: app"
+assert_before "${failure_report_files[0]}" "[7-2] Compose サービス: app" "[7-3] Compose サービス: adot-collector"
+assert_before "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector" "[7-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector" "TracesExporter resource spans"
+assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[7-4] Compose サービス: cache"
 # レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
 assert_not_contains "${failure_report_files[0]}" $'\033['
 
@@ -468,14 +523,43 @@ assert_contains "${build_failure_reports[0]}" "結果          : 失敗"
 assert_contains "${build_failure_reports[0]}" "対象コンテナが起動していないため取得していません。"
 # ビルド失敗でコンテナが 1 つも作られていない場合も、compose.yml 定義の全サービスを
 # 見出しとして残し、ログがないことを明示する。
-assert_contains "${build_failure_reports[0]}" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${build_failure_reports[0]}" "[7] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${build_failure_reports[0]}" "取得範囲      : コンテナ作成時からの全期間 (compose up 到達前に終了)"
 assert_contains "${build_failure_reports[0]}" "対象サービス  : base app adot-collector (3 サービス)"
-assert_contains "${build_failure_reports[0]}" "[5-1] Compose サービス: base"
-assert_contains "${build_failure_reports[0]}" "[5-2] Compose サービス: app"
-assert_contains "${build_failure_reports[0]}" "[5-3] Compose サービス: adot-collector"
+assert_contains "${build_failure_reports[0]}" "[7-1] Compose サービス: base"
+assert_contains "${build_failure_reports[0]}" "[7-2] Compose サービス: app"
+assert_contains "${build_failure_reports[0]}" "[7-3] Compose サービス: adot-collector"
 assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテナなし)" 3
 assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
+
+# JVM を実行しないコンテナ (OTel Collector / DB など) でも、Java プロセス無しを
+# 明示したうえで OpenTelemetry の環境変数側は同じ形式で一覧化する。
+no_java_output="$TEST_TMP/no-java-process.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_DOCKER_NO_JAVA_PROCESS="true"
+if ! (
+  cd "$REPO_ROOT"
+  CLICOLOR_FORCE=0 bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$no_java_output" 2>&1; then
+  unset FAKE_DOCKER_NO_JAVA_PROCESS
+  cat "$no_java_output" >&2
+  fail "non-java container scenario returned a non-zero status"
+fi
+unset FAKE_DOCKER_NO_JAVA_PROCESS
+
+assert_contains "$no_java_output" "Java JVM パラメータ (サービス: app, コンテナ: test-app-1, Java プロセス: 0)"
+assert_contains "$no_java_output" "Java プロセスを検出できませんでした。"
+assert_not_contains "$no_java_output" "[Java プロセス 1] PID:"
+assert_contains "$no_java_output" "[OpenTelemetry 標準環境変数 (OTEL_*)] 4 件"
+assert_contains "$no_java_output" "[OpenTelemetry 関連 JVM パラメータ (コマンドライン)] 0 件"
+assert_contains "$no_java_output" "[OpenTelemetry 関連 JVM パラメータ (環境変数由来)] 1 件"
 
 invalid_keep_mode_output="$TEST_TMP/keep-mode-invalid.out"
 if (

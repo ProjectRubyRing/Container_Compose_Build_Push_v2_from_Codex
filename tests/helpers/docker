@@ -649,9 +649,57 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "find" ]; then
   exit 0
 fi
 
+# /proc/<pid>/cmdline の走査 (JVM パラメータ / OpenTelemetry 一覧の収集)。
+# 実際のスクリプトと同じく "PID<US>arg0<US>arg1..." 形式で返す。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"/proc/[0-9]"* ]]; then
+  if [ "${FAKE_DOCKER_NO_JAVA_PROCESS:-false}" = "true" ]; then
+    # JVM を実行しないコンテナ (Collector / DB など) の再現。
+    printf '1\037/usr/bin/otelcol\037--config=/etc/otel/config.yaml\037\n'
+    exit 0
+  fi
+  # JBoss EAP を OpenTelemetry Java エージェント付きで起動した状態の再現。
+  printf '1\037/opt/java/openjdk/bin/java'
+  printf '\037-D[Standalone]'
+  printf '\037-server'
+  printf '\037-Xms512m'
+  printf '\037-Xmx1024m'
+  printf '\037-XX:MetaspaceSize=96M'
+  printf '\037-XX:MaxMetaspaceSize=256m'
+  printf '\037-XX:+UseG1GC'
+  printf '\037-XX:MaxGCPauseMillis=200'
+  printf '\037-javaagent:/opt/otel/opentelemetry-javaagent.jar'
+  printf '\037-Dotel.service.name=orders-app'
+  printf '\037-Dotel.exporter.otlp.endpoint=http://adot-collector:4317'
+  printf '\037-Dotel.traces.exporter=otlp'
+  printf '\037-Djava.net.preferIPv4Stack=true'
+  printf '\037-Djboss.modules.system.pkgs=org.jboss.byteman'
+  printf '\037-Djboss.password=do-not-log-this-jvm-value'
+  printf '\037--add-opens=java.base/java.lang=ALL-UNNAMED'
+  printf '\037--add-exports\037java.base/sun.nio.ch=ALL-UNNAMED'
+  printf '\037-jar\037/opt/jboss-eap/jboss-modules.jar'
+  printf '\037-mp\037/opt/jboss-eap/modules'
+  printf '\037org.jboss.as.standalone'
+  printf '\037-Djboss.home.dir=/opt/jboss-eap'
+  printf '\037\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/opt/java/openjdk/bin/java" ] \
+    && [ "${4:-}" = "-version" ]; then
+  printf 'openjdk version "17.0.11" 2024-04-16 LTS\n' >&2
+  printf 'OpenJDK Runtime Environment (build 17.0.11+9-LTS)\n' >&2
+  exit 0
+fi
+
 if [ "${1:-}" = "exec" ]; then
   printf 'APP_CONFIG_DIR=/opt/app/config\n'
   printf 'API_TOKEN=do-not-log-this-value\n'
+  printf 'JAVA_TOOL_OPTIONS=-javaagent:/opt/otel/opentelemetry-javaagent.jar\n'
+  printf 'OTEL_EXPORTER_OTLP_ENDPOINT=http://adot-collector:4317\n'
+  printf 'OTEL_EXPORTER_OTLP_HEADERS=authorization=do-not-log-this-header\n'
+  printf 'OTEL_SERVICE_NAME=orders-app\n'
+  printf 'OTEL_TRACES_EXPORTER=otlp\n'
   printf 'PATH=/usr/bin\n'
   exit 0
 fi
