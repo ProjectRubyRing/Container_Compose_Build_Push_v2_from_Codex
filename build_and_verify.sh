@@ -1116,6 +1116,42 @@ show_companion_service_logs() {
   done
 }
 
+# compose.yml に定義された全サービスと、停止済みを含むコンテナを持つ全サービスを
+# 重複なく列挙する。失敗レポートへログを書き出す対象を決めるために使うので、
+# 起動確認対象かどうか、サイドカー (adot collector 等) かどうかで絞り込まない。
+# 定義順を優先し、profiles などで定義側に現れないサービスは ps の結果で補う。
+compose_all_service_names() {
+  {
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" config --services 2>/dev/null || true
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -a --services 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++'
+}
+
+# レポートのサービス見出しへ添えるコンテナ名と状態を組み立てる。停止済みも対象に
+# するため ps -aq を使い、サイドカーの異常終了をログ本文より先に示す。
+compose_service_container_summary() {
+  local service_name="$1" cid name state status exit_code entry summary=""
+  while IFS= read -r cid; do
+    [ -n "$cid" ] || continue
+    name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    state="$(docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}' "$cid" 2>/dev/null || printf '|')"
+    status="${state%%|*}"
+    exit_code="${state##*|}"
+    case "$status" in
+      running) entry="${name} (状態: running)" ;;
+      "")      entry="${name} (状態: 不明)" ;;
+      *)       entry="${name} (状態: ${status}, 終了コード: ${exit_code:-不明})" ;;
+    esac
+    if [ -n "$summary" ]; then
+      summary="${summary}, ${entry}"
+    else
+      summary="$entry"
+    fi
+  done < <(compose_container_ids_all "$service_name")
+  [ -n "$summary" ] || summary="(コンテナなし)"
+  printf '%s\n' "$summary"
+}
+
 normalize_container_name() {
   local name="$1"
   printf '%s\n' "${name#/}"
@@ -4949,6 +4985,56 @@ cleanup_all_docker_data() {
 }
 
 # ---- 全量ビルドレポート ------------------------------------------------------
+# 失敗時の一次調査をレポート 1 枚で完結させるため、Compose サービスごとのログ全文を
+# 追記する。起動確認対象だけでなく adot collector などのサイドカーも含む全サービスを
+# 対象とし、どこからどこまでが 1 サービスのログかを見出しと罫線で区切る。
+# 画面表示用の行数上限 (--startup-log-lines) や抑制指定は適用しない。
+append_compose_service_logs_report() {
+  local report_file="$1"
+  local service_name index=0 normalized_logs line_count containers log_scope
+  local -a services=()
+
+  if [ -n "$CONTAINER_LOG_SINCE" ]; then
+    log_scope="今回の compose up 以降 (--since ${CONTAINER_LOG_SINCE})"
+  else
+    log_scope="コンテナ作成時からの全期間 (compose up 到達前に終了)"
+  fi
+  printf '取得範囲      : %s\n' "$log_scope" >> "$report_file"
+  printf '出力方針      : サービス単位に全行を出力 (画面表示の行数制限は適用しない)\n' >> "$report_file"
+
+  mapfile -t services < <(compose_all_service_names)
+  if [ ${#services[@]} -eq 0 ]; then
+    printf '対象サービス  : (なし)\n' >> "$report_file"
+    printf 'Compose サービスを特定できなかったため、ログを取得していません。\n' >> "$report_file"
+    return 0
+  fi
+  printf '対象サービス  : %s (%s サービス)\n' "${services[*]}" "${#services[@]}" >> "$report_file"
+
+  for service_name in "${services[@]}"; do
+    index=$((index + 1))
+    containers="$(compose_service_container_summary "$service_name")"
+    normalized_logs="$(compose_logs "$service_name" | strip_ansi_codes)"
+    if [ -n "$normalized_logs" ]; then
+      line_count="$(printf '%s\n' "$normalized_logs" | awk 'END { print NR }')"
+    else
+      line_count=0
+    fi
+
+    printf '\n' >> "$report_file"
+    printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
+    printf '[5-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
+    printf 'コンテナ      : %s\n' "$containers" >> "$report_file"
+    printf 'ログ行数      : %s 行\n' "$line_count" >> "$report_file"
+    printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
+    if [ "$line_count" -gt 0 ]; then
+      printf '%s\n' "$normalized_logs" >> "$report_file"
+    else
+      printf '(このサービスのログはありません)\n' >> "$report_file"
+    fi
+  done
+  return 0
+}
+
 # EXIT トラップからコンテナ停止前に呼び、画面表示の制限にかかわらず環境変数は
 # 全件、各ディレクトリは全深度・全ファイル名で保存する。
 write_build_report() {
@@ -5013,6 +5099,7 @@ write_build_report() {
     printf '詳細          : %s\n' "${BUILD_RESULT_DETAIL:-(なし)}"
     printf 'イメージ      : %s\n' "${BUILD_IMAGE_INFO:-(未確認)}"
     printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
+    printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -5061,6 +5148,15 @@ write_build_report() {
       append_container_deployment_structure_report "$cid" "$service_name" "$container_name" \
           "$report_tmp" "all" "all"
     done
+  fi
+
+  # 失敗時は原因調査に必要なため全サービスのログ全文を残す。成功時は同じ内容が
+  # 画面へ出ており、レポートを不必要に肥大化させるだけなので省略する。
+  printf '\n[5] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
+  if [ "$exit_status" -eq 0 ]; then
+    printf '処理が成功したため、Compose サービス別ログの全文出力は省略しました。\n' >> "$report_tmp"
+  else
+    append_compose_service_logs_report "$report_tmp"
   fi
 
   if ! mv -- "$report_tmp" "$candidate"; then

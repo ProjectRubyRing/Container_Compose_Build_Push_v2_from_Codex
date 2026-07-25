@@ -20,7 +20,7 @@ if [ "${1:-}" = "compose" ]; then
   subcommand=""
   for arg in "$@"; do
     case "$arg" in
-      version|build|up|logs|ps|down)
+      version|build|up|logs|ps|down|config)
         subcommand="$arg"
         break
         ;;
@@ -30,6 +30,15 @@ if [ "${1:-}" = "compose" ]; then
   case "$subcommand" in
     version)
       printf 'Docker Compose version v2.29.0\n'
+      ;;
+    config)
+      if [[ " $* " != *" --services "* ]]; then
+        fail "compose $*"
+      fi
+      # compose.yml の定義順。コンテナを持たないサービスも含む点が ps との違い。
+      for fake_service in ${FAKE_COMPOSE_CONFIG_SERVICES:-${FAKE_COMPOSE_PS_SERVICES:-app}}; do
+        printf '%s\n' "$fake_service"
+      done
       ;;
     build)
       printf '[fake-build] BUILDKIT_PROGRESS=%s\n' "${BUILDKIT_PROGRESS:-unset}"
@@ -42,6 +51,10 @@ if [ "${1:-}" = "compose" ]; then
       printf 'fake app container started\n'
       ;;
     logs)
+      # ビルド失敗などでコンテナが 1 つも作られていない状態の再現。
+      if [ "${FAKE_COMPOSE_NO_CONTAINERS:-false}" = "true" ]; then
+        exit 0
+      fi
       if [ -z "${FAKE_COMPOSE_LOG_FILE:-}" ]; then
         printf 'FAKE_COMPOSE_LOG_FILE is not set\n' >&2
         exit 65
@@ -64,7 +77,10 @@ if [ "${1:-}" = "compose" ]; then
       fi
       ;;
     ps)
-      if [[ " $* " == *" --services "* ]]; then
+      # ps はコンテナを持つサービスだけを返すため、コンテナ未作成時は何も返さない。
+      if [ "${FAKE_COMPOSE_NO_CONTAINERS:-false}" = "true" ]; then
+        :
+      elif [[ " $* " == *" --services "* ]]; then
         for fake_service in ${FAKE_COMPOSE_PS_SERVICES:-app}; do
           printf '%s\n' "$fake_service"
         done
@@ -286,6 +302,14 @@ if [ "${1:-}" = "inspect" ]; then
       printf '出力:\n'
       printf 'healthcheck request completed\n'
       printf '────────────────────\n'
+      ;;
+    *".State.Status"*)
+      # サイドカーの異常終了をレポートへ残せるか確認できるよう、
+      # adot collector だけ終了済みとして扱う。
+      case "$*" in
+        *"cid-adot-collector"*) printf 'exited|1\n' ;;
+        *) printf 'running|0\n' ;;
+      esac
       ;;
     *".State.Running"*)
       printf 'true\n'

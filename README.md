@@ -94,7 +94,7 @@ CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されま�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する | (なし) |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -357,6 +357,15 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   レポートだけは画面用の件数・深度制限を適用せず、環境変数全件、除外対象を除く
   全ディレクトリ深度、全ファイル名を出力します。起動確認を伴わないビルドのみの場合、コンテナ由来の 3 セクションは
   「未取得」と記録します。`--dry-run` ではファイルを作成せず、出力予定だけを表示します。
+- ビルドや動作確認が失敗した場合、レポート末尾の
+  **`[5] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
+  起動確認対象だけでなく、adot collector などのサイドカーを含む
+  `compose.yml` 定義の全サービス (コンテナを持つが定義に現れないサービスも含む) が対象で、
+  サービスごとに見出し・コンテナ名・状態 (異常終了時は終了コード)・ログ行数を付けて
+  区切ります。`--startup-log-lines` や `--suppress-startup-logs` の画面向け制限は
+  適用せず全行を残します。ログの取得範囲は今回の `compose up` 以降で、
+  `compose up` に到達せずビルドが失敗した場合はコンテナ作成時からの全期間です。
+  処理が成功した場合は同じ内容が画面に出ているため、このセクションは省略と記録します。
 
 ```bash
 # ビルド + jbosseap 起動確認

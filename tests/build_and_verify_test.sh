@@ -185,6 +185,8 @@ assert_contains "$full_report" "[1] ビルド結果"
 assert_contains "$full_report" "[2] 環境変数一覧 (全件)"
 assert_contains "$full_report" "[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)"
 assert_contains "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)"
+assert_contains "$full_report" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "$full_report" "処理が成功したため、Compose サービス別ログの全文出力は省略しました。"
 assert_contains "$full_report" "API_TOKEN=[REDACTED]"
 assert_not_contains "$full_report" "do-not-log-this-value"
 assert_contains "$full_report" "application.yaml"
@@ -384,6 +386,10 @@ assert_contains "$tree_find_failure_output" "ビルドおよび確認が完了�
 failure_output="$TEST_TMP/failure.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-failure.log"
+# 起動確認対象 (app) 以外に、コンテナを持つサイドカー (adot-collector) と
+# コンテナを持たない定義だけのサービス (base / cache) を混在させる。
+export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector cache"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector"
 if (
   cd "$REPO_ROOT"
   unset NO_COLOR
@@ -395,9 +401,11 @@ if (
     --report-dir "$TEST_TMP/failure-reports" \
     --suppress-removed-logs
 ) >"$failure_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
   cat "$failure_output" >&2
   fail "failure fixture unexpectedly returned zero"
 fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 
 assert_contains "$failure_output" "JBoss EAP 8.1 が正常起動しませんでした"
 assert_contains "$failure_output" "コンテナ起動ログ (対象サービス: app, 末尾 5/5 行 (指定上限: 50)):"
@@ -414,17 +422,43 @@ failure_report_files=("$TEST_TMP/failure-reports"/build_and_verify_*.txt)
   || fail "expected one report for failed verification"
 assert_contains "${failure_report_files[0]}" "全体結果     : 失敗 (exit=1)"
 assert_contains "${failure_report_files[0]}" "結果          : 成功"
+# 失敗レポートには、起動確認対象・サイドカーを問わず全 Compose サービスのログを
+# サービス単位に区切って残す。
+assert_contains "${failure_report_files[0]}" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${failure_report_files[0]}" "対象サービス  : base app adot-collector cache (4 サービス)"
+assert_contains "${failure_report_files[0]}" "[5-1] Compose サービス: base"
+assert_contains "${failure_report_files[0]}" "[5-2] Compose サービス: app"
+assert_contains "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector"
+assert_contains "${failure_report_files[0]}" "[5-4] Compose サービス: cache"
+assert_contains "${failure_report_files[0]}" "コンテナ      : test-app-1 (状態: running)"
+assert_contains "${failure_report_files[0]}" "コンテナ      : adot-collector (状態: exited, 終了コード: 1)"
+assert_contains "${failure_report_files[0]}" "ログ行数      : 5 行"
+assert_contains "${failure_report_files[0]}" "ログ行数      : 1 行"
+assert_contains "${failure_report_files[0]}" "ログ行数      : 2 行"
+assert_contains "${failure_report_files[0]}" "WFLYSRV0026"
+assert_contains "${failure_report_files[0]}" "adot-collector  | TracesExporter resource spans: 2, spans: 4"
+assert_contains "${failure_report_files[0]}" "cache-1  | CACHE001: cache ready"
+assert_before "${failure_report_files[0]}" "[5-1] Compose サービス: base" "[5-2] Compose サービス: app"
+assert_before "${failure_report_files[0]}" "[5-2] Compose サービス: app" "[5-3] Compose サービス: adot-collector"
+assert_before "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector" "[5-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[5-3] Compose サービス: adot-collector" "TracesExporter resource spans"
+assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[5-4] Compose サービス: cache"
+# レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
+assert_not_contains "${failure_report_files[0]}" $'\033['
 
 build_failure_output="$TEST_TMP/build-failure.out"
 export FAKE_DOCKER_BUILD_FAIL="true"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"
+export FAKE_COMPOSE_NO_CONTAINERS="true"
 if (
   cd "$REPO_ROOT"
   bash ./build_and_verify.sh --report-dir "$TEST_TMP/build-failure-reports"
 ) >"$build_failure_output" 2>&1; then
+  unset FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
   cat "$build_failure_output" >&2
   fail "failed compose build unexpectedly returned zero"
 fi
-unset FAKE_DOCKER_BUILD_FAIL
+unset FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
 assert_contains "$build_failure_output" "compose build に失敗しました"
 build_failure_reports=("$TEST_TMP/build-failure-reports"/build_and_verify_*.txt)
 [ ${#build_failure_reports[@]} -eq 1 ] && [ -f "${build_failure_reports[0]}" ] \
@@ -432,6 +466,16 @@ build_failure_reports=("$TEST_TMP/build-failure-reports"/build_and_verify_*.txt)
 assert_contains "${build_failure_reports[0]}" "全体結果     : 失敗 (exit=1)"
 assert_contains "${build_failure_reports[0]}" "結果          : 失敗"
 assert_contains "${build_failure_reports[0]}" "対象コンテナが起動していないため取得していません。"
+# ビルド失敗でコンテナが 1 つも作られていない場合も、compose.yml 定義の全サービスを
+# 見出しとして残し、ログがないことを明示する。
+assert_contains "${build_failure_reports[0]}" "[5] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${build_failure_reports[0]}" "取得範囲      : コンテナ作成時からの全期間 (compose up 到達前に終了)"
+assert_contains "${build_failure_reports[0]}" "対象サービス  : base app adot-collector (3 サービス)"
+assert_contains "${build_failure_reports[0]}" "[5-1] Compose サービス: base"
+assert_contains "${build_failure_reports[0]}" "[5-2] Compose サービス: app"
+assert_contains "${build_failure_reports[0]}" "[5-3] Compose サービス: adot-collector"
+assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテナなし)" 3
+assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
 
 invalid_keep_mode_output="$TEST_TMP/keep-mode-invalid.out"
 if (
