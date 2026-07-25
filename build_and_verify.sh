@@ -498,48 +498,58 @@ append_services() {
   done
 }
 
+# 値を取るオプションで値が省略されると "$2" の参照が set -u の unbound variable
+# となり、原因の分からないエラーになる。各 case の先頭で残り引数数を検証する。
+need_value() {
+  if [ "$2" -lt 2 ]; then
+    err "オプションに値が指定されていません: $1"
+    err "  使い方は --help を参照してください。"
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --local-image)         LOCAL_IMAGE="$2"; shift 2 ;;
-    --compose-file)        COMPOSE_FILE="$2"; shift 2 ;;
-    --compose-service)     append_services COMPOSE_SERVICES "$2"; shift 2 ;;
+    --local-image)         need_value "$1" $#; LOCAL_IMAGE="$2"; shift 2 ;;
+    --compose-file)        need_value "$1" $#; COMPOSE_FILE="$2"; shift 2 ;;
+    --compose-service)     need_value "$1" $#; append_services COMPOSE_SERVICES "$2"; shift 2 ;;
     --no-cache)            NO_CACHE="true"; shift ;;
     --dry-run)             DRY_RUN="true"; shift ;;
     --cleanup-all-docker-data) CLEANUP_ALL_DOCKER_DATA="true"; shift ;;
-    --copy-file)           COPY_SPECS+=("$2"); shift 2 ;;
-    --region)              REGION="$2"; shift 2 ;;
-    --jboss-password-param) JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
-    --jboss-password)       JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
-    --jboss-password-env)   JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --copy-file)           need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
+    --region)              need_value "$1" $#; REGION="$2"; shift 2 ;;
+    --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
+    --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
+    --jboss-password-env)   need_value "$1" $#; JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
     --verify-startup)      VERIFY_STARTUP="true"; shift ;;
-    --startup-service)     append_services STARTUP_SERVICES "$2"; VERIFY_STARTUP="true"; shift 2 ;;
-    --startup-log-pattern) STARTUP_LOG_PATTERN="$2"; shift 2 ;;
-    --startup-timeout)     STARTUP_TIMEOUT="$2"; shift 2 ;;
-    --startup-interval)    STARTUP_INTERVAL="$2"; shift 2 ;;
-    --startup-log-lines)   STARTUP_LOG_LINES="$2"; shift 2 ;;
+    --startup-service)     need_value "$1" $#; append_services STARTUP_SERVICES "$2"; VERIFY_STARTUP="true"; shift 2 ;;
+    --startup-log-pattern) need_value "$1" $#; STARTUP_LOG_PATTERN="$2"; shift 2 ;;
+    --startup-timeout)     need_value "$1" $#; STARTUP_TIMEOUT="$2"; shift 2 ;;
+    --startup-interval)    need_value "$1" $#; STARTUP_INTERVAL="$2"; shift 2 ;;
+    --startup-log-lines)   need_value "$1" $#; STARTUP_LOG_LINES="$2"; shift 2 ;;
     --wait-healthy)        STARTUP_WAIT="true"; shift ;;
-    --wait-timeout)        STARTUP_WAIT_TIMEOUT="$2"; STARTUP_WAIT="true"; shift 2 ;;
-    --allow-service-exit)  append_services ALLOW_SERVICE_EXIT "$2"; shift 2 ;;
+    --wait-timeout)        need_value "$1" $#; STARTUP_WAIT_TIMEOUT="$2"; STARTUP_WAIT="true"; shift 2 ;;
+    --allow-service-exit)  need_value "$1" $#; append_services ALLOW_SERVICE_EXIT "$2"; shift 2 ;;
     --suppress-startup-logs) SUPPRESS_STARTUP_LOGS="true"; shift ;;
     --keep-container)      KEEP_CONTAINER="true"; shift ;;
-    --keep-container-mode) KEEP_CONTAINER_MODE="$2"; shift 2 ;;
-    --jboss-context-root)  JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
-    --jboss-http-port)     JBOSS_HTTP_PORT="$2"; shift 2 ;;
+    --keep-container-mode) need_value "$1" $#; KEEP_CONTAINER_MODE="$2"; shift 2 ;;
+    --jboss-context-root)  need_value "$1" $#; JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
+    --jboss-http-port)     need_value "$1" $#; JBOSS_HTTP_PORT="$2"; shift 2 ;;
     --suppress-removed-logs) SUPPRESS_REMOVED_LOGS="true"; shift ;;
-    --env-list-limit)      ENV_LIST_LIMIT="$2"; shift 2 ;;
-    --env-list-file)       ENV_LIST_FILE="$2"; shift 2 ;;
-    --directory-tree-depth) DIRECTORY_TREE_DEPTH="$2"; DIRECTORY_TREE_DEPTH_SET="true"; shift 2 ;;
-    --directory-file-limit) DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
-    --deployment-dir-env) append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
-    --report-dir)          BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
-    --verify-url)          VERIFY_URL="$2"; shift 2 ;;
-    --expect-status)       EXPECT_STATUS="$2"; shift 2 ;;
-    --url-method)          URL_METHOD="$2"; shift 2 ;;
-    --url-content-type)    URL_CONTENT_TYPE="$2"; shift 2 ;;
-    --url-body-json)       URL_BODY_JSON="$2"; shift 2 ;;
-    --url-body-form)       URL_BODY_FORM="$2"; shift 2 ;;
-    --url-timeout)         URL_TIMEOUT="$2"; shift 2 ;;
-    --url-interval)        URL_INTERVAL="$2"; shift 2 ;;
+    --env-list-limit)      need_value "$1" $#; ENV_LIST_LIMIT="$2"; shift 2 ;;
+    --env-list-file)       need_value "$1" $#; ENV_LIST_FILE="$2"; shift 2 ;;
+    --directory-tree-depth) need_value "$1" $#; DIRECTORY_TREE_DEPTH="$2"; DIRECTORY_TREE_DEPTH_SET="true"; shift 2 ;;
+    --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
+    --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
+    --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
+    --verify-url)          need_value "$1" $#; VERIFY_URL="$2"; shift 2 ;;
+    --expect-status)       need_value "$1" $#; EXPECT_STATUS="$2"; shift 2 ;;
+    --url-method)          need_value "$1" $#; URL_METHOD="$2"; shift 2 ;;
+    --url-content-type)    need_value "$1" $#; URL_CONTENT_TYPE="$2"; shift 2 ;;
+    --url-body-json)       need_value "$1" $#; URL_BODY_JSON="$2"; shift 2 ;;
+    --url-body-form)       need_value "$1" $#; URL_BODY_FORM="$2"; shift 2 ;;
+    --url-timeout)         need_value "$1" $#; URL_TIMEOUT="$2"; shift 2 ;;
+    --url-interval)        need_value "$1" $#; URL_INTERVAL="$2"; shift 2 ;;
     --url-insecure)        URL_INSECURE="true"; shift ;;
     -h|--help)             usage; exit 0 ;;
     *) err "不明なオプション: $1"; usage; exit 2 ;;

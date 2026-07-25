@@ -4,6 +4,14 @@
 `imagedefinition.json` を出力するためのスクリプトです。ビルド方法の異なる
 2 つのスクリプトを提供します (ビルド以降の処理・オプションは共通)。
 
+> **スクリプト別の詳細資料** — パラメータ、全体構成、処理フローを網羅した資料を
+> `docs/` に用意しています。
+>
+> - [build_and_push.sh 詳細ガイド](docs/build_and_push_guide.md)
+> - [buildx_build_and_push.sh 詳細ガイド](docs/buildx_build_and_push_guide.md)
+> - [build_and_verify.sh 詳細ガイド](docs/build_and_verify_guide.md)
+> - [scripts_reference.xlsx](docs/scripts_reference.xlsx) — 上記を一覧化した Excel 資料 (全 8 シート)
+
 | スクリプト | ビルド方法 |
 | --- | --- |
 | `build_and_push.sh` | `compose.yml` を使った `docker compose build` |
@@ -54,6 +62,17 @@ CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されま�
 - 例 (既定): `BaseImage-20260702153000`
 - リポジトリ名を変更してもタグ接頭辞は影響を受けません。
 
+### 命名規則の制約
+
+ECR / Docker の規則により、**リポジトリ名 (`--repository`) には大文字を使えません**
+(使用可能: 小文字英数字と `.` `_` `-` `/`)。**タグ (`--tag-prefix`) は大文字も使えます**
+(使用可能: 英数字と `.` `_` `-`、先頭は英数字か `_`、タグ全体で 128 文字以内)。
+
+両スクリプトはビルド開始前にこれらを検証し、違反していれば `exit 2` で終了します
+(ビルド完了後の `docker image tag` で
+`invalid reference format: repository name must be lowercase` となって
+ビルド時間を無駄にしないため)。
+
 ```bash
 # リポジトリ名は my-repo、タグ接頭辞は BaseImage
 ./build_and_push.sh --repository my-repo --tag-prefix BaseImage
@@ -69,8 +88,8 @@ CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されま�
 | `--account-id ID` | ECR レジストリの AWS アカウント ID | env: `AWS_ACCOUNT_ID` |
 | `--region REGION` | AWS リージョン | `ap-northeast-1` / env: `AWS_REGION` |
 | `--registry URL` | ECR レジストリ名(URL) を明示指定 | env: `ECR_REGISTRY`<br>未指定時は `<account-id>.dkr.ecr.<region>.amazonaws.com` を組み立て |
-| `--repository NAME` | ECR リポジトリ名 = プッシュするイメージ名 | `BaseImage` |
-| `--tag-prefix PREFIX` | イメージタグの接頭辞。リポジトリ名とは独立に指定でき、タグは `<PREFIX>-<YYYYMMDDHHMMSS>` となる | `BaseImage` |
+| `--repository NAME` | ECR リポジトリ名 = プッシュするイメージ名。ECR / Docker の規則により**小文字**英数字と `.` `_` `-` `/` のみ | `baseimage` |
+| `--tag-prefix PREFIX` | イメージタグの接頭辞。リポジトリ名とは独立に指定でき、タグは `<PREFIX>-<YYYYMMDDHHMMSS>` となる (タグは大文字可) | `BaseImage` |
 | `--local-image NAME` | ビルドで生成されるローカルイメージ名 | `j1/base.local` |
 | `--container-name NAME` | `imagedefinition.json` の name | `--repository` の値 |
 | `--compose-file FILE` | compose ファイル (**compose 版のみ**) | `compose.yml` |
@@ -87,7 +106,7 @@ CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されま�
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
 | `--log-dir DIR` | コンソールに出力されるログを `DIR` 配下のログファイルにも保存する。画面表示は従来どおり継続し、ログ末尾には処理実行時間 (経過秒数) も記録される。`DIR` が無ければ自動作成する。ファイル名は compose 版が `build_and_push_<YYYYMMDDHHMMSS>.log`、buildx 版が `buildx_build_and_push_<YYYYMMDDHHMMSS>.log`。compose 版で `--build-only` 委譲時も、委譲先 (`build_and_verify.sh`) の出力を含めて記録する | (なし。指定時のみログファイル出力) |
-| `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述) | `false` |
+| `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述)。ECR 関連オプション (`--account-id` / `--registry` / `--repository` / `--tag-prefix` / `--container-name` / `--output` / `--switchback-shell` / `--auto-switchback` / `--warn-only`) は委譲先が解釈できないため、**警告のうえ無視される** | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応 | (なし) |
 | `--env-list-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後に表示する環境変数一覧の件数。各対象コンテナごとに先頭 `N` 件を表示し、既定は `all` | `all` |
 | `--env-list-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後の環境変数一覧を `FILE` にも出力する。画面表示も継続 | (なし) |
@@ -179,7 +198,9 @@ CI でもそのまま利用できます。compose 版 (`build_and_push.sh`) / bu
 イメージのビルドだけを行い ECR へのプッシュは行わない処理は、専用スクリプト
 `build_and_verify.sh` に切り出しています。ローカルでの動作確認や CI でのビルド
 検証などに利用できます。`build_and_push.sh --build-only` を指定した場合も、
-このスクリプトへ委譲されます (`--build-only` を除いた引数がそのまま渡されます)。
+このスクリプトへ委譲されます (`--build-only`、`--log-dir` (委譲元で処理済み)、および
+ECR 関連オプションを除いた引数がそのまま渡されます。ECR 関連オプションを併せて
+指定した場合は、無視した旨を警告してからビルドを実行します)。
 
 - ECR 権限チェック / ログイン / タグ付け / プッシュ / `imagedefinition.json` の
   出力はいずれも行いません。

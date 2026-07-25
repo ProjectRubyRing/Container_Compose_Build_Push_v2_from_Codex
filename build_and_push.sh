@@ -64,8 +64,8 @@ fi
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-1}}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 REGISTRY="${ECR_REGISTRY:-}"      # ECR レジストリ名(URL)。未指定なら <account>.dkr.ecr.<region>.amazonaws.com を組み立てる
-REPOSITORY="BaseImage"            # ECR 側リポジトリ名 (= プッシュするイメージ名)
-TAG_PREFIX="BaseImage"            # イメージタグの接頭辞。タグは <TAG_PREFIX>-<YYYYMMDDHHMMSS> となる (リポジトリ名とは独立)
+REPOSITORY="baseimage"            # ECR 側リポジトリ名 (= プッシュするイメージ名)。ECR / Docker の規則により小文字のみ
+TAG_PREFIX="BaseImage"            # イメージタグの接頭辞。タグは <TAG_PREFIX>-<YYYYMMDDHHMMSS> となる (リポジトリ名とは独立。タグは大文字可)
 LOCAL_IMAGE="j1/base.local"       # compose build で生成されるローカルベースイメージ名
 CONTAINER_NAME=""                 # imagedefinition.json の name。未指定なら REPOSITORY を使用
 COMPOSE_FILE="compose.yml"
@@ -76,6 +76,10 @@ ECR_USERNAME="AWS"                # ECR ログイン時の固定ユーザー名
 DRY_RUN="false"                   # true: 実際の変更は行わず、実行内容のプレビューのみ表示
 LOG_DIR=""                        # 指定時: コンソール出力をこのディレクトリのログファイルにも保存する
 LOG_FILE=""                       # --log-dir 指定時に組み立てる実際のログファイルパス
+TEE_PID=""                        # ログ複製用 tee (プロセス置換) の PID
+
+# 一時ファイル (SSM のエラー出力 / push ログ)。途中終了時も残さないよう EXIT トラップで削除する。
+TEMP_FILES=()
 
 # ビルドのみを実行する処理は build_and_verify.sh に切り出した。
 # --build-only 指定時はこのスクリプト冒頭で build_and_verify.sh に委譲する。
@@ -128,6 +132,43 @@ log_elapsed() {
       "$(( elapsed / 3600 ))" "$(( (elapsed % 3600) / 60 ))" "$(( elapsed % 60 ))"))"
 }
 
+# ログ複製 (tee) への書き込み側を閉じて EOF を通知し、tee が書き切るまで待つ。
+# これを行わないとシェルの終了と tee の書き込みが競合し、ログファイル末尾の行
+# (処理実行時間など) が欠けることがある。出力先を閉じるため EXIT トラップの最後で呼ぶ。
+finish_logging() {
+  [ -n "$TEE_PID" ] || return 0
+  exec 1>&- 2>&-
+  wait "$TEE_PID" 2>/dev/null
+  TEE_PID=""
+}
+
+# 一時ファイルを作成してパスを返す。mktemp が使えない環境で予測可能なパス
+# (/tmp/xxx.$$) へフォールバックすると、シンボリックリンク経由の上書きや
+# 他プロセスとの衝突を招くため、その場で失敗させる。
+new_temp_file() {
+  local f
+  f="$(mktemp 2>/dev/null)" || f=""
+  if [ -z "$f" ]; then
+    err "一時ファイルを作成できませんでした (mktemp が利用できません)。TMPDIR を確認してください。"
+    return 1
+  fi
+  printf '%s' "$f"
+}
+
+# EXIT トラップから呼び出す一時ファイルの削除処理 (途中終了・中断時も残さない)。
+cleanup_temp_files() {
+  [ ${#TEMP_FILES[@]} -eq 0 ] && return 0
+  local f
+  for f in "${TEMP_FILES[@]}"; do
+    [ -n "$f" ] && rm -f "$f"
+  done
+  TEMP_FILES=()
+  return 0
+}
+
+# imagedefinition.json へ埋め込む値を JSON 文字列としてエスケープする。
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
 usage() {
   cat <<'EOF'
 Usage: build_and_push.sh [OPTIONS]
@@ -138,10 +179,12 @@ Options:
   --registry URL           ECR レジストリ名(URL) を明示指定 (env: ECR_REGISTRY)
                            例: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com
                            (未指定時は <account-id>.dkr.ecr.<region>.amazonaws.com を組み立て)
-  --repository NAME        ECR リポジトリ名 = プッシュするイメージ名 (既定: BaseImage)
+  --repository NAME        ECR リポジトリ名 = プッシュするイメージ名 (既定: baseimage)
+                           ECR / Docker の規則により小文字英数字と . _ - / のみ使用できる
   --tag-prefix PREFIX      イメージタグの接頭辞 (既定: BaseImage)。リポジトリ名とは独立に
                            指定でき、タグは <PREFIX>-<YYYYMMDDHHMMSS> となる
                            例: BaseImage-20260702153000
+                           (タグは大文字も使用できる。使用可能文字: 英数字 . _ -)
   --local-image NAME       compose build で生成されるローカルイメージ名 (既定: j1/base.local)
   --container-name NAME    imagedefinition.json の name (既定: --repository の値)
   --compose-file FILE      compose ファイル (既定: compose.yml)
@@ -163,11 +206,15 @@ Options:
                            起動確認 (--verify-startup) や URL 応答確認 (--verify-url) 等の
                            追加オプションも build_and_verify.sh に委譲されるため利用できる。
                            詳細は ./build_and_verify.sh --help を参照。
+                           なお ECR 関連オプション (--account-id / --registry /
+                           --repository / --tag-prefix / --container-name / --output /
+                           --switchback-shell / --auto-switchback / --warn-only) は
+                           委譲先が解釈できないため、警告のうえ無視される。
 
   --copy-file SRC:DEST_DIR ビルド前に SRC を DEST_DIR ディレクトリへコピーし、
                            ビルド終了後 (成功・失敗を問わず) に自動削除する。
                            複数ファイルに対応するため繰り返し指定できる。
-                           例: --copy-file .npmrc ./app --copy-file cert.pem ./app/certs
+                           例: --copy-file .npmrc:./app --copy-file cert.pem:./app/certs
                            - DEST_DIR は既存ディレクトリである必要がある
                            - コピー先に同名ファイルが既存の場合は事故防止のため中止する
 
@@ -203,17 +250,78 @@ Options:
 EOF
 }
 
-# ---- ログファイル出力の準備 (build-only 委譲より前に行う) --------------------
-# --log-dir を先に解釈し、以降のコンソール出力 (stdout/stderr) を tee でログファイル
-# へ複製する。画面表示はそのまま継続し、時系列の順序を保つため stdout/stderr を
-# 同一の tee にまとめる。--build-only による委譲時 (下の for ループ) にも出力を
-# 取りこぼさないよう、引数パースより前のこの位置で設定しておく。
-# ここでは --log-dir の値取得のみを行い、後段の本パースでも同オプションを受理する。
-_prev_arg=""
-for _arg in "$@"; do
-  if [ "$_prev_arg" = "--log-dir" ]; then LOG_DIR="$_arg"; break; fi
-  _prev_arg="$_arg"
+# ---- 引数の事前走査 (--log-dir / --build-only) ------------------------------
+# --log-dir と --build-only は本パースより前に解釈する必要がある:
+#   --log-dir    : 委譲時も含め全出力をログファイルへ複製するため
+#   --build-only : ECR 関連処理を一切行わず build_and_verify.sh へ委譲するため
+# 走査では「オプションの値」をオプション名と取り違えないよう、値を取るオプションの
+# 次の引数を読み飛ばす (例: --startup-log-pattern '--build-only' の誤検出を防ぐ)。
+# ここに無いオプションは値なしとして扱う (未知のオプションがあっても走査は継続する)。
+arg_takes_value() {
+  case "$1" in
+    # このスクリプト自身のオプション
+    --account-id|--region|--registry|--repository|--tag-prefix|--local-image) return 0 ;;
+    --container-name|--compose-file|--compose-service|--output|--log-dir|--copy-file) return 0 ;;
+    --jboss-password-param|--jboss-password|--jboss-password-env|--switchback-shell) return 0 ;;
+    # 委譲先 build_and_verify.sh のオプション (--build-only 時にそのまま透過する)
+    --startup-service|--startup-log-pattern|--startup-timeout|--startup-interval) return 0 ;;
+    --startup-log-lines|--wait-timeout|--allow-service-exit|--keep-container-mode) return 0 ;;
+    --jboss-context-root|--jboss-http-port|--env-list-limit|--env-list-file) return 0 ;;
+    --directory-tree-depth|--directory-file-limit|--deployment-dir-env|--report-dir) return 0 ;;
+    --verify-url|--expect-status|--url-method|--url-content-type) return 0 ;;
+    --url-body-json|--url-body-form|--url-timeout|--url-interval) return 0 ;;
+  esac
+  return 1
+}
+
+# 委譲先が解釈できない ECR 専用オプション (--build-only 時は警告して除去する)。
+ecr_only_option() {
+  case "$1" in
+    --account-id|--registry|--repository|--tag-prefix|--container-name|--output) return 0 ;;
+    --switchback-shell|--auto-switchback|--warn-only) return 0 ;;
+  esac
+  return 1
+}
+
+BUILD_ONLY="false"
+FORWARD_ARGS=()      # --build-only 時に build_and_verify.sh へ渡す引数
+DROPPED_ARGS=()      # --build-only 時に転送しなかった ECR 専用オプション
+_scan_args=("$@")
+_scan_i=0
+while [ "$_scan_i" -lt "${#_scan_args[@]}" ]; do
+  _arg="${_scan_args[$_scan_i]}"
+  _scan_i=$(( _scan_i + 1 ))
+  _has_value="false"
+  _value=""
+  if arg_takes_value "$_arg" && [ "$_scan_i" -lt "${#_scan_args[@]}" ]; then
+    _has_value="true"
+    _value="${_scan_args[$_scan_i]}"
+    _scan_i=$(( _scan_i + 1 ))
+  fi
+  case "$_arg" in
+    --build-only)
+      BUILD_ONLY="true"
+      ;;
+    --log-dir)
+      # このスクリプトで処理する (委譲先は未対応のため転送しない)
+      [ "$_has_value" = "true" ] && LOG_DIR="$_value"
+      ;;
+    *)
+      if ecr_only_option "$_arg"; then
+        DROPPED_ARGS+=("$_arg")
+      else
+        FORWARD_ARGS+=("$_arg")
+        [ "$_has_value" = "true" ] && FORWARD_ARGS+=("$_value")
+      fi
+      ;;
+  esac
 done
+
+# ---- ログファイル出力の準備 (build-only 委譲より前に行う) --------------------
+# 以降のコンソール出力 (stdout/stderr) を tee でログファイルへ複製する。画面表示は
+# そのまま継続し、時系列の順序を保つため stdout/stderr を同一の tee にまとめる。
+# --build-only による委譲時にも出力を取りこぼさないよう、引数パースより前のこの
+# 位置で設定しておく (--log-dir は後段の本パースでも受理する)。
 if [ -n "$LOG_DIR" ]; then
   if ! mkdir -p "$LOG_DIR"; then
     err "ログ出力先ディレクトリを作成できませんでした: $LOG_DIR"
@@ -222,68 +330,72 @@ if [ -n "$LOG_DIR" ]; then
   LOG_FILE="${LOG_DIR%/}/build_and_push_$(date '+%Y%m%d%H%M%S').log"
   # 以降の全出力を tee で LOG_FILE にも書き込む (画面にも出力)
   exec > >(tee -a "$LOG_FILE") 2>&1
+  TEE_PID=$!
   # このパス以降のどの経路 (build-only 委譲・途中 exit 含む) でも処理実行時間を残す。
   # 後段でコピーファイル削除も伴うトラップに差し替える。
-  trap log_elapsed EXIT
+  trap 'log_elapsed; finish_logging' EXIT
   log "コンソール出力をログファイルにも保存します: $LOG_FILE"
 fi
 
 # ---- --build-only は build_and_verify.sh へ委譲する -------------------------
 # ビルドのみを実行する処理は build_and_verify.sh に切り出してある。
-# --build-only が指定されていれば、--build-only を除いた残りの引数をそのまま
+# --build-only が指定されていれば、事前走査で組み立てた FORWARD_ARGS
+# (--build-only / --log-dir / ECR 専用オプションを除いた引数) をそのまま
 # build_and_verify.sh に渡して委譲する (起動確認/URL 応答確認オプション等も
 # そのまま透過する)。以降の ECR 関連処理は実行されない。
-for _arg in "$@"; do
-  if [ "$_arg" = "--build-only" ]; then
-    if [ ! -f "$BUILD_VERIFY_SCRIPT" ]; then
-      err "ビルド専用スクリプトが見つかりません: $BUILD_VERIFY_SCRIPT"
-      exit 1
-    fi
-    FORWARD_ARGS=()
-    _skip_next="false"
-    for a in "$@"; do
-      if [ "$_skip_next" = "true" ]; then _skip_next="false"; continue; fi
-      [ "$a" = "--build-only" ] && continue
-      # --log-dir はこのスクリプトで処理済み (build_and_verify.sh は未対応) のため除去する
-      if [ "$a" = "--log-dir" ]; then _skip_next="true"; continue; fi
-      FORWARD_ARGS+=("$a")
-    done
-    log "--build-only が指定されました。ビルド処理を ${BUILD_VERIFY_SCRIPT} に委譲します。"
-    if [ -n "$LOG_DIR" ]; then
-      # ログ複製が有効な場合は、経過時間も記録するため exec せず子プロセスで実行する。
-      # 子プロセスは複製先の fd を継承するため、委譲先の出力もログファイルに残る。
-      _bv_status=0
-      bash "$BUILD_VERIFY_SCRIPT" "${FORWARD_ARGS[@]}" || _bv_status=$?
-      exit "$_bv_status"
-    else
-      # ログ複製が無い通常時は従来どおり exec で完全に委譲する。
-      exec bash "$BUILD_VERIFY_SCRIPT" "${FORWARD_ARGS[@]}"
-    fi
+if [ "$BUILD_ONLY" = "true" ]; then
+  if [ ! -f "$BUILD_VERIFY_SCRIPT" ]; then
+    err "ビルド専用スクリプトが見つかりません: $BUILD_VERIFY_SCRIPT"
+    exit 1
   fi
-done
+  log "--build-only が指定されました。ビルド処理を ${BUILD_VERIFY_SCRIPT} に委譲します。"
+  if [ ${#DROPPED_ARGS[@]} -gt 0 ]; then
+    warn "--build-only では ECR 関連処理を行わないため、次のオプションは無視します: ${DROPPED_ARGS[*]}"
+  fi
+  if [ -n "$LOG_DIR" ]; then
+    # ログ複製が有効な場合は、経過時間も記録するため exec せず子プロセスで実行する。
+    # 子プロセスは複製先の fd を継承するため、委譲先の出力もログファイルに残る。
+    _bv_status=0
+    bash "$BUILD_VERIFY_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} || _bv_status=$?
+    exit "$_bv_status"
+  else
+    # ログ複製が無い通常時は従来どおり exec で完全に委譲する。
+    exec bash "$BUILD_VERIFY_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+  fi
+fi
 
 # ---- 引数パース -------------------------------------------------------------
+# 値を取るオプションで値が省略されると "$2" の参照が set -u の unbound variable
+# となり、原因の分からないエラーになる。各 case の先頭で残り引数数を検証する。
+need_value() {
+  if [ "$2" -lt 2 ]; then
+    err "オプションに値が指定されていません: $1"
+    err "  使い方は --help を参照してください。"
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --account-id)       ACCOUNT_ID="$2"; shift 2 ;;
-    --region)           REGION="$2"; shift 2 ;;
-    --registry)         REGISTRY="$2"; shift 2 ;;
-    --repository)       REPOSITORY="$2"; shift 2 ;;
-    --tag-prefix)       TAG_PREFIX="$2"; shift 2 ;;
-    --local-image)      LOCAL_IMAGE="$2"; shift 2 ;;
-    --container-name)   CONTAINER_NAME="$2"; shift 2 ;;
-    --compose-file)     COMPOSE_FILE="$2"; shift 2 ;;
-    --compose-service)  COMPOSE_SERVICE="$2"; shift 2 ;;
+    --account-id)       need_value "$1" $#; ACCOUNT_ID="$2"; shift 2 ;;
+    --region)           need_value "$1" $#; REGION="$2"; shift 2 ;;
+    --registry)         need_value "$1" $#; REGISTRY="$2"; shift 2 ;;
+    --repository)       need_value "$1" $#; REPOSITORY="$2"; shift 2 ;;
+    --tag-prefix)       need_value "$1" $#; TAG_PREFIX="$2"; shift 2 ;;
+    --local-image)      need_value "$1" $#; LOCAL_IMAGE="$2"; shift 2 ;;
+    --container-name)   need_value "$1" $#; CONTAINER_NAME="$2"; shift 2 ;;
+    --compose-file)     need_value "$1" $#; COMPOSE_FILE="$2"; shift 2 ;;
+    --compose-service)  need_value "$1" $#; COMPOSE_SERVICE="$2"; shift 2 ;;
     --no-cache)         NO_CACHE="true"; shift ;;
-    --output)           OUTPUT_FILE="$2"; shift 2 ;;
-    --log-dir)          LOG_DIR="$2"; shift 2 ;;  # 冒頭でログ複製を設定済み (値の再取得のみ)
+    --output)           need_value "$1" $#; OUTPUT_FILE="$2"; shift 2 ;;
+    --log-dir)          need_value "$1" $#; LOG_DIR="$2"; shift 2 ;;  # 冒頭でログ複製を設定済み (値の再取得のみ)
     --dry-run)          DRY_RUN="true"; shift ;;
     --build-only)       shift ;;  # 冒頭で build_and_verify.sh に委譲済み (ここには到達しない)
-    --copy-file)        COPY_SPECS+=("$2"); shift 2 ;;
-    --jboss-password-param) JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
-    --jboss-password)       JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
-    --jboss-password-env)   JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
-    --switchback-shell) SWITCHBACK_SHELL="$2"; shift 2 ;;
+    --copy-file)        need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
+    --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
+    --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
+    --jboss-password-env)   need_value "$1" $#; JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --switchback-shell) need_value "$1" $#; SWITCHBACK_SHELL="$2"; shift 2 ;;
     --auto-switchback)  AUTO_SWITCHBACK="true"; shift ;;
     --warn-only)        AUTO_SWITCHBACK="false"; shift ;;
     -h|--help)          usage; exit 0 ;;
@@ -294,7 +406,7 @@ done
 # 本パース以降のどの経路 (途中の exit を含む) でも処理実行時間を記録する。
 # --help / 不明オプションはパース中に exit するため、この行には到達せず経過時間は
 # 出力されない。後段で一時ファイル削除も伴うトラップに差し替える。
-trap log_elapsed EXIT
+trap 'cleanup_temp_files; log_elapsed; finish_logging' EXIT
 
 # ---- JBoss マスターパスワード関連オプションの検証 ----------------------------
 # 取得元はパラメータストア (--jboss-password-param) / 直接指定 (--jboss-password) /
@@ -320,6 +432,19 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
     exit 1
   fi
 done
+
+# ---- Docker デーモンへの接続確認 --------------------------------------------
+# デーモン停止や権限不足はビルド開始まで気づけないため、ここで先に確認する。
+if docker info >/dev/null 2>&1; then
+  :
+elif [ "$DRY_RUN" = "true" ]; then
+  warn "Docker デーモンへ接続できませんが、DRY-RUN のため中止せずにプレビューを継続します。"
+else
+  err "Docker デーモンへ接続できません (docker info に失敗)。"
+  err "  デーモンの起動状態 (systemctl status docker) と、実行ユーザーが docker グループに"
+  err "  所属しているかを確認してください。"
+  exit 1
+fi
 
 # ---- AWS 認証 (aws login --remote) 済みかのチェック --------------------------
 # スクリプト実行開始時に、事前に aws login --remote による認証操作が実行されて
@@ -354,8 +479,27 @@ if [ -z "$REGISTRY" ]; then
   fi
   REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 fi
+# 末尾のスラッシュが残ると <registry>//<repository> となり参照が壊れる
+REGISTRY="${REGISTRY%/}"
 
 [ -n "$CONTAINER_NAME" ] || CONTAINER_NAME="$REPOSITORY"
+
+# ---- イメージ参照の事前検証 -------------------------------------------------
+# ECR / Docker のリポジトリ名は小文字英数字と . _ - / のみ。検証しないと、時間の
+# かかるビルドが完了した後の docker image tag で
+# 'invalid reference format: repository name must be lowercase' となって失敗する。
+if ! printf '%s' "$REPOSITORY" \
+    | grep -qE '^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
+  err "--repository には小文字英数字と . _ - / のみ指定できます: ${REPOSITORY}"
+  err "  ECR / Docker のリポジトリ名は大文字を含められません (例: baseimage, j1/base)。"
+  exit 2
+fi
+# タグは <TAG_PREFIX>-<YYYYMMDDHHMMSS> (接尾辞 15 文字)。タグ全体は 128 文字以内で、
+# 先頭は英数字か _、以降は英数字と . _ - のみ (タグは大文字も使用できる)。
+if ! printf '%s' "$TAG_PREFIX" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,112}$'; then
+  err "--tag-prefix には英数字と . _ - のみ (先頭は英数字か _、113 文字以内) を指定してください: ${TAG_PREFIX}"
+  exit 2
+fi
 
 if [ "$DRY_RUN" = "true" ]; then
   log "*** DRY-RUN モードです。実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行いません。 ***"
@@ -364,13 +508,30 @@ fi
 # ---- ECR 操作権限チェック ---------------------------------------------------
 # ecr:GetAuthorizationToken を要求する get-login-password を叩けるかどうかで判定する。
 # 成功すればパスワードを取得できるので、そのまま docker login に流用する。
+# 失敗理由 (権限不足 / 認証切れ / ネットワーク不通 / リージョン誤り) を区別できるよう、
+# aws の標準エラー出力は捨てずに ECR_AUTH_ERROR へ保持して失敗時に表示する。
 ECR_PASSWORD=""
+ECR_AUTH_ERROR=""
 check_ecr_permission() {
-  ECR_PASSWORD="$(aws ecr get-login-password --region "$REGION" 2>/dev/null)"
-  if [ $? -ne 0 ] || [ -z "$ECR_PASSWORD" ]; then
+  local errfile status
+  ECR_AUTH_ERROR=""
+  errfile="$(new_temp_file)" || return 1
+  TEMP_FILES+=("$errfile")
+  ECR_PASSWORD="$(aws ecr get-login-password --region "$REGION" 2>"$errfile")"
+  status=$?
+  ECR_AUTH_ERROR="$(cat "$errfile")"
+  rm -f "$errfile"
+  if [ "$status" -ne 0 ] || [ -z "$ECR_PASSWORD" ]; then
     return 1
   fi
   return 0
+}
+
+# ECR 権限チェック失敗時に、aws が返したエラー本文を警告として表示する。
+warn_ecr_auth_error() {
+  [ -n "$ECR_AUTH_ERROR" ] || return 0
+  warn "aws ecr get-login-password のエラー内容:"
+  printf '%s\n' "$ECR_AUTH_ERROR" | sed 's/^/    /' >&2
 }
 
 # ---- スイッチバック処理 -----------------------------------------------------
@@ -405,7 +566,8 @@ prepare_jboss_password() {
       log "[DRY-RUN] aws ssm get-parameter --name ${JBOSS_PASSWORD_PARAM} --with-decryption --region ${REGION} (値の取得・表示は行いません)"
     else
       local ssm_errfile
-      ssm_errfile="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/ssm_err.$$")"
+      ssm_errfile="$(new_temp_file)" || exit 1
+      TEMP_FILES+=("$ssm_errfile")
       if ! password="$(aws ssm get-parameter --name "$JBOSS_PASSWORD_PARAM" \
             --with-decryption --region "$REGION" \
             --query 'Parameter.Value' --output text 2>"$ssm_errfile")"; then
@@ -504,8 +666,10 @@ cleanup_copied_files() {
   COPIED_FILES=()
 }
 # ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に削除する。
-# 併せて処理実行時間 (経過秒数) を末尾に記録する (冒頭の暫定トラップを差し替える)。
-trap 'cleanup_copied_files; log_elapsed' EXIT
+# 併せて一時ファイルの削除と処理実行時間 (経過秒数) の記録を行い、最後にログ複製を
+# 閉じる (冒頭の暫定トラップを差し替える)。SIGINT / SIGTERM で中断した場合も
+# EXIT トラップが実行されるため、コピーしたファイルは残らない。
+trap 'cleanup_copied_files; cleanup_temp_files; log_elapsed; finish_logging' EXIT
 
 # ---- docker push 失敗時の原因診断 / 調査ガイド ------------------------------
 # 各原因カテゴリごとの詳細な説明・AWS CLI 調査コマンド・AWS コンソール確認箇所を出力する。
@@ -711,8 +875,10 @@ diagnose_push_failure() {
   err "==================================================================="
 }
 
-if { log "ECR 操作権限を確認します (region=${REGION}) ..."; ! check_ecr_permission; }; then
+log "ECR 操作権限を確認します (region=${REGION}) ..."
+if ! check_ecr_permission; then
   warn "現在の操作権限では ECR を操作できません。"
+  warn_ecr_auth_error
   if [ "$AUTO_SWITCHBACK" = "true" ]; then
     # (B) 終了せず、自動的にスイッチバックして継続する
     log "自動スイッチバックモードです。スイッチバックを実行します。"
@@ -723,6 +889,7 @@ if { log "ECR 操作権限を確認します (region=${REGION}) ..."; ! check_ec
     log "スイッチバック後に再度 ECR 操作権限を確認します ..."
     if ! check_ecr_permission; then
       err "スイッチバック後も ECR を操作できません。権限設定を確認してください。"
+      warn_ecr_auth_error
       exit 1
     fi
     log "スイッチバックにより ECR 操作が可能になりました。処理を継続します。"
@@ -747,9 +914,12 @@ fi
 # パラメータストアへのアクセスに AWS 権限が必要なため、スイッチバック確定後に行う。
 prepare_jboss_password
 
-# compose.yml の environment 型シークレット (既定: JBOSS_MASTER_PASSWORD) は、
-# 環境変数が未定義だと compose build が失敗するため、シークレットを使わない
-# 場合でも空文字で定義しておく (既に値が入っていればそのまま維持する)。
+# compose.yml の environment 型シークレットは、参照先の環境変数が未定義だと
+# compose build が失敗するため、シークレットを使わない場合でも空文字で定義しておく
+# (既に値が入っていればそのまま維持する)。--jboss-password-env で名前を変更した
+# 場合はその変数を、同梱の compose.yml が参照する JBOSS_MASTER_PASSWORD も併せて
+# 定義する。
+export "${JBOSS_PASSWORD_ENV}=${!JBOSS_PASSWORD_ENV:-}"
 export JBOSS_MASTER_PASSWORD="${JBOSS_MASTER_PASSWORD:-}"
 
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
@@ -810,12 +980,12 @@ if [ "$DRY_RUN" = "true" ]; then
 else
   # push の出力を画面に流しつつ (tee) ログへ保存し、失敗時に原因解析へ回す。
   # pipefail 有効のため、docker push 失敗時はパイプライン全体も失敗扱いになる。
-  PUSH_LOG="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/push.$$.log")"
+  PUSH_LOG="$(new_temp_file)" || exit 1
+  TEMP_FILES+=("$PUSH_LOG")
   if docker push "$TARGET_IMAGE" 2>&1 | tee "$PUSH_LOG"; then
     log "docker push に成功しました。"
   else
     diagnose_push_failure "$PUSH_LOG"
-    rm -f "$PUSH_LOG"
     exit 1
   fi
   rm -f "$PUSH_LOG"
@@ -823,11 +993,12 @@ fi
 
 # ---- imagedefinition.json 出力 ---------------------------------------------
 # CodePipeline の ECS デプロイ等で使われる標準フォーマット。
+# name / imageUri に " や \ が含まれても壊れた JSON にならないようエスケープする。
 IMAGEDEF_CONTENT="$(cat <<EOF
 [
   {
-    "name": "${CONTAINER_NAME}",
-    "imageUri": "${TARGET_IMAGE}"
+    "name": "$(json_escape "$CONTAINER_NAME")",
+    "imageUri": "$(json_escape "$TARGET_IMAGE")"
   }
 ]
 EOF
@@ -837,7 +1008,12 @@ if [ "$DRY_RUN" = "true" ]; then
   log "[DRY-RUN] ${OUTPUT_FILE} に以下を出力します (実際には書き込みません):"
   printf '%s\n' "$IMAGEDEF_CONTENT"
 else
-  printf '%s\n' "$IMAGEDEF_CONTENT" > "$OUTPUT_FILE"
+  # 書き込み失敗 (権限不足・容量不足など) を見逃すと、後続の CodePipeline が
+  # 古い imagedefinition を参照してしまうため、必ず結果を確認する。
+  if ! printf '%s\n' "$IMAGEDEF_CONTENT" > "$OUTPUT_FILE"; then
+    err "imagedefinition の書き込みに失敗しました: ${OUTPUT_FILE}"
+    exit 1
+  fi
   log "imagedefinition を出力しました: ${OUTPUT_FILE}"
 fi
 
