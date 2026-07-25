@@ -22,6 +22,17 @@
 
 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash / GNU coreutils / Docker CE)。
 
+### 時刻表示について
+
+3 スクリプトが表示・保存する時刻はすべて **JST (日本標準時)** に統一しています。
+ホストや CI のタイムゾーンが UTC でも、ログ行の先頭時刻、レポートの日時、イメージタグ・
+ログファイル名の `YYYYMMDDHHMMSS`、healthcheck 履歴、`docker image inspect` の作成日時、
+CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されます。ログ行の時刻には
+`2026-07-25 17:31:26 JST` のようにタイムゾーン名を併記します
+(`Asia/Tokyo` を解決できない環境では tzdata 不要の `JST-9` を使用します)。
+なお、コンテナ内アプリケーションが自身で出力するログ行の時刻は、
+そのコンテナのタイムゾーン設定に従います。
+
 ## 使い方
 
 ```bash
@@ -154,7 +165,7 @@ CI でもそのまま利用できます。compose 版 (`build_and_push.sh`) / bu
 #  => ./build-logs/buildx_build_and_push_20260702153000.log にログを保存
 ```
 
-- ファイル名は `<スクリプト名>_<YYYYMMDDHHMMSS>.log` (実行開始時刻) です。
+- ファイル名は `<スクリプト名>_<YYYYMMDDHHMMSS>.log` (実行開始時刻、JST) です。
 - `DIR` が存在しない場合は `mkdir -p` で自動作成します。
 - 標準出力と標準エラー出力を同一の `tee` にまとめるため、ログの時系列順が保たれます。
 - ログの末尾には、ビルド成功・失敗・途中終了のいずれの場合でも **処理実行時間**
@@ -437,6 +448,22 @@ timeout、retries、start period と、`State.Health` の現在状態、連続�
 スキップし、Docker の実行履歴だけを表示します。表示内容にはアプリケーション情報が含まれ得るため、
 画面出力とログファイルの取り扱いには注意してください。
 
+ADOT Collector のような distroless イメージには `/bin/sh` が無く、`CMD-SHELL` 形式の
+healthcheck をそのまま再実行できません。この場合は次の順にフォールバックし、
+どの手段を使ったかを「実行方式」として表示します。
+
+1. コンテナ内シェル (`/bin/sh` → `/bin/bash` → `/bin/ash` → `/busybox/sh` → `/usr/bin/sh` →
+   `/usr/bin/bash`) で実行
+2. シェルが無い場合、シェル構文を含まないコマンド（末尾の `|| exit N` は除去）を
+   `docker exec` で直接実行
+3. コンテナ内に実行ファイルやシェルが無い場合、healthcheck の URL をホストから確認
+   （公開ポート優先、未公開ならコンテナ IP）
+4. いずれも不可なら、`docker inspect` の `State.Health` 参照、ネットワーク名前空間を借りた
+   一時コンテナからの `curl`、ホストからの `curl` など、手元で実行すべきコマンドを案内
+
+healthcheck 実行ファイルの確認も、シェルが無い場合は `docker cp` での取り出し方法を
+案内するだけに切り替えます。
+
 `logs` モードで選択した実行中コンテナに `mysql` クライアントと `mysqld` がある場合、
 `MySQL クライアントへ接続` が次の操作番号（通常は `4`）として追加されます。選択すると
 コンテナ内の Unix socket 経由で対話式 `mysql` クライアントが直ちに開き、SQL クエリを
@@ -463,12 +490,17 @@ MySQL 8.4 / Aurora 8.4 互換系で共通です。
   journalの`CreateLogGroup`、`CreateLogStream`、`PutLogEvents`受信数と、直近100リクエスト
   内のイベントを照合します。設定したグループ／ストリームごとの送信件数と、最新20件の
   イベント本文をコンソールへ表示します。
-- `otel` / `adot-collector` / `jaeger`: Collectorの`/healthcheck`とdebug exporterログから
+- `otel` / `adot-collector` / `jaeger`: Collectorのヘルスチェックとdebug exporterログから
   アプリケーションからのスパン受信を確認し、Jaeger Query APIからトレースサービスを
   番号選択します。選択サービスについて直近1時間・最大5トレースを取得し、trace ID、
   開始時刻、所要時間、サービス、スパン親子関係、リソース属性、スパン属性、イベントを
   コンソールへ表示します。参照先ComposeではOTel Collectorのサービス名は
   `adot-collector`です。`otel`も別Composeでの互換サービス名として認識します。
+  Collectorのヘルスチェックは、composeサービスに設定された`healthcheck`定義を最優先で
+  実行し、`/bin/sh`を持たないイメージでは「シェル無しの直接実行 → 同梱`/healthcheck`
+  バイナリ → `health_check`拡張のエンドポイント (既定 13133/tcp) へホストからHTTP確認」の
+  順にフォールバックします。すべて実行できない場合は、`docker inspect`で記録済みの
+  health状態を表示したうえで、手元で実行すべきコマンドを案内します。
 
 CloudWatch Logsモックは実ログストレージではなく、受信要求を成功応答するWireMockです。
 したがってヘルパーの`OK`は、`cwagent`設定とrequest journal内の`PutLogEvents`送信先・

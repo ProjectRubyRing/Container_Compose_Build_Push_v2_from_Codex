@@ -99,7 +99,9 @@ assert_contains "$success_output" "java:app/jdbc/ReportingDS"
 assert_contains "$success_output" "orders.war"
 assert_contains "$success_output" "/orders"
 assert_occurrences "$success_output" "java:/JmsXA" 1
-assert_occurrences "$success_output" "old.war" 1
+# WFLYSRV0009 の 1 行に old.war が 2 回現れる (名前と runtime-name) ため、
+# 「アンデプロイ済みアプリを要約側で再掲しない」= 元ログ 1 行分 = 2 件が期待値。
+assert_occurrences "$success_output" "old.war" 2
 assert_occurrences "$success_output" "/opt/eap/standalone/data/content/ab/cd/content" 1
 assert_not_contains "$success_output" "利用可能な JNDI データソース:"
 assert_not_contains "$success_output" "JNDI データソースエラー:"
@@ -788,6 +790,8 @@ assert_contains "$FAKE_DOCKER_CALLS" "healthcheck-file /healthcheck"
 assert_contains "$FAKE_DOCKER_CALLS" "port cid-jaeger 16686/tcp"
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:16686/api/services"
 assert_contains "$FAKE_CURL_CALLS" "--data-urlencode service=myapp-front"
+# Python ヘルパーの出力に CR 等が混ざるとサービス名が壊れるため、後続引数まで検査する。
+assert_matches "$FAKE_CURL_CALLS" 'service=myapp-front --data-urlencode'
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:16686/api/traces"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
@@ -814,6 +818,80 @@ fi
 unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY
 assert_contains "$otel_no_traces_output" "Jaeger にトレースサービスが登録されていません。"
 assert_contains "$otel_no_traces_output" "サービス操作の選択へ戻ります"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# distroless の adot-collector: /bin/sh も wget も /healthcheck も無い状態で、
+# compose の healthcheck 定義 → シェル無し直接実行 → ホストからの HTTP 確認へ
+# フォールバックできることを確認する。
+otel_distroless_output="$TEST_TMP/keep-mode-otel-distroless.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_BODY='{"data":[]}'
+export FAKE_ADOT_DISTROLESS="true"
+if ! printf '2\n3\n\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$otel_distroless_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_DISTROLESS
+  cat "$otel_distroless_output" >&2
+  fail "distroless adot-collector scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_DISTROLESS
+
+assert_contains "$otel_distroless_output" \
+  "実行方式   : コンテナ内にシェルが無いため docker exec で直接実行: wget -q -O- http://127.0.0.1:13133/"
+assert_contains "$otel_distroless_output" "コンテナ内にシェルが無いため、ホストからの HTTP 確認へ切り替えます。"
+assert_contains "$otel_distroless_output" "送信元     : ホスト (curl、コンテナへは公開ポート/コンテナ IP 経由)"
+assert_contains "$otel_distroless_output" '{"status":"Server available"}'
+assert_contains "$otel_distroless_output" "OTel Collector ヘルスチェック: OK (service=adot-collector)"
+assert_contains "$otel_distroless_output" "確認方式: ホストから health_check エンドポイントへ HTTP 確認"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-adot-collector wget -q -O- http://127.0.0.1:13133/"
+assert_contains "$FAKE_DOCKER_CALLS" "port cid-adot-collector 13133/tcp"
+assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:13133/"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 自動確認の手段が尽きた場合は、手元で実行すべきコマンドを案内する。
+otel_manual_output="$TEST_TMP/keep-mode-otel-manual-commands.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_BODY='{"data":[]}'
+export FAKE_ADOT_DISTROLESS="true"
+export FAKE_OTEL_HEALTH_HTTP_FAIL="true"
+if ! printf '2\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$otel_manual_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_DISTROLESS \
+    FAKE_OTEL_HEALTH_HTTP_FAIL
+  cat "$otel_manual_output" >&2
+  fail "adot-collector manual command guidance scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_DISTROLESS \
+  FAKE_OTEL_HEALTH_HTTP_FAIL
+
+assert_contains "$otel_manual_output" "health_check エンドポイントへの HTTP 確認にも失敗しました"
+assert_contains "$otel_manual_output" "[手動で確認する場合のコマンド]"
+assert_contains "$otel_manual_output" \
+  "  docker inspect --format '{{json .State.Health}}' adot-collector"
+assert_contains "$otel_manual_output" \
+  "  docker run --rm --network container:adot-collector curlimages/curl:latest -sS -i http://127.0.0.1:13133/"
+assert_contains "$otel_manual_output" "  curl -sS -i http://127.0.0.1:13133/"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 http_get_output="$TEST_TMP/keep-mode-http-get.out"

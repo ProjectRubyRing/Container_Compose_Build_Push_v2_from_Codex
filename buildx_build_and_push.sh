@@ -39,6 +39,30 @@
 
 set -uo pipefail
 
+# ---- 表示タイムゾーン (JST 固定) --------------------------------------------
+# ホストや CI が UTC でも、ログ・イメージタグ・ログファイル名の時刻を JST に揃える。
+# tzdata を持たない環境でも +09:00 になるよう、Asia/Tokyo が使えない場合は tzdata
+# 不要の POSIX 形式 (JST-9) へフォールバックする。
+# 時刻表示へ付ける名前は %Z が空になる環境があるため、この変数から明示的に付ける。
+DISPLAY_TZ_LABEL='JST'
+setup_display_timezone() {
+  local tz_candidate
+  for tz_candidate in 'Asia/Tokyo' 'JST-9'; do
+    if [ "$(TZ="$tz_candidate" date '+%z' 2>/dev/null)" = "+0900" ]; then
+      export TZ="$tz_candidate"
+      return 0
+    fi
+  done
+  DISPLAY_TZ_LABEL="$(date '+%Z' 2>/dev/null)"
+  [ -n "$DISPLAY_TZ_LABEL" ] || DISPLAY_TZ_LABEL="ローカル時刻"
+  return 1
+}
+if ! setup_display_timezone; then
+  # ログ用ヘルパはまだ定義前のため、ここだけ printf で警告する。
+  printf '[%s %s] [WARN] JST へ切り替えられないため、ホストのタイムゾーンで表示します。\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL" >&2
+fi
+
 # ---- 既定値 -----------------------------------------------------------------
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-1}}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
@@ -82,15 +106,17 @@ JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシ�
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # スクリプト開始時刻 (処理実行時間の算出に使用)
 START_EPOCH="$(date +%s)"
-log()  { printf '[%s] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-warn() { printf '[%s] [WARN] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
-err()  { printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+# 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
+now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
+log()  { printf '[%s] %s\n'  "$(now_display_time)" "$*"; }
+warn() { printf '[%s] [WARN] %s\n'  "$(now_display_time)" "$*" >&2; }
+err()  { printf '[%s] [ERROR] %s\n' "$(now_display_time)" "$*" >&2; }
 # 診断ガイド出力用 (タイムスタンプ等の接頭辞を付けず、そのまま整形表示する)
 diag() { printf '%s\n' "$*" >&2; }
 # dry-run 時は実行内容を表示するだけ、通常時はそのままコマンドを実行する。
 run()  {
   if [ "$DRY_RUN" = "true" ]; then
-    printf '[%s] [DRY-RUN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    printf '[%s] [DRY-RUN] %s\n' "$(now_display_time)" "$*"
     return 0
   fi
   "$@"

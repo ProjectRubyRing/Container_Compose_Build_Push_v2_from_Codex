@@ -61,8 +61,33 @@
 
 set -uo pipefail
 
+# ---- 表示タイムゾーン (JST 固定) --------------------------------------------
+# ホストや CI が UTC でも、このスクリプトが表示・保存する時刻はすべて JST に揃える。
+# tzdata を持たない環境でも +09:00 になるよう、Asia/Tokyo が使えない場合は tzdata
+# 不要の POSIX 形式 (JST-9) へフォールバックする。日本標準時は夏時間を持たないため
+# 固定オフセットでも Asia/Tokyo と同じ結果になる。
+# 時刻表示へ付ける名前は %Z が空になる環境があるため、この変数から明示的に付ける。
+DISPLAY_TZ_LABEL='JST'
+setup_display_timezone() {
+  local tz_candidate
+  for tz_candidate in 'Asia/Tokyo' 'JST-9'; do
+    if [ "$(TZ="$tz_candidate" date '+%z' 2>/dev/null)" = "+0900" ]; then
+      export TZ="$tz_candidate"
+      return 0
+    fi
+  done
+  DISPLAY_TZ_LABEL="$(date '+%Z' 2>/dev/null)"
+  [ -n "$DISPLAY_TZ_LABEL" ] || DISPLAY_TZ_LABEL="ローカル時刻"
+  return 1
+}
+if ! setup_display_timezone; then
+  # ログ用ヘルパはまだ定義前のため、ここだけ printf で警告する。
+  printf '[%s %s] [WARN] JST へ切り替えられないため、ホストのタイムゾーンで表示します。\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL" >&2
+fi
+
 # ---- 既定値 -----------------------------------------------------------------
-RUN_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+RUN_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S') ${DISPLAY_TZ_LABEL}"
 RUN_TIMESTAMP="$(date '+%Y%m%d%H%M%S')"
 LOCAL_IMAGE="j1/base.local"       # compose build で生成されるローカルベースイメージ名
 COMPOSE_FILE="compose.yml"
@@ -150,6 +175,9 @@ OBSERVABILITY_PYTHON=""
 OBSERVABILITY_WIREMOCK_REQUEST_LIMIT="100"
 OBSERVABILITY_EVENT_DISPLAY_LIMIT="20"
 OBSERVABILITY_TRACE_LIMIT="5"
+# OTel Collector の health_check 拡張が待ち受ける既定ポート。コンテナ内で
+# healthcheck コマンドを実行できない場合の代替確認先として使う。
+OTEL_HEALTH_CHECK_PORT="13133"
 
 # BuildKit の tty 表示はログ保存時に途中経過が上書きされるため、未指定時は
 # plain を使用して各ビルドステップの出力を確実に残す。利用者が環境変数を
@@ -214,18 +242,73 @@ BUILD_RESULT_DETAIL=""
 BUILD_IMAGE_INFO=""
 
 # ---- ログ用ヘルパ -----------------------------------------------------------
-log()  { printf '[%s] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-warn() { printf '[%s] [WARN] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
-err()  { printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+# 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
+now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
+log()  { printf '[%s] %s\n'  "$(now_display_time)" "$*"; }
+warn() { printf '[%s] [WARN] %s\n'  "$(now_display_time)" "$*" >&2; }
+err()  { printf '[%s] [ERROR] %s\n' "$(now_display_time)" "$*" >&2; }
 # 診断ガイド等の整形出力用 (タイムスタンプ等の接頭辞を付けず、そのまま表示する)
 diag() { printf '%s\n' "$*" >&2; }
 # dry-run 時は実行内容を表示するだけ、通常時はそのままコマンドを実行する。
 run()  {
   if [ "$DRY_RUN" = "true" ]; then
-    printf '[%s] [DRY-RUN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    printf '[%s] [DRY-RUN] %s\n' "$(now_display_time)" "$*"
     return 0
   fi
   "$@"
+}
+
+# docker inspect や docker image inspect が返す時刻は、TZ 設定によらず RFC3339 の
+# UTC 表記になる。表示前にこのヘルパで JST へ変換し、スクリプト全体の時刻表記を
+# 揃える。date -d を持たない環境や解釈できない値は、元の文字列をそのまま返す。
+DATE_PARSE_SUPPORTED=""
+date_parse_supported() {
+  if [ -z "$DATE_PARSE_SUPPORTED" ]; then
+    if date -d '2000-01-02T03:04:05Z' '+%s' >/dev/null 2>&1; then
+      DATE_PARSE_SUPPORTED="true"
+    else
+      DATE_PARSE_SUPPORTED="false"
+    fi
+  fi
+  [ "$DATE_PARSE_SUPPORTED" = "true" ]
+}
+
+to_jst_display_time() {
+  local value="$1" converted
+  case "$value" in
+    ''|0001-01-01T00:00:00Z)  # Docker が「未設定」を表すゼロ値はそのまま扱う
+      printf '%s' "$value"
+      return 0
+      ;;
+  esac
+  if ! date_parse_supported; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if converted="$(date -d "$value" '+%Y-%m-%d %H:%M:%S.%3N' 2>/dev/null)" \
+      && [ -n "$converted" ]; then
+    printf '%s %s' "$converted" "$DISPLAY_TZ_LABEL"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+# 「開始: <RFC3339>」「終了: <RFC3339>」形式の行だけを JST 表記へ書き換える。
+# healthcheck 履歴の出力本文 (任意のテキスト) は変換対象にしない。
+rewrite_health_history_time() {
+  local line prefix value
+  while IFS= read -r line; do
+    case "$line" in
+      '開始: '[0-9][0-9][0-9][0-9]-[0-9][0-9]-*|'終了: '[0-9][0-9][0-9][0-9]-[0-9][0-9]-*)
+        prefix="${line%%: *}"
+        value="${line#*: }"
+        printf '%s: %s\n' "$prefix" "$(to_jst_display_time "$value")"
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done
 }
 
 usage() {
@@ -1849,7 +1932,13 @@ start_container() {
   fi
   # 既存コンテナを再利用した場合に前回起動の WFLYSRV0025 を誤検出しないよう、
   # compose up の直前を今回のログ取得開始時刻として記録する。
-  CONTAINER_LOG_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')"
+  # docker compose logs --since は RFC3339 を受け取る。表示・記録を JST に揃える
+  # ため +09:00 付きで生成し、オフセットを組み立てられない環境では UTC 表記へ戻す。
+  CONTAINER_LOG_SINCE="$(date '+%Y-%m-%dT%H:%M:%S.%N%:z' 2>/dev/null)"
+  case "$CONTAINER_LOG_SINCE" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*[+-][0-9][0-9]:[0-9][0-9]) ;;
+    *) CONTAINER_LOG_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ;;
+  esac
   local up_args=(-f "$COMPOSE_FILE" up -d --no-build)
   # --wait を付けると、compose が depends_on の条件に加えて対象サービス自身が
   # healthy (healthcheck 未定義なら running) になるまで待ってから戻る。
@@ -2502,18 +2591,283 @@ print_healthcheck_capture() {
   fi
 }
 
+# ---- healthcheck の実行手段解決 ---------------------------------------------
+# adot-collector のような distroless イメージには /bin/sh が無く、CMD-SHELL 形式の
+# healthcheck や補助スクリプトをそのまま実行できない。利用できるシェルを順に探し、
+# 見つからない場合は呼び出し側でシェル不要の方式へ切り替える。
+CONTAINER_SHELL_CACHE_ID=""
+CONTAINER_SHELL_CACHE_PATH=""
+detect_container_shell() {
+  local container_id="$1" shell_candidate
+  if [ "$CONTAINER_SHELL_CACHE_ID" != "$container_id" ]; then
+    CONTAINER_SHELL_CACHE_ID="$container_id"
+    CONTAINER_SHELL_CACHE_PATH=""
+    for shell_candidate in /bin/sh /bin/bash /bin/ash /busybox/sh /usr/bin/sh /usr/bin/bash; do
+      if docker exec "$container_id" "$shell_candidate" -c 'exit 0' >/dev/null 2>&1; then
+        CONTAINER_SHELL_CACHE_PATH="$shell_candidate"
+        break
+      fi
+    done
+  fi
+  [ -n "$CONTAINER_SHELL_CACHE_PATH" ] || return 1
+  printf '%s\n' "$CONTAINER_SHELL_CACHE_PATH"
+}
+
+# Config.Healthcheck.Test を取得して配列へ格納する。healthcheck 未設定なら 1 を返す。
+HEALTHCHECK_TEST_LINES=()
+load_container_healthcheck_test() {
+  local container_id="$1" test_text
+  HEALTHCHECK_TEST_LINES=()
+  test_text="$(
+    docker inspect -f \
+      '{{if .Config.Healthcheck}}{{range .Config.Healthcheck.Test}}{{println .}}{{end}}{{end}}' \
+      "$container_id" 2>/dev/null
+  )" || return 1
+  [ -n "$test_text" ] || return 1
+  mapfile -t HEALTHCHECK_TEST_LINES <<< "$test_text"
+  case "${HEALTHCHECK_TEST_LINES[0]:-}" in
+    ''|NONE)
+      HEALTHCHECK_TEST_LINES=()
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# healthcheck 定義 (Test 配列) から、形式・表示用コマンド文字列・実行ファイルパスを
+# 組み立てる。CMD / CMD-SHELL 以外は 1 を返す。
+HEALTHCHECK_MODE=""
+HEALTHCHECK_COMMAND_TEXT=""
+HEALTHCHECK_EXECUTABLE_PATH=""
+parse_healthcheck_test() {
+  local -a test_lines=("$@")
+
+  HEALTHCHECK_MODE="${test_lines[0]:-}"
+  HEALTHCHECK_COMMAND_TEXT=""
+  HEALTHCHECK_EXECUTABLE_PATH=""
+  case "$HEALTHCHECK_MODE" in
+    CMD-SHELL)
+      HEALTHCHECK_COMMAND_TEXT="${test_lines[1]:-}"
+      if [ ${#test_lines[@]} -gt 2 ]; then
+        HEALTHCHECK_COMMAND_TEXT+=$'\n'
+        HEALTHCHECK_COMMAND_TEXT+="$(printf '%s\n' "${test_lines[@]:2}")"
+      fi
+      HEALTHCHECK_EXECUTABLE_PATH="${HEALTHCHECK_COMMAND_TEXT%%[[:space:]]*}"
+      HEALTHCHECK_EXECUTABLE_PATH="${HEALTHCHECK_EXECUTABLE_PATH#\"}"
+      HEALTHCHECK_EXECUTABLE_PATH="${HEALTHCHECK_EXECUTABLE_PATH%\"}"
+      HEALTHCHECK_EXECUTABLE_PATH="${HEALTHCHECK_EXECUTABLE_PATH#\'}"
+      HEALTHCHECK_EXECUTABLE_PATH="${HEALTHCHECK_EXECUTABLE_PATH%\'}"
+      ;;
+    CMD)
+      printf -v HEALTHCHECK_COMMAND_TEXT '%q ' "${test_lines[@]:1}"
+      HEALTHCHECK_COMMAND_TEXT="${HEALTHCHECK_COMMAND_TEXT% }"
+      HEALTHCHECK_EXECUTABLE_PATH="${test_lines[1]:-}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# CMD-SHELL のコマンド文字列を、シェル無しで実行できる引数列へ分解する。
+# healthcheck で定型的な `... || exit N` だけは取り除き、それ以外のシェル構文
+# (パイプ・リダイレクト・変数展開・クォート) を含む場合は変換しない。
+HEALTHCHECK_DIRECT_ARGV=()
+build_healthcheck_direct_argv() {
+  local command_text="$1" core="$1" trailer
+
+  HEALTHCHECK_DIRECT_ARGV=()
+  case "$core" in
+    *'||'*)
+      trailer="${core#*||}"
+      core="${core%%||*}"
+      printf '%s' "$trailer" \
+        | grep -Eq '^[[:space:]]*exit[[:space:]]+[0-9]+[[:space:]]*$' || return 1
+      ;;
+  esac
+  printf '%s' "$core" \
+    | grep -Eq '^[[:space:]]*[A-Za-z0-9_./-]+([[:space:]]+[A-Za-z0-9_./:@=,%?&#+-]+)*[[:space:]]*$' \
+    || return 1
+  read -r -a HEALTHCHECK_DIRECT_ARGV <<< "$core"
+  [ ${#HEALTHCHECK_DIRECT_ARGV[@]} -gt 0 ] || return 1
+  return 0
+}
+
+# healthcheck コマンドをコンテナ内で実行する。実行手段を次の順に切り替える。
+#   1) CMD 形式        : docker exec で直接実行 (シェル不要)
+#   2) CMD-SHELL 形式  : コンテナ内シェル (/bin/sh または代替シェル) で実行
+#   3) シェルが無い場合: シェル構文を含まなければ引数へ分解して直接実行
+# どの手段も使えない場合は 125 を返し、呼び出し側で HTTP 等の別方式へ切り替える。
+HEALTHCHECK_TIMEOUT_RUNNER=()
+HEALTHCHECK_EXEC_METHOD=""
+HEALTHCHECK_EXEC_AVAILABLE="false"
+run_healthcheck_command_with_fallback() {
+  local container_id="$1" health_mode="$2" health_command_text="$3" output_file="$4"
+  shift 4
+  local -a command_argv=("$@")
+  local shell_path status=0
+
+  HEALTHCHECK_EXEC_METHOD=""
+  HEALTHCHECK_EXEC_AVAILABLE="false"
+
+  if [ "$health_mode" = "CMD" ]; then
+    HEALTHCHECK_EXEC_AVAILABLE="true"
+    HEALTHCHECK_EXEC_METHOD="docker exec で直接実行 (コンテナ内シェル不要)"
+    ${HEALTHCHECK_TIMEOUT_RUNNER[@]+"${HEALTHCHECK_TIMEOUT_RUNNER[@]}"} \
+      docker exec "$container_id" "${command_argv[@]}" \
+      >"$output_file" 2>&1 || status=$?
+    return "$status"
+  fi
+
+  if shell_path="$(detect_container_shell "$container_id")"; then
+    HEALTHCHECK_EXEC_AVAILABLE="true"
+    HEALTHCHECK_EXEC_METHOD="コンテナ内シェル ${shell_path} で実行"
+    ${HEALTHCHECK_TIMEOUT_RUNNER[@]+"${HEALTHCHECK_TIMEOUT_RUNNER[@]}"} \
+      docker exec "$container_id" "$shell_path" -c "$health_command_text" \
+      >"$output_file" 2>&1 || status=$?
+    return "$status"
+  fi
+
+  if build_healthcheck_direct_argv "$health_command_text"; then
+    HEALTHCHECK_EXEC_AVAILABLE="true"
+    HEALTHCHECK_EXEC_METHOD="コンテナ内にシェルが無いため docker exec で直接実行: ${HEALTHCHECK_DIRECT_ARGV[*]}"
+    ${HEALTHCHECK_TIMEOUT_RUNNER[@]+"${HEALTHCHECK_TIMEOUT_RUNNER[@]}"} \
+      docker exec "$container_id" "${HEALTHCHECK_DIRECT_ARGV[@]}" \
+      >"$output_file" 2>&1 || status=$?
+    return "$status"
+  fi
+
+  HEALTHCHECK_EXEC_METHOD="コンテナ内にシェルが無く、シェル構文を含むコマンドのため実行不可"
+  return 125
+}
+
+# healthcheck URL (コンテナ内から見たアドレス) を、ホストから到達できる URL へ変換する。
+# 公開ポートを優先し、未公開ならコンテナ IP を使う。解決できない場合は 1 を返す。
+resolve_healthcheck_url_for_host() {
+  local container_id="$1" url="$2"
+  local scheme rest hostport path port mapping mapped_host mapped_port container_ip host_for_url
+
+  case "$url" in
+    http://*|https://*) ;;
+    *) return 1 ;;
+  esac
+  scheme="${url%%://*}"
+  rest="${url#*://}"
+  case "$rest" in
+    */*)
+      hostport="${rest%%/*}"
+      path="/${rest#*/}"
+      ;;
+    *)
+      hostport="$rest"
+      path="/"
+      ;;
+  esac
+  case "$hostport" in
+    \[*\]:*) port="${hostport##*:}" ;;
+    \[*\])   port="" ;;
+    *:*)     port="${hostport##*:}" ;;
+    *)       port="" ;;
+  esac
+  if [ -z "$port" ]; then
+    case "$scheme" in
+      https) port="443" ;;
+      *)     port="80" ;;
+    esac
+  fi
+  printf '%s' "$port" | grep -qE '^[0-9]+$' || return 1
+
+  mapping="$(docker port "$container_id" "${port}/tcp" 2>/dev/null | sed -n '1p' || true)"
+  if [ -n "$mapping" ]; then
+    mapped_port="${mapping##*:}"
+    mapped_host="${mapping%:*}"
+    mapped_host="${mapped_host#[}"
+    mapped_host="${mapped_host%]}"
+    case "$mapped_host" in
+      ""|0.0.0.0|::) mapped_host="127.0.0.1" ;;
+    esac
+    if printf '%s' "$mapped_port" | grep -qE '^[0-9]+$'; then
+      host_for_url="$mapped_host"
+      case "$host_for_url" in
+        *:*) host_for_url="[${host_for_url}]" ;;
+      esac
+      printf '%s://%s:%s%s\n' "$scheme" "$host_for_url" "$mapped_port" "$path"
+      return 0
+    fi
+  fi
+
+  container_ip="$(
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+      "$container_id" 2>/dev/null | sed -n '/./{p;q;}' || true
+  )"
+  [ -n "$container_ip" ] || return 1
+  host_for_url="$container_ip"
+  case "$host_for_url" in
+    *:*) host_for_url="[${host_for_url}]" ;;
+  esac
+  printf '%s://%s:%s%s\n' "$scheme" "$host_for_url" "$port" "$path"
+}
+
+# 自動確認の手段が尽きた場合に、利用者が手元で実行できるコマンドを案内する。
+# 認証情報の混入を避けるため、コマンド行は伏せ字処理を通して表示する。
+print_healthcheck_manual_commands() {
+  local service_name="$1" container_name="$2" health_mode="$3"
+  local health_command_text="$4" http_url="$5" container_id="$6"
+  local host_url=""
+
+  diag ""
+  diag "[手動で確認する場合のコマンド]"
+  diag "  # Docker が記録した healthcheck の状態と履歴 (コンテナ内シェル不要)"
+  diag "  docker inspect --format '{{json .State.Health}}' ${container_name}"
+  diag "  # コンテナのログから稼働状況を確認"
+  diag "  ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} logs ${service_name}"
+  case "$health_mode" in
+    CMD)
+      diag "  # healthcheck と同じコマンドを直接実行 (シェル不要)"
+      printf '  docker exec %s %s\n' "$container_name" "$health_command_text" \
+        | redact_healthcheck_text >&2
+      ;;
+    CMD-SHELL)
+      diag "  # シェルを持つイメージであれば同じコマンド文字列を実行"
+      printf "  docker exec %s /bin/sh -c '%s'\n" "$container_name" "$health_command_text" \
+        | redact_healthcheck_text >&2
+      ;;
+  esac
+  if [ -n "$http_url" ]; then
+    host_url="$(resolve_healthcheck_url_for_host "$container_id" "$http_url" || true)"
+    diag "  # 対象コンテナのネットワークを借りた一時コンテナから HTTP 確認"
+    diag "  # (対象イメージに curl/wget が無くても確認できる)"
+    printf '  docker run --rm --network container:%s curlimages/curl:latest -sS -i %s\n' \
+      "$container_name" "$http_url" | redact_healthcheck_text >&2
+    if [ -n "$host_url" ]; then
+      diag "  # ホストから公開ポート経由で HTTP 確認"
+      printf '  curl -sS -i %s\n' "$host_url" | redact_healthcheck_text >&2
+    fi
+  fi
+}
+
 # CMD 形式で直接指定された /healthcheck 等について、実際に呼ばれるファイルの
 # 存在・実行権限・内容識別用 SHA-256 をコンテナ内で確認する。
+# シェルを持たないイメージでは確認できないため、その旨だけを表示する。
 show_healthcheck_executable_file() {
-  local container_id="$1" executable_path="$2" file_info file_status=0
+  local container_id="$1" executable_path="$2" file_info file_status=0 shell_path
 
   case "$executable_path" in
     /*) ;;
     *) return 0 ;;
   esac
 
+  if ! shell_path="$(detect_container_shell "$container_id")"; then
+    diag ""
+    diag "[healthcheck 実行ファイル]"
+    diag "コンテナ内にシェルが無いため、ファイル情報を取得できません: ${executable_path}"
+    diag "イメージ側から確認する場合: docker cp <コンテナ>:${executable_path} ./healthcheck-binary"
+    return 0
+  fi
+
   file_info="$(
-    docker exec "$container_id" /bin/sh -c '
+    docker exec "$container_id" "$shell_path" -c '
       target=$1
       if [ ! -e "$target" ]; then
         printf "ファイル: %s (存在しません)\n" "$target"
@@ -2544,38 +2898,8 @@ show_healthcheck_executable_file() {
   fi
 }
 
-# 単純な curl / wget の HTTP healthcheck について、元のチェックとは別のボディなし
-# 補助リクエストを同じコンテナのネットワーク名前空間から送り、ヘッダー・本文・
-# 接続メトリクスを表示する。認証ヘッダーやリクエストボディを伴う複雑な設定は扱わない。
-run_healthcheck_http_probe() {
-  local container_id="$1" probe_kind="$2" request_method="$3" request_url="$4"
-  local probe_status=0 probe_script
-
-  if ! HEALTHCHECK_DIAGNOSTIC_FILE="$(mktemp 2>/dev/null)"; then
-    warn "healthcheck HTTP 通信の保存用一時ファイルを作成できませんでした。"
-    return 1
-  fi
-  : > "$HEALTHCHECK_DIAGNOSTIC_FILE"
-
-  case "$probe_kind" in
-    curl)
-      probe_script="$(cat <<'HEALTHCHECK_CURL_PROBE'
-set -u
-health_url=$1
-health_timeout=$2
-health_method=$3
-if ! command -v curl >/dev/null 2>&1; then
-  printf "curl がコンテナ内にありません。\n" >&2
-  exit 127
-fi
-set -- \
-  --silent \
-  --show-error \
-  --verbose \
-  --include \
-  --max-time "$health_timeout" \
-  --max-filesize 1048576 \
-  --write-out '
+# curl の通信メトリクス出力書式 (コンテナ側・ホスト側の補助リクエストで共用)。
+HEALTHCHECK_CURL_METRICS_FORMAT='
 [通信メトリクス]
 http_status=%{http_code}
 remote=%{remote_ip}:%{remote_port}
@@ -2585,18 +2909,100 @@ time_starttransfer=%{time_starttransfer}s
 time_total=%{time_total}s
 size_download=%{size_download} bytes
 '
-if [ "$health_method" = "HEAD" ]; then
-  set -- "$@" --head
-fi
-exec curl "$@" "$health_url"
-HEALTHCHECK_CURL_PROBE
-)"
-      docker exec "$container_id" /bin/sh -c "$probe_script" \
-        healthcheck-http-probe "$request_url" "$URL_TIMEOUT" "$request_method" \
-        >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || probe_status=$?
+
+# ホスト側にある HTTP クライアントを返す (curl 優先、無ければ wget)。
+detect_host_http_tool() {
+  local tool
+  for tool in curl wget; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf '%s\n' "$tool"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ホストから URL へ補助リクエストを送る。コンテナ内にシェルや curl/wget が無い
+# (distroless イメージ等) 場合のフォールバック経路。
+run_healthcheck_http_probe_on_host() {
+  local tool="$1" request_method="$2" request_url="$3" output_file="$4"
+  local status=0
+  local -a curl_args=()
+
+  case "$tool" in
+    curl)
+      curl_args=(--silent --show-error --verbose --include --noproxy '*'
+        --max-time "$URL_TIMEOUT" --max-filesize 1048576
+        --write-out "$HEALTHCHECK_CURL_METRICS_FORMAT")
+      if [ "$request_method" = "HEAD" ]; then
+        curl_args+=(--head)
+      fi
+      curl "${curl_args[@]}" "$request_url" >"$output_file" 2>&1 || status=$?
       ;;
     wget)
-      probe_script="$(cat <<'HEALTHCHECK_WGET_PROBE'
+      wget -S -O - -T "$URL_TIMEOUT" "$request_url" >"$output_file" 2>&1 || status=$?
+      ;;
+    *)
+      return 125
+      ;;
+  esac
+  return "$status"
+}
+
+# 単純な curl / wget の HTTP healthcheck について、元のチェックとは別のボディなし
+# 補助リクエストを同じコンテナのネットワーク名前空間から送り、ヘッダー・本文・
+# 接続メトリクスを表示する。認証ヘッダーやリクエストボディを伴う複雑な設定は扱わない。
+# コンテナにシェルが無い、または curl/wget が無い場合は、公開ポート (無ければ
+# コンテナ IP) へホスト側から送り直して確認する。
+run_healthcheck_http_probe() {
+  local container_id="$1" probe_kind="$2" request_method="$3" request_url="$4"
+  local probe_status=0 probe_script shell_path="" probe_origin="" probe_url="$request_url"
+  local container_probe_done="false" host_tool="" host_url=""
+
+  case "$probe_kind" in
+    curl|wget) ;;
+    *) return 1 ;;
+  esac
+  if ! HEALTHCHECK_DIAGNOSTIC_FILE="$(mktemp 2>/dev/null)"; then
+    warn "healthcheck HTTP 通信の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  : > "$HEALTHCHECK_DIAGNOSTIC_FILE"
+
+  if shell_path="$(detect_container_shell "$container_id")"; then
+    container_probe_done="true"
+    probe_origin="選択したコンテナのネットワーク名前空間 (${shell_path})"
+    case "$probe_kind" in
+      curl)
+        probe_script="$(cat <<HEALTHCHECK_CURL_PROBE
+set -u
+health_url=\$1
+health_timeout=\$2
+health_method=\$3
+if ! command -v curl >/dev/null 2>&1; then
+  printf "curl がコンテナ内にありません。\n" >&2
+  exit 127
+fi
+set -- \\
+  --silent \\
+  --show-error \\
+  --verbose \\
+  --include \\
+  --max-time "\$health_timeout" \\
+  --max-filesize 1048576 \\
+  --write-out '${HEALTHCHECK_CURL_METRICS_FORMAT}'
+if [ "\$health_method" = "HEAD" ]; then
+  set -- "\$@" --head
+fi
+exec curl "\$@" "\$health_url"
+HEALTHCHECK_CURL_PROBE
+)"
+        docker exec "$container_id" "$shell_path" -c "$probe_script" \
+          healthcheck-http-probe "$request_url" "$URL_TIMEOUT" "$request_method" \
+          >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || probe_status=$?
+        ;;
+      wget)
+        probe_script="$(cat <<'HEALTHCHECK_WGET_PROBE'
 set -u
 health_url=$1
 health_timeout=$2
@@ -2607,21 +3013,42 @@ fi
 exec wget -S -O - -T "$health_timeout" "$health_url"
 HEALTHCHECK_WGET_PROBE
 )"
-      docker exec "$container_id" /bin/sh -c "$probe_script" \
-        healthcheck-http-probe "$request_url" "$URL_TIMEOUT" \
-        >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || probe_status=$?
-      ;;
-    *)
+        docker exec "$container_id" "$shell_path" -c "$probe_script" \
+          healthcheck-http-probe "$request_url" "$URL_TIMEOUT" \
+          >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || probe_status=$?
+        ;;
+    esac
+  fi
+
+  # コンテナ内で実行できない (シェル無し)、または curl/wget が無い (exit 127) 場合は、
+  # ホストから到達できる URL へ切り替えて同じ確認を試みる。
+  if [ "$container_probe_done" != "true" ] || [ "$probe_status" -eq 127 ]; then
+    if [ "$container_probe_done" = "true" ]; then
+      warn "コンテナ内に ${probe_kind} が無いため、ホストからの HTTP 確認へ切り替えます。"
+    else
+      warn "コンテナ内にシェルが無いため、ホストからの HTTP 確認へ切り替えます。"
+    fi
+    if host_url="$(resolve_healthcheck_url_for_host "$container_id" "$request_url")" \
+        && host_tool="$(detect_host_http_tool)"; then
+      probe_url="$host_url"
+      probe_origin="ホスト (${host_tool}、コンテナへは公開ポート/コンテナ IP 経由)"
+      probe_status=0
+      : > "$HEALTHCHECK_DIAGNOSTIC_FILE"
+      run_healthcheck_http_probe_on_host \
+        "$host_tool" "$request_method" "$host_url" "$HEALTHCHECK_DIAGNOSTIC_FILE" \
+        || probe_status=$?
+    elif [ "$container_probe_done" != "true" ]; then
       rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
       HEALTHCHECK_DIAGNOSTIC_FILE=""
-      return 1
-      ;;
-  esac
+      warn "コンテナ内でもホストからも HTTP 確認を実行できませんでした。"
+      return 125
+    fi
+  fi
 
   diag ""
   diag "[HTTP healthcheck 通信詳細（補助リクエスト）]"
-  diag "送信元     : 選択したコンテナのネットワーク名前空間"
-  printf 'リクエスト : [%s] %s\n' "$request_method" "$request_url" \
+  diag "送信元     : ${probe_origin}"
+  printf 'リクエスト : [%s] %s\n' "$request_method" "$probe_url" \
     | redact_healthcheck_text >&2
   diag "追加ヘッダー/ボディ: なし（通信詳細取得用の補助リクエスト）"
   diag "終了コード : ${probe_status}"
@@ -2634,14 +3061,17 @@ HEALTHCHECK_WGET_PROBE
   if [ "$probe_status" -ne 0 ]; then
     warn "healthcheck の HTTP 補助リクエストに失敗しました (exit=${probe_status})。"
   fi
-  return 0
+  # 呼び出し側が「別方式でも確認できなかった」を判断できるよう、実際の結果を返す。
+  return "$probe_status"
 }
 
 # healthcheck コマンドから安全に再送できる単純な HTTP(S) URL を抽出し、
-# curl / wget の補助プローブへ振り分ける。
+# curl / wget の補助プローブへ振り分ける。URL が無い、または補助リクエストを
+# 自動生成できない場合は、手元で実行できるコマンドを案内する。
 run_healthcheck_http_details() {
   local container_id="$1" health_command_text="$2"
-  local http_url probe_kind="" request_method="GET"
+  local service_name="${3:-}" container_name="${4:-}" health_mode="${5:-}"
+  local http_url probe_kind="" request_method="GET" probe_status=0
 
   http_url="$(
     printf '%s\n' "$health_command_text" \
@@ -2653,6 +3083,10 @@ run_healthcheck_http_details() {
     diag "[通信・リクエスト・レスポンス]"
     diag "HTTP(S) URL を含む healthcheck ではないため、HTTP 補助リクエストは対象外です。"
     diag "通信成否とコマンド出力は、Docker 実行履歴および手動再実行結果を確認してください。"
+    if [ "$HEALTHCHECK_EXEC_AVAILABLE" != "true" ] && [ -n "$container_name" ]; then
+      print_healthcheck_manual_commands "$service_name" "$container_name" \
+        "$health_mode" "$health_command_text" "" "$container_id"
+    fi
     return 0
   fi
   if printf '%s\n' "$http_url" \
@@ -2674,6 +3108,10 @@ run_healthcheck_http_details() {
         | grep -Eq '(^|[[:space:]])(-X|--request|-d|--data[^[:space:]]*|-H|--header|-u|--user)([=[:space:]]|$)'; then
       warn "healthcheck にメソッド・ヘッダー・ボディ・認証の指定があるため、安全な HTTP 補助リクエストを自動生成できません。"
       diag "正確な実行結果は上の手動再実行結果を確認してください。"
+      if [ "$HEALTHCHECK_EXEC_AVAILABLE" != "true" ] && [ -n "$container_name" ]; then
+        print_healthcheck_manual_commands "$service_name" "$container_name" \
+          "$health_mode" "$health_command_text" "$http_url" "$container_id"
+      fi
       return 0
     fi
     if printf ' %s ' "$health_command_text" \
@@ -2683,6 +3121,13 @@ run_healthcheck_http_details() {
   elif printf '%s\n' "$health_command_text" \
       | grep -Eq '(^|[[:space:];|&()])wget([[:space:]]|$)'; then
     probe_kind="wget"
+  elif [ "$HEALTHCHECK_EXEC_AVAILABLE" != "true" ]; then
+    # 専用バイナリ等でコマンドを再実行できない場合でも、URL が判明していれば
+    # 同じ URL への HTTP 確認で代替できるため、curl 相当の補助リクエストを試みる。
+    probe_kind="curl"
+    diag ""
+    diag "[通信・リクエスト・レスポンス]"
+    diag "healthcheck コマンドを再実行できないため、検出した URL への HTTP 確認で代替します。"
   else
     diag ""
     diag "[通信・リクエスト・レスポンス]"
@@ -2691,8 +3136,16 @@ run_healthcheck_http_details() {
     return 0
   fi
 
-  run_healthcheck_http_probe "$container_id" "$probe_kind" "$request_method" "$http_url" || true
-  diag "注意: 補助リクエストは単純な GET/HEAD の通信詳細取得用で、Docker の health 状態・履歴を更新しません。"
+  run_healthcheck_http_probe "$container_id" "$probe_kind" "$request_method" "$http_url" \
+    || probe_status=$?
+  if [ "$probe_status" -eq 0 ]; then
+    diag "注意: 補助リクエストは単純な GET/HEAD の通信詳細取得用で、Docker の health 状態・履歴を更新しません。"
+  fi
+  if [ -n "$container_name" ] \
+      && { [ "$probe_status" -ne 0 ] || [ "$HEALTHCHECK_EXEC_AVAILABLE" != "true" ]; }; then
+    print_healthcheck_manual_commands "$service_name" "$container_name" \
+      "$health_mode" "$health_command_text" "$http_url" "$container_id"
+  fi
   return 0
 }
 
@@ -2742,34 +3195,17 @@ run_interactive_compose_healthcheck() {
     return 0
   fi
 
-  case "$health_mode" in
-    CMD-SHELL)
-      health_command_text="${health_test[1]:-}"
-      if [ ${#health_test[@]} -gt 2 ]; then
-        health_command_text+=$'\n'
-        health_command_text+="$(printf '%s\n' "${health_test[@]:2}")"
-      fi
-      health_command_display="$health_command_text"
-      executable_path="${health_command_text%%[[:space:]]*}"
-      executable_path="${executable_path#\"}"
-      executable_path="${executable_path%\"}"
-      executable_path="${executable_path#\'}"
-      executable_path="${executable_path%\'}"
-      ;;
-    CMD)
-      printf -v health_command_text '%q ' "${health_test[@]:1}"
-      health_command_text="${health_command_text% }"
-      health_command_display="$health_command_text"
-      executable_path="${health_test[1]:-}"
-      ;;
-    *)
-      warn "未対応の healthcheck 形式です: ${health_mode}"
-      diag "設定値:"
-      printf '%s\n' "$health_test_text" | redact_healthcheck_text >&2
-      diag "════════════════════════════════════════════════════════"
-      return 0
-      ;;
-  esac
+  if parse_healthcheck_test "${health_test[@]}"; then
+    health_command_text="$HEALTHCHECK_COMMAND_TEXT"
+    health_command_display="$health_command_text"
+    executable_path="$HEALTHCHECK_EXECUTABLE_PATH"
+  else
+    warn "未対応の healthcheck 形式です: ${health_mode}"
+    diag "設定値:"
+    printf '%s\n' "$health_test_text" | redact_healthcheck_text >&2
+    diag "════════════════════════════════════════════════════════"
+    return 0
+  fi
 
   if ! health_config="$(
     docker inspect -f \
@@ -2821,9 +3257,9 @@ run_interactive_compose_healthcheck() {
     diag "保持された履歴 : Docker inspect に失敗したため未取得"
   elif [ -n "$health_history" ]; then
     retained_count="$(printf '%s\n' "$health_history" | grep -c '^開始: ' || true)"
-    diag "保持された履歴 : ${retained_count} 件"
+    diag "保持された履歴 : ${retained_count} 件 (時刻は JST 表記へ変換)"
     diag "───────────────────────────────────────────────────────────────────"
-    printf '%s\n' "$health_history" | redact_healthcheck_text >&2
+    printf '%s\n' "$health_history" | rewrite_health_history_time | redact_healthcheck_text >&2
   else
     diag "保持された履歴 : 0 件（まだ未実行、または Docker が履歴を保持していません）"
   fi
@@ -2858,24 +3294,31 @@ run_interactive_compose_healthcheck() {
     exact_timeout_label="未適用 (timeout コマンドなし)"
     warn "ホストに timeout コマンドがないため、healthcheck 手動再実行へ時間上限を適用できません。"
   fi
-  exact_started_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  HEALTHCHECK_TIMEOUT_RUNNER=(${exact_runner[@]+"${exact_runner[@]}"})
+  exact_started_at="$(now_display_time)"
   exact_started_epoch="$(date +%s)"
-  case "$health_mode" in
-    CMD-SHELL)
-      "${exact_runner[@]}" docker exec "$container_id" /bin/sh -c "$health_command_text" \
-        >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || exact_status=$?
-      ;;
-    CMD)
-      "${exact_runner[@]}" docker exec "$container_id" "${health_test[@]:1}" \
-        >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1 || exact_status=$?
-      ;;
-  esac
+  run_healthcheck_command_with_fallback \
+    "$container_id" "$health_mode" "$health_command_text" "$HEALTHCHECK_DIAGNOSTIC_FILE" \
+    "${health_test[@]:1}" || exact_status=$?
   exact_finished_epoch="$(date +%s)"
-  exact_finished_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  exact_finished_at="$(now_display_time)"
 
   diag ""
   diag "[現在時点の healthcheck コマンド手動再実行]"
   diag "注意: この手動再実行は Docker の health 状態・履歴を更新しません。"
+  diag "実行方式   : ${HEALTHCHECK_EXEC_METHOD}"
+  if [ "$HEALTHCHECK_EXEC_AVAILABLE" != "true" ]; then
+    # /bin/sh が無いイメージ (distroless 等) では、コマンドをそのまま再実行できない。
+    # HTTP など別方式での確認と、手元で実行できるコマンドの案内へ切り替える。
+    rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+    HEALTHCHECK_DIAGNOSTIC_FILE=""
+    warn "コンテナ内で healthcheck コマンドを再実行できないため、別方式での確認へ切り替えます。"
+    diag "Docker が実際に実行した結果は、上の State.Health と実行履歴を確認してください。"
+    run_healthcheck_http_details \
+      "$container_id" "$health_command_text" "$service_name" "$container_name" "$health_mode"
+    diag "════════════════════════════════════════════════════════"
+    return 0
+  fi
   diag "開始       : ${exact_started_at}"
   diag "終了       : ${exact_finished_at}"
   diag "実行上限   : ${exact_timeout_label}"
@@ -2893,7 +3336,8 @@ run_interactive_compose_healthcheck() {
     diag "手動再実行結果 : NG (exit=${exact_status})"
   fi
 
-  run_healthcheck_http_details "$container_id" "$health_command_text"
+  run_healthcheck_http_details \
+    "$container_id" "$health_command_text" "$service_name" "$container_name" "$health_mode"
   diag "════════════════════════════════════════════════════════"
   return 0
 }
@@ -3174,6 +3618,62 @@ resolve_compose_service_http_endpoint() {
   log "Compose サービスの確認 URL を解決しました: ${service_name} -> ${OBSERVABILITY_HTTP_BASE_URL}"
 }
 
+# Python ヘルパーへ JSON を渡す共通経路。
+# プロセス置換と追加 fd (3< <(...)) は、Windows 版 Python を使う Git Bash のように
+# 子プロセスが 0-2 以外の fd を継承できない環境で失敗するため、標準入力へ NUL 区切りで
+# 渡す方式に統一する。JSON テキストに NUL バイトは現れないため区切りとして安全で、
+# 機微情報を含み得る JSON を一時ファイルやコマンドライン引数へ出さずに渡せる。
+# 使い方: run_observability_python "<プログラム>" <JSON 個数> [JSON...] [プログラム引数...]
+run_observability_python() {
+  local program="$1" document_count="$2"
+  shift 2
+  local index
+  local -a documents=()
+
+  while [ "$document_count" -gt 0 ]; do
+    documents+=("$1")
+    shift
+    document_count=$((document_count - 1))
+  done
+  # レポートは日本語と罫線文字を含むため、ロケール既定の文字コード (Windows の cp932 等)
+  # で出力が落ちないよう UTF-8 を明示する。
+  {
+    for index in "${!documents[@]}"; do
+      [ "$index" -eq 0 ] || printf '\000'
+      printf '%s' "${documents[$index]}"
+    done
+  } | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" -c "$program" "$@"
+}
+
+# 各 Python ヘルパーの先頭へ連結する、入出力の共通定義。
+# プログラム本文側にも同じ import があるが、二重 import は無害。
+OBSERVABILITY_PYTHON_JSON_LOADER='
+import json
+import sys
+
+# Windows の Python は既定でロケール文字コード変換と LF -> CRLF 変換を行う。
+# レポートの罫線が化けたり、シェルが受け取る値へ CR が混入したりしないよう明示する。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+
+def load_json_documents(labels):
+    """標準入力の NUL 区切り JSON を、labels の順に解析して返す。"""
+    chunks = sys.stdin.buffer.read().split(b"\0")
+    documents = []
+    for index, label in enumerate(labels):
+        chunk = chunks[index] if index < len(chunks) else b""
+        try:
+            documents.append(json.loads(chunk.decode("utf-8")))
+        except Exception as exc:
+            print(f"[ERROR] {label} の JSON を解析できません: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+    return documents
+'
+
 observability_http_get() {
   curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" "$1"
 }
@@ -3192,34 +3692,24 @@ wiremock_request_count() {
   if ! response="$(printf '%s' "$payload" | observability_http_post_json "${base_url}/__admin/requests/count")"; then
     return 1
   fi
-  printf '%s' "$response" | "$OBSERVABILITY_PYTHON" -c \
-    'import json,sys; value=json.load(sys.stdin).get("count"); print(value if isinstance(value, int) else "?")'
+  # 改行を書かずに返し、Windows の Python が付ける CR が値へ混ざらないようにする。
+  printf '%s' "$response" | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" -c \
+    'import json,sys; value=json.load(sys.stdin).get("count"); sys.stdout.write(str(value) if isinstance(value, int) else "?")'
 }
 
-# fd 3: cwagent 設定、fd 4: WireMock request journal。
+# 標準入力の 1 つ目に cwagent 設定、2 つ目に WireMock request journal を受け取る。
 # Authorization 等のヘッダーは読み捨て、設定済み送信先と PutLogEvents 本文だけを表示する。
 render_cloudwatch_delivery_report() {
   local config_json="$1" journal_json="$2"
   local create_group_count="$3" create_stream_count="$4" put_count="$5"
+  local program
 
-  "$OBSERVABILITY_PYTHON" - "$create_group_count" "$create_stream_count" "$put_count" \
-      "$OBSERVABILITY_EVENT_DISPLAY_LIMIT" "$OBSERVABILITY_WIREMOCK_REQUEST_LIMIT" \
-      3< <(printf '%s' "$config_json") 4< <(printf '%s' "$journal_json") <<'PY'
+  program="$(cat <<'PY'
 import base64
 import datetime
 import json
-import os
 import re
 import sys
-
-
-def load_json_fd(fd, label):
-    try:
-        with os.fdopen(fd, encoding="utf-8") as stream:
-            return json.load(stream)
-    except Exception as exc:
-        print(f"[ERROR] {label} の JSON を解析できません: {exc}", file=sys.stderr)
-        raise SystemExit(2)
 
 
 def header_value(request, name):
@@ -3270,18 +3760,21 @@ def clean_text(value, limit=500):
     return text if len(text) <= limit else text[:limit] + "...(省略)"
 
 
+# 表示時刻はスクリプト全体と揃えて JST 固定にする (ログイベントの元値は UTC epoch)。
+JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
+
+
 def event_time(value):
     try:
         stamp = float(value) / 1000.0
         return datetime.datetime.fromtimestamp(
-            stamp, datetime.timezone.utc
-        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            stamp, JST
+        ).isoformat(timespec="milliseconds").replace("+09:00", " JST")
     except Exception:
         return clean_text(value)
 
 
-config = load_json_fd(3, "cwagent 設定")
-journal = load_json_fd(4, "WireMock request journal")
+config, journal = load_json_documents(["cwagent 設定", "WireMock request journal"])
 create_group_count, create_stream_count, put_count = sys.argv[1:4]
 event_limit = int(sys.argv[4])
 journal_limit = int(sys.argv[5])
@@ -3377,6 +3870,11 @@ else:
         print(f"    {clean_text(event['message'])}")
 print("═══════════════════════════════════════════════════════════")
 PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 2 "$config_json" "$journal_json" \
+    "$create_group_count" "$create_stream_count" "$put_count" \
+    "$OBSERVABILITY_EVENT_DISPLAY_LIMIT" "$OBSERVABILITY_WIREMOCK_REQUEST_LIMIT"
 }
 
 run_cloudwatch_logs_delivery_helper() {
@@ -3454,19 +3952,13 @@ find_first_running_compose_service() {
 }
 
 extract_jaeger_services() {
-  local services_json="$1"
+  local services_json="$1" program
 
-  "$OBSERVABILITY_PYTHON" - 3< <(printf '%s' "$services_json") <<'PY'
+  program="$(cat <<'PY'
 import json
-import os
 import sys
 
-try:
-    with os.fdopen(3, encoding="utf-8") as stream:
-        document = json.load(stream)
-except Exception as exc:
-    print(f"[ERROR] Jaeger サービス一覧の JSON を解析できません: {exc}", file=sys.stderr)
-    raise SystemExit(2)
+document, = load_json_documents(["Jaeger サービス一覧"])
 
 services = document.get("data", []) if isinstance(document, dict) else []
 if not isinstance(services, list):
@@ -3476,18 +3968,20 @@ for service in services:
     if isinstance(service, str) and service:
         print(service)
 PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 1 "$services_json"
 }
 
 # Jaeger Query API の応答から、トレース、スパン、親子関係、リソース属性、
 # スパン属性、イベントを人間が追いやすい形式へ整形する。
 render_jaeger_trace_report() {
   local traces_json="$1" selected_trace_service="$2"
+  local program
 
-  "$OBSERVABILITY_PYTHON" - "$selected_trace_service" \
-      3< <(printf '%s' "$traces_json") <<'PY'
+  program="$(cat <<'PY'
 import datetime
 import json
-import os
 import re
 import sys
 
@@ -3499,15 +3993,6 @@ SENSITIVE_TEXT = re.compile(
     r"(?i)\b(password|passwd|pwd|secret|token|authorization|cookie|api[_-]?key|credential)"
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
-
-
-def load_document():
-    try:
-        with os.fdopen(3, encoding="utf-8") as stream:
-            return json.load(stream)
-    except Exception as exc:
-        print(f"[ERROR] Jaeger トレース JSON を解析できません: {exc}", file=sys.stderr)
-        raise SystemExit(2)
 
 
 def clean_value(key, value, limit=300):
@@ -3535,12 +4020,16 @@ def tags_as_pairs(tags):
     return pairs
 
 
+# スパンの時刻も JST 表記へ統一する (Jaeger の元値は UTC のマイクロ秒 epoch)。
+JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
+
+
 def micros_to_time(value):
     try:
         stamp = float(value) / 1_000_000.0
         return datetime.datetime.fromtimestamp(
-            stamp, datetime.timezone.utc
-        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            stamp, JST
+        ).isoformat(timespec="milliseconds").replace("+09:00", " JST")
     except Exception:
         return clean_value("time", value)
 
@@ -3568,7 +4057,7 @@ def trace_start(trace):
     return min(starts) if starts else 0
 
 
-document = load_document()
+document, = load_json_documents(["Jaeger トレース"])
 selected_service = sys.argv[1]
 traces = document.get("data", []) if isinstance(document, dict) else []
 if not isinstance(traces, list):
@@ -3691,6 +4180,133 @@ for trace_index, trace in enumerate(traces, 1):
 print("")
 print("════════════════════════════════════════════════════════════")
 PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 1 "$traces_json" \
+    "$selected_trace_service"
+}
+
+# OTel Collector (adot-collector / otel) の稼働確認。
+# compose サービスに設定された healthcheck 定義を最優先で実行し、/bin/sh を持たない
+# distroless イメージでも確認できるよう、次の順にフォールバックする。
+#   1) compose の healthcheck 定義 (CMD はそのまま、CMD-SHELL はシェル→直接実行)
+#   2) ADOT Collector 同梱の /healthcheck バイナリを直接実行 (シェル不要)
+#   3) health_check 拡張のエンドポイント (13133) へ HTTP 確認
+#   4) Docker が記録した State.Health を参照
+# いずれも使えない場合は、利用者が手元で実行できるコマンドを案内する。
+verify_otel_collector_health() {
+  local service_name="$1" container_id="$2"
+  local container_name health_state health_status="" status=0
+  local health_mode="" health_command_text="" http_url="" host_url="" host_tool=""
+  local -a health_test=()
+
+  container_name="$(normalize_container_name \
+    "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+
+  # Docker が記録した health 状態は、コンテナ内へ一切立ち入らずに参照できる。
+  health_state="$(
+    docker inspect -f \
+      '{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{end}}' \
+      "$container_id" 2>/dev/null || true
+  )"
+  if [ -n "$health_state" ]; then
+    health_status="${health_state%%|*} (連続失敗 ${health_state#*|} 回)"
+  fi
+
+  if ! HEALTHCHECK_DIAGNOSTIC_FILE="$(mktemp 2>/dev/null)"; then
+    warn "OTel Collector ヘルスチェックの保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  : > "$HEALTHCHECK_DIAGNOSTIC_FILE"
+
+  # 1) compose に設定された healthcheck 定義を使う。
+  if load_container_healthcheck_test "$container_id" \
+      && parse_healthcheck_test "${HEALTHCHECK_TEST_LINES[@]}"; then
+    health_test=("${HEALTHCHECK_TEST_LINES[@]}")
+    health_mode="$HEALTHCHECK_MODE"
+    health_command_text="$HEALTHCHECK_COMMAND_TEXT"
+    HEALTHCHECK_TIMEOUT_RUNNER=()
+    if command -v timeout >/dev/null 2>&1; then
+      HEALTHCHECK_TIMEOUT_RUNNER=(timeout "${URL_TIMEOUT}s")
+    fi
+    status=0
+    run_healthcheck_command_with_fallback \
+      "$container_id" "$health_mode" "$health_command_text" "$HEALTHCHECK_DIAGNOSTIC_FILE" \
+      "${health_test[@]:1}" || status=$?
+    if [ "$HEALTHCHECK_EXEC_AVAILABLE" = "true" ] && [ "$status" -eq 0 ]; then
+      log "OTel Collector ヘルスチェック: OK (service=${service_name})"
+      diag "確認方式: compose の healthcheck 定義を ${HEALTHCHECK_EXEC_METHOD}"
+      rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+      HEALTHCHECK_DIAGNOSTIC_FILE=""
+      return 0
+    fi
+    # 125-127 はコマンド自体を起動できなかった場合 (シェル無し・コマンド未同梱)。
+    # healthcheck の失敗ではないため、次の確認方式へ進む。
+    if [ "$HEALTHCHECK_EXEC_AVAILABLE" = "true" ] \
+        && [ "$status" -ne 125 ] && [ "$status" -ne 126 ] && [ "$status" -ne 127 ]; then
+      warn "OTel Collector の healthcheck が失敗しました (service=${service_name}, exit=${status})。"
+      diag "確認方式: compose の healthcheck 定義を ${HEALTHCHECK_EXEC_METHOD}"
+      print_healthcheck_capture "$HEALTHCHECK_DIAGNOSTIC_FILE" "(healthcheck の出力はありません)"
+      rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+      HEALTHCHECK_DIAGNOSTIC_FILE=""
+      return 1
+    fi
+    warn "compose の healthcheck をコンテナ内で実行できません (${HEALTHCHECK_EXEC_METHOD}, exit=${status})。別方式で確認します。"
+    http_url="$(
+      printf '%s\n' "$health_command_text" \
+        | grep -Eo "https?://[^[:space:]\"'<>|;&)]+" | head -n 1 || true
+    )"
+  else
+    warn "compose サービス '${service_name}' に healthcheck が設定されていないため、既定の方式で確認します。"
+  fi
+
+  # 2) ADOT Collector 同梱の /healthcheck バイナリ (シェル不要)。
+  status=0
+  : > "$HEALTHCHECK_DIAGNOSTIC_FILE"
+  if docker exec "$container_id" /healthcheck >"$HEALTHCHECK_DIAGNOSTIC_FILE" 2>&1; then
+    log "OTel Collector ヘルスチェック: OK (service=${service_name})"
+    diag "確認方式: コンテナ同梱の /healthcheck を docker exec で直接実行"
+    rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+    HEALTHCHECK_DIAGNOSTIC_FILE=""
+    return 0
+  fi
+  rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+  HEALTHCHECK_DIAGNOSTIC_FILE=""
+
+  # 3) health_check 拡張のエンドポイントへ HTTP 確認 (コンテナ内ツール不要)。
+  [ -n "$http_url" ] || http_url="http://127.0.0.1:${OTEL_HEALTH_CHECK_PORT}/"
+  if host_url="$(resolve_healthcheck_url_for_host "$container_id" "$http_url")" \
+      && host_tool="$(detect_host_http_tool)"; then
+    if ! HEALTHCHECK_DIAGNOSTIC_FILE="$(mktemp 2>/dev/null)"; then
+      warn "OTel Collector ヘルスチェックの保存用一時ファイルを作成できませんでした。"
+      return 1
+    fi
+    status=0
+    run_healthcheck_http_probe_on_host "$host_tool" "GET" "$host_url" "$HEALTHCHECK_DIAGNOSTIC_FILE" \
+      || status=$?
+    if [ "$status" -eq 0 ]; then
+      log "OTel Collector ヘルスチェック: OK (service=${service_name})"
+      diag "確認方式: ホストから health_check エンドポイントへ HTTP 確認 (${host_url})"
+      print_healthcheck_capture "$HEALTHCHECK_DIAGNOSTIC_FILE" "(レスポンス本文はありません)"
+      rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+      HEALTHCHECK_DIAGNOSTIC_FILE=""
+      return 0
+    fi
+    warn "health_check エンドポイントへの HTTP 確認にも失敗しました (${host_url}, exit=${status})。"
+    print_healthcheck_capture "$HEALTHCHECK_DIAGNOSTIC_FILE" "(レスポンス本文・接続エラー出力はありません)"
+    rm -f -- "$HEALTHCHECK_DIAGNOSTIC_FILE"
+    HEALTHCHECK_DIAGNOSTIC_FILE=""
+  fi
+
+  # 4) 実行系がすべて使えない場合は、Docker の記録と手動コマンドで補う。
+  if [ -n "$health_status" ]; then
+    warn "OTel Collector を能動的に確認できないため、Docker が記録した health 状態のみ表示します: ${health_status} (service=${service_name})"
+  else
+    warn "OTel Collector のヘルスチェックを確認できませんでした (service=${service_name})。"
+  fi
+  print_healthcheck_manual_commands "$service_name" "$container_name" \
+    "$health_mode" "$health_command_text" "$http_url" "$container_id"
+  return 1
 }
 
 run_otel_jaeger_trace_helper() {
@@ -3713,11 +4329,7 @@ run_otel_jaeger_trace_helper() {
     mapfile -t collector_ids < <(compose_container_ids "$collector_service")
     if [ ${#collector_ids[@]} -gt 0 ]; then
       collector_id="${collector_ids[0]}"
-      if docker exec "$collector_id" /healthcheck >/dev/null 2>&1; then
-        log "OTel Collector ヘルスチェック: OK (service=${collector_service})"
-      else
-        warn "OTel Collector の /healthcheck が失敗しました (service=${collector_service})。"
-      fi
+      verify_otel_collector_health "$collector_service" "$collector_id" || true
 
       if collector_logs="$(compose_logs "$collector_service" 2>/dev/null)"; then
         collector_evidence="$(
@@ -4376,7 +4988,7 @@ write_build_report() {
   if [ "$exit_status" -ne 0 ] && [ "$build_status" = "実行中" ]; then
     build_status="失敗 (ビルド処理中に中断)"
   fi
-  report_finished_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  report_finished_at="$(now_display_time)"
 
   if ! {
     printf '===================================================================\n'
@@ -4541,6 +5153,8 @@ verify_local_image() {
     return 1
   else
     IFS='|' read -r image_id image_created image_size <<< "$image_info"
+    # docker が返す作成日時は UTC 固定のため、表示前に JST へ変換する。
+    image_created="$(to_jst_display_time "$image_created")"
     BUILD_IMAGE_INFO="image=${LOCAL_IMAGE}, id=${image_id}, created=${image_created}, size=${image_size} bytes"
     log "ビルド結果: image=${LOCAL_IMAGE}, id=${image_id}, created=${image_created}, size=${image_size} bytes"
   fi

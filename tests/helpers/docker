@@ -116,6 +116,12 @@ if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-jaeger" ] && [ "${3:-}" = "16686/t
   exit 0
 fi
 
+# OTel Collector の health_check 拡張ポート (ホストからの代替確認に使う)。
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-adot-collector" ] && [ "${3:-}" = "13133/tcp" ]; then
+  printf '0.0.0.0:13133\n'
+  exit 0
+fi
+
 if [ "${1:-}" = "system" ] && [ "${2:-}" = "df" ]; then
   if is_cleaned; then
     printf 'Images|0 B\n'
@@ -235,7 +241,15 @@ if [ "${1:-}" = "inspect" ]; then
     *".Config.Healthcheck.Test"*)
       case "$*" in
         *"cid-nohealth"*) ;;
-        *"cid-adot-collector"*) printf 'CMD\n/healthcheck\n' ;;
+        *"cid-adot-collector"*)
+          if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ]; then
+            # distroless イメージでよく使われる CMD-SHELL 形式の healthcheck。
+            printf 'CMD-SHELL\n'
+            printf 'wget -q -O- http://127.0.0.1:13133/ || exit 1\n'
+          else
+            printf 'CMD\n/healthcheck\n'
+          fi
+          ;;
         *)
           printf 'CMD-SHELL\n'
           if [ "${FAKE_HEALTHCHECK_SECRET:-false}" = "true" ]; then
@@ -305,6 +319,24 @@ if [ "${1:-}" = "inspect" ]; then
       ;;
   esac
   exit 0
+fi
+
+# distroless イメージの再現: シェルも wget も同梱されておらず、
+# /healthcheck バイナリも持たないコンテナとして振る舞う。
+if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ] \
+    && [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-adot-collector" ]; then
+  case "${3:-}" in
+    /bin/sh|/bin/bash|/bin/ash|/busybox/sh|/usr/bin/sh|/usr/bin/bash)
+      printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
+        "${3:-}" "${3:-}" >&2
+      exit 126
+      ;;
+    wget|/healthcheck)
+      printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": executable file not found in $PATH: unknown\n' \
+        "${3:-}" >&2
+      exit 127
+      ;;
+  esac
 fi
 
 if [ "${1:-}" = "exec" ] && [ "${6:-}" = "healthcheck-http-probe" ]; then
