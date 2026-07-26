@@ -162,6 +162,9 @@ flowchart TD
     AB --> Z2[完了 exit 0]
 ```
 
+エラー終了時は、`EXIT` の後始末でレポートのログ本文を集める直前に
+`compose stop` (SIGTERM) を挟みます (3.6 参照)。
+
 ### 3.2 ビルドフェーズの詳細
 
 `--compose-service` の指定数によってビルド戦略が変わります。
@@ -231,7 +234,43 @@ curl -s -S -m 30 -o <一時ファイル> -w '%{http_code}' -X <URL_METHOD> \
 | 通常 | `compose down` で停止・削除 |
 | `--keep-container` / `--keep-container-mode` 指定 | 残す (手動停止コマンドを案内) |
 | `--cleanup-all-docker-data` 指定 | 確認フレーズ入力後、Docker 全体を削除 |
-| `--suppress-removed-logs` 指定 | `compose down` の出力を抑制 |
+| `--suppress-removed-logs` 指定 | `compose down` / `compose stop` の出力を抑制 |
+
+### 3.6 エラー終了時の終了 (SIGTERM) ログ
+
+ECS はタスク停止時に各コンテナへ SIGTERM を送るため、adot collector のような
+サイドカーは「シグナル受信 → パイプラインの graceful shutdown → 終了」までを
+ログに残します。ローカル検証で `compose down` まで一気に実行すると、この終了ログは
+誰にも取得されないままコンテナごと削除されてしまいます。
+
+そこで**エラー終了時に限り**、削除の前に SIGTERM による停止を挟みます。
+
+```
+[2] 〜 [6] の収集 (起動中のコンテナが必要)
+        ↓
+compose stop -t <--shutdown-timeout>   ← SIGTERM。既定 30 秒後に SIGKILL
+        ↓
+終了ログ (停止前後のログ行数の差分) を画面へ表示
+        ↓
+[7] Compose サービス別ログ (終了処理込みの全文をレポートへ保存)
+        ↓
+compose down (削除)
+```
+
+- 対象は `compose ps --services` が返す**稼働中の全サービス**です
+  (起動確認対象だけでなく adot collector などのサイドカーも含みます)
+- 表示する行は「SIGTERM 送出前後のログ行数の差分」で求めるため、
+  ホストとコンテナの時刻差に影響されません
+- 差分が無いコンテナは `SIGTERM 受信後に追加されたログはありません。` と表示します
+- `--suppress-startup-logs` を指定していても表示します (原因を隠さないため)
+- `--keep-container` / `--keep-container-mode` 指定時はコンテナを停止できないため、
+  終了ログの取得も行いません
+- `--no-shutdown-logs` を指定すると、この停止と終了ログ取得を丸ごと無効化し、
+  従来どおり `compose down` でまとめて削除します
+
+`adot collector` の healthcheck が失敗し、`depends_on` の `condition: service_healthy`
+を満たせずバックエンドが起動しなかった場合、ECS 上でも同じくタスクが停止します。
+その終了処理まで含めてローカルで再現・確認できるようにするのがこの動作の狙いです。
 
 ---
 
@@ -271,7 +310,9 @@ curl -s -S -m 30 -o <一時ファイル> -w '%{http_code}' -X <URL_METHOD> \
 | `--wait-timeout SEC` | 1 以上の整数 | `600` | 不可 | `--wait` の最大待機秒数。指定すると `--wait-healthy` を暗黙に有効化 |
 | `--allow-service-exit NAME` | サービス名 | (なし) | **可** | 起動確認中に停止していても失敗扱いにしないサービス |
 | `--suppress-startup-logs` | フラグ | `false` | — | 起動ログの表示を抑制 (判定は継続。失敗時は表示される) |
-| `--suppress-removed-logs` | フラグ | `false` | — | `compose down` の `Removed` 等の出力を抑制 |
+| `--shutdown-timeout SEC` | 1 以上の整数 | `30` | 不可 | エラー終了時の SIGTERM から SIGKILL までの猶予秒数 (ECS の StopTimeout 既定と同じ) |
+| `--no-shutdown-logs` | フラグ | `false` | — | エラー終了時の SIGTERM 停止と終了ログ取得を行わない |
+| `--suppress-removed-logs` | フラグ | `false` | — | `compose down` / `compose stop` の `Removed` 等の出力を抑制 |
 | `--keep-container` | フラグ | `false` | — | 確認後もコンテナを停止・削除しない |
 
 ### 4.4 URL 応答確認
@@ -383,6 +424,12 @@ services:
         condition: service_healthy
 ```
 
+依存サービス (adot collector など) の healthcheck が失敗すると、
+`condition: service_healthy` を満たせないまま `compose up` が
+`dependency failed to start: container ... is unhealthy` で失敗します。
+この場合もエラー終了時の SIGTERM 停止が働くため、依存サービス側の
+終了処理ログまで画面と全量レポートに残ります (3.6 参照)。
+
 ### 5.4 `--keep-container-mode` の 3 モード
 
 | モード | 動作 |
@@ -437,9 +484,9 @@ services:
 | 項目 | 内容 |
 | --- | --- |
 | ファイル名 | `build_and_verify_<YYYYMMDDHHMMSS>.txt` (同名があれば `_1`, `_2` … を付与) |
-| 保存タイミング | EXIT トラップの**最初**。コンテナ停止や Docker 削除より前に取得する |
+| 保存タイミング | EXIT トラップの**最初**。コンテナ削除や Docker 削除より前に取得する |
 | 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[7]` |
-| 失敗時 | `[7]` へ全 Compose サービスのログをサービス単位で全行追記 |
+| 失敗時 | `[7]` へ全 Compose サービスのログをサービス単位で全行追記。`[2]`〜`[6]` を集めた後に SIGTERM で停止するため、終了処理のログまで含まれる (3.6 参照) |
 | 画面表示との違い | 画面の表示上限 (`--env-list-limit` 等) にかかわらず**常に全量** |
 | `--dry-run` | ファイル出力はスキップ (予定のみ表示) |
 
@@ -500,6 +547,17 @@ services:
  → JVM パラメータ → OpenTelemetry 環境変数・JVM パラメータ)
 ```
 
+エラー終了時は、後始末の中で SIGTERM 送出後の終了ログも続けて表示します。
+
+```
+───────────────────────────────────────────────
+終了 (SIGTERM) 時のコンテナログ (サービス: adot-collector, 追加 3 行):
+コンテナ      : adot-collector (状態: exited, 終了コード: 0)
+───────────────────────────────────────────────
+  … (Received signal from OS … Shutdown complete.) …
+───────────────────────────────────────────────
+```
+
 ### 6.2 出力ファイル
 
 | ファイル | 生成条件 | 内容 |
@@ -517,7 +575,7 @@ services:
 | `[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)` | デプロイ先 / Web ルート / クラスパスルート | 「未取得」と記録 |
 | `[5] Java JVM パラメータ (全件)` | Java プロセスごとの JVM パラメータ (分類別) | 「未取得」と記録 |
 | `[6] OpenTelemetry 環境変数・JVM パラメータ (全件)` | OpenTelemetry 関連の環境変数と JVM パラメータ | 「未取得」と記録 |
-| `[7] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[7-1]`, `[7-2]` … と採番) | 定義済みサービスを見出しとして記録 |
+| `[7] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[7-1]`, `[7-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -737,7 +795,9 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
 | `--url-body-json と --url-body-form は同時に指定できません` | ボディの二重指定 | どちらか一方にする |
 | `ローカルベースイメージが見つかりません` | `compose.yml` の `image:` と `--local-image` が不一致 | 両者を一致させる |
 | `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 | 表示された失敗行と起動ログを確認 |
+| `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | `dependency failed to start` の対象サービスと、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |
 | `コンテナが起動途中で停止しました` | アプリの異常終了 | 表示されたログで原因を確認 |
+| `SIGTERM による停止に失敗しました (compose stop, exit=…)` | `compose stop` が失敗 (daemon 応答なし等) | 終了処理のログが欠ける場合がある。`docker ps -a` で状態を確認 |
 | `起動対象の Compose サービスが停止しました` | 依存サービスの準備不足など | `--wait-healthy` の利用、`--allow-service-exit` での除外を検討 |
 | `起動確認がタイムアウトしました` | 起動が遅い / パターン不一致 | `--startup-timeout` を延長、`--startup-log-pattern` を確認 |
 | `URL 応答の確認に失敗しました` | ポート・パス・期待ステータスの誤り | 表示された最後の応答コードと本文を確認 |

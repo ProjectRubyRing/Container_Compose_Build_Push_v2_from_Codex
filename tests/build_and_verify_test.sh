@@ -501,6 +501,88 @@ assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[7-4
 # レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
 assert_not_contains "${failure_report_files[0]}" $'\033['
 
+# adot collector の healthcheck 失敗で depends_on: service_healthy を満たせず、
+# compose up が失敗する状況。ECS のタスク停止と同じく SIGTERM で終了させ、
+# サイドカーの終了処理ログまで画面とレポートへ残す。
+shutdown_logs_output="$TEST_TMP/shutdown-logs.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector"
+export FAKE_COMPOSE_UP_FAIL="true"
+export FAKE_COMPOSE_SHUTDOWN_MARKER="$TEST_TMP/compose-stopped"
+rm -f "$FAKE_COMPOSE_SHUTDOWN_MARKER"
+if (
+  cd "$REPO_ROOT"
+  CLICOLOR_FORCE=0 bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app,adot-collector \
+    --startup-service app \
+    --wait-healthy \
+    --report-dir "$TEST_TMP/shutdown-reports"
+) >"$shutdown_logs_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
+  unset FAKE_COMPOSE_SHUTDOWN_MARKER
+  cat "$shutdown_logs_output" >&2
+  fail "unhealthy dependency scenario unexpectedly returned zero"
+fi
+
+assert_contains "$shutdown_logs_output" "コンテナの起動に失敗しました (compose up)"
+assert_contains "$shutdown_logs_output" "エラー終了のため、ECS のタスク停止と同じく SIGTERM でコンテナを終了させ、終了処理のログを取得します (compose stop -t 30, 対象: app adot-collector)"
+assert_matches "$FAKE_DOCKER_CALLS" 'compose -f compose\.yml stop -t 30'
+# サイドカーは SIGTERM 受信後の graceful shutdown ログまで表示する。
+assert_contains "$shutdown_logs_output" "終了 (SIGTERM) 時のコンテナログ (サービス: adot-collector, 追加 3 行):"
+assert_contains "$shutdown_logs_output" 'Received signal from OS {"signal": "terminated"}'
+assert_contains "$shutdown_logs_output" "Shutdown complete."
+# 終了ログを出さないコンテナは、その旨を明示して差分なしと分かるようにする。
+assert_contains "$shutdown_logs_output" "終了 (SIGTERM) 時のコンテナログ (サービス: app, 追加 0 行):"
+assert_contains "$shutdown_logs_output" "SIGTERM 受信後に追加されたログはありません。"
+assert_before "$shutdown_logs_output" \
+  "終了 (SIGTERM) 時のコンテナログ (サービス: app" \
+  "終了 (SIGTERM) 時のコンテナログ (サービス: adot-collector"
+shutdown_reports=("$TEST_TMP/shutdown-reports"/build_and_verify_*.txt)
+[ ${#shutdown_reports[@]} -eq 1 ] && [ -f "${shutdown_reports[0]}" ] \
+  || fail "expected one report for unhealthy dependency scenario"
+# 全量レポートのログ本文も、SIGTERM 送出後に取得した終了処理込みのものとなる。
+assert_contains "${shutdown_reports[0]}" "終了処理      : SIGTERM (compose stop -t 30) 送出後の終了ログまで含む"
+assert_contains "${shutdown_reports[0]}" "[7-3] Compose サービス: adot-collector"
+assert_contains "${shutdown_reports[0]}" "Shutdown complete."
+assert_contains "${shutdown_reports[0]}" "ログ行数      : 4 行"
+
+# --no-shutdown-logs 指定時は SIGTERM 停止も終了ログの取得も行わない。
+no_shutdown_logs_output="$TEST_TMP/no-shutdown-logs.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_COMPOSE_SHUTDOWN_MARKER"
+if (
+  cd "$REPO_ROOT"
+  CLICOLOR_FORCE=0 bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app,adot-collector \
+    --startup-service app \
+    --wait-healthy \
+    --no-shutdown-logs
+) >"$no_shutdown_logs_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
+  unset FAKE_COMPOSE_SHUTDOWN_MARKER
+  cat "$no_shutdown_logs_output" >&2
+  fail "--no-shutdown-logs scenario unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
+unset FAKE_COMPOSE_SHUTDOWN_MARKER
+
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml stop"
+assert_not_contains "$no_shutdown_logs_output" "終了 (SIGTERM) 時のコンテナログ"
+
+invalid_shutdown_timeout_output="$TEST_TMP/shutdown-timeout-invalid.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --shutdown-timeout 0
+) >"$invalid_shutdown_timeout_output" 2>&1; then
+  cat "$invalid_shutdown_timeout_output" >&2
+  fail "invalid shutdown timeout unexpectedly returned zero"
+fi
+assert_contains "$invalid_shutdown_timeout_output" "--shutdown-timeout には 1 以上の整数を指定してください: 0"
+
 build_failure_output="$TEST_TMP/build-failure.out"
 export FAKE_DOCKER_BUILD_FAIL="true"
 export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"

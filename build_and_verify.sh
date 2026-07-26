@@ -34,6 +34,11 @@
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
 #                          healthcheck 設定・実行履歴・HTTP 通信、および
 #                          cwagent / OTel のローカル送達診断を実行する。
+#  (10) 終了 (SIGTERM) ログ : エラー終了時は、ECS のタスク停止と同じく SIGTERM で
+#                          コンテナを終了させてから最終ログを取得する。これにより
+#                          adot collector などサイドカーの graceful shutdown ログ
+#                          (シグナル受信 → パイプライン停止 → 終了) まで、画面と
+#                          全量レポートの双方へ残る。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -140,6 +145,13 @@ KEEP_CONTAINER_MODE=""            # bash/http/logs: 確認後に実行する対�
 SUPPRESS_REMOVED_LOGS="false"     # true: compose down の Removed ログ等を抑制する
 SUPPRESS_STARTUP_LOGS="false"     # true: 起動確認対象と同時起動サービスのログ表示を抑制する
 STARTUP_LOG_LINES="50"            # all: 全行表示 / 数値: 末尾からの最大表示行数
+# エラー終了時に、削除 (compose down) の前へ SIGTERM による停止 (compose stop) を
+# 挟み、コンテナの終了処理が出すログまで取得するか。ECS はタスク停止時に各
+# コンテナへ SIGTERM を送るため、ローカル検証でも同じ終了ログを残せるようにする。
+CAPTURE_SHUTDOWN_LOGS="true"
+SHUTDOWN_LOG_TIMEOUT="30"         # SIGTERM 後に SIGKILL するまでの猶予秒数 (ECS 既定と同じ)
+SHUTDOWN_LOGS_CAPTURED="false"    # 終了ログの取得を試行済みか (二重実行の防止)
+SHUTDOWN_STOP_EXECUTED="false"    # 実際に SIGTERM で停止したか (レポートの記載条件)
 # EAP 8.1 の起動、ドライバー、データソース、リスナー、デプロイ、終了状態を
 # 重要ログとして色分けする。
 STARTUP_IMPORTANT_LOG_PATTERN='WFLYSRV0049|WFLYJCA0009|WFLYJCA0018|WFLYJCA0001|WFLYJCA0098|WFLYDS0013|WFLYSRV0027|WFLYSRV0207|WFLYUT0006|WFLYUT0021|WFLYSRV0010|WFLYSRV0051|WFLYSRV0060|WFLYSRV0025|WFLYSRV0026|WFLYSRV0056'
@@ -480,6 +492,13 @@ JBoss マスターパスワード (BuildKit シークレット):
                            (base を除く) の停止を失敗として即座に報告する
   --suppress-startup-logs  起動確認対象と同時起動サービスのログ表示を抑制する
                            (起動判定は継続)
+  --shutdown-timeout SEC   エラー終了時に SIGTERM でコンテナを終了させる際、
+                           SIGKILL へ切り替えるまでの猶予秒数 (既定: 30 /
+                           ECS の StopTimeout 既定と同じ)。この停止を挟むことで、
+                           adot collector などサイドカーの終了処理ログまで
+                           画面・全量レポートへ残す
+  --no-shutdown-logs       エラー終了時の SIGTERM 停止と終了ログ取得を行わない。
+                           コンテナは従来どおり compose down でまとめて削除する
   --keep-container         確認後もコンテナを停止・削除せずに残す (調査用)
   --keep-container-mode MODE
                            起動確認後もコンテナを残し、検証対象コンテナで MODE の
@@ -612,6 +631,8 @@ while [ $# -gt 0 ]; do
     --wait-timeout)        need_value "$1" $#; STARTUP_WAIT_TIMEOUT="$2"; STARTUP_WAIT="true"; shift 2 ;;
     --allow-service-exit)  need_value "$1" $#; append_services ALLOW_SERVICE_EXIT "$2"; shift 2 ;;
     --suppress-startup-logs) SUPPRESS_STARTUP_LOGS="true"; shift ;;
+    --shutdown-timeout)    need_value "$1" $#; SHUTDOWN_LOG_TIMEOUT="$2"; shift 2 ;;
+    --no-shutdown-logs)    CAPTURE_SHUTDOWN_LOGS="false"; shift ;;
     --keep-container)      KEEP_CONTAINER="true"; shift ;;
     --keep-container-mode) need_value "$1" $#; KEEP_CONTAINER_MODE="$2"; shift 2 ;;
     --jboss-context-root)  need_value "$1" $#; JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
@@ -654,6 +675,8 @@ if [ "$STARTUP_LOG_LINES" != "all" ]; then
 fi
 validate_positive_integer "$STARTUP_TIMEOUT" "--startup-timeout" || exit 2
 validate_positive_integer "$STARTUP_WAIT_TIMEOUT" "--wait-timeout" || exit 2
+# 0 を許すと SIGTERM 直後に SIGKILL となり、終了処理のログが残らないため 1 以上とする。
+validate_positive_integer "$SHUTDOWN_LOG_TIMEOUT" "--shutdown-timeout" || exit 2
 validate_positive_integer "$URL_TIMEOUT" "--url-timeout" || exit 2
 if [ "$ENV_LIST_LIMIT" != "all" ]; then
   validate_positive_integer "$ENV_LIST_LIMIT" "--env-list-limit" || exit 2
@@ -979,6 +1002,9 @@ cleanup_copied_files() {
 
 # ---- 起動確認 / URL 確認 用ヘルパ -------------------------------------------
 STARTED_CONTAINER="false"          # コンテナを起動したか (teardown 判定用)
+# compose up を実行したか。up に失敗してもコンテナは作られているため、今回の実行が
+# 触れたコンテナかどうかの判定にはこちらを使う (終了ログ取得の対象判定)。
+COMPOSE_UP_ATTEMPTED="false"
 CONTAINER_LOG_SINCE=""             # 今回の起動より前のコンテナログを除外する基準時刻
 
 # 対象コンテナの ID を取得する (引数でサービスを指定、未指定なら対象サービス全体)。
@@ -1031,6 +1057,16 @@ compose_logs() {
 # EAP のメッセージ解析前に ANSI SGR シーケンスを取り除く。
 strip_ansi_codes() {
   LC_ALL=C sed $'s/\033\[[0-9;]*m//g'
+}
+
+# ログ文字列の行数を数える。空文字列は「1 行 (空行)」ではなく 0 行として扱う。
+count_log_lines() {
+  local logs="$1"
+  if [ -z "$logs" ]; then
+    printf '0\n'
+    return 0
+  fi
+  printf '%s\n' "$logs" | awk 'END { print NR }'
 }
 
 # 端末への直接表示時だけ色を付ける。NO_COLOR を優先し、リダイレクトされたログへ
@@ -2592,6 +2628,7 @@ start_container() {
     log "  compose の起動完了待ちを有効にしました (--wait, 最大 ${STARTUP_WAIT_TIMEOUT}s)。"
   fi
   up_args+=(${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"})
+  COMPOSE_UP_ATTEMPTED="true"
   if ! run "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${up_args[@]}"; then
     err "コンテナの起動に失敗しました (compose up)"
     return 1
@@ -2617,6 +2654,99 @@ teardown_container() {
   if [ "$down_ok" -ne 0 ]; then
     warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
   fi
+}
+
+# ---- エラー終了時の終了 (SIGTERM) ログ取得 -----------------------------------
+# ECS はタスク停止時に各コンテナへ SIGTERM を送るため、adot collector のような
+# サイドカーは「シグナル受信 → パイプラインの graceful shutdown → 終了」までを
+# ログへ出す。ローカル検証で compose down まで一気に実行すると、この終了ログは
+# 誰にも取得されないままコンテナごと削除されてしまう。
+# 特に adot collector の healthcheck が失敗し、depends_on の condition:
+# service_healthy を満たせずバックエンドが起動しなかった場合、ECS 上でも同じく
+# タスクが停止するため、終了処理まで含んだログが原因調査の手掛かりになる。
+# そこでエラー終了時に限り、削除の前に SIGTERM による停止を挟み、そこで追加された
+# ログを画面と全量レポートの双方へ残す。
+
+# SIGTERM 送出前後のログ行数の差分を「終了処理で追加された行」として表示する。
+# compose logs --since と同じ範囲で数えるため、ホストとコンテナの時刻差に
+# 影響されない。
+show_service_shutdown_logs() {
+  local service_name="$1" before_count="$2"
+  local logs total_count new_count new_lines containers
+
+  logs="$(compose_logs "$service_name" | strip_ansi_codes)"
+  total_count="$(count_log_lines "$logs")"
+  new_count=$(( total_count - before_count ))
+  [ "$new_count" -gt 0 ] || new_count=0
+  containers="$(compose_service_container_summary "$service_name")"
+
+  diag ""
+  diag "───────────────────────────────────────────────────────────────────"
+  diag "終了 (SIGTERM) 時のコンテナログ (サービス: ${service_name}, 追加 ${new_count} 行):"
+  diag "コンテナ      : ${containers}"
+  diag "───────────────────────────────────────────────────────────────────"
+  if [ "$new_count" -gt 0 ]; then
+    new_lines="$(printf '%s\n' "$logs" | tail -n "$new_count")"
+    print_startup_logs_with_highlights "$new_lines"
+  else
+    diag "SIGTERM 受信後に追加されたログはありません。"
+  fi
+  diag "───────────────────────────────────────────────────────────────────"
+}
+
+# エラー終了時に SIGTERM でコンテナを終了させ、終了処理のログを取得する。
+# 環境変数やディレクトリツリーは起動中のコンテナからしか取得できないため、
+# 全量レポートではそれらの収集を終えた位置 (ログ本文の直前) から呼び出す。
+# レポート出力が無効な場合は後始末から呼ばれるため、二重実行しないよう記録する。
+capture_shutdown_logs() {
+  local exit_status="$1"
+  [ "$SHUTDOWN_LOGS_CAPTURED" = "true" ] && return 0
+  [ "$CAPTURE_SHUTDOWN_LOGS" = "true" ] || return 0
+  # 成功時は通常の後始末 (compose down) に任せ、終了ログの取得は行わない。
+  [ "$exit_status" -ne 0 ] || return 0
+  # 調査のためコンテナを残す指定では停止できないため、終了ログも取得しない。
+  [ "$KEEP_CONTAINER" != "true" ] || return 0
+  # 今回の実行が compose up まで進んでいない場合 (ビルド失敗など) は、
+  # 前回の実行が残したコンテナを止めてしまわないよう対象外とする。
+  [ "$COMPOSE_UP_ATTEMPTED" = "true" ] || return 0
+
+  SHUTDOWN_LOGS_CAPTURED="true"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] エラー終了時は SIGTERM (compose stop -t ${SHUTDOWN_LOG_TIMEOUT}) でコンテナを終了させ、終了処理のログまで取得します。"
+    return 0
+  fi
+
+  local -a running_services=()
+  mapfile -t running_services < <(compose_started_services)
+  if [ ${#running_services[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  # 停止前のログ行数をサービスごとに控え、停止後の増分を終了ログとして扱う。
+  local svc
+  local -a before_counts=()
+  for svc in "${running_services[@]}"; do
+    before_counts+=("$(count_log_lines "$(compose_logs "$svc" | strip_ansi_codes)")")
+  done
+
+  log "エラー終了のため、ECS のタスク停止と同じく SIGTERM でコンテナを終了させ、終了処理のログを取得します (compose stop -t ${SHUTDOWN_LOG_TIMEOUT}, 対象: ${running_services[*]}) ..."
+  SHUTDOWN_STOP_EXECUTED="true"
+  local stop_status=0
+  if [ "$SUPPRESS_REMOVED_LOGS" = "true" ]; then
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" stop -t "$SHUTDOWN_LOG_TIMEOUT" > /dev/null 2>&1 || stop_status=$?
+  else
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" stop -t "$SHUTDOWN_LOG_TIMEOUT" || stop_status=$?
+  fi
+  if [ "$stop_status" -ne 0 ]; then
+    warn "SIGTERM による停止に失敗しました (compose stop, exit=${stop_status})。終了処理のログが欠けている可能性があります。"
+  fi
+
+  local index=0
+  for svc in "${running_services[@]}"; do
+    show_service_shutdown_logs "$svc" "${before_counts[$index]}"
+    index=$((index + 1))
+  done
+  return 0
 }
 
 # jbosseap サーバーの起動完了をログから待つ。
@@ -5609,6 +5739,10 @@ append_compose_service_logs_report() {
   fi
   printf '取得範囲      : %s\n' "$log_scope" >> "$report_file"
   printf '出力方針      : サービス単位に全行を出力 (画面表示の行数制限は適用しない)\n' >> "$report_file"
+  if [ "$SHUTDOWN_STOP_EXECUTED" = "true" ]; then
+    printf '終了処理      : SIGTERM (compose stop -t %s) 送出後の終了ログまで含む\n' \
+        "$SHUTDOWN_LOG_TIMEOUT" >> "$report_file"
+  fi
 
   mapfile -t services < <(compose_all_service_names)
   if [ ${#services[@]} -eq 0 ]; then
@@ -5709,6 +5843,7 @@ write_build_report() {
     printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
+    printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -5781,6 +5916,11 @@ write_build_report() {
     done
   fi
 
+  # 失敗時は、ログ本文を集める前に SIGTERM でコンテナを終了させ、adot collector
+  # などの終了処理ログまでレポートへ含める。環境変数・ツリー・JVM パラメータは
+  # 起動中のコンテナからしか取得できないため、[2]〜[6] を集め終えたこの位置で停止する。
+  capture_shutdown_logs "$exit_status"
+
   # 失敗時は原因調査に必要なため全サービスのログ全文を残す。成功時は同じ内容が
   # 画面へ出ており、レポートを不必要に肥大化させるだけなので省略する。
   printf '\n[7] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
@@ -5808,9 +5948,13 @@ cleanup_all() {
   trap - EXIT
 
   # コンテナの停止・Docker 全体削除より前に、取得可能な全量情報を保存する。
+  # (エラー時の終了ログ取得は、レポート内でログ本文を集める直前に実行される)
   if ! write_build_report "$original_status"; then
     cleanup_status=1
   fi
+  # レポート出力が無効な場合でも、エラー時は SIGTERM で終了させて終了ログを
+  # 画面へ残す。レポート側で実行済みならここでは何もしない。
+  capture_shutdown_logs "$original_status"
 
   # 全体クリーンアップを先に実行し、削除前容量へ今回の Compose コンテナも含める。
   # 未承認・失敗時は、その後に従来どおり今回起動したコンテナだけを後始末する。

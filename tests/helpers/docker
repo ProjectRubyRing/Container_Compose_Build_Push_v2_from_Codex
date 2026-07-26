@@ -15,12 +15,17 @@ is_cleaned() {
   [ -n "${FAKE_DOCKER_CLEANED:-}" ] && [ -f "$FAKE_DOCKER_CLEANED" ]
 }
 
+# compose stop (SIGTERM) 済みかどうか。停止後は終了処理のログが増える様子を再現する。
+is_compose_stopped() {
+  [ -n "${FAKE_COMPOSE_SHUTDOWN_MARKER:-}" ] && [ -f "$FAKE_COMPOSE_SHUTDOWN_MARKER" ]
+}
+
 if [ "${1:-}" = "compose" ]; then
   shift
   subcommand=""
   for arg in "$@"; do
     case "$arg" in
-      version|build|up|logs|ps|down|config)
+      version|build|up|logs|ps|down|stop|config)
         subcommand="$arg"
         break
         ;;
@@ -48,6 +53,12 @@ if [ "${1:-}" = "compose" ]; then
       fi
       ;;
     up)
+      # 依存サービス (adot collector) の healthcheck 失敗で
+      # compose up --wait が失敗する状況の再現。
+      if [ "${FAKE_COMPOSE_UP_FAIL:-false}" = "true" ]; then
+        printf 'dependency failed to start: container adot-collector is unhealthy\n' >&2
+        exit 1
+      fi
       printf 'fake app container started\n'
       ;;
     logs)
@@ -72,6 +83,12 @@ if [ "${1:-}" = "compose" ]; then
         printf 'cwagent  | I! Log collection configured\n'
       elif [ "$last_arg" = "adot-collector" ] || [ "$last_arg" = "otel" ]; then
         printf 'adot-collector  | TracesExporter resource spans: 2, spans: 4\n'
+        # SIGTERM 受信後は ECS と同じく graceful shutdown のログが追記される。
+        if is_compose_stopped; then
+          printf 'adot-collector  | info service@v0.102.0/service.go:255 Received signal from OS {"signal": "terminated"}\n'
+          printf 'adot-collector  | info extensions/extensions.go:60 Stopping extensions...\n'
+          printf 'adot-collector  | info service@v0.102.0/service.go:169 Shutdown complete.\n'
+        fi
       else
         cat "$FAKE_COMPOSE_LOG_FILE"
       fi
@@ -96,6 +113,12 @@ if [ "${1:-}" = "compose" ]; then
           *) printf 'cid-app\n' ;;
         esac
       fi
+      ;;
+    stop)
+      if [ -n "${FAKE_COMPOSE_SHUTDOWN_MARKER:-}" ]; then
+        : > "$FAKE_COMPOSE_SHUTDOWN_MARKER"
+      fi
+      printf 'fake app container stopped\n'
       ;;
     down)
       printf 'fake app container removed\n'

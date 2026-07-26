@@ -105,6 +105,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--wait-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--wait` の最大待機秒数。指定すると `--wait-healthy` も暗黙に有効化する | `600` |
 | `--allow-service-exit NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。起動確認中に停止していても失敗扱いにしないサービス名。繰り返し指定またはカンマ区切りで複数指定できる | (なし) |
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
+| `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
+| `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
 | `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
@@ -401,6 +403,20 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   適用せず全行を残します。ログの取得範囲は今回の `compose up` 以降で、
   `compose up` に到達せずビルドが失敗した場合はコンテナ作成時からの全期間です。
   処理が成功した場合は同じ内容が画面に出ているため、このセクションは省略と記録します。
+- **エラー終了時は、コンテナを削除する前に SIGTERM で終了させ、終了処理のログまで
+  取得します**。ECS はタスク停止時に各コンテナへ SIGTERM を送るため、
+  adot collector のようなサイドカーは「シグナル受信 → パイプラインの
+  graceful shutdown → 終了」までをログへ出しますが、`compose down` まで一気に
+  実行するとこの終了ログは取得されないまま削除されてしまいます。
+  そこでエラー終了時に限り、削除の前に `docker compose stop -t <--shutdown-timeout>`
+  (既定 30 秒。ECS の StopTimeout 既定と同じ) を挟み、そこで追加されたログを
+  `終了 (SIGTERM) 時のコンテナログ` として画面へ表示し、`[7] Compose サービス別ログ`
+  にも終了処理込みの全文を残します。対象は稼働中の全サービスで、表示行は停止前後の
+  ログ行数の差分から求めるためホストとコンテナの時刻差に影響されません。
+  adot collector の healthcheck 失敗で `depends_on` の `condition: service_healthy`
+  を満たせず、バックエンドが起動しないまま `compose up` が失敗した場合も同様です。
+  `--keep-container` / `--keep-container-mode` 指定時はコンテナを残すため実行せず、
+  `--no-shutdown-logs` を指定すると無効化できます。
 
 ```bash
 # ビルド + jbosseap 起動確認
@@ -440,6 +456,12 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
 # app と batch の両方で JBoss EAP の起動完了を個別に確認
 ./build_and_verify.sh --compose-service app,batch,db \
     --startup-service app --startup-service batch
+
+# adot collector の healthcheck 待ちで失敗した場合に、
+# SIGTERM の猶予を 60 秒へ広げて終了処理のログまで確実に取得する
+./build_and_verify.sh --compose-service app,adot-collector \
+    --startup-service app --wait-healthy \
+    --shutdown-timeout 60 --report-dir ./build-reports
 ```
 
 EAP 8.1の起動ログ解析、同時起動サービスログ、対話操作、healthcheck 診断、ディレクトリツリー集計、
