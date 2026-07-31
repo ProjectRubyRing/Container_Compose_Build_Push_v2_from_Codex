@@ -45,6 +45,7 @@
 | 9 | 全量レポートのファイル保存 | `--report-dir` |
 | 10 | 起動後の対話操作 (bash / HTTP / ログ調査) | `--keep-container-mode` |
 | 11 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
+| 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -78,6 +79,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 中盤 | 入力値の検証 | 数値・モード・排他関係・サービス指定の整合性 |
 | 中盤 | 依存コマンド / AWS 認証 / compose 判定 | 実行環境の確認 |
 | 中盤 | シークレット準備・一時ファイルコピー | `prepare_jboss_password` / `prepare_copy_files` |
+| 中盤 | マスターパスワードの伝搬検証 | 危険文字の分析、段ごとの比較、`compose.yml` と `standalone.xml` の解析、CredentialStore の開封確認 |
 | 中盤 | 起動確認・ログ表示ヘルパ | ログ取得、ANSI 除去、色分け、companion ログ |
 | 中盤 | 環境変数・ツリー・デプロイ構造 | コンテナ内情報の収集と整形 |
 | 中盤 | JVM パラメータ・OpenTelemetry 設定 | `/proc/<pid>/cmdline` の走査、JVM オプションの分類、OpenTelemetry 設定の突き合わせ |
@@ -103,7 +105,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | healthcheck | `run_interactive_compose_healthcheck` / `run_healthcheck_http_probe` | healthcheck の設定・履歴・通信確認 |
 | 可観測性 | `render_cloudwatch_delivery_report` / `run_otel_jaeger_trace_helper` | cwagent / OTel のローカル送達診断 |
 | クリーンアップ | `cleanup_all_docker_data` / `teardown_container` / `cleanup_copied_files` | Docker 全体削除と通常後始末 |
-| レポート | `write_build_report` / `append_compose_service_logs_report` | 全量レポートの生成 |
+| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` | 全量レポートの生成 |
+| パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
 ### 2.3 EXIT トラップ (`cleanup_all`)
 
@@ -138,12 +141,14 @@ flowchart TD
     G --> H[compose コマンド判定<br/>並列オプションの準備]
     H --> I[EXIT トラップ設定 cleanup_all]
     I --> J[JBoss マスターパスワード取得 → export]
-    J --> K[--copy-file の事前コピー]
+    J --> J2[伝搬検証 1-2: 取得元 → 環境変数 → compose.yml の secrets<br/>--verify-jboss-password 指定時]
+    J2 --> K[--copy-file の事前コピー]
     K --> L{--compose-service が 2 個以上?}
     L -- はい --> M[base を単独で先行ビルド] --> N[ローカルイメージ確認] --> O[base 以外をまとめて並列ビルド]
     L -- いいえ --> P[compose build] --> Q[ローカルイメージ確認]
-    O --> R
-    Q --> R{起動が必要?<br/>--verify-startup / --verify-url}
+    O --> Q2
+    Q --> Q2[伝搬検証 3: /run/secrets の到達値<br/>プローブビルド --no-cache]
+    Q2 --> R{起動が必要?<br/>--verify-startup / --verify-url}
     R -- 不要 --> Z1[ビルドのみ完了 exit 0]
     R -- 必要 --> S[compose up -d --no-build<br/>--wait-healthy 指定時は --wait]
     S --> T{--verify-startup?}
@@ -158,7 +163,8 @@ flowchart TD
     Y --> AA[環境変数一覧・ツリー・デプロイ構造を表示]
     AA --> AA2[JVM パラメータ一覧を表示<br/>/proc から Java プロセスを検出]
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
-    AA3 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
+    AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
+    AA4 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
 ```
 
@@ -252,7 +258,7 @@ compose stop -t <--shutdown-timeout>   ← SIGTERM。既定 30 秒後に SIGKILL
         ↓
 終了ログ (停止前後のログ行数の差分) を画面へ表示
         ↓
-[7] Compose サービス別ログ (終了処理込みの全文をレポートへ保存)
+[8] Compose サービス別ログ (終了処理込みの全文をレポートへ保存)
         ↓
 compose down (削除)
 ```
@@ -294,9 +300,25 @@ compose down (削除)
 | `--jboss-password-param NAME` | SSM パラメータ名 | (なし) | パラメータストアから取得。**このとき AWS 認証が必要** |
 | `--jboss-password VALUE` | パスワード文字列 | (なし) | 直接指定。`--jboss-password-param` とは排他 |
 | `--jboss-password-env NAME` | 環境変数名 | `JBOSS_MASTER_PASSWORD` | 受け渡しに使う環境変数名。単独指定時は既存の環境変数値を使用 |
+| `--jboss-secret-id ID` | シークレット id | `jboss_master_password` | `compose.yml` の secrets 名 / Dockerfile の `RUN --mount=type=secret,id=...` と一致させる |
 | `--region REGION` | AWS リージョン名 | `ap-northeast-1` (env `AWS_REGION`) | パラメータストア参照時のリージョン |
 
-### 4.3 起動確認 (JBoss EAP / WildFly)
+### 4.3 マスターパスワードの伝搬検証
+
+| オプション | 値の形式 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `--verify-jboss-password` | (フラグ) | `false` | 取得元から実行時に利用される値までの各段で、パスワードが一致するかを検証して出力する (6.5 参照) |
+| `--jboss-password-mask` | (フラグ) | `false` | 検証出力のパスワード文字列を伏字にする (判定・バイト長・16 進ダンプは表示) |
+| `--jboss-config-file PATH` | コンテナ内の絶対パス | (自動探索) | 比較対象の `standalone.xml` |
+| `--jboss-cli-path PATH` | コンテナ内の絶対パス | (自動探索) | `jboss-cli.sh` |
+| `--jboss-elytron-tool PATH` | コンテナ内の絶対パス | (自動探索) | `elytron-tool.sh` |
+| `--jboss-credential-store PATH` | コンテナ内の絶対パス | (`standalone.xml` から特定) | CredentialStore ファイル |
+
+パス系オプションは、`docker exec` へ渡すスクリプトへ埋め込むため
+**絶対パスのみ**を受け付け、`' " ` $ ; & | < > * ?` と空白を含む場合は
+起動前に `exit 2` で中止します。
+
+### 4.4 起動確認 (JBoss EAP / WildFly)
 
 | オプション | 値の形式 | 既定値 | 複数 | 説明 |
 | --- | --- | --- | --- | --- |
@@ -315,7 +337,7 @@ compose down (削除)
 | `--suppress-removed-logs` | フラグ | `false` | — | `compose down` / `compose stop` の `Removed` 等の出力を抑制 |
 | `--keep-container` | フラグ | `false` | — | 確認後もコンテナを停止・削除しない |
 
-### 4.4 URL 応答確認
+### 4.5 URL 応答確認
 
 | オプション | 値の形式 | 既定値 | 説明 |
 | --- | --- | --- | --- |
@@ -329,7 +351,7 @@ compose down (削除)
 | `--url-interval SEC` | 1 以上の整数 | `3` | リトライ間隔 |
 | `--url-insecure` | フラグ | `false` | TLS 証明書検証を無効化 (`curl -k`) |
 
-### 4.5 起動維持後の対話操作
+### 4.6 起動維持後の対話操作
 
 | オプション | 値の形式 | 既定値 | 説明 |
 | --- | --- | --- | --- |
@@ -337,7 +359,7 @@ compose down (削除)
 | `--jboss-context-root ROOT` | コンテキストルートのパス | (ログから検出) | `http` モード専用。URL 全体は指定不可 |
 | `--jboss-http-port PORT` | 1〜65535 | (ログから検出。既定 8080) | `http` モード専用。公開ポートがあれば自動変換 |
 
-### 4.6 情報表示・レポート
+### 4.7 情報表示・レポート
 
 | オプション | 値の形式 | 既定値 | 複数 | 説明 |
 | --- | --- | --- | --- | --- |
@@ -348,13 +370,13 @@ compose down (削除)
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示 |
 | `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 |
 
-### 4.7 終了時のクリーンアップ
+### 4.8 終了時のクリーンアップ
 
 | オプション | 値の形式 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `--cleanup-all-docker-data` | フラグ | `false` | 終了時に確認フレーズ入力のうえ、Docker context の全データを削除。`--keep-container` とは排他 |
 
-### 4.8 その他
+### 4.9 その他
 
 | オプション | 説明 |
 | --- | --- |
@@ -485,8 +507,8 @@ services:
 | --- | --- |
 | ファイル名 | `build_and_verify_<YYYYMMDDHHMMSS>.txt` (同名があれば `_1`, `_2` … を付与) |
 | 保存タイミング | EXIT トラップの**最初**。コンテナ削除や Docker 削除より前に取得する |
-| 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[7]` |
-| 失敗時 | `[7]` へ全 Compose サービスのログをサービス単位で全行追記。`[2]`〜`[6]` を集めた後に SIGTERM で停止するため、終了処理のログまで含まれる (3.6 参照) |
+| 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[8]` |
+| 失敗時 | `[8]` へ全 Compose サービスのログをサービス単位で全行追記。`[2]`〜`[6]` を集めた後に SIGTERM で停止するため、終了処理のログまで含まれる (3.6 参照) |
 | 画面表示との違い | 画面の表示上限 (`--env-list-limit` 等) にかかわらず**常に全量** |
 | `--dry-run` | ファイル出力はスキップ (予定のみ表示) |
 
@@ -575,7 +597,8 @@ services:
 | `[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)` | デプロイ先 / Web ルート / クラスパスルート | 「未取得」と記録 |
 | `[5] Java JVM パラメータ (全件)` | Java プロセスごとの JVM パラメータ (分類別) | 「未取得」と記録 |
 | `[6] OpenTelemetry 環境変数・JVM パラメータ (全件)` | OpenTelemetry 関連の環境変数と JVM パラメータ | 「未取得」と記録 |
-| `[7] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[7-1]`, `[7-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
+| `[7] JBoss マスターパスワードの伝搬検証` | `--verify-jboss-password` 指定時、段ごとの判定・パスワード文字列・16 進ダンプ | 段 1〜3 のみ記録し、残りは「未確認」 |
+| `[8] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[8-1]`, `[8-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -663,6 +686,96 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
   「OpenTelemetry 関連の環境変数・JVM パラメータは検出されませんでした。」とだけ表示します。
 - Collector 側の稼働確認・送達確認は `--keep-container-mode logs` の
   送達診断 (5.4 参照) を使います。この一覧は**設定値の確認**が目的です。
+
+### 6.5 JBoss マスターパスワードの伝搬検証
+
+`--verify-jboss-password` を指定すると、`compose.yml` の環境変数へ設定した
+マスターパスワードが、**実行時に利用される値まで同じ文字列のままか**を段ごとに
+突き合わせて出力します。`$` `#` `"` `` ` `` などは、シェル (変数展開・コマンド置換・
+コメント)、XML (実体参照)、WildFly の式 (`${...}` と `$$`) のそれぞれで別の意味を
+持つため、**途中の段までは一致しているのに最後で化ける**ことがあります。
+
+#### 検証する段と取得方法
+
+| # | 段 | 取得方法 | 実行タイミング |
+| --- | --- | --- | --- |
+| 1 | 取得元 → 環境変数 | `prepare_jboss_password` が export した値と原本を比較。`--jboss-password-param` 利用時は `--output json` の生値とも比較し、`--output text` によるタブ・末尾空白の欠落を検出 | ビルド前 |
+| 2 | 環境変数 → `compose.yml` の secrets 定義 | `compose.yml` を awk で解析し、`secrets.<名前>.environment` と `services.<名前>.build.secrets` の参照を突き合わせる | ビルド前 |
+| 3 | BuildKit シークレット → `/run/secrets/<id>` | ビルド済みイメージをベースにした**プローブビルド**でマウント内容を base64 で取り出す | ビルド直後 |
+| 4 | `standalone.xml` のファイル上の表記 | コンテナ内の設定ファイルを base64 で取り出し、`credential-store` 直下の `credential-reference` の `clear-text` を抽出 | 起動確認後 |
+| 5 | → WildFly が実行時に解釈する値 | 4 の値から XML 実体参照と WildFly の `$$` → `$` を戻す | 起動確認後 |
+| 6 | Elytron CredentialStore | `elytron-tool.sh credential-store --location <store> --password <原本> --aliases` が成功するか | 起動確認後 |
+| 7 | 利用箇所の一覧 | `credential-reference` の `store` / `alias` を持つリソースを列挙 | 起動確認後 |
+
+段 3 は **必ず `--no-cache` で実行**します。BuildKit はシークレットの内容を
+キャッシュキーに含めないため、キャッシュを使うと前回のビルド結果を拾ってしまい、
+検証にならないからです。プローブの最終ステージは `scratch` で、
+取り出した値はイメージにもレイヤにも残りません。
+またプローブの `RUN` だけは `USER root` で実行します。BuildKit はシークレットを
+`uid=0` / `mode=0400` でマウントするため、JBoss EAP のイメージのように既定の
+`USER` が非 root だと読み取れず、値が届いていても「マウントされていない」と
+誤判定してしまうためです (読み取るのはファイルの内容だけなので、実行ユーザーの
+違いは結果に影響しません)。
+
+段 2 では、`compose.yml` のシークレット名が `--jboss-secret-id` と異なる場合に
+補足として警告します。Dockerfile は `/run/secrets/<compose のシークレット名>` を
+参照するため、名前がずれていると段 3 のプローブが実際とは違うマウント先を
+見ることになります。表示された名前を `--jboss-secret-id` に指定して再実行してください。
+
+段 4〜7 はコンテナ内のファイルを読むため、`--verify-startup` または `--verify-url`
+との併用が必要です。単独指定時は段 1〜3 のみ検証し、残りは `未確認` と記録します。
+
+#### 判定の種類
+
+| 判定 | 意味 |
+| --- | --- |
+| `一致` | 原本とバイト列が完全に一致 |
+| `一致 (エスケープ済み)` | ファイル上の表記は異なるが、XML 実体参照と `$$` を戻すと一致。ファイル上の表記も併記する |
+| `不一致` | 原本と異なる。原本と「実際に設定されている文字列」の双方を、可視化表記・16 進ダンプ・最初に相違したバイト位置とともに表示 |
+| `不一致 (式が未解決)` | `clear-text` に `${...}` が残り、かつ原本に `$` が含まれる。`$$` へのエスケープ漏れの可能性が高い |
+| `未確認` | 対象ファイル・コマンドが無い、またはコンテナ未起動のため比較していない |
+| `情報` | 比較対象ではなく、参考として表示する内容 (ファイル上の表記、利用箇所の一覧) |
+
+#### 可視化表記
+
+目に見えない差分を判別するため、`可視化表記` 行では次のように置き換えます。
+
+| バイト | 表記 |
+| --- | --- |
+| 0x20 (空白) | `<SP>` |
+| 0x09 (タブ) | `<TAB>` |
+| 0x0A (LF) | `<LF>` |
+| 0x0D (CR) | `<CR>` |
+| その他の制御文字・非 ASCII | `<xNN>` (16 進) |
+
+#### 出力例
+
+```text
+  [一致] (3) BuildKit シークレット → ビルド中コンテナの /run/secrets/jboss_master_password
+      一致した文字列: pa$w#o"r`d&x
+      可視化表記    : pa$w#o"r`d&x
+      16 進ダンプ   : 70 61 24 77 23 6f 22 72 60 64 26 78
+      バイト長      : 12 バイト
+
+  [不一致] (5) standalone.xml → WildFly が実行時に解釈する値 (利用される値)
+      原本 (取得元) : pa$w#o"r`d&x
+        16 進ダンプ : 70 61 24 77 23 6f 22 72 60 64 26 78
+      実際に設定されている文字列: pa$w
+        16 進ダンプ : 70 61 24 77
+      相違位置      : 5 バイト目から相違 (原本: 23 / 実際: (ここで終端))
+```
+
+#### 注意
+
+- 既定では**パスワードを平文で出力**します。`--jboss-password-mask` で伏字にできます
+  (判定・バイト長・16 進ダンプは残ります)。
+- 不一致を検出しても**終了コードは変わりません**。画面に `[WARN]` を出し、
+  全量レポートの `[7]` に記録します。
+- CredentialStore は鍵ストアのため、**登録済みのパスワード文字列は取り出せません**。
+  段 6 は「原本で開けるか」による確認です。実際の文字列は段 4・5 で確認します。
+- 段 6 のパスワードは、ホストの `ps` に残さないよう **base64 で標準入力から**
+  コンテナへ渡します (`docker exec -i`)。
+- `--dry-run` 併用時は実際の値を取得しないため、検証を行いません。
 
 ---
 
@@ -769,6 +882,21 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
 # 14) パラメータストアのマスターパスワードを使ってビルド
 ./build_and_verify.sh --jboss-password-param /j1/jboss/master-password
 
+# 14-2) マスターパスワードが実行時の値まで一致しているかを検証
+#       (standalone.xml と CredentialStore まで見るので起動確認と併用する)
+export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
+./build_and_verify.sh --verify-startup --verify-jboss-password
+
+# 14-3) パラメータストアから取得した値で検証し、平文は伏せる
+./build_and_verify.sh --verify-startup \
+    --jboss-password-param /j1/jboss/master-password \
+    --verify-jboss-password --jboss-password-mask
+
+# 14-4) 既定以外のパスに設定ファイル・CredentialStore がある場合
+./build_and_verify.sh --verify-startup --verify-jboss-password \
+    --jboss-config-file /opt/eap/standalone/configuration/standalone-full.xml \
+    --jboss-credential-store /opt/eap/standalone/data/credential-store.jceks
+
 # 15) 検証後に Docker を完全クリーンアップ (確認フレーズ入力が必要)
 ./build_and_verify.sh --verify-startup --cleanup-all-docker-data
 
@@ -805,3 +933,14 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
 | `Java プロセスを検出できませんでした。` | 対象コンテナが JVM を実行していない、または `/proc` / `/bin/sh` を読み取れない | JVM を持たないコンテナ (DB / Collector など) なら想定どおり。JBoss のコンテナで出る場合は起動状態と `docker exec <cid> /bin/sh` の可否を確認 |
 | `バージョン       : (取得できませんでした)` | `java -version` を実行できない (実行ファイルのパスを解決できない等) | JVM パラメータ自体は表示されるため情報表示のみの影響。必要なら `docker exec <cid> <java> -version` を直接確認 |
 | `OpenTelemetry 関連の環境変数・JVM パラメータは検出されませんでした。` | `OTEL_*` も `-Dotel.*` も javaagent も設定されていない | `compose.yml` の `environment` や `JAVA_TOOL_OPTIONS` の設定漏れを確認 |
+| `--verify-jboss-password には検証対象のマスターパスワードが必要です` | 取得元を指定せず、環境変数も未設定 (exit 2) | `--jboss-password-param` / `--jboss-password` を指定するか、環境変数を export する |
+| `--jboss-secret-id には英数字と . _ - のみ指定できます` | シークレット id に記号・空白が含まれる (exit 2) | `/run/secrets/<id>` として使える名前にする |
+| `--jboss-config-file にはコンテナ内の絶対パスを指定してください` | 相対パス、または引用を壊す文字を含む (exit 2) | コンテナ内の絶対パスを指定する |
+| `[不一致] compose.yml の secrets 定義` | `secrets.<名前>.environment` と `--jboss-password-env` の名前が食い違う、または `build.secrets` から参照されていない | `compose.yml` と `--jboss-password-env` を一致させ、`build.secrets` へ追加する |
+| `[不一致] BuildKit シークレット → …/run/secrets/…` | ビルドへ届いた値が原本と違う | 表示された 16 進ダンプと相違位置を確認。末尾の改行落ち・`#` 以降の切り捨て・`$` の展開が典型 |
+| `[不一致 (式が未解決)]` | `standalone.xml` の `clear-text` に `${...}` が残っている | `jboss-cli` への登録時にリテラルの `$` を `$$` へエスケープする |
+| `[不一致] Elytron CredentialStore をマスターパスワードで開けるか` | CredentialStore が原本と違うパスワードで作られている | 段 4・5 に表示された「実際に設定されている文字列」と突き合わせ、作成時のエスケープを見直す |
+| `[未確認] プローブビルドに失敗しました` | `docker build --secret` / `--output type=local` が使えない。ベースイメージにシェルが無い (distroless) | BuildKit を有効にする (`DOCKER_BUILDKIT=1`)。Docker のバージョンとベースイメージを確認 |
+| `注意: シークレット名 '…' が --jboss-secret-id '…' と異なります` | `compose.yml` の secrets 名と既定の id がずれている | 表示された名前を `--jboss-secret-id` に指定して再実行する |
+| `[未確認] elytron-tool.sh が見つかりません` | 自動探索でパスを特定できない | `--jboss-elytron-tool` で指定する |
+| `[未確認] Elytron の credential-store 定義が見つかりませんでした` | `jboss-cli` による生成前、または別方式でパスワードを渡している | 生成後のイメージで実行する。設定ファイルが既定以外なら `--jboss-config-file` を指定 |

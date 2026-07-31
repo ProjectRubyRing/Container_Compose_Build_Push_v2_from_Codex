@@ -230,7 +230,7 @@ assert_contains "$full_report" "[3] コンテナ内ディレクトリツリー (
 assert_contains "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)"
 assert_contains "$full_report" "[5] Java JVM パラメータ (全件)"
 assert_contains "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
-assert_contains "$full_report" "[7] Compose サービス別ログ (全サービス・全行)"
+assert_contains "$full_report" "[8] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "処理が成功したため、Compose サービス別ログの全文出力は省略しました。"
 assert_contains "$full_report" "API_TOKEN=[REDACTED]"
 assert_not_contains "$full_report" "do-not-log-this-value"
@@ -243,7 +243,7 @@ assert_contains "$full_report" "  OTEL_SERVICE_NAME                            =
 assert_contains "$full_report" "[未設定の主要 OpenTelemetry 設定] 7 件"
 assert_before "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)" "[5] Java JVM パラメータ (全件)"
 assert_before "$full_report" "[5] Java JVM パラメータ (全件)" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
-assert_before "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)" "[7] Compose サービス別ログ (全サービス・全行)"
+assert_before "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)" "[8] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "application.yaml"
 assert_contains "$full_report" "deep.json"
 assert_contains "$full_report" "Order01.class"
@@ -479,12 +479,12 @@ assert_contains "${failure_report_files[0]}" "全体結果     : 失敗 (exit=1)
 assert_contains "${failure_report_files[0]}" "結果          : 成功"
 # 失敗レポートには、起動確認対象・サイドカーを問わず全 Compose サービスのログを
 # サービス単位に区切って残す。
-assert_contains "${failure_report_files[0]}" "[7] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${failure_report_files[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${failure_report_files[0]}" "対象サービス  : base app adot-collector cache (4 サービス)"
-assert_contains "${failure_report_files[0]}" "[7-1] Compose サービス: base"
-assert_contains "${failure_report_files[0]}" "[7-2] Compose サービス: app"
-assert_contains "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector"
-assert_contains "${failure_report_files[0]}" "[7-4] Compose サービス: cache"
+assert_contains "${failure_report_files[0]}" "[8-1] Compose サービス: base"
+assert_contains "${failure_report_files[0]}" "[8-2] Compose サービス: app"
+assert_contains "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector"
+assert_contains "${failure_report_files[0]}" "[8-4] Compose サービス: cache"
 assert_contains "${failure_report_files[0]}" "コンテナ      : test-app-1 (状態: running)"
 assert_contains "${failure_report_files[0]}" "コンテナ      : adot-collector (状態: exited, 終了コード: 1)"
 assert_contains "${failure_report_files[0]}" "ログ行数      : 5 行"
@@ -493,11 +493,11 @@ assert_contains "${failure_report_files[0]}" "ログ行数      : 2 行"
 assert_contains "${failure_report_files[0]}" "WFLYSRV0026"
 assert_contains "${failure_report_files[0]}" "adot-collector  | TracesExporter resource spans: 2, spans: 4"
 assert_contains "${failure_report_files[0]}" "cache-1  | CACHE001: cache ready"
-assert_before "${failure_report_files[0]}" "[7-1] Compose サービス: base" "[7-2] Compose サービス: app"
-assert_before "${failure_report_files[0]}" "[7-2] Compose サービス: app" "[7-3] Compose サービス: adot-collector"
-assert_before "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector" "[7-4] Compose サービス: cache"
-assert_before "${failure_report_files[0]}" "[7-3] Compose サービス: adot-collector" "TracesExporter resource spans"
-assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[7-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[8-1] Compose サービス: base" "[8-2] Compose サービス: app"
+assert_before "${failure_report_files[0]}" "[8-2] Compose サービス: app" "[8-3] Compose サービス: adot-collector"
+assert_before "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector" "[8-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector" "TracesExporter resource spans"
+assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[8-4] Compose サービス: cache"
 # レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
 assert_not_contains "${failure_report_files[0]}" $'\033['
 
@@ -545,7 +545,7 @@ shutdown_reports=("$TEST_TMP/shutdown-reports"/build_and_verify_*.txt)
   || fail "expected one report for unhealthy dependency scenario"
 # 全量レポートのログ本文も、SIGTERM 送出後に取得した終了処理込みのものとなる。
 assert_contains "${shutdown_reports[0]}" "終了処理      : SIGTERM (compose stop -t 30) 送出後の終了ログまで含む"
-assert_contains "${shutdown_reports[0]}" "[7-3] Compose サービス: adot-collector"
+assert_contains "${shutdown_reports[0]}" "[8-3] Compose サービス: adot-collector"
 assert_contains "${shutdown_reports[0]}" "Shutdown complete."
 assert_contains "${shutdown_reports[0]}" "ログ行数      : 4 行"
 
@@ -605,12 +605,12 @@ assert_contains "${build_failure_reports[0]}" "結果          : 失敗"
 assert_contains "${build_failure_reports[0]}" "対象コンテナが起動していないため取得していません。"
 # ビルド失敗でコンテナが 1 つも作られていない場合も、compose.yml 定義の全サービスを
 # 見出しとして残し、ログがないことを明示する。
-assert_contains "${build_failure_reports[0]}" "[7] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${build_failure_reports[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${build_failure_reports[0]}" "取得範囲      : コンテナ作成時からの全期間 (compose up 到達前に終了)"
 assert_contains "${build_failure_reports[0]}" "対象サービス  : base app adot-collector (3 サービス)"
-assert_contains "${build_failure_reports[0]}" "[7-1] Compose サービス: base"
-assert_contains "${build_failure_reports[0]}" "[7-2] Compose サービス: app"
-assert_contains "${build_failure_reports[0]}" "[7-3] Compose サービス: adot-collector"
+assert_contains "${build_failure_reports[0]}" "[8-1] Compose サービス: base"
+assert_contains "${build_failure_reports[0]}" "[8-2] Compose サービス: app"
+assert_contains "${build_failure_reports[0]}" "[8-3] Compose サービス: adot-collector"
 assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテナなし)" 3
 assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
 
@@ -1322,4 +1322,261 @@ assert_contains "$FAKE_DOCKER_CALLS" "network prune --force"
 assert_contains "$FAKE_DOCKER_CALLS" "system prune --all --volumes --force"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, and Docker cleanup scenarios\n'
+# ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
+# compose.yml の環境変数 → BuildKit シークレット → Elytron CredentialStore →
+# jboss-cli が生成した standalone.xml → 実行時の値、の各段でパスワードが
+# 一致しているかを検証する機能。$ # " ` & を含むパスワードで確認する。
+#
+# ここまでのシナリオが export した fixture 切り替え用の変数を引き継ぐと、
+# 起動確認やクリーンアップの挙動が変わってしまうため、先にすべて解除する。
+unset FAKE_DOCKER_CLEANED FAKE_COMPOSE_SHUTDOWN_MARKER FAKE_COMPOSE_NO_CONTAINERS \
+      FAKE_COMPOSE_UP_FAIL FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES \
+      FAKE_COMPOSE_PS_SERVICES FAKE_DOCKER_FIND_FAIL FAKE_DOCKER_NO_JAVA_PROCESS \
+      FAKE_JBOSS_SECRET_VALUE FAKE_JBOSS_SECRET_MISSING FAKE_JBOSS_PROBE_BUILD_FAIL \
+      FAKE_JBOSS_HOME FAKE_JBOSS_CS_PASSWORD FAKE_JBOSS_ELYTRON_TOOL_MISSING \
+      FAKE_JBOSS_CS_FILE_MISSING
+
+jboss_password_fixture='pa$w#o"r`d&x'
+jboss_standalone_xml="$TEST_TMP/standalone.xml"
+cat > "$jboss_standalone_xml" <<'XML'
+<?xml version="1.0" ?>
+<server>
+  <!-- コメント内の <credential-store name="commented-out"> は解析対象外 -->
+  <profile>
+    <subsystem xmlns="urn:wildfly:elytron:18.0">
+      <credential-stores>
+        <credential-store name="jbossCS" path="credential-store.jceks" relative-to="jboss.server.config.dir">
+          <credential-reference clear-text="pa$$w#o&quot;r`d&amp;x"/>
+        </credential-store>
+      </credential-stores>
+    </subsystem>
+    <subsystem xmlns="urn:jboss:domain:datasources:7.0">
+      <datasources>
+        <datasource jndi-name="java:/OrdersDS" pool-name="OrdersDS">
+          <security><credential-reference store="jbossCS" alias="orders-db-pw"/></security>
+        </datasource>
+      </datasources>
+    </subsystem>
+  </profile>
+</server>
+XML
+
+# --- 全段一致するケース ---
+jboss_match_output="$TEST_TMP/jboss-password-match.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_JBOSS_STANDALONE_XML="$jboss_standalone_xml"
+if ! (
+  cd "$REPO_ROOT"
+  JBOSS_MASTER_PASSWORD="$jboss_password_fixture" bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --verify-jboss-password \
+    --report-dir "$TEST_TMP/jboss-reports" \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$jboss_match_output" 2>&1; then
+  cat "$jboss_match_output" >&2
+  fail "jboss password verification (match) returned a non-zero status"
+fi
+
+# リスク分析は、実際に含まれる文字だけを挙げること
+assert_contains "$jboss_match_output" "[パスワード文字列のリスク分析]"
+assert_contains "$jboss_match_output" "(ドル記号)"
+assert_contains "$jboss_match_output" "(シャープ)"
+assert_contains "$jboss_match_output" "(二重引用符)"
+assert_contains "$jboss_match_output" "(バッククォート)"
+assert_contains "$jboss_match_output" "(アンパサンド)"
+assert_not_contains "$jboss_match_output" "(パーセント)"
+
+# 段ごとの判定
+assert_contains "$jboss_match_output" "[一致] (1) 取得元 → 環境変数 JBOSS_MASTER_PASSWORD"
+assert_contains "$jboss_match_output" "[一致] (2) compose.yml の secrets 定義"
+assert_contains "$jboss_match_output" "secrets.jboss_master_password.environment: JBOSS_MASTER_PASSWORD"
+assert_contains "$jboss_match_output" "[一致] (3) BuildKit シークレット → ビルド中コンテナの /run/secrets/jboss_master_password"
+assert_contains "$jboss_match_output" "[情報] (4) standalone.xml のマスターパスワード定義"
+assert_contains "$jboss_match_output" "[一致 (エスケープ済み)] (5) standalone.xml → WildFly が実行時に解釈する値"
+assert_contains "$jboss_match_output" "[一致] (6) Elytron CredentialStore をマスターパスワードで開けるか"
+assert_contains "$jboss_match_output" "[情報] (7) CredentialStore の値を利用している箇所"
+assert_contains "$jboss_match_output" "store=jbossCS, alias=orders-db-pw"
+assert_contains "$jboss_match_output" "リソース: OrdersDS"
+assert_not_contains "$jboss_match_output" "commented-out"
+
+# 一致した場合も、一致したパスワード文字列を表示すること
+assert_contains "$jboss_match_output" "一致した文字列: $jboss_password_fixture"
+assert_contains "$jboss_match_output" "16 進ダンプ   : 70 61 24 77 23 6f 22 72 60 64 26 78"
+assert_contains "$jboss_match_output" "総合判定: 全段一致"
+assert_contains "$jboss_match_output" "一致したパスワード文字列: $jboss_password_fixture"
+# ファイル上の表記 (XML エスケープ + WildFly の $$) も見えること
+assert_contains "$jboss_match_output" 'pa$$w#o&quot;r`d&amp;x'
+# どの段にも不一致の判定が出ないこと (総括の「不一致なし」は本文に含まれるため、
+# 判定ラベルの角括弧付きで確認する)
+assert_not_contains "$jboss_match_output" "[不一致"
+assert_contains "$jboss_match_output" "伝搬検証が完了しました (不一致なし)"
+
+# 全量レポートにも同じ内容が残ること
+jboss_report_files=("$TEST_TMP"/jboss-reports/build_and_verify_*.txt)
+[ -f "${jboss_report_files[0]}" ] || fail "jboss password report was not created"
+assert_contains "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証"
+assert_contains "${jboss_report_files[0]}" "総合判定      : 全段一致"
+assert_contains "${jboss_report_files[0]}" "原本の文字列  : $jboss_password_fixture"
+assert_contains "${jboss_report_files[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_before "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証" "[8] Compose サービス別ログ (全サービス・全行)"
+
+# --- 各段で食い違うケース ---
+# ビルドへ届いた値は # 以降が切り捨てられ、standalone.xml と CredentialStore にも
+# 別の値が設定されている状況を再現する。
+jboss_mismatch_xml="$TEST_TMP/standalone-mismatch.xml"
+cat > "$jboss_mismatch_xml" <<'XML'
+<?xml version="1.0" ?>
+<server>
+  <profile>
+    <subsystem xmlns="urn:wildfly:elytron:18.0">
+      <credential-stores>
+        <credential-store name="jbossCS" path="credential-store.jceks" relative-to="jboss.server.config.dir">
+          <credential-reference clear-text="pa$w"/>
+        </credential-store>
+      </credential-stores>
+    </subsystem>
+  </profile>
+</server>
+XML
+jboss_mismatch_output="$TEST_TMP/jboss-password-mismatch.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_JBOSS_STANDALONE_XML="$jboss_mismatch_xml"
+export FAKE_JBOSS_SECRET_VALUE='pa$w'
+export FAKE_JBOSS_CS_PASSWORD='pa$w'
+if ! (
+  cd "$REPO_ROOT"
+  JBOSS_MASTER_PASSWORD="$jboss_password_fixture" bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --verify-jboss-password \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$jboss_mismatch_output" 2>&1; then
+  cat "$jboss_mismatch_output" >&2
+  fail "jboss password verification (mismatch) returned a non-zero status"
+fi
+
+# 不一致の段では、原本と実際に設定されている文字列の双方を表示すること
+assert_contains "$jboss_mismatch_output" "[不一致] (3) BuildKit シークレット"
+assert_contains "$jboss_mismatch_output" "原本 (取得元) : $jboss_password_fixture"
+assert_contains "$jboss_mismatch_output" '実際に設定されている文字列: pa$w'
+assert_contains "$jboss_mismatch_output" "16 進ダンプ : 70 61 24 77"
+assert_contains "$jboss_mismatch_output" "5 バイト目から相違 (原本: 23 / 実際: (ここで終端))"
+assert_contains "$jboss_mismatch_output" "[不一致] (5) standalone.xml → WildFly が実行時に解釈する値"
+assert_contains "$jboss_mismatch_output" "[不一致] (6) Elytron CredentialStore をマスターパスワードで開けるか"
+assert_contains "$jboss_mismatch_output" "CredentialStore からは設定済みのパスワードを取り出せないため"
+assert_contains "$jboss_mismatch_output" "総合判定: 不一致あり"
+assert_contains "$jboss_mismatch_output" "JBoss マスターパスワードの伝搬検証で不一致を検出しました"
+unset FAKE_JBOSS_SECRET_VALUE FAKE_JBOSS_CS_PASSWORD
+
+# --- $ のエスケープ漏れで ${...} が式として残るケース ---
+jboss_expr_xml="$TEST_TMP/standalone-expression.xml"
+cat > "$jboss_expr_xml" <<'XML'
+<?xml version="1.0" ?>
+<server>
+  <profile>
+    <subsystem xmlns="urn:wildfly:elytron:18.0">
+      <credential-stores>
+        <credential-store name="jbossCS" path="credential-store.jceks" relative-to="jboss.server.config.dir">
+          <credential-reference clear-text="pa${env.MISSING}word"/>
+        </credential-store>
+      </credential-stores>
+    </subsystem>
+  </profile>
+</server>
+XML
+jboss_expr_output="$TEST_TMP/jboss-password-expression.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_JBOSS_STANDALONE_XML="$jboss_expr_xml"
+if ! (
+  cd "$REPO_ROOT"
+  JBOSS_MASTER_PASSWORD='pa${env.MISSING}word' bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --verify-jboss-password \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$jboss_expr_output" 2>&1; then
+  cat "$jboss_expr_output" >&2
+  fail "jboss password verification (expression) returned a non-zero status"
+fi
+
+assert_contains "$jboss_expr_output" "[不一致 (式が未解決)]"
+assert_contains "$jboss_expr_output" 'へエスケープできていない可能性が高いです'
+assert_contains "$jboss_expr_output" 'jboss-cli への登録時に $ を $$ へエスケープしてください'
+# 式の段はバイト比較に意味が無いため、相違位置を出さないこと
+assert_not_contains "$jboss_expr_output" "相違位置      : 差分なし"
+
+# --- --jboss-password-mask で平文を伏せるケース ---
+jboss_mask_output="$TEST_TMP/jboss-password-mask.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_JBOSS_STANDALONE_XML="$jboss_standalone_xml"
+if ! (
+  cd "$REPO_ROOT"
+  JBOSS_MASTER_PASSWORD="$jboss_password_fixture" bash ./build_and_verify.sh \
+    --verify-jboss-password \
+    --jboss-password-mask
+) >"$jboss_mask_output" 2>&1; then
+  cat "$jboss_mask_output" >&2
+  fail "jboss password verification (mask) returned a non-zero status"
+fi
+
+assert_contains "$jboss_mask_output" "--jboss-password-mask により非表示: 12 バイト"
+assert_not_contains "$jboss_mask_output" "一致した文字列: $jboss_password_fixture"
+# 伏字でも判定と 16 進ダンプは残す (切り分けに必要なため)
+assert_contains "$jboss_mask_output" "16 進ダンプ   : 70 61 24 77 23 6f 22 72 60 64 26 78"
+# コンテナ未起動時は、その旨を未確認として記録すること
+assert_contains "$jboss_mask_output" "[未確認] (4) standalone.xml / Elytron CredentialStore の検証"
+assert_contains "$jboss_mask_output" "総合判定: 確認できた段はすべて一致 (未確認の段あり)"
+
+# --- compose.yml の environment 名が食い違うケース ---
+jboss_bad_compose="$TEST_TMP/bad-compose.yml"
+cat > "$jboss_bad_compose" <<'YML'
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      secrets:
+        - jboss_master_password
+    image: j1/base.local
+secrets:
+  jboss_master_password:
+    environment: SOME_OTHER_NAME
+YML
+jboss_bad_compose_output="$TEST_TMP/jboss-bad-compose.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  JBOSS_MASTER_PASSWORD="$jboss_password_fixture" bash ./build_and_verify.sh \
+    --verify-jboss-password \
+    --compose-file "$jboss_bad_compose"
+) >"$jboss_bad_compose_output" 2>&1; then
+  cat "$jboss_bad_compose_output" >&2
+  fail "jboss password verification (bad compose) returned a non-zero status"
+fi
+
+assert_contains "$jboss_bad_compose_output" "[不一致] (2) compose.yml の secrets 定義"
+assert_contains "$jboss_bad_compose_output" "は 'SOME_OTHER_NAME' を参照していますが"
+assert_contains "$jboss_bad_compose_output" "ビルドには空の値が渡ります"
+
+# --- 原本を取得できない場合はオプションエラーとすること ---
+jboss_no_password_output="$TEST_TMP/jboss-no-password.out"
+if (
+  cd "$REPO_ROOT"
+  env -u JBOSS_MASTER_PASSWORD bash ./build_and_verify.sh --verify-jboss-password
+) >"$jboss_no_password_output" 2>&1; then
+  cat "$jboss_no_password_output" >&2
+  fail "jboss password verification without a password unexpectedly returned zero"
+fi
+assert_contains "$jboss_no_password_output" "--verify-jboss-password には検証対象のマスターパスワードが必要です"
+
+unset FAKE_JBOSS_STANDALONE_XML
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, and Docker cleanup scenarios\n'

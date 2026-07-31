@@ -386,6 +386,121 @@ if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ] \
   esac
 fi
 
+# ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
+# build_and_verify.sh が投げる各プローブを、環境変数で挙動を切り替えながら再現する。
+#   FAKE_JBOSS_SECRET_VALUE       : ビルド中の /run/secrets が返す値 (未設定なら $JBOSS_MASTER_PASSWORD)
+#   FAKE_JBOSS_SECRET_MISSING     : true なら /run/secrets にファイルが無い状態を再現
+#   FAKE_JBOSS_PROBE_BUILD_FAIL   : true ならプローブビルドを失敗させる
+#   FAKE_JBOSS_HOME               : コンテナ内の JBoss インストール先 (空なら未検出)
+#   FAKE_JBOSS_STANDALONE_XML     : standalone.xml として返すホスト側のファイル
+#   FAKE_JBOSS_CS_PASSWORD        : CredentialStore を開けるパスワード (未設定なら $JBOSS_MASTER_PASSWORD)
+#   FAKE_JBOSS_ELYTRON_TOOL_MISSING : true なら elytron-tool.sh が無い状態を再現
+#   FAKE_JBOSS_CS_FILE_MISSING    : true なら CredentialStore ファイルが無い状態を再現
+fake_jboss_home() { printf '%s' "${FAKE_JBOSS_HOME-/opt/jboss-eap}"; }
+
+# 伝搬検証のプローブビルド (docker build --secret ... --output type=local,dest=DIR)。
+# BuildKit へ渡した環境変数の値がそのままマウントされる様子を再現する。
+if [ "${1:-}" = "build" ] && [[ " $* " == *" --output "* ]]; then
+  fake_probe_dest=""
+  fake_probe_next=""
+  for arg in "$@"; do
+    if [ "$fake_probe_next" = "output" ]; then
+      case "$arg" in
+        type=local,dest=*) fake_probe_dest="${arg#type=local,dest=}" ;;
+      esac
+      fake_probe_next=""
+      continue
+    fi
+    [ "$arg" = "--output" ] && fake_probe_next="output"
+  done
+  if [ "${FAKE_JBOSS_PROBE_BUILD_FAIL:-false}" = "true" ]; then
+    printf 'ERROR: failed to solve: failed to compute cache key\n' >&2
+    exit 1
+  fi
+  [ -n "$fake_probe_dest" ] || fail "$@"
+  mkdir -p "$fake_probe_dest"
+  if [ "${FAKE_JBOSS_SECRET_MISSING:-false}" = "true" ]; then
+    printf 'missing' > "$fake_probe_dest/encoding"
+    : > "$fake_probe_dest/value"
+  else
+    printf 'base64' > "$fake_probe_dest/encoding"
+    printf '%s' "${FAKE_JBOSS_SECRET_VALUE-${JBOSS_MASTER_PASSWORD:-}}" \
+      | base64 | tr -d '\n' > "$fake_probe_dest/value"
+  fi
+  exit 0
+fi
+
+# コンテナ内シェルで実行される伝搬検証のプローブ。
+# build_and_verify.sh は次の形で呼ぶため、スクリプト本文の特徴で処理を振り分ける。
+#   docker exec    <cid> /bin/sh -c '<script>' _ <引数...>   → script は $5
+#   docker exec -i <cid> /bin/sh -c '<script>' _ <引数...>   → script は $6
+# ここで拾わないスクリプト (既存の環境変数収集など) は case を素通りし、
+# このブロックより後ろの従来のハンドラへ引き継がれる。
+if [ "${1:-}" = "exec" ]; then
+  if [ "${2:-}" = "-i" ] && [ "${4:-}" = "/bin/sh" ] && [ "${5:-}" = "-c" ]; then
+    fake_exec_script="${6:-}"
+  elif [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ]; then
+    fake_exec_script="${5:-}"
+  else
+    fake_exec_script=""
+  fi
+
+  case "$fake_exec_script" in
+    '') ;;
+    *'$candidate/bin'*)
+      # JBoss インストール先の検出
+      fake_home="$(fake_jboss_home)"
+      [ -n "$fake_home" ] || exit 1
+      printf '%s' "$fake_home"
+      exit 0
+      ;;
+    *'jboss-modules.jar'*)
+      # 起動中サーバーのコマンドライン (既定設定で起動しているものとする)
+      [ -n "$(fake_jboss_home)" ] || exit 1
+      printf 'java -jar %s/jboss-modules.jar -mp %s/modules org.jboss.as.standalone -c standalone.xml' \
+        "$(fake_jboss_home)" "$(fake_jboss_home)"
+      exit 0
+      ;;
+    *'standalone-full-ha.xml'*)
+      # 比較対象の standalone.xml の決定
+      [ -n "${FAKE_JBOSS_STANDALONE_XML:-}" ] || exit 1
+      printf '%s/standalone/configuration/standalone.xml' "$(fake_jboss_home)"
+      exit 0
+      ;;
+    *'base64 < "$1"'*)
+      # standalone.xml の読み出し
+      [ -n "${FAKE_JBOSS_STANDALONE_XML:-}" ] || exit 1
+      [ -f "$FAKE_JBOSS_STANDALONE_XML" ] || exit 1
+      base64 < "$FAKE_JBOSS_STANDALONE_XML" | tr -d '\n'
+      exit 0
+      ;;
+    '[ -x "$1" ]')
+      # elytron-tool.sh の存在確認
+      [ "${FAKE_JBOSS_ELYTRON_TOOL_MISSING:-false}" = "true" ] && exit 1
+      exit 0
+      ;;
+    '[ -f "$1" ]')
+      # CredentialStore ファイルの存在確認
+      [ "${FAKE_JBOSS_CS_FILE_MISSING:-false}" = "true" ] && exit 1
+      exit 0
+      ;;
+    *'credential-store --location'*)
+      # elytron-tool credential-store --aliases 相当。
+      # 標準入力の base64 を復号し、想定パスワードと一致したときだけ成功させる。
+      fake_cs_encoded="$(cat)"
+      fake_cs_password="$(printf '%s' "$fake_cs_encoded" | base64 -d 2>/dev/null; printf 'x')"
+      fake_cs_password="${fake_cs_password%x}"
+      fake_cs_expected="${FAKE_JBOSS_CS_PASSWORD-${JBOSS_MASTER_PASSWORD:-}}"
+      if [ "$fake_cs_password" = "$fake_cs_expected" ]; then
+        printf 'Aliases: orders-db-pw, mail-pw\n'
+        exit 0
+      fi
+      printf 'ELYTOOL00013: Credential store command failed: keystore password was incorrect\n'
+      exit 1
+      ;;
+  esac
+fi
+
 if [ "${1:-}" = "exec" ] && [ "${6:-}" = "healthcheck-http-probe" ]; then
   if [ "${FAKE_HEALTHCHECK_HTTP_FAIL:-false}" = "true" ]; then
     printf 'curl: (7) Failed to connect to 127.0.0.1 port 8080\n' >&2

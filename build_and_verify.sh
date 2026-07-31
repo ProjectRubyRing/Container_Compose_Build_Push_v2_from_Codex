@@ -116,6 +116,42 @@ JBOSS_PASSWORD_VALUE=""           # 直接指定されたマスターパスワ�
 JBOSS_PASSWORD_ENV="JBOSS_MASTER_PASSWORD"  # シークレット受け渡しに使う環境変数名
 JBOSS_PASSWORD_ENV_SET="false"    # --jboss-password-env が明示指定されたか
 JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシークレットとして注入するか
+JBOSS_SECRET_ID="jboss_master_password"  # BuildKit シークレットの id。compose.yml の
+                                  # secrets 名および Dockerfile の
+                                  # RUN --mount=type=secret,id=... と一致させる。
+                                  # 伝搬検証のプローブビルドで参照する。
+
+# ---- JBoss マスターパスワードの伝搬検証 (--verify-jboss-password) ------------
+# 「compose.yml の環境変数 → BuildKit シークレット → Elytron CredentialStore →
+#  jboss-cli が生成した standalone.xml → 実行時に解決される値」の各段で、
+# パスワード文字列が原本と一致しているかを突き合わせる。
+# $ # " ` \ 等はシェル・XML・WildFly 式のいずれかで意味を持つため、
+# 段のどこかで欠落・展開・二重エスケープされていても気付けるようにする。
+VERIFY_JBOSS_PASSWORD="false"     # true: 伝搬検証を実行する
+JBOSS_PASSWORD_SHOW="true"        # false: 平文表示を伏字にする (--jboss-password-mask)
+JBOSS_CONFIG_FILE=""              # コンテナ内 standalone.xml のパス (未指定は自動探索)
+JBOSS_CLI_PATH=""                 # コンテナ内 jboss-cli.sh のパス (未指定は自動探索)
+JBOSS_ELYTRON_TOOL_PATH=""        # コンテナ内 elytron-tool.sh のパス (未指定は自動探索)
+JBOSS_CREDENTIAL_STORE_FILE=""    # コンテナ内 CredentialStore ファイル (未指定は XML から特定)
+JBOSS_PASSWORD_ORIGIN=""          # 取得元から読み出した原本パスワード (比較の基準)
+JBOSS_PASSWORD_ORIGIN_SET="false" # 原本を取得できたか
+JBOSS_PASSWORD_SOURCE_LABEL=""    # 取得元の説明 (画面表示用)
+JBOSS_PASSWORD_STAGE_RESULTS=()   # 段ごとの検証結果 (画面表示・全量レポート共通)
+JBOSS_PASSWORD_MISMATCH="false"   # 1 段でも不一致を検出したか
+JBOSS_PASSWORD_UNKNOWN="false"    # 1 段でも確認できなかったか
+# 段の記録に使う区切り。パスワードにも説明文にも現れない制御文字を使う。
+JBOSS_STAGE_SEPARATOR=$'\037'
+# コンテナ内で JBoss のインストール先を探す既定の候補。
+# JBOSS_HOME / JBOSS_EAP_HOME が設定されていればそちらを優先する。
+JBOSS_HOME_CANDIDATES=(
+  /opt/jboss-eap
+  /opt/eap
+  /opt/jboss/jboss-eap
+  /opt/jboss
+  /opt/wildfly
+  /usr/local/jboss-eap
+  /usr/local/wildfly
+)
 
 # ビルド前に一時コピーし、ビルド後に自動削除するファイル群
 # COPY_SPECS: "SRC:DEST_DIR" の配列 (--copy-file で繰り返し指定)
@@ -456,8 +492,38 @@ JBoss マスターパスワード (BuildKit シークレット):
                            secrets の environment: と一致させること。
                            このオプションのみを指定した場合は、事前に export
                            済みの環境変数の値をそのままパスワードとして使う。
+  --jboss-secret-id ID     BuildKit シークレットの id (既定: jboss_master_password)。
+                           compose.yml の secrets 名、および Dockerfile の
+                           RUN --mount=type=secret,id=... と一致させる。
+                           --verify-jboss-password のプローブビルドで参照する。
   --region REGION          パラメータストア参照時の AWS リージョン
                            (既定: ap-northeast-1 / env: AWS_REGION)
+
+JBoss マスターパスワードの伝搬検証:
+  --verify-jboss-password  マスターパスワードが「取得元 → 環境変数 →
+                           compose.yml の secrets → BuildKit シークレット
+                           (/run/secrets) → Elytron CredentialStore →
+                           jboss-cli が生成した standalone.xml → 実行時に
+                           解決される値」の各段で原本と一致しているかを検証し、
+                           結果をビルド時に画面へ出力する。
+                           - 一致した段は「一致」と、一致したパスワード文字列を表示
+                           - 一致しない段は「不一致」と、原本・実際に設定されている
+                             文字列の双方を、バイト長・16 進ダンプ付きで表示
+                           - $ # " ` \ 等、シェル / XML / WildFly 式のいずれかで
+                             意味を持つ文字を検出し、壊れうる段を併せて表示
+                           standalone.xml と CredentialStore の確認には
+                           コンテナ起動が必要なため、--verify-startup または
+                           --verify-url と併用する (単独指定時はビルドまでの段のみ)。
+  --jboss-password-mask    伝搬検証の出力でパスワード文字列を伏字にする。
+                           一致・不一致の判定とバイト長・差分位置は表示する。
+  --jboss-config-file PATH コンテナ内の standalone.xml のパス。
+                           未指定時は JBOSS_HOME 等から自動探索する。
+  --jboss-cli-path PATH    コンテナ内の jboss-cli.sh のパス (未指定時は自動探索)
+  --jboss-elytron-tool PATH
+                           コンテナ内の elytron-tool.sh のパス (未指定時は自動探索)
+  --jboss-credential-store PATH
+                           コンテナ内の CredentialStore ファイルのパス。
+                           未指定時は standalone.xml の credential-store 定義から特定する。
 
 起動確認 (jbosseap / WildFly):
   --verify-startup         ビルド後にコンテナを起動し、jbosseap サーバーの起動完了を
@@ -621,6 +687,13 @@ while [ $# -gt 0 ]; do
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
     --jboss-password-env)   need_value "$1" $#; JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --jboss-secret-id)      need_value "$1" $#; JBOSS_SECRET_ID="$2"; shift 2 ;;
+    --verify-jboss-password) VERIFY_JBOSS_PASSWORD="true"; shift ;;
+    --jboss-password-mask)  JBOSS_PASSWORD_SHOW="false"; shift ;;
+    --jboss-config-file)    need_value "$1" $#; JBOSS_CONFIG_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
+    --jboss-cli-path)       need_value "$1" $#; JBOSS_CLI_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
+    --jboss-elytron-tool)   need_value "$1" $#; JBOSS_ELYTRON_TOOL_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
+    --jboss-credential-store) need_value "$1" $#; JBOSS_CREDENTIAL_STORE_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --verify-startup)      VERIFY_STARTUP="true"; shift ;;
     --startup-service)     need_value "$1" $#; append_services STARTUP_SERVICES "$2"; VERIFY_STARTUP="true"; shift 2 ;;
     --startup-log-pattern) need_value "$1" $#; STARTUP_LOG_PATTERN="$2"; shift 2 ;;
@@ -821,6 +894,49 @@ if ! printf '%s' "$JBOSS_PASSWORD_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; th
   err "--jboss-password-env に不正な環境変数名が指定されました: $JBOSS_PASSWORD_ENV"
   exit 2
 fi
+# シークレット id は BuildKit のマウント先 (/run/secrets/<id>) とプローブビルドの
+# Dockerfile へそのまま埋め込むため、パス・シェルの特殊文字を含めさせない。
+if ! printf '%s' "$JBOSS_SECRET_ID" | grep -qE '^[A-Za-z0-9._-]+$'; then
+  err "--jboss-secret-id には英数字と . _ - のみ指定できます: $JBOSS_SECRET_ID"
+  exit 2
+fi
+# 伝搬検証は、マスターパスワードの取得元が決まっていて初めて突き合わせができる。
+# どの取得オプションも無い場合は、事前 export 済みの環境変数を取得元として扱う。
+if [ "$VERIFY_JBOSS_PASSWORD" = "true" ] && [ "$JBOSS_SECRET_ENABLED" != "true" ]; then
+  if [ -n "${!JBOSS_PASSWORD_ENV:-}" ]; then
+    JBOSS_SECRET_ENABLED="true"
+    log "--verify-jboss-password: 事前 export 済みの環境変数 ${JBOSS_PASSWORD_ENV} を検証対象のマスターパスワードとして使用します。"
+  else
+    err "--verify-jboss-password には検証対象のマスターパスワードが必要です。"
+    err "  --jboss-password-param / --jboss-password のいずれかを指定するか、"
+    err "  環境変数 ${JBOSS_PASSWORD_ENV} を export してから再実行してください。"
+    exit 2
+  fi
+fi
+# コンテナ内のパスは、docker exec へ渡すシェルスクリプトに埋め込む。
+# 引用を壊す文字が混ざっていると意図しないコマンドが動くため、事前に弾く。
+for _jboss_path_opt in \
+    "--jboss-config-file:$JBOSS_CONFIG_FILE" \
+    "--jboss-cli-path:$JBOSS_CLI_PATH" \
+    "--jboss-elytron-tool:$JBOSS_ELYTRON_TOOL_PATH" \
+    "--jboss-credential-store:$JBOSS_CREDENTIAL_STORE_FILE"; do
+  _jboss_path_name="${_jboss_path_opt%%:*}"
+  _jboss_path_value="${_jboss_path_opt#*:}"
+  [ -n "$_jboss_path_value" ] || continue
+  case "$_jboss_path_value" in
+    /*) ;;
+    *)
+      err "${_jboss_path_name} にはコンテナ内の絶対パスを指定してください: ${_jboss_path_value}"
+      exit 2
+      ;;
+  esac
+  case "$_jboss_path_value" in
+    *[\'\"\`\$\;\&\|\<\>\*\?]*|*' '*)
+      err "${_jboss_path_name} に使用できない文字が含まれています: ${_jboss_path_value}"
+      exit 2
+      ;;
+  esac
+done
 
 # ---- 依存コマンド確認 -------------------------------------------------------
 # ビルドには docker が必須。URL 応答確認または対話式 HTTP 通信では curl も必須。
@@ -896,6 +1012,7 @@ prepare_jboss_password() {
   [ "$JBOSS_SECRET_ENABLED" = "true" ] || return 0
   local password=""
   if [ -n "$JBOSS_PASSWORD_PARAM" ]; then
+    JBOSS_PASSWORD_SOURCE_LABEL="パラメータストア ${JBOSS_PASSWORD_PARAM} (region=${REGION})"
     log "パラメータストアから JBoss マスターパスワードを取得します: ${JBOSS_PASSWORD_PARAM} (region=${REGION}) ..."
     if [ "$DRY_RUN" = "true" ]; then
       log "[DRY-RUN] aws ssm get-parameter --name ${JBOSS_PASSWORD_PARAM} --with-decryption --region ${REGION} (値の取得・表示は行いません)"
@@ -919,10 +1036,12 @@ prepare_jboss_password() {
       log "パラメータストアから取得しました (値はログに出力しません)。"
     fi
   elif [ -n "$JBOSS_PASSWORD_VALUE" ]; then
+    JBOSS_PASSWORD_SOURCE_LABEL="コマンドライン引数 --jboss-password"
     log "直接指定された JBoss マスターパスワードを使用します (値はログに出力しません)。"
     password="$JBOSS_PASSWORD_VALUE"
   else
     # --jboss-password-env のみ指定: 事前に export 済みの環境変数の値をそのまま使う
+    JBOSS_PASSWORD_SOURCE_LABEL="事前 export 済みの環境変数 ${JBOSS_PASSWORD_ENV}"
     password="${!JBOSS_PASSWORD_ENV:-}"
     if [ -z "$password" ] && [ "$DRY_RUN" != "true" ]; then
       err "環境変数 ${JBOSS_PASSWORD_ENV} が未設定または空です。"
@@ -931,9 +1050,1250 @@ prepare_jboss_password() {
     fi
     log "既存の環境変数 ${JBOSS_PASSWORD_ENV} の値を JBoss マスターパスワードとして使用します。"
   fi
+  # 伝搬検証の基準となる原本を、export する前の値として記録しておく。
+  # 以降の各段は、この値とのバイト列一致で判定する。
+  if [ "$DRY_RUN" != "true" ]; then
+    JBOSS_PASSWORD_ORIGIN="$password"
+    JBOSS_PASSWORD_ORIGIN_SET="true"
+  fi
   export "${JBOSS_PASSWORD_ENV}=${password}"
   log "JBoss マスターパスワードを環境変数 ${JBOSS_PASSWORD_ENV} 経由で BuildKit シークレットとして注入します。"
   log "  (compose.yml の secrets で environment: ${JBOSS_PASSWORD_ENV} を定義しておくこと)"
+}
+
+# ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
+# compose.yml の環境変数へ設定したマスターパスワードが、
+#   (1) 取得元 → 環境変数
+#   (2) 環境変数 → compose.yml の secrets 定義 (BuildKit シークレットの入口)
+#   (3) BuildKit シークレット → ビルド中コンテナの /run/secrets/<id>
+#   (4) Elytron CredentialStore (原本パスワードで実際に開けるか)
+#   (5) jboss-cli が生成した standalone.xml の credential-reference
+#   (6) WildFly が実行時に解釈する値 (利用される箇所の実効値)
+# のどの段で変質するかを、バイト列の突き合わせで特定する。
+#
+# $ # " ` \ ' & < > などは、シェル (変数展開・コマンド置換・コメント)、
+# XML (実体参照)、WildFly の式 (${...} と $$ エスケープ) のそれぞれで別の意味を持つ。
+# 「途中の段までは合っているのに最後で化ける」ことがあるため、段ごとに独立して
+# 原本と比較し、一致した段は一致した文字列を、一致しない段は原本と実際の双方を
+# 16 進ダンプ付きで表示する。
+
+# コマンド出力を「末尾の改行を落とさずに」変数へ取り込む。
+# $(...) は末尾の改行をすべて削るため、パスワード末尾に改行や CR が混入している
+# 事故 (CRLF ファイル / echo での生成) をそのままでは検出できない。
+# 使い方: jboss_read_exact <格納先変数名> <関数またはコマンド> [引数...]
+jboss_read_exact() {
+  local _target_var="$1"
+  shift
+  local _captured
+  _captured="$("$@"; printf 'x')"
+  printf -v "$_target_var" '%s' "${_captured%x}"
+}
+
+# パスワードを段の間で受け渡すための base64 化 / 復元。
+# 改行・NUL 以外の制御文字・非 ASCII バイトを、シェルや docker exec の引数解釈に
+# 触れさせずに運ぶ。
+jboss_b64_encode() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
+jboss_b64_decode() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+
+# 16 進文字列 (空白等は無視) をバイト列へ戻す。
+# base64 を持たないコンテナからの取り込み用フォールバック。
+jboss_hex_decode() {
+  local hex="$1" format="" index
+  hex="${hex//[^0-9a-fA-F]/}"
+  # 奇数桁は壊れた入力のため、末尾の 1 桁を捨てて解釈可能な範囲だけ戻す。
+  for (( index = 0; index + 1 < ${#hex}; index += 2 )); do
+    format+="\\x${hex:index:2}"
+  done
+  [ -n "$format" ] && printf "$format"
+  return 0
+}
+
+# バイト単位の 16 進ダンプ (空白区切り)。目に見えない差分 (末尾改行・CR・全角空白・
+# 非 ASCII の別コードポイント) を突き合わせるために使う。
+jboss_password_hex() {
+  local value="$1"
+  [ -n "$value" ] || return 0
+  if command -v od >/dev/null 2>&1; then
+    printf '%s' "$value" | od -An -v -tx1 2>/dev/null | tr -s ' \n' ' ' | sed -e 's/^ //' -e 's/ $//'
+  fi
+  return 0
+}
+
+jboss_password_byte_length() {
+  local hex
+  hex="$(jboss_password_hex "$1")"
+  if [ -z "$hex" ]; then
+    printf '%s' "${#1}"
+    return 0
+  fi
+  printf '%s' "$hex" | awk '{ print NF }'
+}
+
+# 表示可能な ASCII (0x20-0x7E) を並べた表。可視化でコードから文字を引くために使う。
+JBOSS_PRINTABLE_ASCII=' !"#$%&'"'"'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~'
+
+# 制御文字・空白・非 ASCII バイトを目に見える表記へ置き換える。
+# 例: 'pa$s ' + CR → pa$s<SP><CR>
+jboss_password_visible() {
+  local value="$1" hex byte code visible=""
+  [ -n "$value" ] || { printf '(空文字)'; return 0; }
+  hex="$(jboss_password_hex "$value")"
+  if [ -z "$hex" ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  for byte in $hex; do
+    code=$((16#$byte))
+    if [ "$code" -eq 9 ]; then
+      visible+='<TAB>'
+    elif [ "$code" -eq 10 ]; then
+      visible+='<LF>'
+    elif [ "$code" -eq 13 ]; then
+      visible+='<CR>'
+    elif [ "$code" -eq 32 ]; then
+      visible+='<SP>'
+    elif [ "$code" -gt 32 ] && [ "$code" -lt 127 ]; then
+      visible+="${JBOSS_PRINTABLE_ASCII:$((code - 32)):1}"
+    else
+      visible+="$(printf '<x%02X>' "$code")"
+    fi
+  done
+  printf '%s' "$visible"
+}
+
+# 画面・レポートへ出すパスワード文字列。--jboss-password-mask 指定時は伏字にするが、
+# 何バイトの値だったかは残して切り分けに使えるようにする。
+jboss_password_display() {
+  local value="$1"
+  if [ "$JBOSS_PASSWORD_SHOW" = "true" ]; then
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+    else
+      printf '(空文字)'
+    fi
+  else
+    printf '(--jboss-password-mask により非表示: %s バイト)' "$(jboss_password_byte_length "$value")"
+  fi
+}
+
+# 原本と実測値が最初に食い違うバイト位置を返す。
+# 「見た目は同じなのに一致しない」場合に、どのバイトが違うのかを 1 行で示す。
+jboss_password_first_diff() {
+  local expected="$1" actual="$2" index max_count
+  local -a expected_bytes=() actual_bytes=()
+  read -r -a expected_bytes <<< "$(jboss_password_hex "$expected")"
+  read -r -a actual_bytes <<< "$(jboss_password_hex "$actual")"
+  max_count=${#expected_bytes[@]}
+  [ ${#actual_bytes[@]} -gt "$max_count" ] && max_count=${#actual_bytes[@]}
+  for (( index = 0; index < max_count; index++ )); do
+    if [ "${expected_bytes[index]:-}" != "${actual_bytes[index]:-}" ]; then
+      printf '%s バイト目から相違 (原本: %s / 実際: %s)' \
+          "$((index + 1))" "${expected_bytes[index]:-(ここで終端)}" "${actual_bytes[index]:-(ここで終端)}"
+      return 0
+    fi
+  done
+  printf '差分なし'
+}
+
+# ---- パスワード文字列に含まれる危険文字の分析 -------------------------------
+# 文字そのものではなく「どの段で・どう壊れるか」を出す。伝搬検証が不一致を
+# 出したときに、原因の当たりを付けられるようにするのが目的。
+JBOSS_RISKY_CHAR_SPECS=()
+jboss_add_risky_char_spec() {
+  JBOSS_RISKY_CHAR_SPECS+=("${1}${JBOSS_STAGE_SEPARATOR}${2}${JBOSS_STAGE_SEPARATOR}${3}")
+}
+
+jboss_init_risky_char_specs() {
+  [ ${#JBOSS_RISKY_CHAR_SPECS[@]} -eq 0 ] || return 0
+  jboss_add_risky_char_spec '$' 'ドル記号' \
+      'シェルは二重引用符の中でも変数展開する ("$PW" 等が空文字や別の値に化ける)。WildFly は standalone.xml の属性値を ${...} 式として解決するため、リテラルの $ は $$ と書く必要がある (jboss-cli の add 時にエスケープしないと起動時に値が変わる)'
+  jboss_add_risky_char_spec '`' 'バッククォート' \
+      'シェルのコマンド置換。二重引用符の中でも実行されるため、値が消えるだけでなく意図しないコマンドが動く'
+  jboss_add_risky_char_spec '"' '二重引用符' \
+      'シェルと jboss-cli の引用を終端させる。XML 属性値の区切りでもあるため standalone.xml では &quot; へのエスケープが必要'
+  jboss_add_risky_char_spec '#' 'シャープ' \
+      '引用しないとシェルのコメント開始となり以降が捨てられる。jboss-cli のスクリプトと properties ファイルでも行コメントになる'
+  jboss_add_risky_char_spec '\' 'バックスラッシュ' \
+      'シェル・jboss-cli・properties ファイルのエスケープ文字。多段で解釈されて 1 個消える / 2 個に増える'
+  jboss_add_risky_char_spec "'" 'シングルクォート' \
+      'シェルの引用を終端させる。XML では &apos; となるため、生成側と読み出し側でエスケープの有無が食い違いやすい'
+  jboss_add_risky_char_spec '&' 'アンパサンド' \
+      'XML の実体参照の開始文字 (&amp; が必要)。引用漏れ時はシェルのバックグラウンド実行として解釈される'
+  jboss_add_risky_char_spec '<' '小なり' \
+      'XML では &lt; が必要。引用漏れ時はシェルの入力リダイレクトになる'
+  jboss_add_risky_char_spec '>' '大なり' \
+      'XML では &gt; が推奨。引用漏れ時はシェルの出力リダイレクトになり、ファイルを上書きする'
+  jboss_add_risky_char_spec '%' 'パーセント' \
+      'printf 系の書式指定として解釈されうる。Windows のバッチ経由で渡すと変数展開される'
+  jboss_add_risky_char_spec '!' 'エクスクラメーション' \
+      '対話 bash の履歴展開 (二重引用符の中でも展開される)。非対話実行では問題にならないため、手元での再現時のみ影響する'
+  jboss_add_risky_char_spec ';' 'セミコロン' \
+      '引用漏れ時にシェルのコマンド区切りになる'
+  jboss_add_risky_char_spec '|' 'パイプ' \
+      '引用漏れ時にシェルのパイプになる'
+  jboss_add_risky_char_spec ',' 'カンマ' \
+      'jboss-cli の操作構文 op(name=value,name2=value2) の引数区切り。引用しないと値が途中で切れる'
+  jboss_add_risky_char_spec '=' 'イコール' \
+      'jboss-cli の name=value と properties ファイルの区切り'
+  jboss_add_risky_char_spec ':' 'コロン' \
+      'jboss-cli のアドレスと操作の区切り (/subsystem=elytron:read-resource)'
+  jboss_add_risky_char_spec '(' '左丸括弧' \
+      'jboss-cli の操作引数の開始。引用漏れ時はシェルのサブシェルになる'
+  jboss_add_risky_char_spec ')' '右丸括弧' \
+      'jboss-cli の操作引数の終端。引用漏れ時はシェルの構文エラーになる'
+}
+
+# パスワードに含まれる危険文字を、実際に含まれるものだけ列挙する。
+# 併せて空白・改行・CR・非 ASCII バイトの有無も判定する。
+jboss_report_risky_characters() {
+  local password="$1" spec risky_char char_name risk_note found_any="false"
+  local hex byte code
+  local has_space="false" has_tab="false" has_lf="false" has_cr="false" has_non_ascii="false" has_control="false"
+
+  jboss_init_risky_char_specs
+  diag "  [パスワード文字列のリスク分析]"
+  diag "    バイト長  : $(jboss_password_byte_length "$password") バイト"
+  diag "    可視化表記: $(jboss_password_visible "$password")"
+
+  for spec in "${JBOSS_RISKY_CHAR_SPECS[@]}"; do
+    IFS="$JBOSS_STAGE_SEPARATOR" read -r risky_char char_name risk_note <<< "$spec"
+    case "$password" in
+      *"$risky_char"*)
+        found_any="true"
+        diag "    - '${risky_char}' (${char_name}): ${risk_note}"
+        ;;
+    esac
+  done
+
+  hex="$(jboss_password_hex "$password")"
+  for byte in $hex; do
+    code=$((16#$byte))
+    if [ "$code" -eq 32 ]; then
+      has_space="true"
+    elif [ "$code" -eq 9 ]; then
+      has_tab="true"
+    elif [ "$code" -eq 10 ]; then
+      has_lf="true"
+    elif [ "$code" -eq 13 ]; then
+      has_cr="true"
+    elif [ "$code" -lt 32 ] || [ "$code" -eq 127 ]; then
+      has_control="true"
+    elif [ "$code" -gt 127 ]; then
+      has_non_ascii="true"
+    fi
+  done
+
+  if [ "$has_space" = "true" ]; then
+    found_any="true"
+    diag "    - 空白 (0x20): 引用漏れで引数が分割される。先頭・末尾の空白はパラメータストアの登録時に混入しやすい"
+  fi
+  if [ "$has_tab" = "true" ]; then
+    found_any="true"
+    diag "    - タブ (0x09): aws ssm get-parameter --output text はタブ区切りで出力するため、値の一部が欠落しうる (--output json での確認を推奨)"
+  fi
+  if [ "$has_lf" = "true" ]; then
+    found_any="true"
+    diag "    - 改行 (0x0A): \$(cat /run/secrets/...) など、コマンド置換で末尾の改行が落ちる。CredentialStore へ登録した値とファイル上の値が 1 バイト違う原因になる"
+  fi
+  if [ "$has_cr" = "true" ]; then
+    found_any="true"
+    diag "    - CR (0x0D): CRLF 改行のファイルから読み込んだ際に混入する。画面では見えないため、一致しない原因として最も気付きにくい"
+  fi
+  if [ "$has_control" = "true" ]; then
+    found_any="true"
+    diag "    - 制御文字: XML の属性値に直接書けない (数値文字参照が必要) ため、standalone.xml 生成時に欠落・置換されうる"
+  fi
+  if [ "$has_non_ascii" = "true" ]; then
+    found_any="true"
+    diag "    - 非 ASCII バイト: ホストとコンテナの文字エンコーディング (UTF-8 / cp932 等) の差で化ける。JVM の -Dfile.encoding とも整合させる必要がある"
+  fi
+
+  if [ "$found_any" != "true" ]; then
+    diag "    - 検出なし (英数字と、シェル・XML・WildFly 式のいずれでも意味を持たない文字のみで構成されています)"
+  fi
+}
+
+# ---- 段ごとの検証結果の記録と表示 -------------------------------------------
+# 1 段 = 「label / 判定 / 補足 / 実測値(base64) / 実測値を取得できたか」。
+# 画面表示と全量レポートで同じ内容を使い回すため、いったん配列へ積む。
+jboss_record_stage() {
+  local label="$1" verdict="$2" note="$3" actual_b64="${4:-}" has_value="${5:-false}"
+  JBOSS_PASSWORD_STAGE_RESULTS+=(
+    "${label}${JBOSS_STAGE_SEPARATOR}${verdict}${JBOSS_STAGE_SEPARATOR}${note}${JBOSS_STAGE_SEPARATOR}${actual_b64}${JBOSS_STAGE_SEPARATOR}${has_value}"
+  )
+  case "$verdict" in
+    不一致*) JBOSS_PASSWORD_MISMATCH="true" ;;
+    未確認*) JBOSS_PASSWORD_UNKNOWN="true" ;;
+  esac
+}
+
+# 実測値を原本と突き合わせて 1 段分を記録する。
+# escaped_source を渡した場合は「ファイル上の表記」と「エスケープを戻した値」が
+# 異なることを意味し、戻した値が一致していれば「一致 (エスケープ済み)」とする。
+jboss_compare_stage() {
+  local label="$1" actual="$2" note="${3:-}" escaped_source="${4:-}"
+  local verdict detail
+  if [ "$actual" = "$JBOSS_PASSWORD_ORIGIN" ]; then
+    if [ -n "$escaped_source" ] && [ "$escaped_source" != "$actual" ]; then
+      verdict="一致 (エスケープ済み)"
+      detail="${note:+${note} / }ファイル上の表記: $(jboss_password_display "$escaped_source")"
+    else
+      verdict="一致"
+      detail="$note"
+    fi
+  else
+    verdict="不一致"
+    detail="$note"
+  fi
+  jboss_record_stage "$label" "$verdict" "$detail" "$(jboss_b64_encode "$actual")" "true"
+}
+
+# 積んだ段の結果を画面へ出す。
+# 一致した段は一致したパスワード文字列を、一致しない段は原本と実際の双方を
+# 可視化表記・16 進ダンプ・最初の相違バイト位置とともに表示する。
+jboss_print_stage_results() {
+  local entry label verdict note actual_b64 has_value actual index=0
+  local origin_display origin_hex
+
+  origin_display="$(jboss_password_display "$JBOSS_PASSWORD_ORIGIN")"
+  origin_hex="$(jboss_password_hex "$JBOSS_PASSWORD_ORIGIN")"
+
+  for entry in "${JBOSS_PASSWORD_STAGE_RESULTS[@]}"; do
+    index=$((index + 1))
+    IFS="$JBOSS_STAGE_SEPARATOR" read -r label verdict note actual_b64 has_value <<< "$entry"
+    diag ""
+    diag "  [${verdict}] (${index}) ${label}"
+    [ -n "$note" ] && diag "      補足    : ${note}"
+    if [ "$has_value" != "true" ]; then
+      continue
+    fi
+    jboss_read_exact actual jboss_b64_decode "$actual_b64"
+    case "$verdict" in
+      一致*)
+        # 「一致していること」だけでなく、一致したパスワード文字列も必ず示す。
+        diag "      一致した文字列: ${origin_display}"
+        diag "      可視化表記    : $(jboss_password_visible "$actual")"
+        diag "      16 進ダンプ   : ${origin_hex}"
+        diag "      バイト長      : $(jboss_password_byte_length "$actual") バイト"
+        ;;
+      '不一致 (式が未解決)')
+        # ファイル上の値が式のため、実効値は起動時にしか決まらない。
+        # バイト列を突き合わせても意味が無いので、相違位置は出さない。
+        diag "      原本 (取得元) : ${origin_display}"
+        diag "        可視化表記  : $(jboss_password_visible "$JBOSS_PASSWORD_ORIGIN")"
+        diag "        16 進ダンプ : ${origin_hex}"
+        diag "      standalone.xml に設定されている文字列: $(jboss_password_display "$actual")"
+        diag "        可視化表記  : $(jboss_password_visible "$actual")"
+        diag "        16 進ダンプ : $(jboss_password_hex "$actual")"
+        diag "      実行時の値    : \${...} の解決結果となるため、この文字列のままでは使われません"
+        diag "      対処          : jboss-cli への登録時に \$ を \$\$ へエスケープしてください"
+        diag "                      (例: pa\$word → clear-text=\"pa\$\$word\")"
+        ;;
+      不一致*)
+        diag "      原本 (取得元) : ${origin_display}"
+        diag "        可視化表記  : $(jboss_password_visible "$JBOSS_PASSWORD_ORIGIN")"
+        diag "        16 進ダンプ : ${origin_hex}"
+        diag "        バイト長    : $(jboss_password_byte_length "$JBOSS_PASSWORD_ORIGIN") バイト"
+        diag "      実際に設定されている文字列: $(jboss_password_display "$actual")"
+        diag "        可視化表記  : $(jboss_password_visible "$actual")"
+        diag "        16 進ダンプ : $(jboss_password_hex "$actual")"
+        diag "        バイト長    : $(jboss_password_byte_length "$actual") バイト"
+        diag "      相違位置      : $(jboss_password_first_diff "$JBOSS_PASSWORD_ORIGIN" "$actual")"
+        ;;
+      *)
+        diag "      取得した文字列: $(jboss_password_display "$actual")"
+        diag "      可視化表記    : $(jboss_password_visible "$actual")"
+        ;;
+    esac
+  done
+}
+
+# 検証結果の総括。1 段でも不一致があれば警告として目立たせる。
+# 終了コードは変えない (ビルド成否の判定は従来どおり)。
+jboss_print_stage_summary() {
+  diag ""
+  diag "───────────────────────────────────────────────────────────────────"
+  if [ "$JBOSS_PASSWORD_MISMATCH" = "true" ]; then
+    diag "  総合判定: 不一致あり — 上記の [不一致] の段で、原本と異なる文字列が設定されています。"
+    diag "            表示された「実際に設定されている文字列」と 16 進ダンプを、"
+    diag "            リスク分析に挙がった文字のエスケープ規則と突き合わせてください。"
+  elif [ "$JBOSS_PASSWORD_UNKNOWN" = "true" ]; then
+    diag "  総合判定: 確認できた段はすべて一致 (未確認の段あり)"
+    diag "            [未確認] の段は、対象ファイル・コマンドが見つからないか、コンテナ未起動のため比較していません。"
+  else
+    diag "  総合判定: 全段一致 — 取得元から実行時に利用される値まで、同一のパスワード文字列です。"
+    diag "            一致したパスワード文字列: $(jboss_password_display "$JBOSS_PASSWORD_ORIGIN")"
+  fi
+  diag "───────────────────────────────────────────────────────────────────"
+  diag ""
+}
+
+# ---- (1)(2) ホスト側で完結する段の検証 --------------------------------------
+# compose.yml を読み、environment 型シークレットの定義と、それをビルドで参照する
+# サービスの有無を確認する。YAML のパスと値を awk で取り出し、
+#   kv <パス> <値>      : key: value 形式
+#   list <パス> <値>    : - value 形式のリスト要素
+# として列挙する。
+jboss_compose_yaml_entries() {
+  local compose_file="$1"
+  [ -f "$compose_file" ] || return 1
+  awk -v SEP="$JBOSS_STAGE_SEPARATOR" '
+    function path_string(   i, s) {
+      s = ""
+      for (i = 1; i <= depth; i++) s = s (i > 1 ? "." : "") stack[i]
+      return s
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+      match(line, /^[ ]*/)
+      indent = RLENGTH
+      content = substr(line, indent + 1)
+      # インデントが浅くなった分だけ階層を畳む
+      while (depth > 0 && indent <= indents[depth]) depth--
+      if (content ~ /^- /) {
+        item = substr(content, 3)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
+        gsub(/^["'"'"']|["'"'"']$/, "", item)
+        sub(/[[:space:]]*#.*$/, "", item)
+        printf "list%s%s%s%s\n", SEP, path_string(), SEP, item
+        next
+      }
+      if (content ~ /^[^:]+:/) {
+        key = content
+        sub(/:.*$/, "", key)
+        gsub(/^["'"'"']|["'"'"']$/, "", key)
+        value = content
+        sub(/^[^:]*:[[:space:]]*/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        gsub(/^["'"'"']|["'"'"']$/, "", value)
+        depth++
+        stack[depth] = key
+        indents[depth] = indent
+        if (value != "") printf "kv%s%s%s%s\n", SEP, path_string(), SEP, value
+      }
+    }
+  ' "$compose_file"
+}
+
+verify_jboss_password_compose_definition() {
+  local kind entry_path value secret_name
+  local matched_secret="" mismatched_env="" file_secret="" build_services="" note=""
+  local stage_label="compose.yml の secrets 定義 (BuildKit シークレットの入口)"
+  local -a defined_env_secrets=()
+  local -A build_refs_by_secret=()
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    jboss_record_stage "$stage_label" "未確認" "compose.yml が見つかりません: ${COMPOSE_FILE}"
+    return 0
+  fi
+
+  while IFS="$JBOSS_STAGE_SEPARATOR" read -r kind entry_path value; do
+    [ -n "$kind" ] || continue
+    case "$kind:$entry_path" in
+      kv:secrets.*.environment)
+        secret_name="${entry_path#secrets.}"
+        secret_name="${secret_name%.environment}"
+        defined_env_secrets+=("${secret_name} → ${value}")
+        if [ "$value" = "$JBOSS_PASSWORD_ENV" ]; then
+          matched_secret="$secret_name"
+        elif [ "$secret_name" = "$JBOSS_SECRET_ID" ]; then
+          mismatched_env="$value"
+        fi
+        ;;
+      kv:secrets.*.file)
+        secret_name="${entry_path#secrets.}"
+        secret_name="${secret_name%.file}"
+        [ "$secret_name" = "$JBOSS_SECRET_ID" ] && file_secret="$value"
+        ;;
+      list:services.*.build.secrets)
+        # シークレット名ごとに、それをビルドで参照するサービス名を集める
+        secret_name="${entry_path#services.}"
+        secret_name="${secret_name%.build.secrets}"
+        build_refs_by_secret["$value"]="${build_refs_by_secret[$value]:-}${secret_name} "
+        ;;
+    esac
+  done < <(jboss_compose_yaml_entries "$COMPOSE_FILE")
+
+  if [ -n "$mismatched_env" ]; then
+    jboss_record_stage "$stage_label" "不一致" \
+        "secrets.${JBOSS_SECRET_ID}.environment は '${mismatched_env}' を参照していますが、パスワードを export しているのは '${JBOSS_PASSWORD_ENV}' です。ビルドには空の値が渡ります (--jboss-password-env と compose.yml を一致させてください)" \
+        "$(jboss_b64_encode "")" "true"
+    return 0
+  fi
+
+  if [ -n "$file_secret" ]; then
+    jboss_record_stage "$stage_label" "未確認" \
+        "secrets.${JBOSS_SECRET_ID} は file 型 (${file_secret}) で定義されています。ファイル経由のため環境変数の値は使われません。末尾改行の混入と \$ の展開に注意してください"
+    return 0
+  fi
+
+  if [ -z "$matched_secret" ]; then
+    jboss_record_stage "$stage_label" "不一致" \
+        "環境変数 ${JBOSS_PASSWORD_ENV} を参照する environment 型シークレットが ${COMPOSE_FILE} にありません。secrets.<名前>.environment: ${JBOSS_PASSWORD_ENV} を定義してください。現在の定義: ${defined_env_secrets[*]:-(なし)}" \
+        "$(jboss_b64_encode "")" "true"
+    return 0
+  fi
+
+  build_services="${build_refs_by_secret[$matched_secret]:-}"
+  if [ -z "$build_services" ]; then
+    jboss_record_stage "$stage_label" "不一致" \
+        "secrets.${matched_secret} は定義されていますが、どのサービスの build.secrets からも参照されていません。ビルド中に /run/secrets/${matched_secret} はマウントされません" \
+        "$(jboss_b64_encode "")" "true"
+    return 0
+  fi
+
+  note="secrets.${matched_secret}.environment: ${JBOSS_PASSWORD_ENV} / build.secrets で参照するサービス: ${build_services% }"
+  # シークレット名と --jboss-secret-id がずれていると、後続のプローブビルドが
+  # 実際の Dockerfile と違うマウント先を見てしまう。判定は環境変数の突き合わせの
+  # ままとし、ずれていることは補足として必ず伝える。
+  if [ "$matched_secret" != "$JBOSS_SECRET_ID" ]; then
+    note="${note} / 注意: シークレット名 '${matched_secret}' が --jboss-secret-id '${JBOSS_SECRET_ID}' と異なります。Dockerfile は /run/secrets/${matched_secret} を参照するため、--jboss-secret-id ${matched_secret} を指定して検証してください"
+  fi
+
+  jboss_compare_stage "$stage_label" "${!JBOSS_PASSWORD_ENV:-}" "$note"
+}
+
+# aws ssm get-parameter --output text は、値をタブ区切りのテキストとして出力するため
+# 末尾の空白・改行が落ち、タブが区切りと解釈されることがある。原本が壊れていないかを
+# --output json の生の値と突き合わせて確認する。
+verify_jboss_password_parameter_store_encoding() {
+  local json_value decoder=""
+  [ -n "$JBOSS_PASSWORD_PARAM" ] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    decoder="python3"
+  elif command -v jq >/dev/null 2>&1; then
+    decoder="jq"
+  else
+    jboss_record_stage "パラメータストアの生値との突き合わせ (--output text の欠落確認)" \
+        "未確認" "python3 も jq も見つからないため、--output json の値と比較できません"
+    return 0
+  fi
+
+  if [ "$decoder" = "python3" ]; then
+    jboss_read_exact json_value jboss_ssm_value_via_python
+  else
+    jboss_read_exact json_value jboss_ssm_value_via_jq
+  fi
+  if [ -z "$json_value" ]; then
+    jboss_record_stage "パラメータストアの生値との突き合わせ (--output text の欠落確認)" \
+        "未確認" "aws ssm get-parameter --output json の取得に失敗しました"
+    return 0
+  fi
+
+  jboss_compare_stage "パラメータストアの生値との突き合わせ (--output text の欠落確認)" \
+      "$json_value" \
+      "--output json で取得した生の値と、実際に使用している --output text の値を比較"
+}
+
+jboss_ssm_value_via_python() {
+  aws ssm get-parameter --name "$JBOSS_PASSWORD_PARAM" --with-decryption \
+      --region "$REGION" --output json 2>/dev/null \
+    | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["Parameter"]["Value"])' 2>/dev/null
+}
+
+jboss_ssm_value_via_jq() {
+  aws ssm get-parameter --name "$JBOSS_PASSWORD_PARAM" --with-decryption \
+      --region "$REGION" --output json 2>/dev/null \
+    | jq -j '.Parameter.Value' 2>/dev/null
+}
+
+# ビルド前に実行する段。取得元 → 環境変数 → compose.yml までを確認する。
+verify_jboss_password_host_stages() {
+  [ "$VERIFY_JBOSS_PASSWORD" = "true" ] || return 0
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] JBoss マスターパスワードの伝搬検証をスキップします (実際の値を取得しないため比較できません)。"
+    return 0
+  fi
+  if [ "$JBOSS_PASSWORD_ORIGIN_SET" != "true" ]; then
+    warn "JBoss マスターパスワードの伝搬検証: 原本を取得できなかったため検証をスキップします。"
+    return 0
+  fi
+
+  log "JBoss マスターパスワードの伝搬検証を開始します (取得元: ${JBOSS_PASSWORD_SOURCE_LABEL:-不明})。"
+
+  diag ""
+  diag "==================================================================="
+  diag "JBoss マスターパスワードの伝搬検証"
+  diag "  取得元        : ${JBOSS_PASSWORD_SOURCE_LABEL:-不明}"
+  diag "  環境変数      : ${JBOSS_PASSWORD_ENV}"
+  diag "  シークレット id: ${JBOSS_SECRET_ID} (ビルド中のマウント先: /run/secrets/${JBOSS_SECRET_ID})"
+  diag "==================================================================="
+  jboss_report_risky_characters "$JBOSS_PASSWORD_ORIGIN"
+
+  # (1) 取得元 → export した環境変数
+  jboss_compare_stage "取得元 → 環境変数 ${JBOSS_PASSWORD_ENV} (compose.yml へ渡る値)" \
+      "${!JBOSS_PASSWORD_ENV:-}" \
+      "取得元: ${JBOSS_PASSWORD_SOURCE_LABEL:-不明}"
+
+  # (1-補足) パラメータストア利用時のみ、--output text による欠落を確認する
+  verify_jboss_password_parameter_store_encoding
+
+  # (2) compose.yml の secrets 定義
+  verify_jboss_password_compose_definition
+}
+
+# ---- (3) BuildKit シークレットがビルド中コンテナへ届いた値の検証 ------------
+# ビルド済みのローカルイメージをベースに、シークレットを読み出して base64 で
+# 書き出すだけのプローブをビルドする。BuildKit はシークレットの内容をキャッシュ
+# キーに含めないため、必ず --no-cache を付けて前回の結果を拾わないようにする。
+# 出力は --output type=local で取り出し、イメージにもレイヤにも値を残さない。
+jboss_write_probe_dockerfile() {
+  local dockerfile="$1" base_image="$2" secret_id="$3"
+  cat > "$dockerfile" <<EOF
+# JBoss マスターパスワードの伝搬検証用プローブ (build_and_verify.sh が自動生成)。
+# /run/secrets/${secret_id} の内容をそのまま符号化して取り出すだけで、
+# 値をイメージへ焼き込むことはしない (最終ステージは scratch)。
+FROM ${base_image} AS probe
+# BuildKit はシークレットを uid=0 / mode=0400 でマウントする。JBoss EAP のイメージ
+# のように既定の USER が非 root だと読み取れず、値が届いていても「マウントされて
+# いない」と誤判定するため、プローブの実行ユーザーだけ root に戻す。
+# 読み取るのはファイルの内容だけなので、実行ユーザーの違いは結果に影響しない。
+USER root
+RUN --mount=type=secret,id=${secret_id} \\
+    mkdir -p /jboss-secret-probe && \\
+    if [ -r /run/secrets/${secret_id} ]; then \\
+      if command -v base64 >/dev/null 2>&1; then \\
+        printf 'base64' > /jboss-secret-probe/encoding && \\
+        base64 < /run/secrets/${secret_id} | tr -d '\\n' > /jboss-secret-probe/value; \\
+      elif command -v od >/dev/null 2>&1; then \\
+        printf 'hex' > /jboss-secret-probe/encoding && \\
+        od -An -v -tx1 < /run/secrets/${secret_id} | tr -d ' \\n' > /jboss-secret-probe/value; \\
+      else \\
+        printf 'unsupported' > /jboss-secret-probe/encoding && \\
+        : > /jboss-secret-probe/value; \\
+      fi; \\
+    else \\
+      printf 'missing' > /jboss-secret-probe/encoding && \\
+      : > /jboss-secret-probe/value; \\
+    fi
+FROM scratch
+COPY --from=probe /jboss-secret-probe/ /
+EOF
+}
+
+verify_jboss_password_build_secret() {
+  local probe_dir context_dir dockerfile output_dir build_log encoding encoded actual
+  local stage_label="BuildKit シークレット → ビルド中コンテナの /run/secrets/${JBOSS_SECRET_ID}"
+
+  [ "$VERIFY_JBOSS_PASSWORD" = "true" ] || return 0
+  [ "$JBOSS_PASSWORD_ORIGIN_SET" = "true" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] BuildKit シークレットの到達値を確認するプローブビルドをスキップします。"
+    return 0
+  fi
+
+  if ! probe_dir="$(mktemp -d 2>/dev/null)"; then
+    jboss_record_stage "$stage_label" "未確認" "プローブビルド用の一時ディレクトリを作成できませんでした"
+    return 0
+  fi
+  # 取り出し先はビルドコンテキストの外に置き、コンテキストへ余計なファイルを
+  # 含めない (プローブは Dockerfile 以外のファイルを一切必要としない)。
+  context_dir="${probe_dir}/ctx"
+  output_dir="${probe_dir}/out"
+  dockerfile="${context_dir}/Dockerfile"
+  build_log="${probe_dir}/build.log"
+  mkdir -p "$context_dir" "$output_dir"
+  jboss_write_probe_dockerfile "$dockerfile" "$LOCAL_IMAGE" "$JBOSS_SECRET_ID"
+
+  log "BuildKit シークレットの到達値を確認します (プローブビルド: ${LOCAL_IMAGE} ベース, --no-cache) ..."
+  if ! DOCKER_BUILDKIT=1 docker build --no-cache \
+        --secret "id=${JBOSS_SECRET_ID},env=${JBOSS_PASSWORD_ENV}" \
+        --file "$dockerfile" \
+        --output "type=local,dest=${output_dir}" \
+        "$context_dir" >"$build_log" 2>&1; then
+    jboss_record_stage "$stage_label" "未確認" \
+        "プローブビルドに失敗しました (docker build --secret / --output type=local が使えない環境の可能性があります)。詳細: $(tail -n 3 "$build_log" 2>/dev/null | tr '\n' ' ')"
+    rm -rf -- "$probe_dir"
+    return 0
+  fi
+
+  if [ ! -f "${output_dir}/encoding" ]; then
+    jboss_record_stage "$stage_label" "未確認" "プローブビルドの出力を取り出せませんでした"
+    rm -rf -- "$probe_dir"
+    return 0
+  fi
+  encoding="$(cat "${output_dir}/encoding" 2>/dev/null)"
+  encoded="$(cat "${output_dir}/value" 2>/dev/null)"
+
+  case "$encoding" in
+    base64)
+      jboss_read_exact actual jboss_b64_decode "$encoded"
+      ;;
+    hex)
+      jboss_read_exact actual jboss_hex_decode "$encoded"
+      ;;
+    missing)
+      jboss_record_stage "$stage_label" "不一致" \
+          "ビルド中に /run/secrets/${JBOSS_SECRET_ID} が存在しませんでした。compose.yml の build.secrets 参照と、Dockerfile の RUN --mount=type=secret,id=${JBOSS_SECRET_ID} を確認してください" \
+          "$(jboss_b64_encode "")" "true"
+      rm -rf -- "$probe_dir"
+      return 0
+      ;;
+    *)
+      jboss_record_stage "$stage_label" "未確認" \
+          "ベースイメージに base64 も od も無いため、シークレットの内容を取り出せませんでした"
+      rm -rf -- "$probe_dir"
+      return 0
+      ;;
+  esac
+
+  jboss_compare_stage "$stage_label" "$actual" \
+      "プローブビルド (--no-cache) でマウント内容をそのまま取得。Dockerfile 側で \$(cat /run/secrets/...) を使うと、ここで一致していても末尾の改行が落ちる点に注意"
+  rm -rf -- "$probe_dir"
+}
+
+# ---- (4)(5)(6) コンテナ内の Elytron / standalone.xml の検証 -----------------
+# コンテナ内でシェルを開き、標準出力をそのまま (末尾の改行も落とさずに) 取り込む。
+jboss_container_exec() {
+  local cid="$1" script="$2"
+  shift 2
+  docker exec "$cid" /bin/sh -c "$script" _ "$@" 2>/dev/null
+}
+
+# コンテナ内のファイルを base64 で取り出す (XML の改行・エンコーディングを保つ)。
+jboss_container_read_file() {
+  local cid="$1" path="$2"
+  jboss_container_exec "$cid" '[ -f "$1" ] && base64 < "$1" | tr -d "\n"' "$path"
+}
+
+# JBoss のインストール先を特定する。JBOSS_HOME / JBOSS_EAP_HOME を優先し、
+# 無ければ既定の候補から bin と standalone を持つディレクトリを探す。
+jboss_detect_home() {
+  local cid="$1"
+  jboss_container_exec "$cid" '
+    for candidate in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+      [ -n "$candidate" ] || continue
+      if [ -d "$candidate/bin" ] && [ -d "$candidate/standalone" ]; then
+        printf "%s" "$candidate"
+        exit 0
+      fi
+    done
+    exit 1
+  ' "${JBOSS_HOME_CANDIDATES[@]}"
+}
+
+# 起動中のサーバーが実際に読み込んだ設定ファイル名を、Java プロセスの
+# コマンドライン (-c NAME / --server-config=NAME) から特定する。
+# 既定以外の設定 (standalone-full.xml 等) で起動している場合に、
+# 誤ったファイルを比較して「不一致」と誤判定しないために必要。
+jboss_detect_running_config_name() {
+  local cid="$1" cmdline previous="" argument
+  cmdline="$(jboss_container_exec "$cid" '
+    for proc_dir in /proc/[0-9]*; do
+      [ -r "$proc_dir/cmdline" ] || continue
+      line=$(tr "\0" "\n" < "$proc_dir/cmdline" | tr "\n" " ")
+      case "$line" in
+        *jboss-modules.jar*) printf "%s" "$line"; exit 0 ;;
+      esac
+    done
+    exit 1
+  ')"
+  [ -n "$cmdline" ] || return 1
+  for argument in $cmdline; do
+    case "$argument" in
+      --server-config=*)
+        printf '%s' "${argument#--server-config=}"
+        return 0
+        ;;
+      -c)
+        previous="config"
+        continue
+        ;;
+    esac
+    if [ "$previous" = "config" ]; then
+      printf '%s' "$argument"
+      return 0
+    fi
+    previous=""
+  done
+  return 1
+}
+
+# 比較対象の standalone.xml を決める。--jboss-config-file が最優先。
+jboss_detect_config_file() {
+  local cid="$1" home="$2" running_name=""
+  if [ -n "$JBOSS_CONFIG_FILE" ]; then
+    printf '%s' "$JBOSS_CONFIG_FILE"
+    return 0
+  fi
+  [ -n "$home" ] || return 1
+  running_name="$(jboss_detect_running_config_name "$cid")"
+  jboss_container_exec "$cid" '
+    home="$1"
+    running="$2"
+    if [ -n "$running" ] && [ -f "$home/standalone/configuration/$running" ]; then
+      printf "%s" "$home/standalone/configuration/$running"
+      exit 0
+    fi
+    for name in standalone.xml standalone-full.xml standalone-ha.xml standalone-full-ha.xml; do
+      if [ -f "$home/standalone/configuration/$name" ]; then
+        printf "%s" "$home/standalone/configuration/$name"
+        exit 0
+      fi
+    done
+    exit 1
+  ' "$home" "$running_name"
+}
+
+# standalone.xml から、要素のパスと属性を取り出す。
+# 出力 1 行 = attr<SEP><要素の通し番号><SEP><要素パス><SEP><属性名><SEP><属性値>
+# 属性値は XML エスケープされたままの「ファイル上の表記」を返す。
+# コメント内の < > に引きずられないよう、先に <!-- --> を取り除く。
+jboss_xml_attributes() {
+  local xml_file="$1"
+  awk '
+    BEGIN { RS = "-->"; ORS = "" }
+    {
+      text = $0
+      start = 1
+      last = 0
+      while ((found = index(substr(text, start), "<!--")) > 0) {
+        last = start + found - 1
+        start = last + 4
+      }
+      if (last > 0) text = substr(text, 1, last - 1)
+      print text
+    }
+  ' "$xml_file" \
+  | awk -v SEP="$JBOSS_STAGE_SEPARATOR" '
+    function attr_value(tag, key,   pattern, rest, quote, position) {
+      pattern = "(^|[ \t\r\n])" key "[ \t]*="
+      if (!match(tag, pattern)) return ABSENT
+      rest = substr(tag, RSTART + RLENGTH)
+      sub(/^[ \t]*/, "", rest)
+      quote = substr(rest, 1, 1)
+      if (quote != "\"" && quote != "'"'"'") return ABSENT
+      rest = substr(rest, 2)
+      position = index(rest, quote)
+      if (position == 0) return ABSENT
+      return substr(rest, 1, position - 1)
+    }
+    function path_string(   i, s) {
+      s = ""
+      for (i = 1; i <= depth; i++) s = s (i > 1 ? "." : "") stack[i]
+      return s
+    }
+    BEGIN {
+      RS = "<"
+      ABSENT = "\002"
+      depth = 0
+      element_index = 0
+      key_count = split("name clear-text store alias path relative-to type pool-name jndi-name", keys, " ")
+    }
+    {
+      record = $0
+      if (record == "") next
+      close_position = index(record, ">")
+      if (close_position == 0) next
+      tag = substr(record, 1, close_position - 1)
+      if (tag == "") next
+      first = substr(tag, 1, 1)
+      if (first == "/") { if (depth > 0) depth--; next }
+      if (first == "?" || first == "!") next
+      element_name = tag
+      sub(/[ \t\r\n\/].*$/, "", element_name)
+      if (element_name == "") next
+      self_closing = (substr(tag, length(tag), 1) == "/")
+      depth++
+      stack[depth] = element_name
+      element_index++
+      for (i = 1; i <= key_count; i++) {
+        value = attr_value(tag, keys[i])
+        if (value != ABSENT) {
+          printf "attr%s%s%s%s%s%s%s%s\n", SEP, element_index, SEP, path_string(), SEP, keys[i], SEP, value
+        }
+      }
+      if (self_closing) depth--
+    }
+  '
+}
+
+# XML の実体参照を戻す。standalone.xml の属性値は & < > " '"'"' が必ずエスケープ
+# されるため、ファイル上の表記のまま比較すると必ず不一致になる。
+# 出力は変数へ直接入れる (コマンド置換だと末尾の改行が落ちるため)。
+jboss_xml_unescape() {
+  local _target_var="$1" value="$2"
+  local result="" rest="$value" head entity code decoded
+  while [ -n "$rest" ]; do
+    head="${rest:0:1}"
+    if [ "$head" != '&' ]; then
+      result+="$head"
+      rest="${rest:1}"
+      continue
+    fi
+    entity="${rest%%;*}"
+    if [ "$entity" = "$rest" ]; then
+      # 対応する ; が無いため実体参照ではない
+      result+="$head"
+      rest="${rest:1}"
+      continue
+    fi
+    rest="${rest#*;}"
+    entity="${entity:1}"
+    case "$entity" in
+      amp)  result+='&' ;;
+      lt)   result+='<' ;;
+      gt)   result+='>' ;;
+      quot) result+='"' ;;
+      apos) result+="'" ;;
+      '#x'*|'#X'*)
+        code="${entity:2}"
+        if printf '%s' "$code" | grep -qE '^[0-9a-fA-F]+$'; then
+          printf -v decoded '%b' "\\u$(printf '%04X' "$((16#$code))")"
+          result+="$decoded"
+        else
+          result+="&${entity};"
+        fi
+        ;;
+      '#'*)
+        code="${entity:1}"
+        if printf '%s' "$code" | grep -qE '^[0-9]+$'; then
+          printf -v decoded '%b' "\\u$(printf '%04X' "$code")"
+          result+="$decoded"
+        else
+          result+="&${entity};"
+        fi
+        ;;
+      *)
+        # 未知の実体参照はそのまま残す
+        result+="&${entity};"
+        ;;
+    esac
+  done
+  printf -v "$_target_var" '%s' "$result"
+}
+
+# WildFly が属性値を解釈した結果 (実行時に利用される値) を求める。
+#   $$    → リテラルの $
+#   ${..} → 起動時にシステムプロパティ / 環境変数として解決される式
+# パスワードに $ を含む場合、jboss-cli 側で $$ へエスケープしていないと
+# WildFly が式として解決しようとするため、ここで検出する。
+JBOSS_WILDFLY_EXPRESSION_FOUND="false"
+jboss_wildfly_literal() {
+  local _target_var="$1" value="$2"
+  local result="" index=0 length=${#2} current next
+  JBOSS_WILDFLY_EXPRESSION_FOUND="false"
+  while [ "$index" -lt "$length" ]; do
+    current="${value:index:1}"
+    if [ "$current" = '$' ]; then
+      next="${value:index+1:1}"
+      if [ "$next" = '$' ]; then
+        result+='$'
+        index=$((index + 2))
+        continue
+      fi
+      if [ "$next" = '{' ]; then
+        JBOSS_WILDFLY_EXPRESSION_FOUND="true"
+      fi
+    fi
+    result+="$current"
+    index=$((index + 1))
+  done
+  printf -v "$_target_var" '%s' "$result"
+}
+
+# credential-store の path / relative-to から、コンテナ内の実ファイルパスを組み立てる。
+jboss_resolve_credential_store_path() {
+  local home="$1" store_path="$2" relative_to="$3" base=""
+  [ -n "$store_path" ] || return 1
+  case "$store_path" in
+    /*) printf '%s' "$store_path"; return 0 ;;
+  esac
+  case "$relative_to" in
+    jboss.server.config.dir) base="${home}/standalone/configuration" ;;
+    jboss.server.data.dir)   base="${home}/standalone/data" ;;
+    jboss.server.base.dir)   base="${home}/standalone" ;;
+    jboss.home.dir)          base="$home" ;;
+    '')                      base="${home}/standalone/configuration" ;;
+    *)                       return 1 ;;
+  esac
+  printf '%s/%s' "$base" "$store_path"
+}
+
+# CredentialStore を原本パスワードで実際に開けるかを確認する。
+# パスワードはコマンドラインではなく標準入力から base64 で渡し、
+# ホスト側の ps とコンテナの環境変数の双方に平文を残さない。
+jboss_open_credential_store() {
+  local cid="$1" tool="$2" store_path="$3" password_b64="$4"
+  printf '%s' "$password_b64" | docker exec -i "$cid" /bin/sh -c '
+    tool="$1"
+    store="$2"
+    encoded=$(cat)
+    # base64 -d の出力を末尾の改行ごと保つ (パスワード末尾の改行を落とさない)
+    password=$(printf "%s" "$encoded" | base64 -d; printf x)
+    password=${password%x}
+    "$tool" credential-store --location "$store" --password "$password" --aliases 2>&1
+  ' _ "$tool" "$store_path" 2>/dev/null
+}
+
+# standalone.xml を解析し、credential-store のパスワード定義と、その値を利用する
+# リソースを取り出して段ごとに記録する。
+jboss_verify_config_file_stages() {
+  local cid="$1" home="$2" config_file="$3" xml_b64="$4"
+  local xml_file entry kind index element_path attr_name attr_value
+  local store_index="" store_name="" store_path="" store_relative_to=""
+  local reference_raw="" reference_found="false"
+  local unescaped="" literal="" resource_name parent_path parent_index usage_text
+  local -A element_path_by_index=()
+  local -A attribute_by_key=()
+  local -A last_index_by_path=()
+  local -a element_indexes=()
+  local -a usage_lines=()
+
+  if ! xml_file="$(mktemp 2>/dev/null)"; then
+    jboss_record_stage "standalone.xml の解析" "未確認" "一時ファイルを作成できませんでした"
+    return 0
+  fi
+  if ! jboss_b64_decode "$xml_b64" > "$xml_file"; then
+    rm -f -- "$xml_file"
+    jboss_record_stage "standalone.xml の解析" "未確認" "設定ファイルを取り出せませんでした: ${config_file}"
+    return 0
+  fi
+
+  while IFS="$JBOSS_STAGE_SEPARATOR" read -r kind index element_path attr_name attr_value; do
+    [ "$kind" = "attr" ] || continue
+    if [ -z "${element_path_by_index[$index]+_}" ]; then
+      element_path_by_index["$index"]="$element_path"
+      element_indexes+=("$index")
+    fi
+    attribute_by_key["${index}|${attr_name}"]="$attr_value"
+  done < <(jboss_xml_attributes "$xml_file")
+  rm -f -- "$xml_file"
+
+  if [ ${#element_indexes[@]} -eq 0 ]; then
+    jboss_record_stage "standalone.xml の解析" "未確認" \
+        "設定ファイルから要素を読み取れませんでした: ${config_file}"
+    return 0
+  fi
+
+  # 文書順に走査し、credential-store とその直下の credential-reference を特定する。
+  # 併せて、各要素パスで最後に現れた要素を覚えておき、利用箇所を表示する際に
+  # 親要素 (datasource など) の名前を引けるようにする。同じパスの要素が複数ある
+  # 場合、文書順で直前のものが常にその時点の祖先になる。
+  for index in "${element_indexes[@]}"; do
+    element_path="${element_path_by_index[$index]}"
+    last_index_by_path["$element_path"]="$index"
+    case "$element_path" in
+      *.credential-store|credential-store)
+        store_index="$index"
+        store_name="${attribute_by_key["${index}|name"]:-(名前なし)}"
+        store_path="${attribute_by_key["${index}|path"]:-}"
+        store_relative_to="${attribute_by_key["${index}|relative-to"]:-}"
+        ;;
+      *.credential-store.credential-reference)
+        if [ -n "$store_index" ] && [ "$reference_found" != "true" ]; then
+          if [ -n "${attribute_by_key["${index}|clear-text"]+_}" ]; then
+            reference_raw="${attribute_by_key["${index}|clear-text"]}"
+            reference_found="true"
+          fi
+        fi
+        ;;
+      *.credential-reference)
+        # 直近の親要素 (security / datasource 等) から、リソースを識別できる
+        # 属性を name → pool-name → jndi-name の順に探す。
+        parent_path="${element_path%.*}"
+        resource_name="(名前なし)"
+        while [ -n "$parent_path" ]; do
+          parent_index="${last_index_by_path[$parent_path]:-}"
+          if [ -n "$parent_index" ]; then
+            if [ -n "${attribute_by_key["${parent_index}|name"]:-}" ]; then
+              resource_name="${attribute_by_key["${parent_index}|name"]}"
+              break
+            elif [ -n "${attribute_by_key["${parent_index}|pool-name"]:-}" ]; then
+              resource_name="${attribute_by_key["${parent_index}|pool-name"]}"
+              break
+            elif [ -n "${attribute_by_key["${parent_index}|jndi-name"]:-}" ]; then
+              resource_name="${attribute_by_key["${parent_index}|jndi-name"]}"
+              break
+            fi
+          fi
+          [ "$parent_path" = "${parent_path%.*}" ] && break
+          parent_path="${parent_path%.*}"
+        done
+        if [ -n "${attribute_by_key["${index}|store"]+_}" ]; then
+          usage_lines+=("${element_path} (リソース: ${resource_name}) → store=${attribute_by_key["${index}|store"]}, alias=${attribute_by_key["${index}|alias"]:-(未指定)}")
+        elif [ -n "${attribute_by_key["${index}|clear-text"]+_}" ]; then
+          usage_lines+=("${element_path} (リソース: ${resource_name}) → clear-text を直接記述 (CredentialStore を経由していません)")
+        fi
+        ;;
+    esac
+  done
+
+  if [ -z "$store_index" ]; then
+    jboss_record_stage "standalone.xml の credential-store 定義 (${config_file})" \
+        "未確認" "Elytron の credential-store 定義が見つかりませんでした。jboss-cli による生成がまだ行われていない可能性があります"
+    return 0
+  fi
+
+  if [ "$reference_found" != "true" ]; then
+    jboss_record_stage "standalone.xml の credential-store 定義 (${config_file})" \
+        "未確認" "credential-store '${store_name}' に clear-text 属性がありません (マスターパスワードを別の方式で渡している構成です)"
+  else
+    # (4) ファイル上の表記そのもの。エスケープの有無を目で確かめられるようにする。
+    jboss_record_stage \
+        "standalone.xml のマスターパスワード定義 (ファイル上の表記 / credential-store '${store_name}')" \
+        "情報" "jboss-cli が書き込んだ clear-text 属性の生の文字列。XML の実体参照と WildFly の \$\$ エスケープが含まれうる" \
+        "$(jboss_b64_encode "$reference_raw")" "true"
+
+    # (5) XML の実体参照を戻し、さらに WildFly の式解釈を適用した「実行時の値」。
+    jboss_xml_unescape unescaped "$reference_raw"
+    jboss_wildfly_literal literal "$unescaped"
+    if [ "$JBOSS_WILDFLY_EXPRESSION_FOUND" = "true" ]; then
+      case "$JBOSS_PASSWORD_ORIGIN" in
+        *'$'*)
+          jboss_record_stage \
+              "standalone.xml → WildFly が実行時に解釈する値 (利用される値)" \
+              "不一致 (式が未解決)" \
+              "clear-text に未解決の \${...} 式が残っています。マスターパスワードに \$ が含まれるため、jboss-cli への登録時に \$ を \$\$ へエスケープできていない可能性が高いです。WildFly は起動時にこの式をシステムプロパティ / 環境変数として解決するため、実行時に使われる値はファイル上の文字列とは異なります" \
+              "$(jboss_b64_encode "$literal")" "true"
+          ;;
+        *)
+          jboss_record_stage \
+              "standalone.xml → WildFly が実行時に解釈する値 (利用される値)" \
+              "未確認" \
+              "clear-text が \${...} 式のため、静的には実効値を決定できません (起動時にシステムプロパティ / 環境変数から解決されます): $(jboss_password_display "$unescaped")"
+          ;;
+      esac
+    else
+      jboss_compare_stage \
+          "standalone.xml → WildFly が実行時に解釈する値 (利用される値)" \
+          "$literal" \
+          "XML の実体参照と WildFly の \$\$ エスケープを戻した結果" \
+          "$reference_raw"
+    fi
+  fi
+
+  # (6) CredentialStore を原本パスワードで実際に開けるか (実効確認)
+  jboss_verify_credential_store_stage "$cid" "$home" "$store_name" "$store_path" "$store_relative_to"
+
+  # (7) マスターパスワードで守られた値の利用箇所 (情報表示)
+  if [ ${#usage_lines[@]} -gt 0 ]; then
+    usage_text="$(printf '%s ; ' "${usage_lines[@]}")"
+    jboss_record_stage "CredentialStore の値を利用している箇所 (${#usage_lines[@]} 件)" "情報" \
+        "${usage_text% ; }"
+  else
+    jboss_record_stage "CredentialStore の値を利用している箇所" "情報" \
+        "credential-reference で store / alias を参照しているリソースはありません"
+  fi
+}
+
+# CredentialStore ファイルを原本パスワードで開けるかどうかを確かめる。
+# 開ければ「CredentialStore に設定されているマスターパスワード = 原本」と言える。
+jboss_verify_credential_store_stage() {
+  local cid="$1" home="$2" store_name="$3" store_path="$4" store_relative_to="$5"
+  local resolved_store tool_path output status
+  local stage_label="Elytron CredentialStore をマスターパスワードで開けるか (credential-store '${store_name}')"
+
+  if [ -n "$JBOSS_CREDENTIAL_STORE_FILE" ]; then
+    resolved_store="$JBOSS_CREDENTIAL_STORE_FILE"
+  elif ! resolved_store="$(jboss_resolve_credential_store_path "$home" "$store_path" "$store_relative_to")"; then
+    jboss_record_stage "$stage_label" "未確認" \
+        "CredentialStore のパスを特定できませんでした (path=${store_path:-(未設定)}, relative-to=${store_relative_to:-(未設定)})。--jboss-credential-store で指定してください"
+    return 0
+  fi
+
+  if [ -n "$JBOSS_ELYTRON_TOOL_PATH" ]; then
+    tool_path="$JBOSS_ELYTRON_TOOL_PATH"
+  else
+    tool_path="${home}/bin/elytron-tool.sh"
+  fi
+
+  if ! jboss_container_exec "$cid" '[ -x "$1" ]' "$tool_path"; then
+    jboss_record_stage "$stage_label" "未確認" \
+        "elytron-tool.sh が見つかりません: ${tool_path} (--jboss-elytron-tool で指定できます)"
+    return 0
+  fi
+  if ! jboss_container_exec "$cid" '[ -f "$1" ]' "$resolved_store"; then
+    jboss_record_stage "$stage_label" "未確認" \
+        "CredentialStore ファイルが見つかりません: ${resolved_store}"
+    return 0
+  fi
+
+  output="$(jboss_open_credential_store "$cid" "$tool_path" "$resolved_store" \
+      "$(jboss_b64_encode "$JBOSS_PASSWORD_ORIGIN")")"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    jboss_record_stage "$stage_label" "一致" \
+        "${resolved_store} を原本パスワードで開けました。CredentialStore に設定されているマスターパスワードは原本と同一です。登録エイリアス: $(printf '%s' "$output" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/ $//')" \
+        "$(jboss_b64_encode "$JBOSS_PASSWORD_ORIGIN")" "true"
+  else
+    # CredentialStore は鍵ストアであり、設定済みのマスターパスワードそのものを
+    # 取り出す手段は無い (取り出せてしまえば保護の意味が無い)。
+    # 実際に設定されている文字列は、standalone.xml の段の表示で確認する。
+    jboss_record_stage "$stage_label" "不一致" \
+        "${resolved_store} を原本パスワードで開けませんでした。CredentialStore の作成時に、原本とは異なる文字列が使われています (シェルの変数展開・コメント切り捨て・エスケープ差が疑われます)。CredentialStore からは設定済みのパスワードを取り出せないため、実際に設定されている文字列は standalone.xml の段の表示を参照してください。elytron-tool の出力: $(printf '%s' "$output" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/ $//')"
+  fi
+}
+
+# コンテナ起動後に実行する段。standalone.xml と CredentialStore を確認する。
+verify_jboss_password_container_stages() {
+  local cid service_name home config_file xml_b64 checked="false"
+  local -a target_container_ids=()
+
+  [ "$VERIFY_JBOSS_PASSWORD" = "true" ] || return 0
+  [ "$JBOSS_PASSWORD_ORIGIN_SET" = "true" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] standalone.xml / CredentialStore の検証をスキップします。"
+    return 0
+  fi
+
+  mapfile -t target_container_ids < <(verification_target_container_ids)
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    jboss_record_stage "standalone.xml / Elytron CredentialStore の検証" "未確認" \
+        "対象コンテナが起動していないため確認できません (--verify-startup または --verify-url を併用してください)"
+    return 0
+  fi
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+
+    home="$(jboss_detect_home "$cid")"
+    if [ -z "$home" ] && [ -z "$JBOSS_CONFIG_FILE" ]; then
+      continue
+    fi
+    if ! config_file="$(jboss_detect_config_file "$cid" "$home")" || [ -z "$config_file" ]; then
+      continue
+    fi
+    xml_b64="$(jboss_container_read_file "$cid" "$config_file")"
+    if [ -z "$xml_b64" ]; then
+      jboss_record_stage "standalone.xml の読み出し (サービス: ${service_name})" "未確認" \
+          "設定ファイルを読み出せませんでした: ${config_file}"
+      checked="true"
+      continue
+    fi
+    log "standalone.xml を確認します (サービス: ${service_name}, ファイル: ${config_file}) ..."
+    jboss_verify_config_file_stages "$cid" "$home" "$config_file" "$xml_b64"
+    checked="true"
+  done
+
+  if [ "$checked" != "true" ]; then
+    jboss_record_stage "standalone.xml / Elytron CredentialStore の検証" "未確認" \
+        "起動中のコンテナから JBoss のインストール先と standalone.xml を特定できませんでした (--jboss-config-file で指定できます)"
+  fi
+}
+
+# 伝搬検証の結果をまとめて画面へ出す。ビルドのみの場合はビルド直後に、
+# 起動確認を伴う場合は起動後の確認出力と並べて呼び出す。
+show_verified_jboss_password_stages() {
+  [ "$VERIFY_JBOSS_PASSWORD" = "true" ] || return 0
+  [ ${#JBOSS_PASSWORD_STAGE_RESULTS[@]} -gt 0 ] || return 0
+  diag ""
+  diag "==================================================================="
+  diag "JBoss マスターパスワードの伝搬検証結果 (${#JBOSS_PASSWORD_STAGE_RESULTS[@]} 段)"
+  diag "==================================================================="
+  jboss_print_stage_results
+  jboss_print_stage_summary
+  if [ "$JBOSS_PASSWORD_MISMATCH" = "true" ]; then
+    warn "JBoss マスターパスワードの伝搬検証で不一致を検出しました (上記を参照)。"
+  else
+    log "JBoss マスターパスワードの伝搬検証が完了しました (不一致なし)。"
+  fi
 }
 
 # ---- ビルド前後の一時ファイルコピー / 自動削除 ------------------------------
@@ -5764,7 +7124,7 @@ append_compose_service_logs_report() {
 
     printf '\n' >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
-    printf '[7-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
+    printf '[8-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
     printf 'コンテナ      : %s\n' "$containers" >> "$report_file"
     printf 'ログ行数      : %s 行\n' "$line_count" >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
@@ -5773,6 +7133,88 @@ append_compose_service_logs_report() {
     else
       printf '(このサービスのログはありません)\n' >> "$report_file"
     fi
+  done
+  return 0
+}
+
+# JBoss マスターパスワードの伝搬検証結果を全量レポートへ追記する。
+# 画面と同じ内容 (一致した文字列 / 不一致時の原本と実際の双方) を残し、
+# 後から 16 進ダンプ同士を突き合わせられるようにする。
+append_jboss_password_report() {
+  local report_file="$1"
+  local entry label verdict note actual_b64 has_value actual index=0
+
+  if [ "$VERIFY_JBOSS_PASSWORD" != "true" ]; then
+    printf '--verify-jboss-password が指定されていないため検証していません。\n' >> "$report_file"
+    return 0
+  fi
+  if [ ${#JBOSS_PASSWORD_STAGE_RESULTS[@]} -eq 0 ]; then
+    printf '検証結果がありません (原本のマスターパスワードを取得できなかった可能性があります)。\n' >> "$report_file"
+    return 0
+  fi
+
+  {
+    printf '取得元        : %s\n' "${JBOSS_PASSWORD_SOURCE_LABEL:-不明}"
+    printf '環境変数      : %s\n' "$JBOSS_PASSWORD_ENV"
+    printf 'シークレット id: %s (ビルド中のマウント先: /run/secrets/%s)\n' "$JBOSS_SECRET_ID" "$JBOSS_SECRET_ID"
+    printf '検証した段数  : %s\n' "${#JBOSS_PASSWORD_STAGE_RESULTS[@]}"
+    if [ "$JBOSS_PASSWORD_MISMATCH" = "true" ]; then
+      printf '総合判定      : 不一致あり\n'
+    elif [ "$JBOSS_PASSWORD_UNKNOWN" = "true" ]; then
+      printf '総合判定      : 確認できた段はすべて一致 (未確認の段あり)\n'
+    else
+      printf '総合判定      : 全段一致\n'
+    fi
+    printf '原本の文字列  : %s\n' "$(jboss_password_display "$JBOSS_PASSWORD_ORIGIN")"
+    printf '  可視化表記  : %s\n' "$(jboss_password_visible "$JBOSS_PASSWORD_ORIGIN")"
+    printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$JBOSS_PASSWORD_ORIGIN")"
+    printf '  バイト長    : %s バイト\n' "$(jboss_password_byte_length "$JBOSS_PASSWORD_ORIGIN")"
+  } >> "$report_file"
+
+  for entry in "${JBOSS_PASSWORD_STAGE_RESULTS[@]}"; do
+    index=$((index + 1))
+    IFS="$JBOSS_STAGE_SEPARATOR" read -r label verdict note actual_b64 has_value <<< "$entry"
+    {
+      printf '\n'
+      printf '───────────────────────────────────────────────────────────────────\n'
+      printf '[%s] %s\n' "$index" "$label"
+      printf '判定          : %s\n' "$verdict"
+      printf '補足          : %s\n' "${note:-(なし)}"
+      printf '───────────────────────────────────────────────────────────────────\n'
+    } >> "$report_file"
+    [ "$has_value" = "true" ] || continue
+    jboss_read_exact actual jboss_b64_decode "$actual_b64"
+    case "$verdict" in
+      '不一致 (式が未解決)')
+        {
+          printf '原本 (取得元) : %s\n' "$(jboss_password_display "$JBOSS_PASSWORD_ORIGIN")"
+          printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$JBOSS_PASSWORD_ORIGIN")"
+          printf 'ファイル上の値: %s\n' "$(jboss_password_display "$actual")"
+          printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$actual")"
+          printf '実行時の値    : ${...} の解決結果となるため、この文字列のままでは使われません\n'
+          printf '対処          : jboss-cli への登録時に $ を $$ へエスケープしてください\n'
+        } >> "$report_file"
+        ;;
+      不一致*)
+        {
+          printf '原本 (取得元) : %s\n' "$(jboss_password_display "$JBOSS_PASSWORD_ORIGIN")"
+          printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$JBOSS_PASSWORD_ORIGIN")"
+          printf '実際の文字列  : %s\n' "$(jboss_password_display "$actual")"
+          printf '  可視化表記  : %s\n' "$(jboss_password_visible "$actual")"
+          printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$actual")"
+          printf '  バイト長    : %s バイト\n' "$(jboss_password_byte_length "$actual")"
+          printf '相違位置      : %s\n' "$(jboss_password_first_diff "$JBOSS_PASSWORD_ORIGIN" "$actual")"
+        } >> "$report_file"
+        ;;
+      *)
+        {
+          printf '文字列        : %s\n' "$(jboss_password_display "$actual")"
+          printf '  可視化表記  : %s\n' "$(jboss_password_visible "$actual")"
+          printf '  16 進ダンプ : %s\n' "$(jboss_password_hex "$actual")"
+          printf '  バイト長    : %s バイト\n' "$(jboss_password_byte_length "$actual")"
+        } >> "$report_file"
+        ;;
+    esac
   done
   return 0
 }
@@ -5916,14 +7358,19 @@ write_build_report() {
     done
   fi
 
+  # JBoss マスターパスワードの伝搬検証は、コンテナを停止する前 ([2]〜[6] と同じ
+  # タイミング) までに集め終えた結果を書き出す。
+  printf '\n[7] JBoss マスターパスワードの伝搬検証\n' >> "$report_tmp"
+  append_jboss_password_report "$report_tmp"
+
   # 失敗時は、ログ本文を集める前に SIGTERM でコンテナを終了させ、adot collector
   # などの終了処理ログまでレポートへ含める。環境変数・ツリー・JVM パラメータは
-  # 起動中のコンテナからしか取得できないため、[2]〜[6] を集め終えたこの位置で停止する。
+  # 起動中のコンテナからしか取得できないため、[2]〜[7] を集め終えたこの位置で停止する。
   capture_shutdown_logs "$exit_status"
 
   # 失敗時は原因調査に必要なため全サービスのログ全文を残す。成功時は同じ内容が
   # 画面へ出ており、レポートを不必要に肥大化させるだけなので省略する。
-  printf '\n[7] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
+  printf '\n[8] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
   if [ "$exit_status" -eq 0 ]; then
     printf '処理が成功したため、Compose サービス別ログの全文出力は省略しました。\n' >> "$report_tmp"
   else
@@ -5992,6 +7439,11 @@ prepare_jboss_password
 # 環境変数が未定義だと compose build が失敗するため、シークレットを使わない
 # 場合でも空文字で定義しておく (既に値が入っていればそのまま維持する)。
 export JBOSS_MASTER_PASSWORD="${JBOSS_MASTER_PASSWORD:-}"
+
+# ---- JBoss マスターパスワードの伝搬検証 (ビルド前に確認できる段) -------------
+# 取得元 → 環境変数 → compose.yml の secrets 定義までは、ビルドを始める前に
+# 突き合わせられる。ここで不一致が出た場合、ビルドしても正しい値は届かない。
+verify_jboss_password_host_stages
 
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_all) により
@@ -6101,8 +7553,17 @@ else
   BUILD_RESULT_DETAIL="docker compose build とローカルイメージ確認が完了しました。"
 fi
 
+# ---- BuildKit シークレットがビルド中コンテナへ届いた値の検証 ------------------
+# ビルド済みイメージをベースにしたプローブビルドで /run/secrets の内容を取り出す。
+verify_jboss_password_build_secret
+
 # ---- 起動確認が不要ならここで終了 -------------------------------------------
 if [ "$NEED_CONTAINER" != "true" ]; then
+  if [ "$VERIFY_JBOSS_PASSWORD" = "true" ]; then
+    jboss_record_stage "standalone.xml / Elytron CredentialStore の検証" "未確認" \
+        "コンテナを起動していないため確認していません。--verify-startup または --verify-url を併用すると、jboss-cli が生成した standalone.xml と CredentialStore まで検証します"
+    show_verified_jboss_password_stages
+  fi
   if [ "$ENV_LIST_LIMIT" != "all" ] || [ -n "$ENV_LIST_FILE" ]; then
     warn "環境変数一覧はコンテナ起動を伴う動作確認時のみ出力されます。--verify-startup または --verify-url を併用してください。"
   fi
@@ -6157,6 +7618,11 @@ show_verified_container_directory_trees
 show_verified_container_deployment_structures
 show_verified_container_jvm_parameters
 show_verified_container_otel_settings
+
+# jboss-cli が生成した standalone.xml と Elytron CredentialStore まで確認し、
+# ビルド前の段と合わせて伝搬検証の結果をまとめて出力する。
+verify_jboss_password_container_stages
+show_verified_jboss_password_stages
 
 if [ "$DRY_RUN" = "true" ]; then
   log "DRY-RUN が完了しました (実際の変更は行われていません)。"

@@ -25,6 +25,7 @@
 **デプロイ済み Web アプリケーションの各ルート表示**、
 **Java の JVM パラメータ一覧表示**、**OpenTelemetry 環境変数・JVM パラメータ一覧表示**、
 **全量テキストレポートの保存**、
+**JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 起動状態を維持した検証対象コンテナへの **bash 直接接続 / 対話式 HTTP 通信**と、
 **起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作**、および
 **cwagent / OTel のローカル送達診断**を任意で行えます。
@@ -122,7 +123,13 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
-| `--jboss-secret-id ID` | BuildKit シークレットの id (**buildx 版のみ**。compose 版は `compose.yml` の secrets 名で決まる) | `jboss_master_password` |
+| `--jboss-secret-id ID` | BuildKit シークレットの id。**buildx 版** は `--secret id=...` に使う。**`build_and_verify.sh` / `--build-only` 委譲時**は `--verify-jboss-password` のプローブビルドで参照する (compose 版のビルド自体は `compose.yml` の secrets 名で決まる) | `jboss_master_password` |
+| `--verify-jboss-password` | **`build_and_verify.sh` / `--build-only` 委譲時**。マスターパスワードが取得元から実行時に利用される値まで一致しているかを段ごとに検証し、結果をビルド時に出力する (後述) | `false` |
+| `--jboss-password-mask` | **`build_and_verify.sh` / `--build-only` 委譲時**。伝搬検証の出力でパスワード文字列を伏字にする (判定・バイト長・16 進ダンプは表示) | `false` |
+| `--jboss-config-file PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の `standalone.xml` のパス | (自動探索) |
+| `--jboss-cli-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の `jboss-cli.sh` のパス | (自動探索) |
+| `--jboss-elytron-tool PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の `elytron-tool.sh` のパス | (自動探索) |
+| `--jboss-credential-store PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の CredentialStore ファイルのパス | (`standalone.xml` から特定) |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
 | `--auto-switchback` | ECR 権限が無い場合に自動でスイッチバックして継続する | `false` |
 | `--warn-only` | ECR 権限が無い場合に警告して終了する (既定) | (既定) |
@@ -395,7 +402,7 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   全件を出力します。起動確認を伴わないビルドのみの場合、コンテナ由来の 5 セクションは
   「未取得」と記録します。`--dry-run` ではファイルを作成せず、出力予定だけを表示します。
 - ビルドや動作確認が失敗した場合、レポート末尾の
-  **`[7] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
+  **`[8] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
   起動確認対象だけでなく、adot collector などのサイドカーを含む
   `compose.yml` 定義の全サービス (コンテナを持つが定義に現れないサービスも含む) が対象で、
   サービスごとに見出し・コンテナ名・状態 (異常終了時は終了コード)・ログ行数を付けて
@@ -410,7 +417,7 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   実行するとこの終了ログは取得されないまま削除されてしまいます。
   そこでエラー終了時に限り、削除の前に `docker compose stop -t <--shutdown-timeout>`
   (既定 30 秒。ECS の StopTimeout 既定と同じ) を挟み、そこで追加されたログを
-  `終了 (SIGTERM) 時のコンテナログ` として画面へ表示し、`[7] Compose サービス別ログ`
+  `終了 (SIGTERM) 時のコンテナログ` として画面へ表示し、`[8] Compose サービス別ログ`
   にも終了処理込みの全文を残します。対象は稼働中の全サービスで、表示行は停止前後の
   ログ行数の差分から求めるためホストとコンテナの時刻差に影響されません。
   adot collector の healthcheck 失敗で `depends_on` の `condition: service_healthy`
@@ -857,6 +864,104 @@ export JBOSS_MASTER_PASSWORD='MyMasterPassword'
   取得に失敗した場合 (権限不足 / パラメータ名誤り / リージョン違い) はエラー内容を
   表示して終了します。
 - `--dry-run` 併用時は、パラメータストアへの実際のアクセスは行いません。
+
+## JBoss マスターパスワードの伝搬検証 (`--verify-jboss-password`)
+
+マスターパスワードに `$` `#` `"` `` ` `` などが含まれると、**取得元では正しいのに、
+CredentialStore の作成や `standalone.xml` の生成を経る間に別の文字列へ変わってしまう**
+ことがあります。`--verify-jboss-password` を指定すると、`build_and_verify.sh` が
+**各段のパスワードを原本とバイト単位で突き合わせ、一致・不一致をビルド時に画面へ出力**
+します。
+
+```bash
+export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
+./build_and_verify.sh --verify-startup --verify-jboss-password
+```
+
+### 検証する段
+
+| # | 段 | 何を確認するか |
+| --- | --- | --- |
+| 1 | 取得元 → 環境変数 | パラメータストア / `--jboss-password` / 事前 export の値が、`--jboss-password-env` の環境変数へ欠落なく入ったか。パラメータストア利用時は `--output json` の生値とも突き合わせ、`--output text` によるタブ・末尾空白の欠落を検出する |
+| 2 | 環境変数 → `compose.yml` の secrets 定義 | `secrets.<名前>.environment` が `--jboss-password-env` と一致し、かつ **どこかのサービスの `build.secrets` から参照されている**か。名前が食い違うとビルドには空文字が渡る |
+| 3 | BuildKit シークレット → `/run/secrets/<id>` | ビルド中のコンテナへ実際に届いた値。ビルド済みイメージをベースにした**プローブビルド (`--no-cache`)** でマウント内容をそのまま取り出す。最終ステージは `scratch` で、値はイメージにもレイヤにも残さない |
+| 4 | `standalone.xml` のファイル上の表記 | `jboss-cli` が書き込んだ `clear-text` 属性の生の文字列 (XML 実体参照と WildFly の `$$` エスケープを含んだまま) |
+| 5 | → WildFly が実行時に解釈する値 | 4 の値から XML 実体参照 (`&amp;` `&quot;` …) と WildFly の `$$` → `$` を戻した、**実際に使われる値** |
+| 6 | Elytron CredentialStore | CredentialStore を**原本パスワードで実際に開けるか** (`elytron-tool.sh credential-store --aliases`)。開ければ、登録済みのマスターパスワードが原本と同一だと確認できる |
+| 7 | 利用箇所の一覧 | `credential-reference` で `store` / `alias` を参照しているリソース (データソース等) の一覧 |
+
+段 4〜7 はコンテナ内の `standalone.xml` を読むため、**`--verify-startup` または
+`--verify-url` との併用が必要**です。単独指定時は段 1〜3 のみ検証し、残りは `未確認`
+として記録します。
+
+### 出力
+
+- **一致した段**: `[一致]` と、**一致したパスワード文字列**、可視化表記、16 進ダンプ、
+  バイト長を表示します。全段一致した場合は総括にも一致した文字列を再掲します。
+- **一致しない段**: `[不一致]` と、**原本と「実際に設定されている文字列」の双方**を、
+  可視化表記・16 進ダンプ・**最初に食い違ったバイト位置**とともに表示します。
+- **エスケープ済みで一致**: ファイル上の表記と実効値が異なるだけの場合は
+  `[一致 (エスケープ済み)]` とし、ファイル上の表記も併記します。
+- **確認できない段**: `[未確認]` と理由 (コンテナ未起動 / ファイルが無い等)。
+
+可視化表記では、目に見えない差分を判別できるよう空白を `<SP>`、タブを `<TAB>`、
+改行を `<LF>`、CR を `<CR>`、その他の制御文字・非 ASCII バイトを `<xNN>` で示します。
+
+```text
+  [一致] (3) BuildKit シークレット → ビルド中コンテナの /run/secrets/jboss_master_password
+      一致した文字列: pa$w#o"r`d&x
+      16 進ダンプ   : 70 61 24 77 23 6f 22 72 60 64 26 78
+
+  [不一致] (5) standalone.xml → WildFly が実行時に解釈する値 (利用される値)
+      原本 (取得元) : pa$w#o"r`d&x
+        16 進ダンプ : 70 61 24 77 23 6f 22 72 60 64 26 78
+      実際に設定されている文字列: pa$w
+        16 進ダンプ : 70 61 24 77
+      相違位置      : 5 バイト目から相違 (原本: 23 / 実際: (ここで終端))
+```
+
+### 危険文字のリスク分析
+
+検証の冒頭で、パスワードに含まれる文字のうち**シェル・XML・WildFly 式のいずれかで
+意味を持つもの**だけを、壊れ方とともに列挙します。
+
+| 文字 | 主なリスク |
+| --- | --- |
+| `$` | シェルの変数展開 (二重引用符内でも展開)。WildFly は `${...}` を式として解決するため、リテラルの `$` は `$$` へのエスケープが必要 |
+| `` ` `` | シェルのコマンド置換 (二重引用符内でも実行される) |
+| `"` `'` | シェル・`jboss-cli` の引用終端。XML 属性値では `&quot;` / `&apos;` が必要 |
+| `#` | 引用しないとシェルのコメント開始。`jboss-cli` スクリプトと properties ファイルでも行コメント |
+| `\` | シェル・`jboss-cli`・properties のエスケープ文字。多段解釈で個数が変わる |
+| `&` `<` `>` | XML の実体参照が必要。引用漏れ時はシェルのリダイレクト・バックグラウンド実行 |
+| `,` `=` `:` `(` `)` | `jboss-cli` の操作構文 `op(name=value,...)` の区切り |
+| 空白 / タブ / CR / LF | 引数分割、`--output text` での欠落、コマンド置換での末尾改行落ち、CRLF 混入 |
+| 非 ASCII | ホストとコンテナの文字エンコーディング差 |
+
+### `$` のエスケープ漏れの検出
+
+`standalone.xml` の `clear-text` に未解決の `${...}` が残っており、かつ原本に `$` が
+含まれる場合は `[不一致 (式が未解決)]` として報告します。WildFly は起動時にこの式を
+システムプロパティ / 環境変数として解決するため、**ファイル上の文字列がそのまま
+使われることはありません**。`jboss-cli` への登録時に `$` を `$$` へエスケープしてください。
+
+```
+pa$word  →  clear-text="pa$$word"
+```
+
+### 注意
+
+- 既定では**パスワードを平文で画面と全量レポートへ出力**します。共有端末や CI ログへ
+  残したくない場合は `--jboss-password-mask` を併用してください (判定・バイト長・
+  16 進ダンプは残ります)。
+- 不一致を検出しても**終了コードは変わりません** (ビルド成否の判定は従来どおり)。
+  画面には `[WARN]` を出し、全量レポートの `[7]` にも記録します。
+- CredentialStore は鍵ストアのため、**登録済みのパスワード文字列そのものは取り出せません**。
+  段 6 は「原本で開けるか」による確認で、実際の文字列は段 4・5 の表示で確認します。
+- `compose.yml` のシークレット名が `--jboss-secret-id` (既定 `jboss_master_password`) と
+  異なる場合は、段 2 の補足で警告します。Dockerfile は
+  `/run/secrets/<compose のシークレット名>` を参照するため、段 3 のプローブが実際とは
+  違うマウント先を見ないよう、表示された名前を `--jboss-secret-id` に指定してください。
+- `--dry-run` 併用時は、実際の値を取得しないため検証を行いません。
 
 ## push 失敗時の原因診断 / 調査ガイド
 

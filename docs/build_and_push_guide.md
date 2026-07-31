@@ -315,7 +315,10 @@ flowchart TD
 
 - 委譲**される**もの: `--local-image` / `--compose-file` / `--compose-service` /
   `--no-cache` / `--dry-run` / `--copy-file` / `--region` / `--jboss-password*` /
-  `build_and_verify.sh` 固有のオプション (`--verify-startup`、`--verify-url` など)
+  `build_and_verify.sh` 固有のオプション (`--verify-startup`、`--verify-url`、
+  `--verify-jboss-password` とその関連オプション `--jboss-secret-id` /
+  `--jboss-password-mask` / `--jboss-config-file` / `--jboss-cli-path` /
+  `--jboss-elytron-tool` / `--jboss-credential-store` など)
 - 委譲**されない**もの:
   - `--log-dir` — 委譲元で処理済み (委譲先の出力もログファイルに記録されます)
   - ECR 専用オプション — `--account-id` / `--registry` / `--repository` /
@@ -487,6 +490,11 @@ RUN --mount=type=secret,id=jboss_master_password \
 
 # 8) ビルドのみ (ECR 不要)。起動確認まで行う
 ./build_and_push.sh --build-only --verify-startup
+
+# 8-2) ビルドのみ + マスターパスワードが実行時の値まで一致しているか検証
+./build_and_push.sh --build-only --verify-startup \
+    --jboss-password-param /j1/jboss/master-password \
+    --verify-jboss-password
 
 # 9) レジストリを直接指定 (アカウント ID 不要)
 ./build_and_push.sh --registry 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com

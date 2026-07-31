@@ -365,11 +365,19 @@ JBoss シークレットは `--secret id=<JBOSS_SECRET_ID>,env=<JBOSS_PASSWORD_E
 
 ```dockerfile
 RUN --mount=type=secret,id=jboss_master_password \
-    JBOSS_MASTER_PASSWORD="$(cat /run/secrets/jboss_master_password)" \
-    && /opt/jboss/bin/setup-credential-store.sh "$JBOSS_MASTER_PASSWORD"
+    /opt/jboss/bin/setup-credential-store.sh "$(cat /run/secrets/jboss_master_password)"
 ```
 
 > `--secret` で同じ id を二重に指定しないよう注意してください
+
+> **パスワードに `$` `#` `"` `` ` `` などを含む場合**
+> シェル・`jboss-cli`・`standalone.xml` のそれぞれで意味が変わるため、
+> CredentialStore の作成や設定ファイルの生成を経る間に値が変わることがあります。
+> `"$(cat ...)"` は末尾の改行を落とし、引用を省くと空白での分割と `#` 以降の
+> 切り捨てが起きます。設定後の値が原本と一致しているかは
+> `build_and_verify.sh --verify-jboss-password` で段ごとに確認できます
+> (この検証は compose 版の `build_and_verify.sh` にのみあります。詳細は
+> [build_and_verify.sh 詳細ガイド](build_and_verify_guide.md) の 6.5 を参照)。
 > (buildx 側でどちらが採用されるかは保証されません)。
 
 ### 6.4 `--repository` と `--tag-prefix` の命名規則
