@@ -7145,7 +7145,9 @@ append_jboss_password_report() {
   local entry label verdict note actual_b64 has_value actual index=0
 
   if [ "$VERIFY_JBOSS_PASSWORD" != "true" ]; then
-    printf '--verify-jboss-password が指定されていないため検証していません。\n' >> "$report_file"
+    # 先頭が "--" の文字列を書式に置くと printf がオプションとして解釈するため、
+    # 書式は '%s\n' に固定して本文は引数として渡す。
+    printf '%s\n' '--verify-jboss-password が指定されていないため検証していません。' >> "$report_file"
     return 0
   fi
   if [ ${#JBOSS_PASSWORD_STAGE_RESULTS[@]} -eq 0 ]; then
