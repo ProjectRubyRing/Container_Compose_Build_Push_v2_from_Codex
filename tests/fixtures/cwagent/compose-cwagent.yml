@@ -1,0 +1,36 @@
+# cwagent のログ送信検証 (正常系) 用の compose 定義。
+# Container_Compose_file プロジェクトの compose.yaml から、CloudWatch Agent の
+# サイドカーと偽装 CloudWatch Logs の部分だけを取り出したもの。
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+
+  # ログ出力元。cwagent と同じボリュームを書き込みモードでマウントする。
+  app:
+    image: j1/base.local
+    volumes:
+      - efs-logs:/mnt/efs/logs
+
+  cwagent:
+    image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    container_name: cwagent
+    environment:
+      AWS_REGION: ap-northeast-1
+    volumes:
+      - ./cwagent-config.json:/etc/cwagentconfig/cwagent-config.json:ro
+      - ./aws-credentials:/root/.aws/credentials:ro
+      - efs-logs:/mnt/logs:ro
+    depends_on:
+      cloudwatch-logs-mock:
+        condition: service_healthy
+
+  cloudwatch-logs-mock:
+    image: wiremock/wiremock:3.13.0
+    ports:
+      - "8480:8080"
+
+volumes:
+  efs-logs:

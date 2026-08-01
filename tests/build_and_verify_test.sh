@@ -230,7 +230,9 @@ assert_contains "$full_report" "[3] コンテナ内ディレクトリツリー (
 assert_contains "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)"
 assert_contains "$full_report" "[5] Java JVM パラメータ (全件)"
 assert_contains "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
-assert_contains "$full_report" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_contains "$full_report" "[8] CloudWatch Logs 送信検証 (cwagent)"
+assert_contains "$full_report" "compose ファイルに CloudWatch Agent のサービス (cwagent) が定義されていないため実行していません。"
+assert_contains "$full_report" "[9] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "処理が成功したため、Compose サービス別ログの全文出力は省略しました。"
 assert_contains "$full_report" "API_TOKEN=[REDACTED]"
 assert_not_contains "$full_report" "do-not-log-this-value"
@@ -243,7 +245,7 @@ assert_contains "$full_report" "  OTEL_SERVICE_NAME                            =
 assert_contains "$full_report" "[未設定の主要 OpenTelemetry 設定] 7 件"
 assert_before "$full_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)" "[5] Java JVM パラメータ (全件)"
 assert_before "$full_report" "[5] Java JVM パラメータ (全件)" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)"
-assert_before "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_before "$full_report" "[6] OpenTelemetry 環境変数・JVM パラメータ (全件)" "[9] Compose サービス別ログ (全サービス・全行)"
 assert_contains "$full_report" "application.yaml"
 assert_contains "$full_report" "deep.json"
 assert_contains "$full_report" "Order01.class"
@@ -479,12 +481,12 @@ assert_contains "${failure_report_files[0]}" "全体結果     : 失敗 (exit=1)
 assert_contains "${failure_report_files[0]}" "結果          : 成功"
 # 失敗レポートには、起動確認対象・サイドカーを問わず全 Compose サービスのログを
 # サービス単位に区切って残す。
-assert_contains "${failure_report_files[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${failure_report_files[0]}" "[9] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${failure_report_files[0]}" "対象サービス  : base app adot-collector cache (4 サービス)"
-assert_contains "${failure_report_files[0]}" "[8-1] Compose サービス: base"
-assert_contains "${failure_report_files[0]}" "[8-2] Compose サービス: app"
-assert_contains "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector"
-assert_contains "${failure_report_files[0]}" "[8-4] Compose サービス: cache"
+assert_contains "${failure_report_files[0]}" "[9-1] Compose サービス: base"
+assert_contains "${failure_report_files[0]}" "[9-2] Compose サービス: app"
+assert_contains "${failure_report_files[0]}" "[9-3] Compose サービス: adot-collector"
+assert_contains "${failure_report_files[0]}" "[9-4] Compose サービス: cache"
 assert_contains "${failure_report_files[0]}" "コンテナ      : test-app-1 (状態: running)"
 assert_contains "${failure_report_files[0]}" "コンテナ      : adot-collector (状態: exited, 終了コード: 1)"
 assert_contains "${failure_report_files[0]}" "ログ行数      : 5 行"
@@ -493,11 +495,11 @@ assert_contains "${failure_report_files[0]}" "ログ行数      : 2 行"
 assert_contains "${failure_report_files[0]}" "WFLYSRV0026"
 assert_contains "${failure_report_files[0]}" "adot-collector  | TracesExporter resource spans: 2, spans: 4"
 assert_contains "${failure_report_files[0]}" "cache-1  | CACHE001: cache ready"
-assert_before "${failure_report_files[0]}" "[8-1] Compose サービス: base" "[8-2] Compose サービス: app"
-assert_before "${failure_report_files[0]}" "[8-2] Compose サービス: app" "[8-3] Compose サービス: adot-collector"
-assert_before "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector" "[8-4] Compose サービス: cache"
-assert_before "${failure_report_files[0]}" "[8-3] Compose サービス: adot-collector" "TracesExporter resource spans"
-assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[8-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[9-1] Compose サービス: base" "[9-2] Compose サービス: app"
+assert_before "${failure_report_files[0]}" "[9-2] Compose サービス: app" "[9-3] Compose サービス: adot-collector"
+assert_before "${failure_report_files[0]}" "[9-3] Compose サービス: adot-collector" "[9-4] Compose サービス: cache"
+assert_before "${failure_report_files[0]}" "[9-3] Compose サービス: adot-collector" "TracesExporter resource spans"
+assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[9-4] Compose サービス: cache"
 # レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
 assert_not_contains "${failure_report_files[0]}" $'\033['
 
@@ -545,7 +547,7 @@ shutdown_reports=("$TEST_TMP/shutdown-reports"/build_and_verify_*.txt)
   || fail "expected one report for unhealthy dependency scenario"
 # 全量レポートのログ本文も、SIGTERM 送出後に取得した終了処理込みのものとなる。
 assert_contains "${shutdown_reports[0]}" "終了処理      : SIGTERM (compose stop -t 30) 送出後の終了ログまで含む"
-assert_contains "${shutdown_reports[0]}" "[8-3] Compose サービス: adot-collector"
+assert_contains "${shutdown_reports[0]}" "[9-3] Compose サービス: adot-collector"
 assert_contains "${shutdown_reports[0]}" "Shutdown complete."
 assert_contains "${shutdown_reports[0]}" "ログ行数      : 4 行"
 
@@ -605,12 +607,12 @@ assert_contains "${build_failure_reports[0]}" "結果          : 失敗"
 assert_contains "${build_failure_reports[0]}" "対象コンテナが起動していないため取得していません。"
 # ビルド失敗でコンテナが 1 つも作られていない場合も、compose.yml 定義の全サービスを
 # 見出しとして残し、ログがないことを明示する。
-assert_contains "${build_failure_reports[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${build_failure_reports[0]}" "[9] Compose サービス別ログ (全サービス・全行)"
 assert_contains "${build_failure_reports[0]}" "取得範囲      : コンテナ作成時からの全期間 (compose up 到達前に終了)"
 assert_contains "${build_failure_reports[0]}" "対象サービス  : base app adot-collector (3 サービス)"
-assert_contains "${build_failure_reports[0]}" "[8-1] Compose サービス: base"
-assert_contains "${build_failure_reports[0]}" "[8-2] Compose サービス: app"
-assert_contains "${build_failure_reports[0]}" "[8-3] Compose サービス: adot-collector"
+assert_contains "${build_failure_reports[0]}" "[9-1] Compose サービス: base"
+assert_contains "${build_failure_reports[0]}" "[9-2] Compose サービス: app"
+assert_contains "${build_failure_reports[0]}" "[9-3] Compose サービス: adot-collector"
 assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテナなし)" 3
 assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
 
@@ -1421,8 +1423,8 @@ jboss_report_files=("$TEST_TMP"/jboss-reports/build_and_verify_*.txt)
 assert_contains "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証"
 assert_contains "${jboss_report_files[0]}" "総合判定      : 全段一致"
 assert_contains "${jboss_report_files[0]}" "原本の文字列  : $jboss_password_fixture"
-assert_contains "${jboss_report_files[0]}" "[8] Compose サービス別ログ (全サービス・全行)"
-assert_before "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証" "[8] Compose サービス別ログ (全サービス・全行)"
+assert_contains "${jboss_report_files[0]}" "[9] Compose サービス別ログ (全サービス・全行)"
+assert_before "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証" "[9] Compose サービス別ログ (全サービス・全行)"
 
 # --- 各段で食い違うケース ---
 # ビルドへ届いた値は # 以降が切り捨てられ、standalone.xml と CredentialStore にも
@@ -1579,4 +1581,184 @@ assert_contains "$jboss_no_password_output" "--verify-jboss-password には検�
 
 unset FAKE_JBOSS_STANDALONE_XML
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, and Docker cleanup scenarios\n'
+# ---- CloudWatch Agent (cwagent) のログ送信検証 -------------------------------
+# compose.yml の cwagent 定義と設定 JSON の静的チェック (ビルド前) と、起動後の
+# 送達チェックを、正常系・異常系の双方で確認する。
+cwagent_fixture_dir="$TEST_DIR/fixtures/cwagent"
+
+# --- 設定・送信先・収集対象がすべて揃っているケース ---
+cwagent_verify_output="$TEST_TMP/cwagent-verify.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app cwagent cloudwatch-logs-mock"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app cwagent cloudwatch-logs-mock"
+export FAKE_CLOUDWATCH_JOURNAL_FILE="$TEST_DIR/fixtures/cloudwatch-wiremock-requests.json"
+export FAKE_CWAGENT_CONFIG_FILE="$cwagent_fixture_dir/cwagent-config.json"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs \
+    --report-dir "$TEST_TMP/cwagent-reports"
+) >"$cwagent_verify_output" 2>&1; then
+  cat "$cwagent_verify_output" >&2
+  fail "cwagent log delivery verification returned a non-zero status"
+fi
+
+# 静的チェック (ビルド前) はビルドコマンドより先に出力されること
+assert_contains "$cwagent_verify_output" "ビルド前の設定ファイルチェック"
+assert_before "$cwagent_verify_output" "ビルド前の設定ファイルチェック" \
+  "BuildKit のビルドログ表示形式: plain"
+assert_contains "$cwagent_verify_output" "[OK] 設定ファイルの注入 (compose.yml volumes → /etc/cwagentconfig)"
+assert_contains "$cwagent_verify_output" "収集対象 2 件 / 送信先: /local/myapp/efs/app-front/front-local, /local/myapp/efs/app-back/back-local / force_flush_interval=5 秒"
+assert_contains "$cwagent_verify_output" "http://cloudwatch-logs-mock:8080 → Compose サービス 'cloudwatch-logs-mock'"
+assert_contains "$cwagent_verify_output" "[OK] 収集対象ログファイルのマウント"
+assert_contains "$cwagent_verify_output" "ap-northeast-1 (設定ファイルの agent.region)"
+assert_contains "$cwagent_verify_output" "共有クレデンシャルファイル ./aws-credentials → /root/.aws/credentials"
+# 送達チェック (起動後)
+assert_contains "$cwagent_verify_output" "CloudWatch Agent の送信状況チェック"
+assert_contains "$cwagent_verify_output" "[OK] コンテナ内の設定ファイル (/etc/cwagentconfig/cwagent-config.json)"
+assert_contains "$cwagent_verify_output" "[OK] ログイベントの送達 (CloudWatch Logs 偽装サービス)"
+assert_contains "$cwagent_verify_output" "[OK] /mnt/logs/app-front*.log"
+assert_contains "$cwagent_verify_output" "総合判定: 全段 OK"
+# ログ本文の機微情報はマスクしたままであること
+assert_contains "$cwagent_verify_output" "request completed token=[REDACTED]"
+assert_not_contains "$cwagent_verify_output" "dummy-secret"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-cwagent cat /etc/cwagentconfig/cwagent-config.json"
+assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:18480/__admin/requests?limit=100"
+
+# 全量レポートにも検証結果が残ること
+cwagent_report_files=("$TEST_TMP"/cwagent-reports/build_and_verify_*.txt)
+[ -f "${cwagent_report_files[0]}" ] || fail "cwagent verification report was not created"
+assert_contains "${cwagent_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)"
+assert_contains "${cwagent_report_files[0]}" "  - log group=/local/myapp/efs/app-front / log stream=front-local / file=/mnt/logs/app-front*.log"
+assert_contains "${cwagent_report_files[0]}" "総合判定: 全段 OK"
+assert_before "${cwagent_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)" \
+  "[9] Compose サービス別ログ (全サービス・全行)"
+
+# --- 送信先・収集対象・命名規則・リージョンが揃っていないケース ---
+cwagent_broken_output="$TEST_TMP/cwagent-broken.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app cwagent"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app cwagent"
+export FAKE_CWAGENT_CONFIG_FILE="$cwagent_fixture_dir/cwagent-config-broken.json"
+unset FAKE_CLOUDWATCH_JOURNAL_FILE
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent-broken.yml" \
+    --compose-service app,cwagent \
+    --startup-service app \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1
+) >"$cwagent_broken_output" 2>&1; then
+  cat "$cwagent_broken_output" >&2
+  fail "cwagent verification of the broken fixture returned a non-zero status"
+fi
+
+assert_contains "$cwagent_broken_output" "log_group_name が CloudWatch Logs の命名規則に反します"
+assert_contains "$cwagent_broken_output" "endpoint_override のホスト 'cloudwatch-logs-stub' が compose.yml のサービス名・container_name のいずれとも一致しません"
+assert_contains "$cwagent_broken_output" "[NG] 収集対象ログファイルのマウント"
+assert_contains "$cwagent_broken_output" "収集対象パスが cwagent にマウントされていません: /mnt/logs/app-front*.log"
+assert_contains "$cwagent_broken_output" "[NG] リージョン (agent.region / AWS_REGION)"
+assert_contains "$cwagent_broken_output" "[NG] ログイベントの送達 (CloudWatch Logs 偽装サービス)"
+assert_contains "$cwagent_broken_output" "総合判定: NG あり"
+# 既定では NG があってもビルド結果の判定は変えない
+assert_contains "$cwagent_broken_output" "NG をビルドの失敗として扱う場合は --cwagent-required を指定してください。"
+
+# --- マウント元の設定ファイルがホストに存在しないケース (ビルドのみ) ---
+cwagent_missing_output="$TEST_TMP/cwagent-missing-config.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_CONFIG_SERVICES="base cwagent"
+unset FAKE_COMPOSE_PS_SERVICES FAKE_CWAGENT_CONFIG_FILE
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent-missing-config.yml"
+) >"$cwagent_missing_output" 2>&1; then
+  cat "$cwagent_missing_output" >&2
+  fail "cwagent verification of the missing config fixture returned a non-zero status"
+fi
+assert_contains "$cwagent_missing_output" "[NG] 設定ファイルの注入 (compose.yml volumes → /etc/cwagentconfig)"
+assert_contains "$cwagent_missing_output" "マウント元のファイルがホストに存在しません: ./missing-cwagent-config.json"
+assert_contains "$cwagent_missing_output" "存在しないパスを bind mount すると Docker が空のディレクトリを作るため"
+# コンテナ未起動でも、送信先を特定できていない段は水増ししない
+assert_not_contains "$cwagent_missing_output" "[未確認] ログイベントの送達"
+
+# --- --cwagent-required では NG を失敗として扱うこと ---
+cwagent_required_output="$TEST_TMP/cwagent-required.out"
+: > "$FAKE_DOCKER_CALLS"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent-missing-config.yml" \
+    --cwagent-required
+) >"$cwagent_required_output" 2>&1; then
+  cat "$cwagent_required_output" >&2
+  fail "--cwagent-required unexpectedly returned zero for a broken cwagent configuration"
+fi
+assert_contains "$cwagent_required_output" "--cwagent-required が指定されているため失敗として終了します。"
+
+# --- --no-verify-cwagent では検証そのものを行わないこと ---
+cwagent_disabled_output="$TEST_TMP/cwagent-disabled.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent-missing-config.yml" \
+    --no-verify-cwagent
+) >"$cwagent_disabled_output" 2>&1; then
+  cat "$cwagent_disabled_output" >&2
+  fail "--no-verify-cwagent returned a non-zero status"
+fi
+assert_not_contains "$cwagent_disabled_output" "ビルド前の設定ファイルチェック"
+assert_not_contains "$cwagent_disabled_output" "CloudWatch Agent のログ送信検証を開始します"
+
+# --- cwagent が定義されていなければ既定では何も出さないこと ---
+cwagent_absent_output="$TEST_TMP/cwagent-absent.out"
+: > "$FAKE_DOCKER_CALLS"
+unset FAKE_COMPOSE_CONFIG_SERVICES
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh
+) >"$cwagent_absent_output" 2>&1; then
+  cat "$cwagent_absent_output" >&2
+  fail "build-only run without a cwagent service returned a non-zero status"
+fi
+assert_not_contains "$cwagent_absent_output" "CloudWatch Agent のログ送信検証を開始します"
+
+# --- --verify-cwagent なら、定義が無いことを NG として報告すること ---
+cwagent_forced_output="$TEST_TMP/cwagent-forced.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --verify-cwagent
+) >"$cwagent_forced_output" 2>&1; then
+  cat "$cwagent_forced_output" >&2
+  fail "--verify-cwagent without a cwagent service returned a non-zero status"
+fi
+assert_contains "$cwagent_forced_output" "[NG] compose.yml の cwagent サービス定義"
+assert_contains "$cwagent_forced_output" "--cwagent-service でサービス名を指定してください"
+
+# --- オプション値の検証 ---
+cwagent_option_error_output="$TEST_TMP/cwagent-option-error.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --cwagent-delivery-target other
+) >"$cwagent_option_error_output" 2>&1; then
+  cat "$cwagent_option_error_output" >&2
+  fail "--cwagent-delivery-target accepted an invalid value"
+fi
+assert_contains "$cwagent_option_error_output" "--cwagent-delivery-target には auto、mock または aws を指定してください: other"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, and Docker cleanup scenarios\n'

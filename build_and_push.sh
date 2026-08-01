@@ -204,7 +204,8 @@ Options:
                            出力は行わない。--copy-file が指定されている場合は、ビルド前に
                            事前ファイルコピーを行い (ビルド後に自動削除)、その上でビルドする。
                            起動確認 (--verify-startup)、URL 応答確認 (--verify-url)、
-                           JBoss マスターパスワードの伝搬検証 (--verify-jboss-password) 等の
+                           JBoss マスターパスワードの伝搬検証 (--verify-jboss-password)、
+                           CloudWatch Agent のログ送信検証 (--cwagent-*) 等の
                            追加オプションも build_and_verify.sh に委譲されるため利用できる。
                            詳細は ./build_and_verify.sh --help を参照。
                            なお ECR 関連オプション (--account-id / --registry /
@@ -271,6 +272,9 @@ arg_takes_value() {
     --jboss-secret-id|--jboss-config-file|--jboss-cli-path|--jboss-elytron-tool) return 0 ;;
     --jboss-credential-store) return 0 ;;
     --directory-tree-depth|--directory-file-limit|--deployment-dir-env|--report-dir) return 0 ;;
+    --cwagent-service|--cwagent-config-dir|--cwagent-delivery-target) return 0 ;;
+    --cwagent-delivery-timeout|--cwagent-delivery-interval) return 0 ;;
+    --cwagent-mock-service|--cwagent-mock-port) return 0 ;;
     --verify-url|--expect-status|--url-method|--url-content-type) return 0 ;;
     --url-body-json|--url-body-form|--url-timeout|--url-interval) return 0 ;;
   esac

@@ -1,0 +1,27 @@
+# cwagent のログ送信検証 (異常系) 用の compose 定義。
+# 設定ファイル自体は届くが「起動はするのに CloudWatch Logs へ 1 件も届かない」
+# 典型的な不備をまとめて再現する。
+#   - logs.endpoint_override の送信先が compose.yml に定義されていない
+#     (cwagent コンテナ内で名前解決できず、送信がすべて失敗する)
+#   - collect_list の file_path が cwagent にマウントされていない (tail 対象が無い)
+#   - log_group_name が CloudWatch Logs の命名規則に反する
+#   - リージョンと認証情報の指定が無い
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+
+  app:
+    image: j1/base.local
+    volumes:
+      - efs-logs:/mnt/efs/logs
+
+  cwagent:
+    image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    volumes:
+      - ./cwagent-config-broken.json:/etc/cwagentconfig/cwagent-config.json:ro
+
+volumes:
+  efs-logs:

@@ -34,7 +34,14 @@
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
 #                          healthcheck 設定・実行履歴・HTTP 通信、および
 #                          cwagent / OTel のローカル送達診断を実行する。
-#  (10) 終了 (SIGTERM) ログ : エラー終了時は、ECS のタスク停止と同じく SIGTERM で
+#  (10) CloudWatch Logs 送信検証:
+#                          compose.yml に cwagent (CloudWatch Agent サイドカー) が
+#                          定義されている場合、ビルド前に設定ファイルを静的に
+#                          チェックし (注入経路・収集定義・送信先の名前解決・
+#                          収集対象のマウント・リージョン/認証)、起動確認後に
+#                          設定済みロググループ / ログストリームへ実際にログが
+#                          届いたかを確認する。
+#  (11) 終了 (SIGTERM) ログ : エラー終了時は、ECS のタスク停止と同じく SIGTERM で
 #                          コンテナを終了させてから最終ログを取得する。これにより
 #                          adot collector などサイドカーの graceful shutdown ログ
 #                          (シグナル受信 → パイプライン停止 → 終了) まで、画面と
@@ -100,6 +107,9 @@ fi
 # ---- 既定値 -----------------------------------------------------------------
 RUN_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S') ${DISPLAY_TZ_LABEL}"
 RUN_TIMESTAMP="$(date '+%Y%m%d%H%M%S')"
+# CloudWatch Logs のイベント時刻は UTC のエポックミリ秒のため、今回の実行で送られた
+# イベントだけを数えられるよう、開始時刻をミリ秒で保持しておく。
+RUN_STARTED_EPOCH_MS="$(( $(date '+%s') * 1000 ))"
 LOCAL_IMAGE="j1/base.local"       # compose build で生成されるローカルベースイメージ名
 COMPOSE_FILE="compose.yml"
 COMPOSE_SERVICES=()               # 指定時はそのサービスのみビルド/起動 (複数指定可、空なら全サービス)
@@ -232,6 +242,55 @@ OBSERVABILITY_TRACE_LIMIT="5"
 # OTel Collector の health_check 拡張が待ち受ける既定ポート。コンテナ内で
 # healthcheck コマンドを実行できない場合の代替確認先として使う。
 OTEL_HEALTH_CHECK_PORT="13133"
+
+# ---- CloudWatch Agent (cwagent) のログ送信検証 --------------------------------
+# ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml で起動する構成では、
+# 「設定ファイルがコンテナへ届いていない」「logs.endpoint_override の送信先を名前解決
+# できない」「収集対象のログファイルが cwagent へマウントされていない」のいずれでも、
+# エージェント自体は正常に起動したまま CloudWatch Logs へ 1 件も届かない。起動ログにも
+# 明確なエラーが出ないことが多いため、ビルド時のチェックとして次の 2 段で検証する。
+#   (A) 設定ファイルのチェック : ビルド前にホスト側だけで完結する静的照合
+#   (B) 送信状況のチェック     : 起動確認後に実際の送達 (ロググループ/ストリーム) を確認
+VERIFY_CWAGENT="auto"             # auto: cwagent が定義されていれば実行 / true: 必ず実行 / false: 実行しない
+CWAGENT_SERVICE="cwagent"         # CloudWatch Agent の Compose サービス名
+# ECS サイドカーの慣例に合わせた、コンテナ内の設定ディレクトリ。
+CWAGENT_CONFIG_DIR="/etc/cwagentconfig"
+# CloudWatch Agent 本体が読み込む既定の設定ファイル。/etc/cwagentconfig を使わず
+# こちらへ直接マウントする構成でも設定は届くため、注入経路の候補として扱う。
+CWAGENT_CONFIG_FALLBACK_PATH="/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+CWAGENT_DELIVERY_TARGET="auto"    # auto: endpoint_override の有無で判定 / mock: 偽装サービス / aws: 実 CloudWatch Logs
+CWAGENT_DELIVERY_TIMEOUT="60"     # 送達を待つ最大秒数 (force_flush_interval より十分長くする)
+CWAGENT_DELIVERY_INTERVAL="5"     # 送達確認のポーリング間隔 (秒)
+CWAGENT_MOCK_SERVICE=""           # 偽装 CloudWatch Logs の Compose サービス名 (空なら endpoint_override から解決)
+CWAGENT_MOCK_PORT=""              # 偽装 CloudWatch Logs のコンテナ側ポート (空なら endpoint_override から解決)
+CWAGENT_REQUIRED="false"          # true: 検証 NG を終了コード 1 として扱う
+# 段の記録に使う区切り。ログ group 名にも説明文にも現れない制御文字を使う。
+CWAGENT_STAGE_SEPARATOR=$'\037'
+COMPOSE_YAML_SEPARATOR=$'\037'    # compose.yml 展開結果の区切り
+CWAGENT_STAGE_RESULTS=()          # "ラベル<US>判定<US>詳細"
+CWAGENT_NG="false"                # 1 段でも NG を検出したか
+CWAGENT_UNKNOWN="false"           # 1 段でも確認できなかったか
+CWAGENT_VERIFY_ACTIVE="false"     # 静的チェックで検証対象と判定できたか (送達チェックの実行条件)
+# 静的チェックで解決し、送達チェックへ引き継ぐ値。
+CWAGENT_HOST_CONFIG_FILE=""       # ホスト側の設定 JSON パス
+CWAGENT_CONTAINER_CONFIG_FILE=""  # コンテナ内の設定 JSON パス
+CWAGENT_CONTAINER_CONFIG_JSON=""  # 起動中の cwagent から取り出した設定 JSON
+CWAGENT_ENDPOINT_OVERRIDE=""      # logs.endpoint_override の生値 (空なら実 CloudWatch Logs 宛て)
+CWAGENT_ENDPOINT_HOST=""          # endpoint_override のホスト名
+CWAGENT_ENDPOINT_PORT=""          # endpoint_override のポート
+CWAGENT_FORCE_FLUSH_INTERVAL=""   # logs.force_flush_interval (未設定なら空)
+CWAGENT_CONFIG_REGION=""          # agent.region または環境変数 AWS_REGION で解決したリージョン
+CWAGENT_CONFIG_PARSED="false"     # 設定 JSON を解析できたか (送信先・収集対象の照合可否)
+CWAGENT_EXPECTED_DESTINATIONS=()  # "log_group<US>log_stream<US>file_path"
+# compose.yml の展開結果 (cwagent の照合に使う)。
+declare -A CWAGENT_ENV_VALUES=()          # cwagent の environment
+declare -A CWAGENT_DEPENDS_ON=()          # cwagent の depends_on (サービス名 → condition)
+declare -A COMPOSE_CONTAINER_NAMES=()     # サービス名 → container_name
+declare -A COMPOSE_DEFINED_SERVICES=()    # compose.yml に定義されたサービス名
+CWAGENT_VOLUME_SPECS=()                   # cwagent の volumes (短縮記法)
+COMPOSE_VOLUME_SPECS=()                   # "サービス名<US>volumes 指定" (全サービス)
+CWAGENT_IMAGE=""                          # cwagent の image
+CWAGENT_LONG_SYNTAX_VOLUMES="false"       # cwagent の volumes に長記法があるか
 
 # BuildKit の tty 表示はログ保存時に途中経過が上書きされるため、未指定時は
 # plain を使用して各ビルドステップの出力を確実に残す。利用者が環境変数を
@@ -631,6 +690,53 @@ JBoss マスターパスワードの伝搬検証:
                            ※ 値に認証情報を含みやすい名前 (PASSWORD / TOKEN /
                              SECRET / HEADERS 等) は [REDACTED] で表示する
 
+CloudWatch Agent (cwagent) のログ送信検証:
+  (compose.yml に cwagent サービスが定義されていれば自動で実行する)
+  設定ファイルのチェック   ビルド前に、compose.yml の cwagent 定義とマウントする
+                           設定 JSON を突き合わせ、次の不備を検出する。
+                           - 設定ファイルが /etc/cwagentconfig へ注入されていない、
+                             またはホスト側の実ファイルが存在しない
+                             (存在しないパスを bind mount すると Docker が空の
+                              ディレクトリを作るため、設定は届かない)
+                           - 設定 JSON の構文エラー、collect_list の必須キー欠落、
+                             CloudWatch Logs の命名規則に反する
+                             log_group_name / log_stream_name
+                           - logs.endpoint_override の送信先ホストが compose.yml の
+                             サービス名・container_name のいずれとも一致しない
+                             (コンテナ内から名前解決できず送信が失敗する)
+                           - collect_list の file_path が cwagent の volumes へ
+                             マウントされていない (tail 対象が存在しない)
+                           - リージョン (agent.region / AWS_REGION) と認証情報が無い
+  送信状況のチェック       起動確認後に、実際に起動した cwagent が読み込んだ設定を
+                           コンテナから取り出してホスト側と比較し、設定済みの
+                           ロググループ / ログストリームへログイベントが届くまで
+                           待って確認する。cwagent の警告・エラーログも併せて表示する。
+                           - logs.endpoint_override が偽装サービス (WireMock) を指す
+                             場合は、その request journal の PutLogEvents を確認する
+                           - endpoint_override が無い場合は aws logs コマンドで
+                             実 CloudWatch Logs のロググループ / ストリーム /
+                             今回の実行以降のイベントを確認する (AWS 認証が必要)
+  --verify-cwagent         cwagent サービスが定義されていない場合も検証を試み、
+                           見つからなければ NG として報告する
+  --no-verify-cwagent      cwagent のログ送信検証を行わない
+  --cwagent-service NAME   CloudWatch Agent の Compose サービス名 (既定: cwagent)
+  --cwagent-config-dir PATH
+                           コンテナ内の設定ディレクトリ (既定: /etc/cwagentconfig)
+  --cwagent-delivery-target auto|mock|aws
+                           送信状況の確認先。auto は logs.endpoint_override が
+                           あれば mock、無ければ aws を選ぶ (既定: auto)
+  --cwagent-delivery-timeout SEC
+                           送達を待つ最大秒数 (既定: 60)
+  --cwagent-delivery-interval SEC
+                           送達確認のポーリング間隔・秒 (既定: 5)
+  --cwagent-mock-service NAME
+                           偽装 CloudWatch Logs (WireMock) の Compose サービス名。
+                           未指定時は endpoint_override のホスト名から解決する
+  --cwagent-mock-port PORT 偽装 CloudWatch Logs のコンテナ側ポート。
+                           未指定時は endpoint_override のポート (既定: 8080)
+  --cwagent-required       設定・送達の検証で NG があった場合、終了コード 1 とする
+                           (既定は警告のみでビルド結果の判定は変えない)
+
 URL 応答確認:
   --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
                            (単独指定でもコンテナを起動して確認する)
@@ -717,6 +823,16 @@ while [ $# -gt 0 ]; do
     --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
     --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
+    --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
+    --no-verify-cwagent)   VERIFY_CWAGENT="false"; shift ;;
+    --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
+    --cwagent-config-dir)  need_value "$1" $#; CWAGENT_CONFIG_DIR="$2"; shift 2 ;;
+    --cwagent-delivery-target) need_value "$1" $#; CWAGENT_DELIVERY_TARGET="$2"; shift 2 ;;
+    --cwagent-delivery-timeout) need_value "$1" $#; CWAGENT_DELIVERY_TIMEOUT="$2"; shift 2 ;;
+    --cwagent-delivery-interval) need_value "$1" $#; CWAGENT_DELIVERY_INTERVAL="$2"; shift 2 ;;
+    --cwagent-mock-service) need_value "$1" $#; CWAGENT_MOCK_SERVICE="$2"; shift 2 ;;
+    --cwagent-mock-port)   need_value "$1" $#; CWAGENT_MOCK_PORT="$2"; shift 2 ;;
+    --cwagent-required)    CWAGENT_REQUIRED="true"; shift ;;
     --verify-url)          need_value "$1" $#; VERIFY_URL="$2"; shift 2 ;;
     --expect-status)       need_value "$1" $#; EXPECT_STATUS="$2"; shift 2 ;;
     --url-method)          need_value "$1" $#; URL_METHOD="$2"; shift 2 ;;
@@ -768,6 +884,50 @@ for _deployment_env in "${DEPLOYMENT_DIR_ENVS[@]}"; do
 done
 if [ "$BUILD_REPORT_DIR_SET" = "true" ] && { [ -z "$BUILD_REPORT_DIR" ] || [ "$BUILD_REPORT_DIR" = "-" ]; }; then
   err "--report-dir にはディレクトリパスを指定してください: $BUILD_REPORT_DIR"
+  exit 2
+fi
+
+# ---- cwagent 検証オプションの検証 -------------------------------------------
+validate_positive_integer "$CWAGENT_DELIVERY_TIMEOUT" "--cwagent-delivery-timeout" || exit 2
+validate_positive_integer "$CWAGENT_DELIVERY_INTERVAL" "--cwagent-delivery-interval" || exit 2
+if [ "$CWAGENT_DELIVERY_INTERVAL" -gt "$CWAGENT_DELIVERY_TIMEOUT" ]; then
+  err "--cwagent-delivery-interval は --cwagent-delivery-timeout 以下にしてください: ${CWAGENT_DELIVERY_INTERVAL} > ${CWAGENT_DELIVERY_TIMEOUT}"
+  exit 2
+fi
+case "$CWAGENT_DELIVERY_TARGET" in
+  auto|mock|aws) ;;
+  *)
+    err "--cwagent-delivery-target には auto、mock または aws を指定してください: ${CWAGENT_DELIVERY_TARGET}"
+    exit 2
+    ;;
+esac
+if [ -z "$CWAGENT_SERVICE" ]; then
+  err "--cwagent-service にはサービス名を指定してください"
+  exit 2
+fi
+case "$CWAGENT_CONFIG_DIR" in
+  /*) ;;
+  *)
+    err "--cwagent-config-dir にはコンテナ内の絶対パスを指定してください: ${CWAGENT_CONFIG_DIR}"
+    exit 2
+    ;;
+esac
+if [ -n "$CWAGENT_MOCK_PORT" ]; then
+  case "$CWAGENT_MOCK_PORT" in
+    *[!0-9]*)
+      err "--cwagent-mock-port には 1 から 65535 の範囲を指定してください: ${CWAGENT_MOCK_PORT}"
+      exit 2
+      ;;
+  esac
+  if [ "${#CWAGENT_MOCK_PORT}" -gt 5 ] \
+      || (( 10#$CWAGENT_MOCK_PORT < 1 || 10#$CWAGENT_MOCK_PORT > 65535 )); then
+    err "--cwagent-mock-port には 1 から 65535 の範囲を指定してください: ${CWAGENT_MOCK_PORT}"
+    exit 2
+  fi
+fi
+if [ "$VERIFY_CWAGENT" = "false" ] \
+    && { [ -n "$CWAGENT_MOCK_SERVICE" ] || [ -n "$CWAGENT_MOCK_PORT" ] || [ "$CWAGENT_REQUIRED" = "true" ]; }; then
+  err "--no-verify-cwagent と cwagent 検証の詳細オプションは同時に指定できません"
   exit 2
 fi
 
@@ -1428,16 +1588,15 @@ jboss_print_stage_summary() {
   diag ""
 }
 
-# ---- (1)(2) ホスト側で完結する段の検証 --------------------------------------
-# compose.yml を読み、environment 型シークレットの定義と、それをビルドで参照する
-# サービスの有無を確認する。YAML のパスと値を awk で取り出し、
+# ---- compose.yml の展開 (JBoss シークレット / cwagent 設定の照合で共用) ------
+# YAML のパスと値を awk で取り出し、
 #   kv <パス> <値>      : key: value 形式
 #   list <パス> <値>    : - value 形式のリスト要素
-# として列挙する。
-jboss_compose_yaml_entries() {
-  local compose_file="$1"
+# として列挙する。第 2 引数で区切り文字を指定できる (既定は US)。
+compose_yaml_entries() {
+  local compose_file="$1" separator="${2:-$'\037'}"
   [ -f "$compose_file" ] || return 1
-  awk -v SEP="$JBOSS_STAGE_SEPARATOR" '
+  awk -v SEP="$separator" '
     function path_string(   i, s) {
       s = ""
       for (i = 1; i <= depth; i++) s = s (i > 1 ? "." : "") stack[i]
@@ -1514,7 +1673,7 @@ verify_jboss_password_compose_definition() {
         build_refs_by_secret["$value"]="${build_refs_by_secret[$value]:-}${secret_name} "
         ;;
     esac
-  done < <(jboss_compose_yaml_entries "$COMPOSE_FILE")
+  done < <(compose_yaml_entries "$COMPOSE_FILE" "$JBOSS_STAGE_SEPARATOR")
 
   if [ -n "$mismatched_env" ]; then
     jboss_record_stage "$stage_label" "不一致" \
@@ -5808,42 +5967,11 @@ def load_json_documents(labels):
     return documents
 '
 
-observability_http_get() {
-  curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" "$1"
-}
-
-observability_http_post_json() {
-  local url="$1"
-  curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" \
-    --request POST --header "Content-Type: application/json" \
-    --data-binary @- "$url"
-}
-
-wiremock_request_count() {
-  local base_url="$1" target="$2" payload response
-
-  payload="$(printf '{"method":"POST","url":"/","headers":{"X-Amz-Target":{"equalTo":"%s"}}}' "$target")"
-  if ! response="$(printf '%s' "$payload" | observability_http_post_json "${base_url}/__admin/requests/count")"; then
-    return 1
-  fi
-  # 改行を書かずに返し、Windows の Python が付ける CR が値へ混ざらないようにする。
-  printf '%s' "$response" | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" -c \
-    'import json,sys; value=json.load(sys.stdin).get("count"); sys.stdout.write(str(value) if isinstance(value, int) else "?")'
-}
-
-# 標準入力の 1 つ目に cwagent 設定、2 つ目に WireMock request journal を受け取る。
-# Authorization 等のヘッダーは読み捨て、設定済み送信先と PutLogEvents 本文だけを表示する。
-render_cloudwatch_delivery_report() {
-  local config_json="$1" journal_json="$2"
-  local create_group_count="$3" create_stream_count="$4" put_count="$5"
-  local program
-
-  program="$(cat <<'PY'
+# WireMock の request journal を読む Python ヘルパーの共通定義。
+# journal のリクエストはヘッダー表現がバージョンで揺れるため、取り出し方をここへ集約する。
+OBSERVABILITY_PYTHON_WIREMOCK_LOADER='
 import base64
-import datetime
 import json
-import re
-import sys
 
 
 def header_value(request, name):
@@ -5880,6 +6008,56 @@ def request_body(request):
         except Exception:
             return {}
     return {}
+
+
+def put_log_events_requests(journal):
+    """journal から PutLogEvents のリクエスト本文だけを取り出す。"""
+    records = journal.get("requests", []) if isinstance(journal, dict) else []
+    bodies = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        request = record.get("request") if isinstance(record.get("request"), dict) else record
+        if header_value(request, "X-Amz-Target") != "Logs_20140328.PutLogEvents":
+            continue
+        bodies.append(request_body(request))
+    return bodies
+'
+
+observability_http_get() {
+  curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" "$1"
+}
+
+observability_http_post_json() {
+  local url="$1"
+  curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" \
+    --request POST --header "Content-Type: application/json" \
+    --data-binary @- "$url"
+}
+
+wiremock_request_count() {
+  local base_url="$1" target="$2" payload response
+
+  payload="$(printf '{"method":"POST","url":"/","headers":{"X-Amz-Target":{"equalTo":"%s"}}}' "$target")"
+  if ! response="$(printf '%s' "$payload" | observability_http_post_json "${base_url}/__admin/requests/count")"; then
+    return 1
+  fi
+  # 改行を書かずに返し、Windows の Python が付ける CR が値へ混ざらないようにする。
+  printf '%s' "$response" | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" -c \
+    'import json,sys; value=json.load(sys.stdin).get("count"); sys.stdout.write(str(value) if isinstance(value, int) else "?")'
+}
+
+# 標準入力の 1 つ目に cwagent 設定、2 つ目に WireMock request journal を受け取る。
+# Authorization 等のヘッダーは読み捨て、設定済み送信先と PutLogEvents 本文だけを表示する。
+render_cloudwatch_delivery_report() {
+  local config_json="$1" journal_json="$2"
+  local create_group_count="$3" create_stream_count="$4" put_count="$5"
+  local program
+
+  program="$(cat <<'PY'
+import datetime
+import re
+import sys
 
 
 def clean_text(value, limit=500):
@@ -6006,7 +6184,8 @@ print("════════════════════════�
 PY
 )"
   run_observability_python \
-    "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 2 "$config_json" "$journal_json" \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${OBSERVABILITY_PYTHON_WIREMOCK_LOADER}${program}" \
+    2 "$config_json" "$journal_json" \
     "$create_group_count" "$create_stream_count" "$put_count" \
     "$OBSERVABILITY_EVENT_DISPLAY_LIMIT" "$OBSERVABILITY_WIREMOCK_REQUEST_LIMIT"
 }
@@ -6068,6 +6247,1130 @@ run_cloudwatch_logs_delivery_helper() {
   diag "判定基準: 設定済み log group / log stream に PutLogEvents とイベント本文があれば送達確認済みです。"
   diag "未確認の場合は cwagent の force_flush_interval (対象構成は 5 秒) 以上待ってから再実行してください。"
   diag "メッセージには機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+}
+
+# =============================================================================
+# CloudWatch Agent (cwagent) のログ送信検証
+# -----------------------------------------------------------------------------
+# ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml から起動する構成は、
+# 設定不備があってもエージェント自体は正常に起動してしまい、CloudWatch Logs へ 1 件も
+# 届かないまま気付かないことが多い。ビルド時のチェックとして次の 2 段で検証する。
+#
+#   (A) verify_cwagent_config_definition : ビルド前の設定ファイルチェック
+#       compose.yml の cwagent 定義と、マウントする設定 JSON をホスト側だけで突き合わせ、
+#       送信先・収集対象・リージョン・認証の不備を起動前に検出する。
+#   (B) verify_cwagent_log_delivery      : 起動確認後の送信状況チェック
+#       起動した cwagent が実際に読み込んだ設定を取り出してホスト側と比較し、
+#       設定済みのロググループ / ログストリームへログイベントが届くまで待って確認する。
+# =============================================================================
+
+cwagent_record_stage() {
+  local label="$1" verdict="$2" note="${3:-}"
+  CWAGENT_STAGE_RESULTS+=(
+    "${label}${CWAGENT_STAGE_SEPARATOR}${verdict}${CWAGENT_STAGE_SEPARATOR}${note}"
+  )
+  case "$verdict" in
+    NG*)     CWAGENT_NG="true" ;;
+    未確認*) CWAGENT_UNKNOWN="true" ;;
+  esac
+}
+
+# ログ本文には認証情報が混ざり得るため、画面へ出す前に代表的な名前の値を伏せる。
+# Python ヘルパー側の clean_text と同じ観点を、シェル経路にも適用する。
+cwagent_redact_text() {
+  sed -E 's/(password|passwd|pwd|secret|token|authorization|cookie|api[_-]?key|credential)([[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1\2[REDACTED]/Ig'
+}
+
+# compose の短縮記法 volumes ("SOURCE:TARGET[:MODE]") を分解する。
+# 出力: SOURCE<US>TARGET<US>MODE (SOURCE が空なら匿名ボリューム)
+cwagent_split_volume_spec() {
+  local spec="$1" source target mode="" rest
+  case "$spec" in
+    *:*) ;;
+    *)
+      printf '%s%s%s%s%s\n' "" "$COMPOSE_YAML_SEPARATOR" "$spec" "$COMPOSE_YAML_SEPARATOR" ""
+      return 0
+      ;;
+  esac
+  source="${spec%%:*}"
+  rest="${spec#*:}"
+  case "$rest" in
+    *:*) target="${rest%%:*}"; mode="${rest#*:}" ;;
+    *)   target="$rest" ;;
+  esac
+  printf '%s%s%s%s%s\n' "$source" "$COMPOSE_YAML_SEPARATOR" "$target" "$COMPOSE_YAML_SEPARATOR" "$mode"
+}
+
+# compose.yml からの相対パスを絶対パスへ直す (bind mount のホスト側実体を確認するため)。
+cwagent_resolve_host_path() {
+  local path="$1" compose_dir
+  case "$path" in
+    /*|~*) printf '%s\n' "$path"; return 0 ;;
+  esac
+  if ! compose_dir="$(compose_file_dir)"; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  path="${path#./}"
+  printf '%s/%s\n' "${compose_dir%/}" "$path"
+}
+
+# compose.yml を 1 回走査し、cwagent の定義と全サービスの volumes を配列へ展開する。
+cwagent_collect_compose_definition() {
+  local kind entry_path value service rest env_name env_value dependency
+
+  CWAGENT_ENV_VALUES=()
+  CWAGENT_DEPENDS_ON=()
+  COMPOSE_CONTAINER_NAMES=()
+  COMPOSE_DEFINED_SERVICES=()
+  CWAGENT_VOLUME_SPECS=()
+  COMPOSE_VOLUME_SPECS=()
+  CWAGENT_IMAGE=""
+  CWAGENT_LONG_SYNTAX_VOLUMES="false"
+
+  [ -f "$COMPOSE_FILE" ] || return 1
+
+  while IFS="$COMPOSE_YAML_SEPARATOR" read -r kind entry_path value; do
+    [ -n "$kind" ] || continue
+    case "$entry_path" in
+      services.*) ;;
+      *) continue ;;
+    esac
+    rest="${entry_path#services.}"
+    service="${rest%%.*}"
+    [ -n "$service" ] || continue
+    COMPOSE_DEFINED_SERVICES["$service"]="true"
+    rest="${rest#"$service"}"
+    rest="${rest#.}"
+
+    case "$kind:$rest" in
+      kv:container_name) COMPOSE_CONTAINER_NAMES["$service"]="$value" ;;
+      list:volumes) COMPOSE_VOLUME_SPECS+=("${service}${COMPOSE_YAML_SEPARATOR}${value}") ;;
+    esac
+
+    [ "$service" = "$CWAGENT_SERVICE" ] || continue
+    case "$kind:$rest" in
+      kv:image) CWAGENT_IMAGE="$value" ;;
+      kv:environment.*)
+        env_name="${rest#environment.}"
+        CWAGENT_ENV_VALUES["$env_name"]="$value"
+        ;;
+      list:environment)
+        # リスト記法 (- NAME=VALUE) は = の前後で分ける。値なしは空文字とする。
+        env_name="${value%%=*}"
+        env_value="${value#*=}"
+        [ "$env_value" = "$value" ] && env_value=""
+        [ -n "$env_name" ] && CWAGENT_ENV_VALUES["$env_name"]="$env_value"
+        ;;
+      list:volumes)
+        # 長記法 (- type: bind / source: ... ) はこの展開では分解できないため、
+        # 検出だけ記録して volumes 依存の判定を「未確認」に落とす。
+        case "$value" in
+          type:*|source:*|target:*|read_only:*) CWAGENT_LONG_SYNTAX_VOLUMES="true" ;;
+          *) CWAGENT_VOLUME_SPECS+=("$value") ;;
+        esac
+        ;;
+      kv:depends_on.*.condition)
+        dependency="${rest#depends_on.}"
+        dependency="${dependency%.condition}"
+        CWAGENT_DEPENDS_ON["$dependency"]="$value"
+        ;;
+      list:depends_on) CWAGENT_DEPENDS_ON["$value"]="(条件指定なし)" ;;
+    esac
+  done < <(compose_yaml_entries "$COMPOSE_FILE" "$COMPOSE_YAML_SEPARATOR")
+  return 0
+}
+
+# compose.yml の定義に現れないサービス (extends / include 経由など) を補うため、
+# YAML の走査で cwagent が見つからなかったときだけ compose 側の解決結果も確認する。
+cwagent_service_is_defined() {
+  local service
+  [ -n "${COMPOSE_DEFINED_SERVICES[$CWAGENT_SERVICE]:-}" ] && return 0
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    COMPOSE_DEFINED_SERVICES["$service"]="true"
+  done < <("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" config --services 2>/dev/null || true)
+  [ -n "${COMPOSE_DEFINED_SERVICES[$CWAGENT_SERVICE]:-}" ]
+}
+
+# 設定 JSON から、照合に必要な項目だけを US 区切りのレコードとして取り出す。
+# レコード種別:
+#   agent_region / agent_debug / agent_credentials / endpoint_override
+#   force_flush_interval / default_log_stream
+#   collect <file_path> <group> <stream> <stream の由来> <timestamp_format> <timezone> <auto_removal>
+#   ng <メッセージ> / warn <メッセージ> / info <メッセージ>
+cwagent_config_facts() {
+  local config_json="$1" program
+
+  program="$(cat <<'PY'
+import re
+import sys
+
+SEP = "\x1f"
+
+
+def out(*fields):
+    print(SEP.join("" if field is None else str(field) for field in fields))
+
+
+config, = load_json_documents(["cwagent 設定ファイル"])
+if not isinstance(config, dict):
+    print("[ERROR] cwagent 設定ファイルの最上位が JSON オブジェクトではありません。", file=sys.stderr)
+    raise SystemExit(2)
+
+agent = config.get("agent") if isinstance(config.get("agent"), dict) else {}
+logs = config.get("logs") if isinstance(config.get("logs"), dict) else {}
+
+out("agent_region", agent.get("region") or "")
+out("agent_debug", "true" if agent.get("debug") else "false")
+credentials = agent.get("credentials")
+if isinstance(credentials, dict) and credentials.get("role_arn"):
+    out("agent_credentials", str(credentials.get("role_arn")))
+
+if not logs:
+    out("ng", "設定に logs セクションがありません。ログファイルの収集・送信は一切行われません。")
+
+out("endpoint_override", str(logs.get("endpoint_override") or ""))
+
+flush = logs.get("force_flush_interval")
+if isinstance(flush, bool) or not isinstance(flush, (int, float)):
+    if flush is not None:
+        out("warn", f"logs.force_flush_interval が数値ではありません: {flush!r}")
+    out("force_flush_interval", "")
+else:
+    out("force_flush_interval", int(flush))
+
+default_stream = str(logs.get("log_stream_name") or "")
+out("default_log_stream", default_stream)
+
+collected = logs.get("logs_collected") if isinstance(logs.get("logs_collected"), dict) else {}
+files = collected.get("files") if isinstance(collected.get("files"), dict) else {}
+collect_list = files.get("collect_list")
+if not isinstance(collect_list, list) or not collect_list:
+    if logs:
+        out("ng", "logs.logs_collected.files.collect_list が空です。収集対象のログファイルがありません。")
+    collect_list = []
+
+# CloudWatch Logs の命名規則 (ロググループ: 英数と _ / . - # のみ、1〜512 文字。
+# ログストリーム: : と * を含められず、1〜512 文字)。
+group_pattern = re.compile(r"^[A-Za-z0-9_./#-]{1,512}$")
+stream_pattern = re.compile(r"^[^:*]{1,512}$")
+
+for index, entry in enumerate(collect_list, start=1):
+    if not isinstance(entry, dict):
+        out("ng", f"collect_list[{index}] がオブジェクトではないため収集対象になりません。")
+        continue
+    file_path = str(entry.get("file_path") or "")
+    group = str(entry.get("log_group_name") or "")
+    stream_value = entry.get("log_stream_name")
+    if stream_value:
+        stream = str(stream_value)
+        stream_source = "エントリ指定"
+    elif default_stream:
+        stream = default_stream
+        stream_source = "logs.log_stream_name の既定値"
+    else:
+        stream = ""
+        stream_source = "未指定 (エージェントがホスト名等から自動生成)"
+    timestamp_format = str(entry.get("timestamp_format") or "")
+    timezone = str(entry.get("timezone") or "")
+    auto_removal = "true" if entry.get("auto_removal") else ""
+
+    if not file_path:
+        out("ng", f"collect_list[{index}] に file_path がありません。収集対象を特定できません。")
+    if not group:
+        out("ng", f"collect_list[{index}] ({file_path or '(file_path 未指定)'}) に log_group_name がありません。送信先ロググループを特定できません。")
+    elif not group_pattern.match(group):
+        out("ng", f"log_group_name が CloudWatch Logs の命名規則に反します (英数と _ . / # - のみ、1〜512 文字): {group}")
+    if stream and not stream_pattern.match(stream):
+        out("ng", f"log_stream_name が CloudWatch Logs の命名規則に反します (: と * は使用不可、1〜512 文字): {stream}")
+    if not stream:
+        out("warn", f"collect_list[{index}] ({file_path}) の log_stream_name が未指定です。送信先ストリーム名が実行環境で変わるため、送達確認では照合できません。")
+    if entry.get("multi_line_start_pattern") and not timestamp_format:
+        out("warn", f"collect_list[{index}] ({file_path}) は multi_line_start_pattern を使いますが timestamp_format がありません。イベントの区切りが想定とずれることがあります。")
+
+    out("collect", file_path, group, stream, stream_source, timestamp_format, timezone, auto_removal)
+PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 1 "$config_json"
+}
+
+# --- (A) 設定ファイルのチェック (ビルド前) -----------------------------------
+
+# 設定ファイルの注入経路を突き止める。
+# 戻り値: 0 = 特定できた / 1 = 特定できない (段は関数内で記録済み)
+cwagent_verify_config_injection() {
+  local stage_label="設定ファイルの注入 (compose.yml volumes → ${CWAGENT_CONFIG_DIR})"
+  local spec source target mode host_path matched_target="" matched_source="" matched_mode=""
+
+  if [ -n "${CWAGENT_ENV_VALUES[CW_CONFIG_CONTENT]:-}" ]; then
+    CWAGENT_HOST_CONFIG_FILE=""
+    cwagent_record_stage "$stage_label" "未確認" \
+        "環境変数 CW_CONFIG_CONTENT で設定を注入しています。設定本文はホスト側のファイルではないため、静的な内容チェックは行いません (起動後の送達チェックで確認します)"
+    return 1
+  fi
+
+  for spec in ${CWAGENT_VOLUME_SPECS[@]+"${CWAGENT_VOLUME_SPECS[@]}"}; do
+    IFS="$COMPOSE_YAML_SEPARATOR" read -r source target mode < <(cwagent_split_volume_spec "$spec")
+    case "$target" in
+      "$CWAGENT_CONFIG_DIR"|"$CWAGENT_CONFIG_DIR"/*|"$CWAGENT_CONFIG_FALLBACK_PATH")
+        matched_target="$target"
+        matched_source="$source"
+        matched_mode="$mode"
+        break
+        ;;
+    esac
+  done
+
+  if [ -z "$matched_target" ]; then
+    if [ "$CWAGENT_LONG_SYNTAX_VOLUMES" = "true" ]; then
+      cwagent_record_stage "$stage_label" "未確認" \
+          "volumes が長記法 (type: bind ...) のため、このスクリプトでは注入先を判定できません。${CWAGENT_CONFIG_DIR} へ設定ファイルをマウントしているか手動で確認してください"
+      return 1
+    fi
+    cwagent_record_stage "$stage_label" "NG" \
+        "${CWAGENT_CONFIG_DIR} (または ${CWAGENT_CONFIG_FALLBACK_PATH}) へ設定ファイルをマウントする volumes がありません。CloudWatch Agent は既定設定で起動し、ログを 1 件も送信しません。現在の volumes: ${CWAGENT_VOLUME_SPECS[*]:-(なし)}"
+    return 1
+  fi
+
+  case "$matched_source" in
+    ./*|../*|/*|~*) ;;
+    *)
+      cwagent_record_stage "$stage_label" "NG" \
+          "設定ファイルの注入元 '${matched_source}' が名前付きボリュームです。ホスト側の設定 JSON を bind mount してください (例: ./compose/cwagent/cwagent-config.json:${CWAGENT_CONFIG_DIR}/cwagent-config.json:ro)"
+      return 1
+      ;;
+  esac
+
+  host_path="$(cwagent_resolve_host_path "$matched_source")"
+  if [ ! -e "$host_path" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "マウント元のファイルがホストに存在しません: ${matched_source} (解決先: ${host_path})。存在しないパスを bind mount すると Docker が空のディレクトリを作るため、CloudWatch Agent へ設定は届きません"
+    return 1
+  fi
+  if [ -d "$host_path" ]; then
+    # ディレクトリごとマウントする構成。中の JSON を 1 つ選んで内容チェックへ回す。
+    local candidate=""
+    for candidate in "$host_path"/*.json; do
+      [ -f "$candidate" ] || continue
+      CWAGENT_HOST_CONFIG_FILE="$candidate"
+      break
+    done
+    if [ -z "$CWAGENT_HOST_CONFIG_FILE" ]; then
+      cwagent_record_stage "$stage_label" "NG" \
+          "マウント元ディレクトリ ${host_path} に設定 JSON がありません。CloudWatch Agent は読み込む設定を見つけられません"
+      return 1
+    fi
+    CWAGENT_CONTAINER_CONFIG_FILE="${matched_target%/}/$(basename "$CWAGENT_HOST_CONFIG_FILE")"
+  else
+    CWAGENT_HOST_CONFIG_FILE="$host_path"
+    CWAGENT_CONTAINER_CONFIG_FILE="$matched_target"
+  fi
+
+  cwagent_record_stage "$stage_label" "OK" \
+      "${matched_source} → ${matched_target}${matched_mode:+:${matched_mode}} (ホスト側実体: ${CWAGENT_HOST_CONFIG_FILE})"
+  return 0
+}
+
+# 設定 JSON の内容 (収集定義・命名規則) を確認し、以降の照合に使う値を取り出す。
+cwagent_verify_config_content() {
+  local stage_label="設定ファイルの内容 (収集定義とロググループ)"
+  local config_json kind field1 field2 field3 field4 field5 field6 field7
+  local collect_count=0 ng_count=0 destinations=""
+
+  [ -n "$CWAGENT_HOST_CONFIG_FILE" ] || return 1
+  if ! config_json="$(cat "$CWAGENT_HOST_CONFIG_FILE" 2>/dev/null)"; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "設定ファイルを読み取れません: ${CWAGENT_HOST_CONFIG_FILE}"
+    return 1
+  fi
+  # 設定 JSON の解析には Python 3 が要る (curl はこの段では不要)。
+  if ! resolve_observability_python; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "Python 3 が見つからないため、設定ファイルの内容を解析できません: ${CWAGENT_HOST_CONFIG_FILE}"
+    return 1
+  fi
+
+  local facts detail
+  if ! facts="$(cwagent_config_facts "$config_json" 2>/dev/null)"; then
+    # 失敗時のみ、原因を示すために標準エラー出力を取り直す。
+    detail="$(cwagent_config_facts "$config_json" 2>&1 >/dev/null | tr '\n' ' ' | cut -c1-200)"
+    cwagent_record_stage "$stage_label" "NG" \
+        "設定ファイルの JSON を解析できません: ${CWAGENT_HOST_CONFIG_FILE} (${detail:-詳細不明})。CloudWatch Agent は設定を読み込めず、ログを送信しません"
+    return 1
+  fi
+
+  CWAGENT_CONFIG_PARSED="true"
+  while IFS="$CWAGENT_STAGE_SEPARATOR" read -r kind field1 field2 field3 field4 field5 field6 field7; do
+    [ -n "$kind" ] || continue
+    case "$kind" in
+      agent_region)   [ -n "$field1" ] && CWAGENT_CONFIG_REGION="$field1" ;;
+      endpoint_override) CWAGENT_ENDPOINT_OVERRIDE="$field1" ;;
+      force_flush_interval) CWAGENT_FORCE_FLUSH_INTERVAL="$field1" ;;
+      collect)
+        collect_count=$((collect_count + 1))
+        CWAGENT_EXPECTED_DESTINATIONS+=(
+          "${field2}${CWAGENT_STAGE_SEPARATOR}${field3}${CWAGENT_STAGE_SEPARATOR}${field1}"
+        )
+        destinations="${destinations}${destinations:+, }${field2}/${field3:-(自動生成)}"
+        ;;
+      ng)
+        ng_count=$((ng_count + 1))
+        cwagent_record_stage "設定ファイルの収集定義" "NG" "$field1"
+        ;;
+      warn)
+        cwagent_record_stage "設定ファイルの収集定義" "注意" "$field1"
+        ;;
+      info)
+        cwagent_record_stage "設定ファイルの収集定義" "情報" "$field1"
+        ;;
+    esac
+  done <<< "$facts"
+
+  if [ "$ng_count" -gt 0 ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "収集定義に ${ng_count} 件の問題があります (収集対象: ${collect_count} 件)"
+    return 1
+  fi
+  cwagent_record_stage "$stage_label" "OK" \
+      "収集対象 ${collect_count} 件 / 送信先: ${destinations:-(なし)}${CWAGENT_FORCE_FLUSH_INTERVAL:+ / force_flush_interval=${CWAGENT_FORCE_FLUSH_INTERVAL} 秒}"
+  return 0
+}
+
+# logs.endpoint_override の送信先が、compose ネットワーク内で名前解決できるか確認する。
+cwagent_verify_endpoint_override() {
+  local stage_label="送信先 (logs.endpoint_override)"
+  local endpoint host port="" hostport service matched=""
+
+  if [ -z "$CWAGENT_ENDPOINT_OVERRIDE" ]; then
+    cwagent_record_stage "$stage_label" "情報" \
+        "endpoint_override が未設定のため、実 CloudWatch Logs (logs.<region>.amazonaws.com) へ送信します。コンテナからの HTTPS 経路と IAM 権限 (logs:CreateLogGroup / logs:CreateLogStream / logs:PutLogEvents) が必要です"
+    return 0
+  fi
+
+  endpoint="$CWAGENT_ENDPOINT_OVERRIDE"
+  hostport="${endpoint#*://}"
+  hostport="${hostport%%/*}"
+  host="${hostport%%:*}"
+  case "$hostport" in
+    *:*) port="${hostport##*:}" ;;
+  esac
+  CWAGENT_ENDPOINT_HOST="$host"
+  CWAGENT_ENDPOINT_PORT="$port"
+
+  if [ -z "$host" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "endpoint_override のホスト名を解釈できません: ${endpoint}"
+    return 1
+  fi
+
+  case "$host" in
+    localhost|127.0.0.1|::1|0.0.0.0)
+      cwagent_record_stage "$stage_label" "NG" \
+          "endpoint_override が ${host} を指しています。cwagent コンテナ自身を指すため、別コンテナの CloudWatch Logs 偽装サービスへは届きません。Compose のサービス名を指定してください: ${endpoint}"
+      return 1
+      ;;
+    *[0-9].[0-9]*)
+      # IP アドレス直指定は名前解決の照合ができないため確認対象外とする。
+      if printf '%s' "$host" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+        cwagent_record_stage "$stage_label" "未確認" \
+            "endpoint_override が IP アドレス (${host}) を直接指しているため、compose.yml との照合はできません: ${endpoint}"
+        return 0
+      fi
+      ;;
+  esac
+
+  if [ -n "${COMPOSE_DEFINED_SERVICES[$host]:-}" ]; then
+    matched="Compose サービス '${host}'"
+  else
+    for service in "${!COMPOSE_CONTAINER_NAMES[@]}"; do
+      if [ "${COMPOSE_CONTAINER_NAMES[$service]}" = "$host" ]; then
+        matched="サービス '${service}' の container_name '${host}'"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$matched" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "endpoint_override のホスト '${host}' が compose.yml のサービス名・container_name のいずれとも一致しません。cwagent コンテナ内で名前解決できず、送信はすべて失敗します: ${endpoint}"
+    return 1
+  fi
+
+  # 送信先が listen する前に送った分は捨てられるため、depends_on での待ち合わせも見る。
+  local dependency_note=""
+  local depends_key="$host"
+  [ -n "${CWAGENT_DEPENDS_ON[$host]:-}" ] || depends_key=""
+  if [ -z "$depends_key" ]; then
+    for service in "${!CWAGENT_DEPENDS_ON[@]}"; do
+      if [ "${COMPOSE_CONTAINER_NAMES[$service]:-}" = "$host" ]; then
+        depends_key="$service"
+        break
+      fi
+    done
+  fi
+  if [ -z "$depends_key" ]; then
+    dependency_note=" / 注意: cwagent の depends_on に送信先がありません。送信先が listen する前に送ったログイベントは失われます"
+  elif [ "${CWAGENT_DEPENDS_ON[$depends_key]}" != "service_healthy" ]; then
+    dependency_note=" / 注意: depends_on の condition が '${CWAGENT_DEPENDS_ON[$depends_key]}' です。listen 完了を待つには service_healthy を指定してください"
+  fi
+
+  cwagent_record_stage "$stage_label" "OK" \
+      "${endpoint} → ${matched}${dependency_note}"
+  return 0
+}
+
+# collect_list の file_path が cwagent へマウントされているかを確認する。
+# ここが抜けていると、設定も送信先も正しいのに tail 対象が存在せず何も送られない。
+cwagent_verify_log_source_mounts() {
+  local stage_label="収集対象ログファイルのマウント"
+  local destination group stream file_path spec source target mode
+  local matched_target matched_source entry writer_service writer_spec
+  local writer_source writer_target writer_mode
+  local unmounted="" mounted_count=0 writerless=""
+
+  if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -eq 0 ]; then
+    return 0
+  fi
+  if [ "$CWAGENT_LONG_SYNTAX_VOLUMES" = "true" ]; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "cwagent の volumes が長記法のため、収集対象パスのマウント有無を判定できません"
+    return 0
+  fi
+
+  for destination in "${CWAGENT_EXPECTED_DESTINATIONS[@]}"; do
+    IFS="$CWAGENT_STAGE_SEPARATOR" read -r group stream file_path <<< "$destination"
+    [ -n "$file_path" ] || continue
+    matched_target=""
+    matched_source=""
+    for spec in ${CWAGENT_VOLUME_SPECS[@]+"${CWAGENT_VOLUME_SPECS[@]}"}; do
+      IFS="$COMPOSE_YAML_SEPARATOR" read -r source target mode < <(cwagent_split_volume_spec "$spec")
+      [ -n "$target" ] || continue
+      case "$file_path" in
+        "$target"|"$target"/*)
+          matched_target="$target"
+          matched_source="$source"
+          break
+          ;;
+      esac
+    done
+
+    if [ -z "$matched_target" ]; then
+      unmounted="${unmounted}${unmounted:+, }${file_path}"
+      continue
+    fi
+    mounted_count=$((mounted_count + 1))
+
+    # 収集元へ実際に書き込むサービスがいるか (読み取り専用マウントだけなら誰も書かない)。
+    writer_service=""
+    for entry in ${COMPOSE_VOLUME_SPECS[@]+"${COMPOSE_VOLUME_SPECS[@]}"}; do
+      IFS="$COMPOSE_YAML_SEPARATOR" read -r writer_spec writer_source <<< "$entry"
+      [ "$writer_spec" = "$CWAGENT_SERVICE" ] && continue
+      IFS="$COMPOSE_YAML_SEPARATOR" read -r writer_source writer_target writer_mode \
+        < <(cwagent_split_volume_spec "$writer_source")
+      [ "$writer_source" = "$matched_source" ] || continue
+      case "$writer_mode" in
+        ro|ro,*|*,ro) continue ;;
+      esac
+      writer_service="$writer_spec"
+      break
+    done
+    if [ -z "$writer_service" ]; then
+      writerless="${writerless}${writerless:+, }${file_path} (マウント元: ${matched_source})"
+    fi
+  done
+
+  if [ -n "$unmounted" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "収集対象パスが cwagent にマウントされていません: ${unmounted}。tail 対象のファイルが存在しないため、ログは 1 件も送信されません。現在の volumes: ${CWAGENT_VOLUME_SPECS[*]:-(なし)}"
+    return 1
+  fi
+  if [ -n "$writerless" ]; then
+    cwagent_record_stage "$stage_label" "注意" \
+        "収集対象はマウントされていますが、書き込み可能なマウントを持つ他サービスが compose.yml にありません: ${writerless}。ログを出力するサービスが同じボリュームを書き込みモードでマウントしているか確認してください"
+    return 0
+  fi
+  cwagent_record_stage "$stage_label" "OK" \
+      "収集対象 ${mounted_count} 件すべてが cwagent の volumes へマウントされています"
+  return 0
+}
+
+# リージョンと認証情報 (SigV4 署名に必要) の指定を確認する。
+cwagent_verify_region_and_credentials() {
+  local region_stage="リージョン (agent.region / AWS_REGION)"
+  local credential_stage="認証情報 (SigV4 署名)"
+  local region="" region_source="" spec source target mode host_path credential_note=""
+
+  if [ -n "$CWAGENT_CONFIG_REGION" ]; then
+    region="$CWAGENT_CONFIG_REGION"
+    region_source="設定ファイルの agent.region"
+  elif [ -n "${CWAGENT_ENV_VALUES[AWS_REGION]:-}" ]; then
+    region="${CWAGENT_ENV_VALUES[AWS_REGION]}"
+    region_source="cwagent の環境変数 AWS_REGION"
+  elif [ -n "${CWAGENT_ENV_VALUES[AWS_DEFAULT_REGION]:-}" ]; then
+    region="${CWAGENT_ENV_VALUES[AWS_DEFAULT_REGION]}"
+    region_source="cwagent の環境変数 AWS_DEFAULT_REGION"
+  fi
+  CWAGENT_CONFIG_REGION="$region"
+
+  if [ -z "$region" ]; then
+    cwagent_record_stage "$region_stage" "NG" \
+        "リージョンが設定ファイルにも cwagent の environment にもありません。CloudWatch Agent は送信先エンドポイントを決められません"
+  else
+    cwagent_record_stage "$region_stage" "OK" "${region} (${region_source})"
+  fi
+
+  # 共有クレデンシャルファイルのマウント、環境変数、ECS タスクロールのいずれか。
+  for spec in ${CWAGENT_VOLUME_SPECS[@]+"${CWAGENT_VOLUME_SPECS[@]}"}; do
+    IFS="$COMPOSE_YAML_SEPARATOR" read -r source target mode < <(cwagent_split_volume_spec "$spec")
+    case "$target" in
+      */.aws/credentials|*/.aws|*/.aws/config)
+        host_path="$(cwagent_resolve_host_path "$source")"
+        if [ -e "$host_path" ]; then
+          credential_note="共有クレデンシャルファイル ${source} → ${target}"
+        else
+          cwagent_record_stage "$credential_stage" "NG" \
+              "クレデンシャルのマウント元がホストに存在しません: ${source} (解決先: ${host_path})。空ディレクトリがマウントされ、署名に使う認証情報が読み込めません"
+          return 1
+        fi
+        break
+        ;;
+    esac
+  done
+  if [ -z "$credential_note" ]; then
+    if [ -n "${CWAGENT_ENV_VALUES[AWS_ACCESS_KEY_ID]:-}" ]; then
+      credential_note="環境変数 AWS_ACCESS_KEY_ID"
+    elif [ -n "${CWAGENT_ENV_VALUES[AWS_PROFILE]:-}" ]; then
+      credential_note="環境変数 AWS_PROFILE=${CWAGENT_ENV_VALUES[AWS_PROFILE]}"
+    elif [ -n "${CWAGENT_ENV_VALUES[AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]:-}" ] \
+        || [ -n "${CWAGENT_ENV_VALUES[AWS_CONTAINER_CREDENTIALS_FULL_URI]:-}" ]; then
+      credential_note="コンテナクレデンシャルプロバイダ (ECS タスクロール相当)"
+    fi
+  fi
+
+  if [ -z "$credential_note" ]; then
+    cwagent_record_stage "$credential_stage" "注意" \
+        "cwagent に認証情報の指定がありません。CloudWatch Logs への送信は SigV4 署名が必要なため、EC2 インスタンスプロファイルなどホスト側の認証情報に依存します。ローカル検証では ダミー値の共有クレデンシャルファイルをマウントしてください"
+    return 0
+  fi
+  cwagent_record_stage "$credential_stage" "OK" "$credential_note"
+  return 0
+}
+
+# (A) の入口。ビルド前に呼び出す。
+verify_cwagent_config_definition() {
+  [ "$VERIFY_CWAGENT" != "false" ] || return 0
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    if [ "$VERIFY_CWAGENT" = "true" ]; then
+      cwagent_record_stage "compose.yml の cwagent サービス定義" "NG" \
+          "compose ファイルが見つかりません: ${COMPOSE_FILE}"
+      CWAGENT_VERIFY_ACTIVE="true"
+    fi
+    return 0
+  fi
+
+  cwagent_collect_compose_definition
+  if ! cwagent_service_is_defined; then
+    if [ "$VERIFY_CWAGENT" = "true" ]; then
+      CWAGENT_VERIFY_ACTIVE="true"
+      cwagent_record_stage "compose.yml の cwagent サービス定義" "NG" \
+          "サービス '${CWAGENT_SERVICE}' が ${COMPOSE_FILE} にありません。--cwagent-service でサービス名を指定してください"
+      cwagent_show_stage_results
+    fi
+    return 0
+  fi
+
+  CWAGENT_VERIFY_ACTIVE="true"
+  log "CloudWatch Agent のログ送信検証を開始します (サービス: ${CWAGENT_SERVICE}, compose: ${COMPOSE_FILE})。"
+
+  cwagent_record_stage "compose.yml の cwagent サービス定義" "OK" \
+      "image=${CWAGENT_IMAGE:-(未指定)}${CWAGENT_ENV_VALUES[AWS_REGION]:+ / AWS_REGION=${CWAGENT_ENV_VALUES[AWS_REGION]}}"
+
+  if cwagent_verify_config_injection; then
+    # 設定 JSON を解析できなかった場合、送信先も収集対象も読み取れていないため、
+    # 「未設定」と誤って報告しないよう後続の照合は行わない。
+    cwagent_verify_config_content
+    if [ "$CWAGENT_CONFIG_PARSED" = "true" ]; then
+      cwagent_verify_endpoint_override
+      cwagent_verify_log_source_mounts
+    fi
+  fi
+  cwagent_verify_region_and_credentials
+
+  cwagent_show_stage_results "ビルド前の設定ファイルチェック"
+}
+
+# --- (B) 送信状況のチェック (起動確認後) -------------------------------------
+
+# WireMock の request journal から、設定済み送信先ごとの受信件数を取り出す。
+# 出力: dest<US>group<US>stream<US>requests<US>events
+cwagent_delivery_stats() {
+  local config_json="$1" journal_json="$2" program
+
+  program="$(cat <<'PY'
+SEP = "\x1f"
+
+config, journal = load_json_documents(["cwagent 設定", "WireMock request journal"])
+
+collect_list = (
+    config.get("logs", {})
+    .get("logs_collected", {})
+    .get("files", {})
+    .get("collect_list", [])
+)
+default_stream = str(config.get("logs", {}).get("log_stream_name") or "")
+
+stats = {}
+for body in put_log_events_requests(journal):
+    key = (str(body.get("logGroupName") or ""), str(body.get("logStreamName") or ""))
+    entry = stats.setdefault(key, {"requests": 0, "events": 0})
+    entry["requests"] += 1
+    events = body.get("logEvents")
+    entry["events"] += len(events) if isinstance(events, list) else 0
+
+for entry in collect_list if isinstance(collect_list, list) else []:
+    if not isinstance(entry, dict):
+        continue
+    group = str(entry.get("log_group_name") or "")
+    stream = str(entry.get("log_stream_name") or default_stream)
+    stat = stats.get((group, stream), {"requests": 0, "events": 0})
+    print(SEP.join(["dest", group, stream, str(stat["requests"]), str(stat["events"])]))
+PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${OBSERVABILITY_PYTHON_WIREMOCK_LOADER}${program}" \
+    2 "$config_json" "$journal_json"
+}
+
+# 起動した cwagent が実際に読み込んでいる設定を取り出し、ホスト側の内容と比較する。
+# マウントが効いていない場合はここで判明する (症状が「送信されない」だけになる典型例)。
+cwagent_verify_container_config() {
+  local container_id="$1"
+  local stage_label="コンテナ内の設定ファイル (${CWAGENT_CONTAINER_CONFIG_FILE:-${CWAGENT_CONFIG_DIR}})"
+  local container_config host_config listing
+
+  if [ -z "$CWAGENT_CONTAINER_CONFIG_FILE" ]; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "静的チェックでコンテナ内の設定ファイルパスを特定できていないため比較できません"
+    return 1
+  fi
+  if ! container_config="$(docker exec "$container_id" cat "$CWAGENT_CONTAINER_CONFIG_FILE" 2>/dev/null)"; then
+    listing="$(docker exec "$container_id" ls -l "$CWAGENT_CONFIG_DIR" 2>&1 | tr '\n' ' ' | cut -c1-200 || true)"
+    cwagent_record_stage "$stage_label" "NG" \
+        "コンテナ内に設定ファイルがありません: ${CWAGENT_CONTAINER_CONFIG_FILE} (${CWAGENT_CONFIG_DIR} の内容: ${listing:-取得できませんでした})"
+    return 1
+  fi
+  CWAGENT_CONTAINER_CONFIG_JSON="$container_config"
+
+  if [ -z "$CWAGENT_HOST_CONFIG_FILE" ]; then
+    cwagent_record_stage "$stage_label" "OK" \
+        "コンテナ内の設定ファイルを取得しました (ホスト側に実体が無いため内容比較は行いません)"
+    return 0
+  fi
+  host_config="$(cat "$CWAGENT_HOST_CONFIG_FILE" 2>/dev/null || true)"
+  if [ "$container_config" != "$host_config" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "ホスト側の ${CWAGENT_HOST_CONFIG_FILE} とコンテナ内の ${CWAGENT_CONTAINER_CONFIG_FILE} の内容が一致しません。編集した設定が反映されていない (コンテナの作り直しが必要) 可能性があります"
+    return 1
+  fi
+  cwagent_record_stage "$stage_label" "OK" \
+      "ホスト側の設定ファイルと一致しました: ${CWAGENT_CONTAINER_CONFIG_FILE}"
+  return 0
+}
+
+# 偽装 CloudWatch Logs (WireMock) への送達を、設定済みの送信先ごとに待って確認する。
+cwagent_verify_delivery_via_mock() {
+  local config_json="$1"
+  local stage_label="ログイベントの送達 (CloudWatch Logs 偽装サービス)"
+  local mock_service="$CWAGENT_MOCK_SERVICE" mock_port="$CWAGENT_MOCK_PORT"
+  local waited=0 journal stats line kind group stream requests events
+  local pending pending_list satisfied_list
+  local create_group_count create_stream_count put_count
+
+  [ -n "$mock_service" ] || mock_service="$CWAGENT_ENDPOINT_HOST"
+  [ -n "$mock_port" ] || mock_port="$CWAGENT_ENDPOINT_PORT"
+  [ -n "$mock_port" ] || mock_port="8080"
+  if [ -z "$mock_service" ]; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "送信先の Compose サービスを特定できません。--cwagent-mock-service で指定してください"
+    return 1
+  fi
+  # endpoint_override が container_name を指す場合は Compose サービス名へ読み替える。
+  if [ -z "${COMPOSE_DEFINED_SERVICES[$mock_service]:-}" ]; then
+    local service
+    for service in "${!COMPOSE_CONTAINER_NAMES[@]}"; do
+      if [ "${COMPOSE_CONTAINER_NAMES[$service]}" = "$mock_service" ]; then
+        mock_service="$service"
+        break
+      fi
+    done
+  fi
+
+  if ! resolve_compose_service_http_endpoint "$mock_service" "$mock_port"; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "CloudWatch Logs 偽装サービス '${mock_service}' の確認 URL を解決できませんでした"
+    return 1
+  fi
+
+  log "CloudWatch Logs への送達を確認します (最大 ${CWAGENT_DELIVERY_TIMEOUT} 秒, ${CWAGENT_DELIVERY_INTERVAL} 秒間隔) ..."
+  while :; do
+    pending=0
+    pending_list=""
+    satisfied_list=""
+    if journal="$(observability_http_get "${OBSERVABILITY_HTTP_BASE_URL}/__admin/requests?limit=${OBSERVABILITY_WIREMOCK_REQUEST_LIMIT}")" \
+        && stats="$(cwagent_delivery_stats "$config_json" "$journal" 2>/dev/null)"; then
+      while IFS="$CWAGENT_STAGE_SEPARATOR" read -r kind group stream requests events; do
+        [ "$kind" = "dest" ] || continue
+        if [ "${events:-0}" -gt 0 ] 2>/dev/null; then
+          satisfied_list="${satisfied_list}${satisfied_list:+, }${group}/${stream} (${events} events)"
+        else
+          pending=$((pending + 1))
+          pending_list="${pending_list}${pending_list:+, }${group}/${stream:-(自動生成)}"
+        fi
+      done <<< "$stats"
+    else
+      pending=1
+      pending_list="request journal を取得できませんでした"
+    fi
+    [ "$pending" -eq 0 ] && break
+    [ "$waited" -ge "$CWAGENT_DELIVERY_TIMEOUT" ] && break
+    sleep "$CWAGENT_DELIVERY_INTERVAL"
+    waited=$((waited + CWAGENT_DELIVERY_INTERVAL))
+  done
+
+  create_group_count="$(wiremock_request_count "$OBSERVABILITY_HTTP_BASE_URL" "Logs_20140328.CreateLogGroup" || printf '?')"
+  create_stream_count="$(wiremock_request_count "$OBSERVABILITY_HTTP_BASE_URL" "Logs_20140328.CreateLogStream" || printf '?')"
+  put_count="$(wiremock_request_count "$OBSERVABILITY_HTTP_BASE_URL" "Logs_20140328.PutLogEvents" || printf '?')"
+
+  diag ""
+  diag "確認先: ${mock_service} (${OBSERVABILITY_HTTP_BASE_URL}) / 待機時間: ${waited} 秒"
+  diag "注意: 実 AWS CloudWatch Logs ではなく、Compose 内 WireMock の受信記録を確認しています。"
+  [ -n "${journal:-}" ] || journal='{"requests":[]}'
+  if ! render_cloudwatch_delivery_report "$config_json" "$journal" \
+      "$create_group_count" "$create_stream_count" "$put_count" >&2; then
+    warn "CloudWatch Logs 偽装送達レポートを生成できませんでした。"
+  fi
+
+  if [ "$pending" -gt 0 ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "${waited} 秒待っても送達を確認できない送信先があります: ${pending_list}${satisfied_list:+ / 確認できた送信先: ${satisfied_list}}。cwagent のログと、収集対象ファイルへの書き込み有無を確認してください"
+    return 1
+  fi
+  cwagent_record_stage "$stage_label" "OK" \
+      "設定済みの全送信先へログイベントが届きました: ${satisfied_list} (待機 ${waited} 秒)"
+  return 0
+}
+
+# 実 CloudWatch Logs のロググループ / ストリーム / 今回の実行以降のイベントを確認する。
+cwagent_verify_delivery_via_aws() {
+  local stage_label="ログイベントの送達 (CloudWatch Logs)"
+  local region="${CWAGENT_CONFIG_REGION:-$REGION}"
+  local waited=0 destination group stream file_path
+  local pending pending_list satisfied_list group_result stream_result event_count messages
+  local -a stream_args=()
+
+  if ! command -v aws >/dev/null 2>&1; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "aws コマンドが見つからないため、実 CloudWatch Logs への送達を確認できません"
+    return 1
+  fi
+  if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    cwagent_record_stage "$stage_label" "未確認" \
+        "AWS 認証が確認できないため、実 CloudWatch Logs への送達を確認できません ('aws login --remote' で認証してください)"
+    return 1
+  fi
+
+  log "実 CloudWatch Logs への送達を確認します (region=${region}, 最大 ${CWAGENT_DELIVERY_TIMEOUT} 秒) ..."
+  diag ""
+  diag "════════════ CloudWatch Logs 送達レポート (region=${region}) ════════════"
+  while :; do
+    pending=0
+    pending_list=""
+    satisfied_list=""
+    for destination in ${CWAGENT_EXPECTED_DESTINATIONS[@]+"${CWAGENT_EXPECTED_DESTINATIONS[@]}"}; do
+      IFS="$CWAGENT_STAGE_SEPARATOR" read -r group stream file_path <<< "$destination"
+      [ -n "$group" ] || continue
+      # ストリーム名が自動生成される設定では、ロググループ全体のイベントで判定する。
+      stream_args=()
+      [ -n "$stream" ] && stream_args=(--log-stream-names "$stream")
+      event_count="$(aws logs filter-log-events --region "$region" \
+          --log-group-name "$group" ${stream_args[@]+"${stream_args[@]}"} \
+          --start-time "$RUN_STARTED_EPOCH_MS" \
+          --limit 50 --query 'length(events)' --output text 2>/dev/null || printf '')"
+      if printf '%s' "$event_count" | grep -qE '^[0-9]+$' && [ "$event_count" -gt 0 ]; then
+        satisfied_list="${satisfied_list}${satisfied_list:+, }${group}/${stream:-(自動生成)} (${event_count} events)"
+      else
+        pending=$((pending + 1))
+        pending_list="${pending_list}${pending_list:+, }${group}/${stream:-(自動生成)}"
+      fi
+    done
+    [ "$pending" -eq 0 ] && break
+    [ "$waited" -ge "$CWAGENT_DELIVERY_TIMEOUT" ] && break
+    sleep "$CWAGENT_DELIVERY_INTERVAL"
+    waited=$((waited + CWAGENT_DELIVERY_INTERVAL))
+  done
+
+  for destination in ${CWAGENT_EXPECTED_DESTINATIONS[@]+"${CWAGENT_EXPECTED_DESTINATIONS[@]}"}; do
+    IFS="$CWAGENT_STAGE_SEPARATOR" read -r group stream file_path <<< "$destination"
+    [ -n "$group" ] || continue
+    group_result="$(aws logs describe-log-groups --region "$region" \
+        --log-group-name-prefix "$group" \
+        --query "logGroups[?logGroupName=='${group}'].logGroupName" --output text 2>/dev/null || printf '')"
+    diag ""
+    diag "収集対象: ${file_path:-(未指定)}"
+    if [ -z "$group_result" ]; then
+      diag "  [NG] ロググループが存在しません: ${group}"
+      continue
+    fi
+    diag "  [OK] ロググループ: ${group}"
+    if [ -n "$stream" ]; then
+      stream_result="$(aws logs describe-log-streams --region "$region" \
+          --log-group-name "$group" --log-stream-name-prefix "$stream" \
+          --query "logStreams[?logStreamName=='${stream}'].lastEventTimestamp" \
+          --output text 2>/dev/null || printf '')"
+      if [ -z "$stream_result" ] || [ "$stream_result" = "None" ]; then
+        diag "  [NG] ログストリームが存在しないか、イベントがありません: ${stream}"
+      else
+        diag "  [OK] ログストリーム: ${stream} (最終イベント: $(to_jst_display_time "@$((stream_result / 1000))"))"
+      fi
+    fi
+    stream_args=()
+    [ -n "$stream" ] && stream_args=(--log-stream-names "$stream")
+    messages="$(aws logs filter-log-events --region "$region" --log-group-name "$group" \
+        ${stream_args[@]+"${stream_args[@]}"} --start-time "$RUN_STARTED_EPOCH_MS" \
+        --limit "$OBSERVABILITY_EVENT_DISPLAY_LIMIT" \
+        --query 'events[].message' --output text 2>/dev/null | cwagent_redact_text || true)"
+    if [ -n "$messages" ]; then
+      diag "  [今回の実行以降に届いたイベント (最大 ${OBSERVABILITY_EVENT_DISPLAY_LIMIT} 件)]"
+      printf '%s\n' "$messages" | sed 's/^/    /' >&2
+    else
+      diag "  [NG] 今回の実行 (${RUN_STARTED_AT} 以降) に届いたイベントはありません。"
+    fi
+  done
+  diag "═══════════════════════════════════════════════════════════"
+  diag "メッセージには機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+
+  if [ "$pending" -gt 0 ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "${waited} 秒待っても送達を確認できない送信先があります: ${pending_list}${satisfied_list:+ / 確認できた送信先: ${satisfied_list}}"
+    return 1
+  fi
+  cwagent_record_stage "$stage_label" "OK" \
+      "設定済みの全送信先へログイベントが届きました: ${satisfied_list} (待機 ${waited} 秒)"
+  return 0
+}
+
+# cwagent 自身が出した警告・エラーを抜き出して表示する (送達 NG の原因調査用)。
+cwagent_show_agent_diagnostics() {
+  local agent_logs agent_diagnostics
+  agent_logs="$(compose_logs "$CWAGENT_SERVICE" 2>/dev/null)" || return 0
+  agent_diagnostics="$(
+    printf '%s\n' "$agent_logs" | strip_ansi_codes \
+      | grep -Ei '(^|[[:space:]])(E!|W!|ERROR|WARN|failed|denied|timeout|no such file)' \
+      | tail -n 20 || true
+  )"
+  diag ""
+  diag "[cwagent の警告・エラー（最大 20 行）]"
+  if [ -n "$agent_diagnostics" ]; then
+    printf '%s\n' "$agent_diagnostics" | cwagent_redact_text >&2
+    cwagent_record_stage "cwagent の警告・エラーログ" "注意" \
+        "$(printf '%s' "$agent_diagnostics" | tail -n 3 | tr '\n' ' ' | cwagent_redact_text | cut -c1-300)"
+  else
+    diag "  今回の起動以降に該当する警告・エラーは見つかりませんでした。"
+    cwagent_record_stage "cwagent の警告・エラーログ" "OK" "該当する警告・エラーはありません"
+  fi
+}
+
+# (B) の入口。起動確認・URL 確認の後に呼び出す。
+verify_cwagent_log_delivery() {
+  local container_id config_json target
+  local -a container_ids=() all_container_ids=()
+
+  [ "$CWAGENT_VERIFY_ACTIVE" = "true" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] cwagent の送信状況チェックをスキップします (コンテナを起動していないため)。"
+    return 0
+  fi
+  if [ "$STARTED_CONTAINER" != "true" ]; then
+    if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ]; then
+      cwagent_record_stage "cwagent コンテナの起動" "未確認" \
+          "コンテナを起動していないため送信状況を確認していません。--verify-startup または --verify-url を併用してください"
+    fi
+    cwagent_show_stage_results "cwagent のログ送信検証"
+    return 0
+  fi
+  if ! require_observability_tools; then
+    cwagent_record_stage "送信状況チェックの前提ツール" "未確認" \
+        "curl と Python 3 が利用できないため、送信状況を確認できません"
+    cwagent_show_stage_results "cwagent のログ送信検証"
+    return 0
+  fi
+
+  mapfile -t container_ids < <(compose_container_ids "$CWAGENT_SERVICE")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    mapfile -t all_container_ids < <(compose_container_ids_all "$CWAGENT_SERVICE")
+    if [ ${#all_container_ids[@]} -eq 0 ]; then
+      cwagent_record_stage "cwagent コンテナの起動" "NG" \
+          "サービス '${CWAGENT_SERVICE}' のコンテナが作成されていません。--compose-service に ${CWAGENT_SERVICE} を含めてください"
+    else
+      cwagent_record_stage "cwagent コンテナの起動" "NG" \
+          "サービス '${CWAGENT_SERVICE}' が実行中ではありません: $(compose_service_container_summary "$CWAGENT_SERVICE")"
+      cwagent_show_agent_diagnostics
+    fi
+    cwagent_show_stage_results "cwagent のログ送信検証"
+    return 0
+  fi
+  container_id="${container_ids[0]}"
+  cwagent_record_stage "cwagent コンテナの起動" "OK" \
+      "$(compose_service_container_summary "$CWAGENT_SERVICE")"
+
+  diag ""
+  diag "==================================================================="
+  diag "CloudWatch Agent の送信状況チェック"
+  diag "  サービス      : ${CWAGENT_SERVICE}"
+  diag "  設定ファイル  : ${CWAGENT_CONTAINER_CONFIG_FILE:-(未特定)}"
+  diag "  送信先        : ${CWAGENT_ENDPOINT_OVERRIDE:-実 CloudWatch Logs (region=${CWAGENT_CONFIG_REGION:-$REGION})}"
+  diag "==================================================================="
+
+  # 実際にエージェントが読み込んでいる設定を優先し、比較できない場合はホスト側を使う。
+  CWAGENT_CONTAINER_CONFIG_JSON=""
+  cwagent_verify_container_config "$container_id"
+  config_json="$CWAGENT_CONTAINER_CONFIG_JSON"
+  if [ -z "$config_json" ] && [ -n "$CWAGENT_HOST_CONFIG_FILE" ]; then
+    config_json="$(cat "$CWAGENT_HOST_CONFIG_FILE" 2>/dev/null || printf '{}')"
+  fi
+  [ -n "$config_json" ] || config_json='{}'
+
+  target="$CWAGENT_DELIVERY_TARGET"
+  if [ "$target" = "auto" ]; then
+    if [ -n "$CWAGENT_ENDPOINT_OVERRIDE" ]; then
+      target="mock"
+    else
+      target="aws"
+    fi
+  fi
+
+  if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -eq 0 ]; then
+    # 送信先を 1 つも特定できていない状態で問い合わせても判定できないため、
+    # 設定側の問題として扱う (静的チェックの NG が原因のことが多い)。
+    cwagent_record_stage "ログイベントの送達" "未確認" \
+        "設定ファイルから送信先 (log group / log stream) を特定できていないため、送達を確認できません"
+  elif [ "$target" = "mock" ]; then
+    cwagent_verify_delivery_via_mock "$config_json"
+  else
+    cwagent_verify_delivery_via_aws
+  fi
+  cwagent_show_agent_diagnostics
+
+  cwagent_show_stage_results "cwagent のログ送信検証"
+  return 0
+}
+
+# --- 検証結果の表示 -----------------------------------------------------------
+
+# 記録済みの段をまとめて表示し、未表示の段だけを対象にする (静的 → 送達の 2 回表示)。
+CWAGENT_STAGE_PRINTED_COUNT=0
+cwagent_show_stage_results() {
+  local title="${1:-cwagent のログ送信検証}"
+  local index=0 entry label verdict note total="${#CWAGENT_STAGE_RESULTS[@]}"
+
+  [ "$total" -gt "$CWAGENT_STAGE_PRINTED_COUNT" ] || return 0
+  diag ""
+  diag "==================================================================="
+  diag "${title}"
+  diag "==================================================================="
+  for entry in "${CWAGENT_STAGE_RESULTS[@]}"; do
+    index=$((index + 1))
+    [ "$index" -gt "$CWAGENT_STAGE_PRINTED_COUNT" ] || continue
+    IFS="$CWAGENT_STAGE_SEPARATOR" read -r label verdict note <<< "$entry"
+    diag "  [${verdict}] ${label}"
+    [ -n "$note" ] && diag "      ${note}"
+  done
+  CWAGENT_STAGE_PRINTED_COUNT="$total"
+  diag "───────────────────────────────────────────────────────────────────"
+  if [ "$CWAGENT_NG" = "true" ]; then
+    diag "  総合判定: NG あり — 上記 [NG] の段が、CloudWatch Logs へ届かない直接の原因です。"
+  elif [ "$CWAGENT_UNKNOWN" = "true" ]; then
+    diag "  総合判定: 確認できた段はすべて OK (未確認の段あり)"
+  else
+    diag "  総合判定: 全段 OK"
+  fi
+  diag "───────────────────────────────────────────────────────────────────"
+  diag ""
+}
+
+# 検証結果を終了コードへ反映する。既定では警告のみとし、ビルド成否の判定は変えない
+# (JBoss マスターパスワードの伝搬検証と同じ扱い)。--cwagent-required 指定時のみ、
+# NG があれば処理全体を失敗として終了する。
+finish_cwagent_verification() {
+  [ "$CWAGENT_VERIFY_ACTIVE" = "true" ] || return 0
+  if [ "$CWAGENT_NG" != "true" ]; then
+    if [ "$CWAGENT_UNKNOWN" = "true" ]; then
+      warn "cwagent のログ送信検証: 未確認の段があります (詳細は上記の一覧を参照してください)。"
+    else
+      log "cwagent のログ送信検証: 全段 OK です。"
+    fi
+    return 0
+  fi
+  if [ "$CWAGENT_REQUIRED" = "true" ]; then
+    err "cwagent のログ送信検証で NG を検出しました。--cwagent-required が指定されているため失敗として終了します。"
+    exit 1
+  fi
+  warn "cwagent のログ送信検証で NG を検出しました。CloudWatch Logs へログが届いていません (上記 [NG] の段を確認してください)。"
+  warn "  NG をビルドの失敗として扱う場合は --cwagent-required を指定してください。"
+  return 0
+}
+
+# 全量レポートへ検証結果を書き出す。
+append_cwagent_report() {
+  local report_file="$1" entry label verdict note
+
+  if [ "$VERIFY_CWAGENT" = "false" ]; then
+    printf '--no-verify-cwagent が指定されたため実行していません。\n' >> "$report_file"
+    return 0
+  fi
+  if [ "$CWAGENT_VERIFY_ACTIVE" != "true" ]; then
+    printf 'compose ファイルに CloudWatch Agent のサービス (%s) が定義されていないため実行していません。\n' \
+      "$CWAGENT_SERVICE" >> "$report_file"
+    return 0
+  fi
+  {
+    printf 'サービス        : %s\n' "$CWAGENT_SERVICE"
+    printf '設定ファイル    : ホスト %s / コンテナ %s\n' \
+      "${CWAGENT_HOST_CONFIG_FILE:-(未特定)}" "${CWAGENT_CONTAINER_CONFIG_FILE:-(未特定)}"
+    printf '送信先          : %s\n' \
+      "${CWAGENT_ENDPOINT_OVERRIDE:-実 CloudWatch Logs (region=${CWAGENT_CONFIG_REGION:-$REGION})}"
+    if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ]; then
+      printf '設定済み送信先  :\n'
+      for entry in "${CWAGENT_EXPECTED_DESTINATIONS[@]}"; do
+        IFS="$CWAGENT_STAGE_SEPARATOR" read -r label verdict note <<< "$entry"
+        printf '  - log group=%s / log stream=%s / file=%s\n' \
+          "$label" "${verdict:-(自動生成)}" "$note"
+      done
+    fi
+    printf '\n'
+  } >> "$report_file"
+
+  if [ ${#CWAGENT_STAGE_RESULTS[@]} -eq 0 ]; then
+    printf '検証結果はありません。\n' >> "$report_file"
+    return 0
+  fi
+  for entry in "${CWAGENT_STAGE_RESULTS[@]}"; do
+    IFS="$CWAGENT_STAGE_SEPARATOR" read -r label verdict note <<< "$entry"
+    printf '[%s] %s\n' "$verdict" "$label" >> "$report_file"
+    [ -n "$note" ] && printf '    %s\n' "$note" >> "$report_file"
+  done
+  printf '\n' >> "$report_file"
+  if [ "$CWAGENT_NG" = "true" ]; then
+    printf '総合判定: NG あり\n' >> "$report_file"
+  elif [ "$CWAGENT_UNKNOWN" = "true" ]; then
+    printf '総合判定: 確認できた段はすべて OK (未確認の段あり)\n' >> "$report_file"
+  else
+    printf '総合判定: 全段 OK\n' >> "$report_file"
+  fi
+  return 0
 }
 
 find_first_running_compose_service() {
@@ -7124,7 +8427,7 @@ append_compose_service_logs_report() {
 
     printf '\n' >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
-    printf '[8-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
+    printf '[9-%s] Compose サービス: %s\n' "$index" "$service_name" >> "$report_file"
     printf 'コンテナ      : %s\n' "$containers" >> "$report_file"
     printf 'ログ行数      : %s 行\n' "$line_count" >> "$report_file"
     printf '───────────────────────────────────────────────────────────────────\n' >> "$report_file"
@@ -7365,14 +8668,18 @@ write_build_report() {
   printf '\n[7] JBoss マスターパスワードの伝搬検証\n' >> "$report_tmp"
   append_jboss_password_report "$report_tmp"
 
+  # cwagent の設定・送達検証も、コンテナを停止する前の結果を書き出す。
+  printf '\n[8] CloudWatch Logs 送信検証 (cwagent)\n' >> "$report_tmp"
+  append_cwagent_report "$report_tmp"
+
   # 失敗時は、ログ本文を集める前に SIGTERM でコンテナを終了させ、adot collector
   # などの終了処理ログまでレポートへ含める。環境変数・ツリー・JVM パラメータは
-  # 起動中のコンテナからしか取得できないため、[2]〜[7] を集め終えたこの位置で停止する。
+  # 起動中のコンテナからしか取得できないため、[2]〜[8] を集め終えたこの位置で停止する。
   capture_shutdown_logs "$exit_status"
 
   # 失敗時は原因調査に必要なため全サービスのログ全文を残す。成功時は同じ内容が
   # 画面へ出ており、レポートを不必要に肥大化させるだけなので省略する。
-  printf '\n[8] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
+  printf '\n[9] Compose サービス別ログ (全サービス・全行)\n' >> "$report_tmp"
   if [ "$exit_status" -eq 0 ]; then
     printf '処理が成功したため、Compose サービス別ログの全文出力は省略しました。\n' >> "$report_tmp"
   else
@@ -7446,6 +8753,11 @@ export JBOSS_MASTER_PASSWORD="${JBOSS_MASTER_PASSWORD:-}"
 # 取得元 → 環境変数 → compose.yml の secrets 定義までは、ビルドを始める前に
 # 突き合わせられる。ここで不一致が出た場合、ビルドしても正しい値は届かない。
 verify_jboss_password_host_stages
+
+# ---- CloudWatch Agent の設定ファイルチェック (ビルド前に確認できる段) ---------
+# compose.yml の cwagent 定義とマウントする設定 JSON は、コンテナを起動する前に
+# 突き合わせられる。ここで NG が出た場合、起動しても CloudWatch Logs には届かない。
+verify_cwagent_config_definition
 
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_all) により
@@ -7578,6 +8890,15 @@ if [ "$NEED_CONTAINER" != "true" ]; then
   if [ "$BUILD_REPORT_DIR_SET" = "true" ]; then
     warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
+  if [ "$CWAGENT_VERIFY_ACTIVE" = "true" ]; then
+    # 送信先を特定できている場合のみ、送達が未確認であることを明示する。
+    if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ]; then
+      cwagent_record_stage "ログイベントの送達" "未確認" \
+          "コンテナを起動していないため送信状況を確認していません。--verify-startup または --verify-url を併用すると、設定済みのロググループへ実際にログが届くまで確認します"
+    fi
+    cwagent_show_stage_results "cwagent のログ送信検証"
+    finish_cwagent_verification
+  fi
   if [ "$DRY_RUN" = "true" ]; then
     log "[DRY-RUN] ビルドのみが完了しました (実際のビルドは行われていません)。"
   else
@@ -7609,6 +8930,11 @@ if [ -n "$VERIFY_URL" ]; then
   fi
 fi
 
+# ---- CloudWatch Agent の送信状況チェック ------------------------------------
+# 起動確認と URL 応答確認を終えた時点 (アプリがログを書き終えた後) に、設定済みの
+# ロググループ / ログストリームへ実際にログイベントが届いたかを確認する。
+verify_cwagent_log_delivery
+
 # ---- 起動維持後の対話操作 ---------------------------------------------------
 if ! run_keep_container_interaction; then
   err "起動維持後の対話操作に失敗しました。コンテナは起動状態のまま残します。"
@@ -7625,6 +8951,9 @@ show_verified_container_otel_settings
 # ビルド前の段と合わせて伝搬検証の結果をまとめて出力する。
 verify_jboss_password_container_stages
 show_verified_jboss_password_stages
+
+# cwagent の検証結果を終了コードへ反映する (--cwagent-required 指定時のみ)。
+finish_cwagent_verification
 
 if [ "$DRY_RUN" = "true" ]; then
   log "DRY-RUN が完了しました (実際の変更は行われていません)。"

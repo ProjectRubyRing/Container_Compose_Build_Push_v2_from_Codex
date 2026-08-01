@@ -318,7 +318,11 @@ flowchart TD
   `build_and_verify.sh` 固有のオプション (`--verify-startup`、`--verify-url`、
   `--verify-jboss-password` とその関連オプション `--jboss-secret-id` /
   `--jboss-password-mask` / `--jboss-config-file` / `--jboss-cli-path` /
-  `--jboss-elytron-tool` / `--jboss-credential-store` など)
+  `--jboss-elytron-tool` / `--jboss-credential-store`、CloudWatch Agent の
+  ログ送信検証 `--verify-cwagent` / `--no-verify-cwagent` / `--cwagent-service` /
+  `--cwagent-config-dir` / `--cwagent-delivery-target` / `--cwagent-delivery-timeout` /
+  `--cwagent-delivery-interval` / `--cwagent-mock-service` / `--cwagent-mock-port` /
+  `--cwagent-required` など)
 - 委譲**されない**もの:
   - `--log-dir` — 委譲元で処理済み (委譲先の出力もログファイルに記録されます)
   - ECR 専用オプション — `--account-id` / `--registry` / `--repository` /

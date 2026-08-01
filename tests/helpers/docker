@@ -565,8 +565,25 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "-it" ] \
   exit 0
 fi
 
+# cwagent のコンテナ内設定ディレクトリの一覧 (設定ファイルを取得できない場合の診断)。
 if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-cwagent" ] \
-    && [ "${3:-}" = "cat" ] && [ "${4:-}" = "/etc/cwagentconfig/cwagent-config.json" ]; then
+    && [ "${3:-}" = "ls" ] && [ "${4:-}" = "-l" ]; then
+  printf 'total 0\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-cwagent" ] \
+    && [ "${3:-}" = "cat" ] && [[ "${4:-}" == /etc/cwagentconfig/* ]]; then
+  # マウントが効かず、コンテナ内に設定ファイルが無い状態の再現。
+  if [ "${FAKE_CWAGENT_CONFIG_MISSING:-false}" = "true" ]; then
+    printf 'cat: %s: No such file or directory\n' "${4:-}" >&2
+    exit 1
+  fi
+  # ホスト側にマウントした設定ファイルがそのまま見える状態の再現。
+  if [ -n "${FAKE_CWAGENT_CONFIG_FILE:-}" ]; then
+    cat "$FAKE_CWAGENT_CONFIG_FILE"
+    exit 0
+  fi
   cat <<'JSON'
 {
   "logs": {

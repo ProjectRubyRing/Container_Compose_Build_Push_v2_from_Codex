@@ -1,0 +1,17 @@
+# cwagent のログ送信検証 (異常系) 用の compose 定義。
+# マウント元の設定ファイルがホストに存在しないケースを再現する。
+# 存在しないパスを bind mount すると Docker が空のディレクトリを作るため、
+# CloudWatch Agent は既定設定のまま起動し、ログを 1 件も送信しない。
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+
+  cwagent:
+    image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    environment:
+      AWS_REGION: ap-northeast-1
+    volumes:
+      - ./missing-cwagent-config.json:/etc/cwagentconfig/cwagent-config.json:ro

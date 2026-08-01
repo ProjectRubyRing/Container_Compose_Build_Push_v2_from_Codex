@@ -1,0 +1,16 @@
+{
+  "logs": {
+    "endpoint_override": "http://cloudwatch-logs-stub:8080",
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/mnt/logs/app-front*.log",
+            "log_group_name": "/local/myapp/efs/app front",
+            "log_stream_name": "front-local"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -46,6 +46,7 @@
 | 10 | 起動後の対話操作 (bash / HTTP / ログ調査) | `--keep-container-mode` |
 | 11 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
+| 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとログ送達確認 | (`compose.yml` に `cwagent` があれば自動) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -105,7 +106,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | healthcheck | `run_interactive_compose_healthcheck` / `run_healthcheck_http_probe` | healthcheck の設定・履歴・通信確認 |
 | 可観測性 | `render_cloudwatch_delivery_report` / `run_otel_jaeger_trace_helper` | cwagent / OTel のローカル送達診断 |
 | クリーンアップ | `cleanup_all_docker_data` / `teardown_container` / `cleanup_copied_files` | Docker 全体削除と通常後始末 |
-| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` | 全量レポートの生成 |
+| cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
+| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
 ### 2.3 EXIT トラップ (`cleanup_all`)
@@ -142,7 +144,8 @@ flowchart TD
     H --> I[EXIT トラップ設定 cleanup_all]
     I --> J[JBoss マスターパスワード取得 → export]
     J --> J2[伝搬検証 1-2: 取得元 → 環境変数 → compose.yml の secrets<br/>--verify-jboss-password 指定時]
-    J2 --> K[--copy-file の事前コピー]
+    J2 --> J3[cwagent 設定ファイルチェック<br/>compose.yml の定義 + 設定 JSON の静的照合]
+    J3 --> K[--copy-file の事前コピー]
     K --> L{--compose-service が 2 個以上?}
     L -- はい --> M[base を単独で先行ビルド] --> N[ローカルイメージ確認] --> O[base 以外をまとめて並列ビルド]
     L -- いいえ --> P[compose build] --> Q[ローカルイメージ確認]
@@ -156,8 +159,9 @@ flowchart TD
     T -- なし --> V
     U --> V{--verify-url?}
     V -- あり --> W[curl でリトライしながら応答確認]
-    V -- なし --> X
-    W --> X{--keep-container-mode?}
+    V -- なし --> W2
+    W --> W2[cwagent 送信状況チェック<br/>コンテナ内設定の照合 → ロググループへの送達待ち]
+    W2 --> X{--keep-container-mode?}
     X -- あり --> Y[対話操作 bash / http / logs]
     X -- なし --> AA
     Y --> AA[環境変数一覧・ツリー・デプロイ構造を表示]
@@ -317,6 +321,24 @@ compose down (削除)
 パス系オプションは、`docker exec` へ渡すスクリプトへ埋め込むため
 **絶対パスのみ**を受け付け、`' " ` $ ; & | < > * ?` と空白を含む場合は
 起動前に `exit 2` で中止します。
+
+### 4.3.1 CloudWatch Agent (cwagent) のログ送信検証
+
+| オプション | 値の形式 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `--verify-cwagent` | (フラグ) | `auto` | `cwagent` サービスが未定義でも検証し、見つからなければ NG とする |
+| `--no-verify-cwagent` | (フラグ) | — | 検証を行わない |
+| `--cwagent-service NAME` | サービス名 | `cwagent` | CloudWatch Agent の Compose サービス名 |
+| `--cwagent-config-dir PATH` | コンテナ内の絶対パス | `/etc/cwagentconfig` | 設定ファイルの注入先ディレクトリ |
+| `--cwagent-delivery-target auto\|mock\|aws` | 列挙 | `auto` | 送達確認先。`auto` は `logs.endpoint_override` の有無で判定 |
+| `--cwagent-delivery-timeout SEC` | 1 以上の整数 | `60` | 送達を待つ最大秒数 |
+| `--cwagent-delivery-interval SEC` | 1 以上の整数 | `5` | 送達確認のポーリング間隔 |
+| `--cwagent-mock-service NAME` | サービス名 | (`endpoint_override` から解決) | 偽装 CloudWatch Logs の Compose サービス名 |
+| `--cwagent-mock-port PORT` | 1〜65535 | (`endpoint_override` から解決、既定 8080) | 偽装 CloudWatch Logs のコンテナ側ポート |
+| `--cwagent-required` | (フラグ) | `false` | 検証 NG を終了コード 1 として扱う |
+
+検証は `compose.yml` に `cwagent` サービスが定義されていれば自動で実行され、
+オプション指定は不要です (6.6 参照)。
 
 ### 4.4 起動確認 (JBoss EAP / WildFly)
 
@@ -598,7 +620,8 @@ services:
 | `[5] Java JVM パラメータ (全件)` | Java プロセスごとの JVM パラメータ (分類別) | 「未取得」と記録 |
 | `[6] OpenTelemetry 環境変数・JVM パラメータ (全件)` | OpenTelemetry 関連の環境変数と JVM パラメータ | 「未取得」と記録 |
 | `[7] JBoss マスターパスワードの伝搬検証` | `--verify-jboss-password` 指定時、段ごとの判定・パスワード文字列・16 進ダンプ | 段 1〜3 のみ記録し、残りは「未確認」 |
-| `[8] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[8-1]`, `[8-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
+| `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送達チェックの段ごとの判定 | 設定ファイルチェックのみ記録し、送達は「未確認」 |
+| `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -777,6 +800,70 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
   コンテナへ渡します (`docker exec -i`)。
 - `--dry-run` 併用時は実際の値を取得しないため、検証を行いません。
 
+### 6.6 CloudWatch Logs 送信検証 (cwagent)
+
+`compose.yml` に CloudWatch Agent サイドカー (`cwagent`) が定義されていると、
+**設定ファイルのチェック (ビルド前)** と **送信状況のチェック (起動確認後)** を
+自動で実行します。設定不備があってもエージェント自体は正常に起動してしまい、
+CloudWatch Logs へ 1 件も届かないまま気付かない構成を検出することが目的です。
+
+#### (A) 設定ファイルのチェック (ビルド前)
+
+`compose.yml` を `compose_yaml_entries` で展開し (JBoss シークレット検証と共用)、
+`cwagent` の `image` / `environment` / `volumes` / `depends_on` と、マウントする
+設定 JSON をホスト側だけで突き合わせます。
+
+| 段 | 判定 | 主な NG 条件 |
+| --- | --- | --- |
+| `compose.yml` の cwagent サービス定義 | OK / NG | サービスが存在しない (`--verify-cwagent` 指定時のみ NG) |
+| 設定ファイルの注入 | OK / NG / 未確認 | 設定ディレクトリへの `volumes` が無い / マウント元がホストに存在しない / 注入元が名前付きボリューム。`CW_CONFIG_CONTENT` 使用時と `volumes` 長記法は「未確認」 |
+| 設定ファイルの内容 | OK / NG / 未確認 | JSON 構文エラー / `logs` セクションが無い / `collect_list` が空 / `file_path`・`log_group_name` の欠落 / 命名規則違反。Python 3 が無い場合は「未確認」 |
+| 送信先 (`logs.endpoint_override`) | OK / NG / 情報 / 未確認 | ホストが `compose.yml` のサービス名・`container_name` と一致しない / `localhost` を指す。未設定なら実 CloudWatch Logs 宛てとして「情報」、IP 直指定は「未確認」 |
+| 収集対象ログファイルのマウント | OK / NG / 注意 / 未確認 | `file_path` が `cwagent` の `volumes` に含まれない。書き込み可能なマウントを持つ他サービスが無い場合は「注意」 |
+| リージョン | OK / NG | `agent.region` も `AWS_REGION` / `AWS_DEFAULT_REGION` も無い |
+| 認証情報 | OK / NG / 注意 | クレデンシャルのマウント元がホストに存在しない。指定が一切無い場合は「注意」 |
+
+ロググループ名は `[A-Za-z0-9_./#-]{1,512}`、ログストリーム名は `:` と `*` を含まない
+1〜512 文字という CloudWatch Logs の制約で検証します。`log_stream_name` を省略した
+エントリは `logs.log_stream_name` の既定値へフォールバックし、それも無ければ
+「実行環境で変わるため送達確認では照合できない」旨を「注意」として記録します。
+
+存在しないパスを bind mount すると Docker が空のディレクトリを作るため、
+CloudWatch Agent は既定設定のまま起動してログだけが送信されません。この
+「マウント元がホストに存在しない」ケースは特に見つけにくいため、明示的に NG とします。
+
+#### (B) 送信状況のチェック (起動確認後)
+
+| 段 | 内容 |
+| --- | --- |
+| cwagent コンテナの起動 | 実行中か。停止していれば状態と終了コードを表示し、警告・エラーログを抜き出す |
+| コンテナ内の設定ファイル | `docker exec <cid> cat <設定ファイル>` の内容をホスト側と比較。不一致なら「編集が反映されていない」ことが分かる |
+| ログイベントの送達 | 設定済みのロググループ / ログストリームへイベントが届くまで待ち合わせる |
+| cwagent の警告・エラーログ | `E!` / `W!` / `ERROR` / `WARN` / `failed` / `denied` / `timeout` / `no such file` を含む行を最大 20 行 |
+
+送達確認は `--cwagent-delivery-target` で確認先を切り替えます。
+
+- `mock` (既定: `logs.endpoint_override` あり)
+  `endpoint_override` のホスト名から Compose サービスを解決し、WireMock の
+  request journal (`/__admin/requests`) を `--cwagent-delivery-interval` 間隔で
+  ポーリングします。設定済みの全 (log group, log stream) にログイベントが現れた
+  時点で成功とし、`CreateLogGroup` / `CreateLogStream` / `PutLogEvents` の受信総数と
+  受信したログイベント本文を表示します。
+- `aws` (既定: `endpoint_override` なし)
+  `aws logs describe-log-groups` / `describe-log-streams` / `filter-log-events` で、
+  ロググループの存在・ログストリームの最終イベント時刻・**今回の実行開始時刻
+  (`RUN_STARTED_EPOCH_MS`) 以降に届いたイベント**を確認します。`aws` コマンドと
+  AWS 認証 (`aws sts get-caller-identity`) が必要で、いずれかが無い場合は「未確認」です。
+
+ログイベント本文は `password` / `token` / `authorization` / `credential` などの名前で
+値が続く箇所を `[REDACTED]` に置き換えてから表示します。
+
+#### 終了コードの扱い
+
+NG を検出しても**既定では終了コードを変えません** (`--verify-jboss-password` と同じ扱い)。
+画面へ `[WARN]` を出し、全量レポートの `[8]` へ記録します。`--cwagent-required` を
+指定した場合のみ、NG があれば `exit 1` で終了します。
+
 ---
 
 ## 7. 環境変数
@@ -821,8 +908,8 @@ Java を実行しないコンテナ (OTel Collector など) でも環境変数�
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
-| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認 |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` の範囲外、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
+| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 
@@ -897,6 +984,21 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
     --jboss-config-file /opt/eap/standalone/configuration/standalone-full.xml \
     --jboss-credential-store /opt/eap/standalone/data/credential-store.jceks
 
+# 14-5) cwagent が CloudWatch Logs へ送信できているかを確認する
+#       (compose.yml に cwagent があれば自動。起動確認と併用すると送達まで見る)
+./build_and_verify.sh --verify-startup \
+    --compose-service app,cwagent,cloudwatch-logs-mock --startup-service app
+
+# 14-6) 送達待ちを 3 分へ延ばし、届かなければビルド失敗として扱う
+./build_and_verify.sh --verify-startup \
+    --compose-service app,cwagent,cloudwatch-logs-mock --startup-service app \
+    --cwagent-delivery-timeout 180 --cwagent-required
+
+# 14-7) 実 CloudWatch Logs のロググループへ届いたかを aws logs で確認する
+./build_and_verify.sh --verify-startup \
+    --compose-service app,cwagent --startup-service app \
+    --cwagent-delivery-target aws
+
 # 15) 検証後に Docker を完全クリーンアップ (確認フレーズ入力が必要)
 ./build_and_verify.sh --verify-startup --cleanup-all-docker-data
 
@@ -944,3 +1046,14 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `注意: シークレット名 '…' が --jboss-secret-id '…' と異なります` | `compose.yml` の secrets 名と既定の id がずれている | 表示された名前を `--jboss-secret-id` に指定して再実行する |
 | `[未確認] elytron-tool.sh が見つかりません` | 自動探索でパスを特定できない | `--jboss-elytron-tool` で指定する |
 | `[未確認] Elytron の credential-store 定義が見つかりませんでした` | `jboss-cli` による生成前、または別方式でパスワードを渡している | 生成後のイメージで実行する。設定ファイルが既定以外なら `--jboss-config-file` を指定 |
+| `[NG] マウント元のファイルがホストに存在しません` | cwagent の設定 JSON のパスが間違っている。存在しないパスの bind mount は空ディレクトリになる | 表示された解決先パスにファイルを置く。`compose.yml` からの相対パスであることに注意 |
+| `[NG] /etc/cwagentconfig … へ設定ファイルをマウントする volumes がありません` | 設定の注入経路が無く、CloudWatch Agent が既定設定で起動している | `volumes` に `./cwagent-config.json:/etc/cwagentconfig/cwagent-config.json:ro` を追加するか、`CW_CONFIG_CONTENT` で注入する |
+| `[NG] endpoint_override のホスト '…' が compose.yml のサービス名・container_name のいずれとも一致しません` | 送信先サービスを `compose.yml` へ入れ忘れている。コンテナ内で名前解決できず送信が全滅する | 送信先サービスを同じ `compose.yml` へ定義し、`--compose-service` の起動対象にも含める |
+| `[NG] 収集対象パスが cwagent にマウントされていません` | `collect_list` の `file_path` が `cwagent` の `volumes` に無く、tail 対象が存在しない | ログ出力元と同じボリュームを `cwagent` へマウントする (読み取り専用で可) |
+| `[NG] log_group_name が CloudWatch Logs の命名規則に反します` | 空白など使用できない文字が含まれる | `[A-Za-z0-9_./#-]` の範囲・512 文字以内へ直す |
+| `[NG] リージョンが設定ファイルにも cwagent の environment にもありません` | `agent.region` も `AWS_REGION` も無く、送信先エンドポイントを決められない | 設定 JSON の `agent.region` か `cwagent` の `environment.AWS_REGION` を設定する |
+| `[NG] コンテナ内に設定ファイルがありません` | マウントが効いていない (ディレクトリが作られた・パス違い) | 表示された設定ディレクトリの内容と `compose.yml` の `volumes` を突き合わせる |
+| `[NG] ホスト側の … とコンテナ内の … の内容が一致しません` | 設定ファイルを編集したがコンテナを作り直していない | `docker compose up -d --force-recreate <cwagent>` で作り直す |
+| `[NG] … 秒待っても送達を確認できない送信先があります` | 収集対象ファイルへ誰も書いていない、送信先が listen していない、認証・権限不足など | 表示された cwagent の警告・エラーログを確認し、`--cwagent-delivery-timeout` を `force_flush_interval` より十分長くして再実行 |
+| `[未確認] Python 3 が見つからないため、設定ファイルの内容を解析できません` | 設定 JSON の解析に必要な Python 3 が無い | `python3` を利用可能にする (静的チェックの他の段は Python 無しでも動作する) |
+| `[未確認] aws コマンドが見つからない / AWS 認証が確認できない` | `--cwagent-delivery-target aws` で実 CloudWatch Logs を確認しようとした | `aws` を導入し `aws login --remote` で認証する。ローカル検証なら `logs.endpoint_override` で偽装サービスへ向ける |
