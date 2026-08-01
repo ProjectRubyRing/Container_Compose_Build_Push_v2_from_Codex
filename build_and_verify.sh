@@ -264,6 +264,15 @@ CWAGENT_DELIVERY_INTERVAL="5"     # 送達確認のポーリング間隔 (秒)
 CWAGENT_MOCK_SERVICE=""           # 偽装 CloudWatch Logs の Compose サービス名 (空なら endpoint_override から解決)
 CWAGENT_MOCK_PORT=""              # 偽装 CloudWatch Logs のコンテナ側ポート (空なら endpoint_override から解決)
 CWAGENT_REQUIRED="false"          # true: 検証 NG を終了コード 1 として扱う
+# 実 CloudWatch Logs 宛ての構成で、設定ファイルの log_group_name が CloudWatch Logs に
+# 存在しない場合、PutLogEvents は ResourceNotFoundException となり 1 件も残らない。
+# cwagent 自身に logs:CreateLogGroup 権限が無い構成ではエージェント側でも作成できない
+# ため、既定ではスクリプト側が設定ファイルのロググループ名で自動作成する。
+CWAGENT_CREATE_LOG_GROUP="true"   # true: 存在しないロググループを設定ファイルの名前で作成する
+CWAGENT_ENSURED_LOG_GROUPS=()     # この実行で存在を確認・作成済みのロググループ (再確認の抑止)
+CWAGENT_CREATED_LOG_GROUPS=()     # この実行で新規作成したロググループ (表示・レポート用)
+CWAGENT_FAILED_LOG_GROUPS=()      # この実行で作成に失敗したロググループ (再試行・二重記録の抑止)
+CWAGENT_LOG_GROUP_STAGE_RECORDED="false"  # 自動作成の前提不足を段として記録済みか
 # 段の記録に使う区切り。ログ group 名にも説明文にも現れない制御文字を使う。
 CWAGENT_STAGE_SEPARATOR=$'\037'
 COMPOSE_YAML_SEPARATOR=$'\037'    # compose.yml 展開結果の区切り
@@ -716,6 +725,9 @@ CloudWatch Agent (cwagent) のログ送信検証:
                            - endpoint_override が無い場合は aws logs コマンドで
                              実 CloudWatch Logs のロググループ / ストリーム /
                              今回の実行以降のイベントを確認する (AWS 認証が必要)
+                           - 実 CloudWatch Logs 宛てで設定ファイルのロググループが
+                             存在しない場合は、コンテナ起動前にその名前で自動作成する
+                             (--no-cwagent-create-log-group で抑止)
   --verify-cwagent         cwagent サービスが定義されていない場合も検証を試み、
                            見つからなければ NG として報告する
   --no-verify-cwagent      cwagent のログ送信検証を行わない
@@ -736,6 +748,13 @@ CloudWatch Agent (cwagent) のログ送信検証:
                            未指定時は endpoint_override のポート (既定: 8080)
   --cwagent-required       設定・送達の検証で NG があった場合、終了コード 1 とする
                            (既定は警告のみでビルド結果の判定は変えない)
+  --cwagent-create-log-group
+                           実 CloudWatch Logs 宛ての構成で、設定ファイルの
+                           log_group_name のロググループが存在しない場合に、
+                           その名前で自動作成する (既定で有効)
+  --no-cwagent-create-log-group
+                           ロググループの自動作成を行わない (存在しない場合は
+                           NG として報告するだけにする)
 
 URL 応答確認:
   --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
@@ -833,6 +852,8 @@ while [ $# -gt 0 ]; do
     --cwagent-mock-service) need_value "$1" $#; CWAGENT_MOCK_SERVICE="$2"; shift 2 ;;
     --cwagent-mock-port)   need_value "$1" $#; CWAGENT_MOCK_PORT="$2"; shift 2 ;;
     --cwagent-required)    CWAGENT_REQUIRED="true"; shift ;;
+    --cwagent-create-log-group)    CWAGENT_CREATE_LOG_GROUP="true"; shift ;;
+    --no-cwagent-create-log-group) CWAGENT_CREATE_LOG_GROUP="false"; shift ;;
     --verify-url)          need_value "$1" $#; VERIFY_URL="$2"; shift 2 ;;
     --expect-status)       need_value "$1" $#; EXPECT_STATUS="$2"; shift 2 ;;
     --url-method)          need_value "$1" $#; URL_METHOD="$2"; shift 2 ;;
@@ -7063,6 +7084,161 @@ cwagent_verify_delivery_via_mock() {
   return 0
 }
 
+# 送達確認先を決める (auto は logs.endpoint_override の有無で判定する)。
+# 起動前のロググループ準備と、起動後の送達チェックの双方で同じ判定を使う。
+cwagent_resolve_delivery_target() {
+  local target="$CWAGENT_DELIVERY_TARGET"
+
+  if [ "$target" = "auto" ]; then
+    if [ -n "$CWAGENT_ENDPOINT_OVERRIDE" ]; then
+      target="mock"
+    else
+      target="aws"
+    fi
+  fi
+  printf '%s\n' "$target"
+}
+
+# この実行で既に存在確認・作成を終えたロググループかどうか。
+cwagent_log_group_ensured() {
+  local group="$1" ensured
+  for ensured in ${CWAGENT_ENSURED_LOG_GROUPS[@]+"${CWAGENT_ENSURED_LOG_GROUPS[@]}"}; do
+    [ "$ensured" = "$group" ] && return 0
+  done
+  return 1
+}
+
+# この実行で新規作成したロググループかどうか (表示の出し分けに使う)。
+cwagent_log_group_created() {
+  local group="$1" created
+  for created in ${CWAGENT_CREATED_LOG_GROUPS[@]+"${CWAGENT_CREATED_LOG_GROUPS[@]}"}; do
+    [ "$created" = "$group" ] && return 0
+  done
+  return 1
+}
+
+# この実行で作成に失敗したロググループかどうか。権限不足などの原因は 1 回の実行中に
+# 変わらないため、2 回目以降は再試行せず、同じ NG も重ねて記録しない。
+cwagent_log_group_failed() {
+  local group="$1" failed
+  for failed in ${CWAGENT_FAILED_LOG_GROUPS[@]+"${CWAGENT_FAILED_LOG_GROUPS[@]}"}; do
+    [ "$failed" = "$group" ] && return 0
+  done
+  return 1
+}
+
+# 設定ファイルの log_group_name が実 CloudWatch Logs に無ければ、その名前で作成する。
+# ロググループが存在しないと PutLogEvents は ResourceNotFoundException となり、
+# cwagent 側に logs:CreateLogGroup 権限が無ければ 1 件も残らないため、送達確認の前
+# (可能ならコンテナ起動前) にここで用意する。確認済みのものは再問い合わせしない。
+cwagent_ensure_log_groups() {
+  local stage_label="ロググループの自動作成 (CloudWatch Logs)"
+  local region="${CWAGENT_CONFIG_REGION:-$REGION}"
+  local destination group stream file_path existing create_error queued duplicate
+  local created_list="" existing_list="" failed_list=""
+  local -a targets=()
+
+  [ "$CWAGENT_CREATE_LOG_GROUP" = "true" ] || return 0
+  [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ] || return 0
+
+  # 同じロググループを複数の収集対象が共有する構成があるため、重複を除いてから扱う。
+  for destination in "${CWAGENT_EXPECTED_DESTINATIONS[@]}"; do
+    IFS="$CWAGENT_STAGE_SEPARATOR" read -r group stream file_path <<< "$destination"
+    [ -n "$group" ] || continue
+    cwagent_log_group_ensured "$group" && continue
+    cwagent_log_group_failed "$group" && continue
+    duplicate="false"
+    for queued in ${targets[@]+"${targets[@]}"}; do
+      if [ "$queued" = "$group" ]; then
+        duplicate="true"
+        break
+      fi
+    done
+    [ "$duplicate" = "true" ] && continue
+    targets+=("$group")
+  done
+  [ ${#targets[@]} -gt 0 ] || return 0
+
+  if ! command -v aws >/dev/null 2>&1; then
+    if [ "$CWAGENT_LOG_GROUP_STAGE_RECORDED" != "true" ]; then
+      CWAGENT_LOG_GROUP_STAGE_RECORDED="true"
+      cwagent_record_stage "$stage_label" "未確認" \
+          "aws コマンドが見つからないため、ロググループの有無を確認・作成できません: ${targets[*]}"
+    fi
+    return 1
+  fi
+  if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    if [ "$CWAGENT_LOG_GROUP_STAGE_RECORDED" != "true" ]; then
+      CWAGENT_LOG_GROUP_STAGE_RECORDED="true"
+      cwagent_record_stage "$stage_label" "未確認" \
+          "AWS 認証が確認できないため、ロググループの有無を確認・作成できません ('aws login --remote' で認証してください): ${targets[*]}"
+    fi
+    return 1
+  fi
+
+  for group in "${targets[@]}"; do
+    existing="$(aws logs describe-log-groups --region "$region" \
+        --log-group-name-prefix "$group" \
+        --query "logGroups[?logGroupName=='${group}'].logGroupName" --output text 2>/dev/null || printf '')"
+    if [ -n "$existing" ] && [ "$existing" != "None" ]; then
+      CWAGENT_ENSURED_LOG_GROUPS+=("$group")
+      existing_list="${existing_list}${existing_list:+, }${group}"
+      continue
+    fi
+    log "CloudWatch Logs にロググループがないため、設定ファイルの名前で作成します: ${group} (region=${region})"
+    if create_error="$(aws logs create-log-group --region "$region" \
+        --log-group-name "$group" 2>&1)"; then
+      CWAGENT_ENSURED_LOG_GROUPS+=("$group")
+      CWAGENT_CREATED_LOG_GROUPS+=("$group")
+      created_list="${created_list}${created_list:+, }${group}"
+      continue
+    fi
+    case "$create_error" in
+      *ResourceAlreadyExistsException*)
+        # 直前に他の実行やエージェント自身が作成した場合。存在する扱いでよい。
+        CWAGENT_ENSURED_LOG_GROUPS+=("$group")
+        existing_list="${existing_list}${existing_list:+, }${group}"
+        ;;
+      *)
+        CWAGENT_FAILED_LOG_GROUPS+=("$group")
+        failed_list="${failed_list}${failed_list:+, }${group} ($(printf '%s' "$create_error" | tr '\n' ' ' | cut -c1-200))"
+        ;;
+    esac
+  done
+
+  CWAGENT_LOG_GROUP_STAGE_RECORDED="true"
+  if [ -n "$failed_list" ]; then
+    cwagent_record_stage "$stage_label" "NG" \
+        "ロググループを作成できませんでした: ${failed_list}。logs:CreateLogGroup 権限とリージョン (${region}) を確認してください${created_list:+ / 作成済み: ${created_list}}"
+    return 1
+  fi
+  if [ -n "$created_list" ]; then
+    cwagent_record_stage "$stage_label" "OK" \
+        "設定ファイルのロググループ名で作成しました (region=${region}): ${created_list}${existing_list:+ / 既存: ${existing_list}}"
+    return 0
+  fi
+  cwagent_record_stage "$stage_label" "情報" \
+      "設定ファイルのロググループはすべて存在するため作成していません (region=${region}): ${existing_list}"
+  return 0
+}
+
+# コンテナ起動前にロググループを用意する入口。cwagent の最初の送信を取りこぼさない
+# よう、実 CloudWatch Logs 宛ての構成に限りビルド前のチェック直後に実行する。
+prepare_cwagent_log_groups() {
+  [ "$CWAGENT_VERIFY_ACTIVE" = "true" ] || return 0
+  [ "$CWAGENT_CREATE_LOG_GROUP" = "true" ] || return 0
+  [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ] || return 0
+  # コンテナを起動しない実行では、送信自体が起きないため作成もしない。
+  [ "$NEED_CONTAINER" = "true" ] || return 0
+  [ "$(cwagent_resolve_delivery_target)" = "aws" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] CloudWatch Logs のロググループ自動作成をスキップします。"
+    return 0
+  fi
+  cwagent_ensure_log_groups || true
+  return 0
+}
+
 # 実 CloudWatch Logs のロググループ / ストリーム / 今回の実行以降のイベントを確認する。
 cwagent_verify_delivery_via_aws() {
   local stage_label="ログイベントの送達 (CloudWatch Logs)"
@@ -7081,6 +7257,10 @@ cwagent_verify_delivery_via_aws() {
         "AWS 認証が確認できないため、実 CloudWatch Logs への送達を確認できません ('aws login --remote' で認証してください)"
     return 1
   fi
+
+  # 起動前の準備を行えなかった場合 (静的チェックの後で送信先が判明した、--dry-run
+  # から切り替わった等) に備え、待ち合わせを始める前にもう一度用意する。
+  cwagent_ensure_log_groups || true
 
   log "実 CloudWatch Logs への送達を確認します (region=${region}, 最大 ${CWAGENT_DELIVERY_TIMEOUT} 秒) ..."
   diag ""
@@ -7120,11 +7300,21 @@ cwagent_verify_delivery_via_aws() {
         --query "logGroups[?logGroupName=='${group}'].logGroupName" --output text 2>/dev/null || printf '')"
     diag ""
     diag "収集対象: ${file_path:-(未指定)}"
-    if [ -z "$group_result" ]; then
-      diag "  [NG] ロググループが存在しません: ${group}"
+    if [ -z "$group_result" ] || [ "$group_result" = "None" ]; then
+      if [ "$CWAGENT_CREATE_LOG_GROUP" = "true" ]; then
+        diag "  [NG] ロググループが存在せず、自動作成もできませんでした: ${group}"
+        diag "       logs:CreateLogGroup 権限とリージョン (${region}) を確認してください。"
+      else
+        diag "  [NG] ロググループが存在しません: ${group}"
+        diag "       --cwagent-create-log-group を指定すると、設定ファイルの名前で自動作成します。"
+      fi
       continue
     fi
-    diag "  [OK] ロググループ: ${group}"
+    if cwagent_log_group_created "$group"; then
+      diag "  [OK] ロググループ: ${group} (存在しなかったため今回の実行で自動作成しました)"
+    else
+      diag "  [OK] ロググループ: ${group}"
+    fi
     if [ -n "$stream" ]; then
       stream_result="$(aws logs describe-log-streams --region "$region" \
           --log-group-name "$group" --log-stream-name-prefix "$stream" \
@@ -7243,14 +7433,7 @@ verify_cwagent_log_delivery() {
   fi
   [ -n "$config_json" ] || config_json='{}'
 
-  target="$CWAGENT_DELIVERY_TARGET"
-  if [ "$target" = "auto" ]; then
-    if [ -n "$CWAGENT_ENDPOINT_OVERRIDE" ]; then
-      target="mock"
-    else
-      target="aws"
-    fi
-  fi
+  target="$(cwagent_resolve_delivery_target)"
 
   if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -eq 0 ]; then
     # 送信先を 1 つも特定できていない状態で問い合わせても判定できないため、
@@ -7349,6 +7532,9 @@ append_cwagent_report() {
         printf '  - log group=%s / log stream=%s / file=%s\n' \
           "$label" "${verdict:-(自動生成)}" "$note"
       done
+    fi
+    if [ ${#CWAGENT_CREATED_LOG_GROUPS[@]} -gt 0 ]; then
+      printf '自動作成した log group: %s\n' "${CWAGENT_CREATED_LOG_GROUPS[*]}"
     fi
     printf '\n'
   } >> "$report_file"
@@ -8758,6 +8944,12 @@ verify_jboss_password_host_stages
 # compose.yml の cwagent 定義とマウントする設定 JSON は、コンテナを起動する前に
 # 突き合わせられる。ここで NG が出た場合、起動しても CloudWatch Logs には届かない。
 verify_cwagent_config_definition
+
+# ---- CloudWatch Logs のロググループ準備 (コンテナ起動前) ---------------------
+# 実 CloudWatch Logs 宛ての構成で、設定ファイルの log_group_name のロググループが
+# 存在しない場合はここで作成する。存在しないままだと PutLogEvents は
+# ResourceNotFoundException となり、cwagent の送信が最初から捨てられる。
+prepare_cwagent_log_groups
 
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_all) により

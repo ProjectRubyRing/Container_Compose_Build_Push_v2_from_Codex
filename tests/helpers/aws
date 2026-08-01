@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+#
+# build_and_verify.sh のテスト用 aws CLI スタブ。
+# CloudWatch Logs のロググループ自動作成と、実 CloudWatch Logs 宛ての送達確認で
+# 使うサブコマンドだけを扱う。存在するロググループは FAKE_AWS_LOG_GROUP_STORE の
+# ファイルへ 1 行 1 件で保持し、create-log-group で追記する。
+
+set -uo pipefail
+
+if [ -n "${FAKE_AWS_CALLS:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_AWS_CALLS"
+fi
+
+service="${1:-}"
+action="${2:-}"
+[ $# -ge 2 ] && shift 2 || shift $#
+
+log_group_name=""
+log_group_prefix=""
+query=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-group-name)        log_group_name="${2:-}"; shift 2 ;;
+    --log-group-name-prefix) log_group_prefix="${2:-}"; shift 2 ;;
+    --query)                 query="${2:-}"; shift 2 ;;
+    --region|--log-stream-name-prefix|--log-stream-names|--start-time|--limit|--output)
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+
+log_group_store="${FAKE_AWS_LOG_GROUP_STORE:-}"
+
+log_group_exists() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  [ -n "$log_group_store" ] && [ -f "$log_group_store" ] || return 1
+  grep -Fxq -- "$name" "$log_group_store"
+}
+
+case "${service}:${action}" in
+  sts:get-caller-identity)
+    if [ "${FAKE_AWS_STS_EXIT_STATUS:-0}" != "0" ]; then
+      printf 'Unable to locate credentials.\n' >&2
+      exit "${FAKE_AWS_STS_EXIT_STATUS}"
+    fi
+    printf '{"Account":"000000000000","Arn":"arn:aws:iam::000000000000:user/fake"}\n'
+    exit 0
+    ;;
+  logs:describe-log-groups)
+    log_group_exists "$log_group_prefix" && printf '%s\n' "$log_group_prefix"
+    exit 0
+    ;;
+  logs:create-log-group)
+    if [ -n "${FAKE_AWS_CREATE_LOG_GROUP_ERROR:-}" ]; then
+      printf '%s\n' "$FAKE_AWS_CREATE_LOG_GROUP_ERROR" >&2
+      exit 254
+    fi
+    if log_group_exists "$log_group_name"; then
+      printf 'An error occurred (ResourceAlreadyExistsException) when calling the CreateLogGroup operation: The specified log group already exists\n' >&2
+      exit 254
+    fi
+    [ -n "$log_group_store" ] && printf '%s\n' "$log_group_name" >> "$log_group_store"
+    exit 0
+    ;;
+  logs:describe-log-streams)
+    if ! log_group_exists "$log_group_name"; then
+      printf 'An error occurred (ResourceNotFoundException) when calling the DescribeLogStreams operation: The specified log group does not exist\n' >&2
+      exit 254
+    fi
+    printf '%s\n' "${FAKE_AWS_LAST_EVENT_TIMESTAMP:-1700000000000}"
+    exit 0
+    ;;
+  logs:filter-log-events)
+    if ! log_group_exists "$log_group_name"; then
+      printf 'An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist\n' >&2
+      exit 254
+    fi
+    case "$query" in
+      *length*) printf '%s\n' "${FAKE_AWS_EVENT_COUNT:-2}" ;;
+      *)        printf '%s\n' "${FAKE_AWS_EVENT_MESSAGES:-request completed token=dummy-secret}" ;;
+    esac
+    exit 0
+    ;;
+esac
+
+printf 'fake aws: unsupported command: %s %s\n' "$service" "$action" >&2
+exit 64

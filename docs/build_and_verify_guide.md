@@ -107,6 +107,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 可観測性 | `render_cloudwatch_delivery_report` / `run_otel_jaeger_trace_helper` | cwagent / OTel のローカル送達診断 |
 | クリーンアップ | `cleanup_all_docker_data` / `teardown_container` / `cleanup_copied_files` | Docker 全体削除と通常後始末 |
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
+| cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
 | レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
@@ -145,7 +146,8 @@ flowchart TD
     I --> J[JBoss マスターパスワード取得 → export]
     J --> J2[伝搬検証 1-2: 取得元 → 環境変数 → compose.yml の secrets<br/>--verify-jboss-password 指定時]
     J2 --> J3[cwagent 設定ファイルチェック<br/>compose.yml の定義 + 設定 JSON の静的照合]
-    J3 --> K[--copy-file の事前コピー]
+    J3 --> J4[ロググループ準備<br/>実 CloudWatch Logs 宛てで存在しなければ設定の名前で作成]
+    J4 --> K[--copy-file の事前コピー]
     K --> L{--compose-service が 2 個以上?}
     L -- はい --> M[base を単独で先行ビルド] --> N[ローカルイメージ確認] --> O[base 以外をまとめて並列ビルド]
     L -- いいえ --> P[compose build] --> Q[ローカルイメージ確認]
@@ -336,6 +338,8 @@ compose down (削除)
 | `--cwagent-mock-service NAME` | サービス名 | (`endpoint_override` から解決) | 偽装 CloudWatch Logs の Compose サービス名 |
 | `--cwagent-mock-port PORT` | 1〜65535 | (`endpoint_override` から解決、既定 8080) | 偽装 CloudWatch Logs のコンテナ側ポート |
 | `--cwagent-required` | (フラグ) | `false` | 検証 NG を終了コード 1 として扱う |
+| `--cwagent-create-log-group` | (フラグ) | `true` | 実 CloudWatch Logs 宛ての構成で、設定ファイルの `log_group_name` のロググループが存在しなければ自動作成する (既定で有効) |
+| `--no-cwagent-create-log-group` | (フラグ) | — | ロググループの自動作成を行わず、存在しない場合は NG として報告するだけにする |
 
 検証は `compose.yml` に `cwagent` サービスが定義されていれば自動で実行され、
 オプション指定は不要です (6.6 参照)。
@@ -838,8 +842,30 @@ CloudWatch Agent は既定設定のまま起動してログだけが送信され
 | --- | --- |
 | cwagent コンテナの起動 | 実行中か。停止していれば状態と終了コードを表示し、警告・エラーログを抜き出す |
 | コンテナ内の設定ファイル | `docker exec <cid> cat <設定ファイル>` の内容をホスト側と比較。不一致なら「編集が反映されていない」ことが分かる |
+| ロググループの自動作成 | 実 CloudWatch Logs 宛ての構成で、設定ファイルの `log_group_name` が存在しなければ作成する (下記) |
 | ログイベントの送達 | 設定済みのロググループ / ログストリームへイベントが届くまで待ち合わせる |
 | cwagent の警告・エラーログ | `E!` / `W!` / `ERROR` / `WARN` / `failed` / `denied` / `timeout` / `no such file` を含む行を最大 20 行 |
+
+#### ロググループの自動作成
+
+ロググループが CloudWatch Logs に無い状態では `PutLogEvents` が
+`ResourceNotFoundException` となり、`cwagent` 側に `logs:CreateLogGroup` 権限が
+無ければログは 1 件も残りません。そこで確認先が `aws` (実 CloudWatch Logs) の
+場合、**設定ファイルに記載されている `log_group_name` のロググループが存在しなければ、
+その名前で自動作成します** (既定で有効。`--no-cwagent-create-log-group` で抑止)。
+
+- 作成は `aws logs describe-log-groups` で存在を確認した後、`aws logs create-log-group`
+  で行い、リージョンは `agent.region` (無ければ `--region`) を使います。
+- **コンテナ起動前** ((A) の直後) に作成するため、`cwagent` の最初の送信から
+  取りこぼしません。送達チェックの直前にも同じ確認を行いますが、確認済みの
+  ロググループへは再度問い合わせません。
+- 同じロググループを複数の `collect_list` エントリが共有する場合は 1 回だけ作成します。
+- 他の実行やエージェント自身が先に作成していた場合 (`ResourceAlreadyExistsException`)
+  は「既存」として扱います。
+- 権限不足などで作成できなかった場合は NG とし、必要な権限
+  (`logs:CreateLogGroup`) とリージョンを表示します。
+- ログストリームは `cwagent` が `CreateLogStream` で作成するため、スクリプトでは作成しません。
+- `--dry-run` / コンテナを起動しない実行 / 確認先が `mock` の場合は作成しません。
 
 送達確認は `--cwagent-delivery-target` で確認先を切り替えます。
 
@@ -854,6 +880,7 @@ CloudWatch Agent は既定設定のまま起動してログだけが送信され
   ロググループの存在・ログストリームの最終イベント時刻・**今回の実行開始時刻
   (`RUN_STARTED_EPOCH_MS`) 以降に届いたイベント**を確認します。`aws` コマンドと
   AWS 認証 (`aws sts get-caller-identity`) が必要で、いずれかが無い場合は「未確認」です。
+  ロググループが存在しない場合は、上記のとおり設定ファイルの名前で自動作成します。
 
 ログイベント本文は `password` / `token` / `authorization` / `credential` などの名前で
 値が続く箇所を `[REDACTED]` に置き換えてから表示します。

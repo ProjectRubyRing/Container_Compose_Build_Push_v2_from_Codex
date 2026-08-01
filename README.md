@@ -478,8 +478,9 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
 ```
 
 EAP 8.1の起動ログ解析、同時起動サービスログ、対話操作、healthcheck 診断、ディレクトリツリー集計、
-CloudWatch Logs偽装送達レポート、Jaegerトレースレポートは、Docker / curlのモックと
-WireMock / JaegerのJSONフィクスチャを使う回帰テストで確認できます。
+CloudWatch Logs偽装送達レポート、ロググループの自動作成、Jaegerトレースレポートは、
+Docker / curl / aws CLIのモックとWireMock / JaegerのJSONフィクスチャを使う
+回帰テストで確認できます。
 
 ```bash
 bash tests/build_and_verify_test.sh
@@ -639,6 +640,8 @@ CloudWatch Logs には届きません。
    - `endpoint_override` が無い (実 CloudWatch Logs 宛て) 場合は `aws logs` コマンドで
      ロググループの存在、ログストリームの最終イベント時刻、**今回の実行以降に届いた
      イベント**を確認します。`aws` コマンドと AWS 認証が必要です。
+     設定ファイルの `log_group_name` のロググループが CloudWatch Logs に存在しない
+     場合は、**その名前で自動作成します** (下記)。
 3. `cwagent` 自身が出した警告・エラーログ (`E!` / `W!` / `failed` など) を最大 20 行
    抜き出して表示します。
 
@@ -647,6 +650,33 @@ CloudWatch Logs には届きません。
 
 `--report-dir` を指定した場合、(A) と (B) の結果は全量レポートの
 `[8] CloudWatch Logs 送信検証 (cwagent)` へ保存されます。
+
+#### ロググループの自動作成
+
+ロググループが CloudWatch Logs に存在しないと `PutLogEvents` は
+`ResourceNotFoundException` となり、`cwagent` 側に `logs:CreateLogGroup` 権限が
+無ければログは 1 件も残りません。そこで確認先が実 CloudWatch Logs (`aws`) の場合、
+**設定ファイルに記載されている `log_group_name` のロググループが存在しなければ、
+その名前で自動的に作成します**。既定で有効で、`--no-cwagent-create-log-group` を
+指定すると作成せず、存在しないことを NG として報告するだけになります。
+
+- 作成は `aws logs create-log-group` で行い、リージョンは `agent.region`
+  (無ければ `--region`) を使います。`logs:CreateLogGroup` 権限が必要です。
+- **コンテナ起動前**に作成するため、`cwagent` の最初の送信から取りこぼしません。
+- 同じロググループを複数の `collect_list` エントリが共有する場合も作成は 1 回だけです。
+- 既に存在する場合は何もしません。他の実行やエージェント自身が先に作成していた場合
+  (`ResourceAlreadyExistsException`) も「既存」として扱います。
+- 作成できなかった場合は NG とし、必要な権限とリージョンを表示します。
+- ログストリームは `cwagent` が作成するため、スクリプトでは作成しません。
+- `--dry-run` / コンテナを起動しない実行 / 確認先が偽装サービス (`mock`) の場合は
+  作成しません。
+
+```
+[10:12:04] CloudWatch Logs にロググループがないため、設定ファイルの名前で作成します: /local/myapp/efs/app-front (region=ap-northeast-1)
+...
+  [OK] ロググループの自動作成 (CloudWatch Logs)
+      設定ファイルのロググループ名で作成しました (region=ap-northeast-1): /local/myapp/efs/app-front, /local/myapp/efs/app-back
+```
 
 #### オプション
 
@@ -662,6 +692,8 @@ CloudWatch Logs には届きません。
 | `--cwagent-mock-service NAME` | 偽装 CloudWatch Logs の Compose サービス名 (未指定時は `endpoint_override` から解決) |
 | `--cwagent-mock-port PORT` | 偽装 CloudWatch Logs のコンテナ側ポート (未指定時は `endpoint_override` から解決、既定 8080) |
 | `--cwagent-required` | 検証で NG があった場合に終了コード 1 とする (既定は警告のみ) |
+| `--cwagent-create-log-group` | 実 CloudWatch Logs 宛ての構成で、設定ファイルの `log_group_name` のロググループが存在しなければ自動作成する (既定で有効) |
+| `--no-cwagent-create-log-group` | ロググループの自動作成を行わない (存在しない場合は NG として報告するだけにする) |
 
 既定では NG を検出しても警告のみで、ビルド結果の判定は変えません
 (`--verify-jboss-password` の伝搬検証と同じ扱いです)。CI で送信不備を失敗として

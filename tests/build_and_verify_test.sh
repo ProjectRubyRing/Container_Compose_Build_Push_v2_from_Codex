@@ -59,11 +59,13 @@ assert_before() {
 mkdir -p "$TEST_TMP/bin"
 cp "$TEST_DIR/helpers/docker" "$TEST_TMP/bin/docker"
 cp "$TEST_DIR/helpers/curl" "$TEST_TMP/bin/curl"
-chmod 755 "$TEST_TMP/bin/docker" "$TEST_TMP/bin/curl"
+cp "$TEST_DIR/helpers/aws" "$TEST_TMP/bin/aws"
+chmod 755 "$TEST_TMP/bin/docker" "$TEST_TMP/bin/curl" "$TEST_TMP/bin/aws"
 
 export PATH="$TEST_TMP/bin:$PATH"
 export FAKE_DOCKER_CALLS="$TEST_TMP/docker.calls"
 export FAKE_CURL_CALLS="$TEST_TMP/curl.calls"
+export FAKE_AWS_CALLS="$TEST_TMP/aws.calls"
 
 success_output="$TEST_TMP/success.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1640,6 +1642,146 @@ assert_contains "${cwagent_report_files[0]}" "  - log group=/local/myapp/efs/app
 assert_contains "${cwagent_report_files[0]}" "総合判定: 全段 OK"
 assert_before "${cwagent_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)" \
   "[9] Compose サービス別ログ (全サービス・全行)"
+
+# --- 実 CloudWatch Logs 宛てで、ロググループが存在しないケース (自動作成) ---
+# 設定ファイルの log_group_name のロググループが無い場合、その名前で作成してから
+# 送達を確認すること。
+cwagent_create_group_output="$TEST_TMP/cwagent-create-log-group.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_AWS_CALLS"
+: > "$TEST_TMP/aws-log-groups.txt"
+export FAKE_AWS_LOG_GROUP_STORE="$TEST_TMP/aws-log-groups.txt"
+export FAKE_COMPOSE_PS_SERVICES="app cwagent cloudwatch-logs-mock"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app cwagent cloudwatch-logs-mock"
+export FAKE_CWAGENT_CONFIG_FILE="$cwagent_fixture_dir/cwagent-config.json"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs \
+    --cwagent-delivery-target aws \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1 \
+    --report-dir "$TEST_TMP/cwagent-create-reports"
+) >"$cwagent_create_group_output" 2>&1; then
+  cat "$cwagent_create_group_output" >&2
+  fail "cwagent log group auto creation returned a non-zero status"
+fi
+
+# コンテナ起動前に、設定ファイルのロググループ名で作成すること
+assert_contains "$cwagent_create_group_output" \
+  "CloudWatch Logs にロググループがないため、設定ファイルの名前で作成します: /local/myapp/efs/app-front (region=ap-northeast-1)"
+assert_before "$cwagent_create_group_output" \
+  "CloudWatch Logs にロググループがないため、設定ファイルの名前で作成します: /local/myapp/efs/app-front (region=ap-northeast-1)" \
+  "BuildKit のビルドログ表示形式: plain"
+assert_contains "$FAKE_AWS_CALLS" \
+  "logs create-log-group --region ap-northeast-1 --log-group-name /local/myapp/efs/app-front"
+assert_contains "$FAKE_AWS_CALLS" \
+  "logs create-log-group --region ap-northeast-1 --log-group-name /local/myapp/efs/app-back"
+assert_contains "$cwagent_create_group_output" "[OK] ロググループの自動作成 (CloudWatch Logs)"
+assert_contains "$cwagent_create_group_output" \
+  "設定ファイルのロググループ名で作成しました (region=ap-northeast-1): /local/myapp/efs/app-front, /local/myapp/efs/app-back"
+assert_contains "$cwagent_create_group_output" \
+  "[OK] ロググループ: /local/myapp/efs/app-front (存在しなかったため今回の実行で自動作成しました)"
+assert_contains "$cwagent_create_group_output" "[OK] ログイベントの送達 (CloudWatch Logs)"
+assert_contains "$cwagent_create_group_output" "総合判定: 全段 OK"
+assert_contains "$cwagent_create_group_output" "request completed token=[REDACTED]"
+assert_not_contains "$cwagent_create_group_output" "dummy-secret"
+cwagent_create_report_files=("$TEST_TMP"/cwagent-create-reports/build_and_verify_*.txt)
+[ -f "${cwagent_create_report_files[0]}" ] || fail "cwagent auto creation report was not created"
+assert_contains "${cwagent_create_report_files[0]}" \
+  "自動作成した log group: /local/myapp/efs/app-front /local/myapp/efs/app-back"
+
+# 既に存在するロググループは作成しないこと (2 回目の実行)
+cwagent_existing_group_output="$TEST_TMP/cwagent-existing-log-group.out"
+: > "$FAKE_AWS_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --cwagent-delivery-target aws \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1
+) >"$cwagent_existing_group_output" 2>&1; then
+  cat "$cwagent_existing_group_output" >&2
+  fail "cwagent verification with existing log groups returned a non-zero status"
+fi
+assert_not_contains "$FAKE_AWS_CALLS" "logs create-log-group"
+assert_contains "$cwagent_existing_group_output" \
+  "設定ファイルのロググループはすべて存在するため作成していません (region=ap-northeast-1): /local/myapp/efs/app-front, /local/myapp/efs/app-back"
+assert_contains "$cwagent_existing_group_output" "[OK] ロググループ: /local/myapp/efs/app-front"
+assert_not_contains "$cwagent_existing_group_output" \
+  "[OK] ロググループ: /local/myapp/efs/app-front (存在しなかったため今回の実行で自動作成しました)"
+
+# --- --no-cwagent-create-log-group では作成せず NG として報告すること ---
+cwagent_no_create_output="$TEST_TMP/cwagent-no-create-log-group.out"
+: > "$FAKE_AWS_CALLS"
+: > "$TEST_TMP/aws-log-groups-empty.txt"
+export FAKE_AWS_LOG_GROUP_STORE="$TEST_TMP/aws-log-groups-empty.txt"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --cwagent-delivery-target aws \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1 \
+    --no-cwagent-create-log-group
+) >"$cwagent_no_create_output" 2>&1; then
+  cat "$cwagent_no_create_output" >&2
+  fail "--no-cwagent-create-log-group returned a non-zero status"
+fi
+assert_not_contains "$FAKE_AWS_CALLS" "logs create-log-group"
+assert_contains "$cwagent_no_create_output" "[NG] ロググループが存在しません: /local/myapp/efs/app-front"
+assert_contains "$cwagent_no_create_output" \
+  "--cwagent-create-log-group を指定すると、設定ファイルの名前で自動作成します。"
+assert_contains "$cwagent_no_create_output" "[NG] ログイベントの送達 (CloudWatch Logs)"
+assert_contains "$cwagent_no_create_output" "総合判定: NG あり"
+
+# --- 権限不足などで作成に失敗した場合は NG として報告すること ---
+cwagent_create_failed_output="$TEST_TMP/cwagent-create-log-group-failed.out"
+: > "$FAKE_AWS_CALLS"
+export FAKE_AWS_CREATE_LOG_GROUP_ERROR="An error occurred (AccessDeniedException) when calling the CreateLogGroup operation: User is not authorized to perform: logs:CreateLogGroup"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --cwagent-delivery-target aws \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1
+) >"$cwagent_create_failed_output" 2>&1; then
+  cat "$cwagent_create_failed_output" >&2
+  fail "cwagent log group creation failure returned a non-zero status"
+fi
+assert_contains "$FAKE_AWS_CALLS" "logs create-log-group --region ap-northeast-1 --log-group-name /local/myapp/efs/app-front"
+# 原因は 1 回の実行中に変わらないため、送達確認の前に再試行しないこと
+assert_occurrences "$FAKE_AWS_CALLS" \
+  "logs create-log-group --region ap-northeast-1 --log-group-name /local/myapp/efs/app-front" 1
+assert_occurrences "$cwagent_create_failed_output" "[NG] ロググループの自動作成 (CloudWatch Logs)" 1
+assert_contains "$cwagent_create_failed_output" "ロググループを作成できませんでした"
+assert_contains "$cwagent_create_failed_output" "AccessDeniedException"
+assert_contains "$cwagent_create_failed_output" \
+  "logs:CreateLogGroup 権限とリージョン (ap-northeast-1) を確認してください"
+assert_contains "$cwagent_create_failed_output" \
+  "[NG] ロググループが存在せず、自動作成もできませんでした: /local/myapp/efs/app-front"
+assert_contains "$cwagent_create_failed_output" "総合判定: NG あり"
+unset FAKE_AWS_CREATE_LOG_GROUP_ERROR FAKE_AWS_LOG_GROUP_STORE
 
 # --- 送信先・収集対象・命名規則・リージョンが揃っていないケース ---
 cwagent_broken_output="$TEST_TMP/cwagent-broken.out"
