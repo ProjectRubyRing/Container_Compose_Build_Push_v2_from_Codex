@@ -1606,6 +1606,7 @@ if ! (
     --env-list-limit 1 \
     --directory-tree-depth 1 \
     --suppress-removed-logs \
+    --cwagent-delivery-report \
     --report-dir "$TEST_TMP/cwagent-reports"
 ) >"$cwagent_verify_output" 2>&1; then
   cat "$cwagent_verify_output" >&2
@@ -1643,6 +1644,81 @@ assert_contains "${cwagent_report_files[0]}" "総合判定: 全段 OK"
 assert_before "${cwagent_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)" \
   "[9] Compose サービス別ログ (全サービス・全行)"
 
+# --- 既定 (--cwagent-delivery-report なし) では送達レポートを行わないこと ---
+# コンテナ内設定の照合と cwagent の警告・エラーログは従来どおり実行し、送信先への
+# 問い合わせと待ち合わせだけを行わないこと。
+cwagent_no_report_output="$TEST_TMP/cwagent-no-delivery-report.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs \
+    --report-dir "$TEST_TMP/cwagent-no-report-reports"
+) >"$cwagent_no_report_output" 2>&1; then
+  cat "$cwagent_no_report_output" >&2
+  fail "cwagent verification without --cwagent-delivery-report returned a non-zero status"
+fi
+# 静的チェックと、起動後のコンテナ内設定の照合は従来どおり行うこと
+assert_contains "$cwagent_no_report_output" "ビルド前の設定ファイルチェック"
+assert_contains "$cwagent_no_report_output" "[OK] 収集対象ログファイルのマウント"
+assert_contains "$cwagent_no_report_output" "CloudWatch Agent の送信状況チェック"
+assert_contains "$cwagent_no_report_output" "[OK] コンテナ内の設定ファイル (/etc/cwagentconfig/cwagent-config.json)"
+assert_contains "$cwagent_no_report_output" "[OK] cwagent の警告・エラーログ"
+# 送達レポートは実行せず、実施していないことを情報として残すこと
+assert_contains "$cwagent_no_report_output" "[情報] ログイベントの送達"
+assert_contains "$cwagent_no_report_output" \
+  "--cwagent-delivery-report が指定されていないため、送達レポートは実行していません (待ち合わせ 0 秒)"
+assert_not_contains "$cwagent_no_report_output" "CloudWatch Logs 偽装送達レポート"
+assert_not_contains "$cwagent_no_report_output" "[OK] ログイベントの送達 (CloudWatch Logs 偽装サービス)"
+# 送信先 (WireMock) への問い合わせも行わないこと
+assert_not_contains "$FAKE_CURL_CALLS" "__admin/requests"
+# 情報の段は総合判定を曇らせないこと
+assert_contains "$cwagent_no_report_output" "総合判定: 全段 OK"
+cwagent_no_report_files=("$TEST_TMP"/cwagent-no-report-reports/build_and_verify_*.txt)
+[ -f "${cwagent_no_report_files[0]}" ] || fail "cwagent no-delivery-report report was not created"
+assert_contains "${cwagent_no_report_files[0]}" "[情報] ログイベントの送達"
+
+# --- 既定 (--cwagent-create-log-group なし) ではロググループを作成しないこと ---
+# 実 CloudWatch Logs 宛てでロググループが存在しない構成でも、明示指定が無ければ
+# CreateLogGroup を呼ばず、指定方法を案内するだけにとどめること。
+cwagent_default_no_create_output="$TEST_TMP/cwagent-default-no-create.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_AWS_CALLS"
+: > "$TEST_TMP/aws-log-groups-default.txt"
+export FAKE_AWS_LOG_GROUP_STORE="$TEST_TMP/aws-log-groups-default.txt"
+export FAKE_COMPOSE_PS_SERVICES="app cwagent cloudwatch-logs-mock"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app cwagent cloudwatch-logs-mock"
+export FAKE_CWAGENT_CONFIG_FILE="$cwagent_fixture_dir/cwagent-config.json"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --cwagent-delivery-target aws \
+    --cwagent-delivery-timeout 1 \
+    --cwagent-delivery-interval 1
+) >"$cwagent_default_no_create_output" 2>&1; then
+  cat "$cwagent_default_no_create_output" >&2
+  fail "cwagent verification without --cwagent-create-log-group returned a non-zero status"
+fi
+assert_not_contains "$FAKE_AWS_CALLS" "logs create-log-group"
+assert_contains "$cwagent_default_no_create_output" \
+  "CloudWatch Logs のロググループ自動作成は行いません (--cwagent-create-log-group を指定すると、設定ファイルの log_group_name で作成します)。"
+assert_not_contains "$cwagent_default_no_create_output" "[OK] ロググループの自動作成 (CloudWatch Logs)"
+# 送達レポートも既定では行わないため、ロググループ不在を NG として報告しないこと
+assert_not_contains "$cwagent_default_no_create_output" "[NG] ロググループが存在しません"
+assert_contains "$cwagent_default_no_create_output" "[情報] ログイベントの送達"
+
 # --- 実 CloudWatch Logs 宛てで、ロググループが存在しないケース (自動作成) ---
 # 設定ファイルの log_group_name のロググループが無い場合、その名前で作成してから
 # 送達を確認すること。
@@ -1667,6 +1743,8 @@ if ! (
     --cwagent-delivery-target aws \
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
+    --cwagent-create-log-group \
+    --cwagent-delivery-report \
     --report-dir "$TEST_TMP/cwagent-create-reports"
 ) >"$cwagent_create_group_output" 2>&1; then
   cat "$cwagent_create_group_output" >&2
@@ -1710,7 +1788,9 @@ if ! (
     --suppress-removed-logs \
     --cwagent-delivery-target aws \
     --cwagent-delivery-timeout 1 \
-    --cwagent-delivery-interval 1
+    --cwagent-delivery-interval 1 \
+    --cwagent-create-log-group \
+    --cwagent-delivery-report
 ) >"$cwagent_existing_group_output" 2>&1; then
   cat "$cwagent_existing_group_output" >&2
   fail "cwagent verification with existing log groups returned a non-zero status"
@@ -1738,6 +1818,7 @@ if ! (
     --cwagent-delivery-target aws \
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
+    --cwagent-delivery-report \
     --no-cwagent-create-log-group
 ) >"$cwagent_no_create_output" 2>&1; then
   cat "$cwagent_no_create_output" >&2
@@ -1764,7 +1845,9 @@ if ! (
     --suppress-removed-logs \
     --cwagent-delivery-target aws \
     --cwagent-delivery-timeout 1 \
-    --cwagent-delivery-interval 1
+    --cwagent-delivery-interval 1 \
+    --cwagent-create-log-group \
+    --cwagent-delivery-report
 ) >"$cwagent_create_failed_output" 2>&1; then
   cat "$cwagent_create_failed_output" >&2
   fail "cwagent log group creation failure returned a non-zero status"
@@ -1802,7 +1885,8 @@ if ! (
     --directory-tree-depth 1 \
     --suppress-removed-logs \
     --cwagent-delivery-timeout 1 \
-    --cwagent-delivery-interval 1
+    --cwagent-delivery-interval 1 \
+    --cwagent-delivery-report
 ) >"$cwagent_broken_output" 2>&1; then
   cat "$cwagent_broken_output" >&2
   fail "cwagent verification of the broken fixture returned a non-zero status"

@@ -261,14 +261,20 @@ CWAGENT_CONFIG_FALLBACK_PATH="/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudw
 CWAGENT_DELIVERY_TARGET="auto"    # auto: endpoint_override の有無で判定 / mock: 偽装サービス / aws: 実 CloudWatch Logs
 CWAGENT_DELIVERY_TIMEOUT="60"     # 送達を待つ最大秒数 (force_flush_interval より十分長くする)
 CWAGENT_DELIVERY_INTERVAL="5"     # 送達確認のポーリング間隔 (秒)
+# 送達レポート (送信先への問い合わせ・最大 CWAGENT_DELIVERY_TIMEOUT 秒の待ち合わせ・
+# 収集対象ごとの結果表示) は、実 CloudWatch Logs / 偽装サービスへ実際に問い合わせるうえ
+# ビルド時間も延ばすため、既定では行わず --cwagent-delivery-report 指定時だけ実行する。
+CWAGENT_DELIVERY_REPORT="false"   # true: 送達を待ち合わせて送達レポートを表示する
 CWAGENT_MOCK_SERVICE=""           # 偽装 CloudWatch Logs の Compose サービス名 (空なら endpoint_override から解決)
 CWAGENT_MOCK_PORT=""              # 偽装 CloudWatch Logs のコンテナ側ポート (空なら endpoint_override から解決)
 CWAGENT_REQUIRED="false"          # true: 検証 NG を終了コード 1 として扱う
 # 実 CloudWatch Logs 宛ての構成で、設定ファイルの log_group_name が CloudWatch Logs に
 # 存在しない場合、PutLogEvents は ResourceNotFoundException となり 1 件も残らない。
 # cwagent 自身に logs:CreateLogGroup 権限が無い構成ではエージェント側でも作成できない
-# ため、既定ではスクリプト側が設定ファイルのロググループ名で自動作成する。
-CWAGENT_CREATE_LOG_GROUP="true"   # true: 存在しないロググループを設定ファイルの名前で作成する
+# ため、スクリプト側から設定ファイルのロググループ名で作成できるようにしている。ただし
+# AWS アカウントへ実体を残す副作用を伴うため、既定では作成せず、
+# --cwagent-create-log-group を指定した実行だけで作成する。
+CWAGENT_CREATE_LOG_GROUP="false"  # true: 存在しないロググループを設定ファイルの名前で作成する
 CWAGENT_ENSURED_LOG_GROUPS=()     # この実行で存在を確認・作成済みのロググループ (再確認の抑止)
 CWAGENT_CREATED_LOG_GROUPS=()     # この実行で新規作成したロググループ (表示・レポート用)
 CWAGENT_FAILED_LOG_GROUPS=()      # この実行で作成に失敗したロググループ (再試行・二重記録の抑止)
@@ -717,17 +723,19 @@ CloudWatch Agent (cwagent) のログ送信検証:
                              マウントされていない (tail 対象が存在しない)
                            - リージョン (agent.region / AWS_REGION) と認証情報が無い
   送信状況のチェック       起動確認後に、実際に起動した cwagent が読み込んだ設定を
-                           コンテナから取り出してホスト側と比較し、設定済みの
-                           ロググループ / ログストリームへログイベントが届くまで
-                           待って確認する。cwagent の警告・エラーログも併せて表示する。
+                           コンテナから取り出してホスト側と比較し、cwagent の
+                           警告・エラーログも併せて表示する。
+                           --cwagent-delivery-report を指定した場合は、さらに設定済みの
+                           ロググループ / ログストリームへログイベントが届くまで待って
+                           確認し、送達レポートを表示する (既定では行わない)。
                            - logs.endpoint_override が偽装サービス (WireMock) を指す
                              場合は、その request journal の PutLogEvents を確認する
                            - endpoint_override が無い場合は aws logs コマンドで
                              実 CloudWatch Logs のロググループ / ストリーム /
                              今回の実行以降のイベントを確認する (AWS 認証が必要)
                            - 実 CloudWatch Logs 宛てで設定ファイルのロググループが
-                             存在しない場合は、コンテナ起動前にその名前で自動作成する
-                             (--no-cwagent-create-log-group で抑止)
+                             存在しない場合は、--cwagent-create-log-group 指定時のみ
+                             コンテナ起動前にその名前で自動作成する (既定では作成しない)
   --verify-cwagent         cwagent サービスが定義されていない場合も検証を試み、
                            見つからなければ NG として報告する
   --no-verify-cwagent      cwagent のログ送信検証を行わない
@@ -737,10 +745,18 @@ CloudWatch Agent (cwagent) のログ送信検証:
   --cwagent-delivery-target auto|mock|aws
                            送信状況の確認先。auto は logs.endpoint_override が
                            あれば mock、無ければ aws を選ぶ (既定: auto)
+  --cwagent-delivery-report
+                           設定済みのロググループ / ログストリームへログイベントが
+                           届くまで待ち合わせ、収集対象ごとの送達レポートを表示する
+                           (既定では行わない。指定しない場合は待ち合わせもしない)
+  --no-cwagent-delivery-report
+                           送達レポートを行わない (既定)
   --cwagent-delivery-timeout SEC
-                           送達を待つ最大秒数 (既定: 60)
+                           送達を待つ最大秒数。--cwagent-delivery-report 指定時に
+                           使う (既定: 60)
   --cwagent-delivery-interval SEC
-                           送達確認のポーリング間隔・秒 (既定: 5)
+                           送達確認のポーリング間隔・秒。--cwagent-delivery-report
+                           指定時に使う (既定: 5)
   --cwagent-mock-service NAME
                            偽装 CloudWatch Logs (WireMock) の Compose サービス名。
                            未指定時は endpoint_override のホスト名から解決する
@@ -751,9 +767,9 @@ CloudWatch Agent (cwagent) のログ送信検証:
   --cwagent-create-log-group
                            実 CloudWatch Logs 宛ての構成で、設定ファイルの
                            log_group_name のロググループが存在しない場合に、
-                           その名前で自動作成する (既定で有効)
+                           その名前で自動作成する (既定では作成しない)
   --no-cwagent-create-log-group
-                           ロググループの自動作成を行わない (存在しない場合は
+                           ロググループの自動作成を行わない (既定。存在しない場合は
                            NG として報告するだけにする)
 
 URL 応答確認:
@@ -847,6 +863,8 @@ while [ $# -gt 0 ]; do
     --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
     --cwagent-config-dir)  need_value "$1" $#; CWAGENT_CONFIG_DIR="$2"; shift 2 ;;
     --cwagent-delivery-target) need_value "$1" $#; CWAGENT_DELIVERY_TARGET="$2"; shift 2 ;;
+    --cwagent-delivery-report)    CWAGENT_DELIVERY_REPORT="true"; shift ;;
+    --no-cwagent-delivery-report) CWAGENT_DELIVERY_REPORT="false"; shift ;;
     --cwagent-delivery-timeout) need_value "$1" $#; CWAGENT_DELIVERY_TIMEOUT="$2"; shift 2 ;;
     --cwagent-delivery-interval) need_value "$1" $#; CWAGENT_DELIVERY_INTERVAL="$2"; shift 2 ;;
     --cwagent-mock-service) need_value "$1" $#; CWAGENT_MOCK_SERVICE="$2"; shift 2 ;;
@@ -7226,13 +7244,19 @@ cwagent_ensure_log_groups() {
 # よう、実 CloudWatch Logs 宛ての構成に限りビルド前のチェック直後に実行する。
 prepare_cwagent_log_groups() {
   [ "$CWAGENT_VERIFY_ACTIVE" = "true" ] || return 0
-  [ "$CWAGENT_CREATE_LOG_GROUP" = "true" ] || return 0
   [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ] || return 0
   # コンテナを起動しない実行では、送信自体が起きないため作成もしない。
   [ "$NEED_CONTAINER" = "true" ] || return 0
   [ "$(cwagent_resolve_delivery_target)" = "aws" ] || return 0
+  # --dry-run では指定の有無にかかわらず作成しないため、先に判定する。
   if [ "$DRY_RUN" = "true" ]; then
     log "[DRY-RUN] CloudWatch Logs のロググループ自動作成をスキップします。"
+    return 0
+  fi
+  # 作成は AWS アカウントへ実体を残すため、明示指定した実行だけで行う。作成対象が
+  # あり得る構成のときだけ、指定方法を 1 行案内する。
+  if [ "$CWAGENT_CREATE_LOG_GROUP" != "true" ]; then
+    log "CloudWatch Logs のロググループ自動作成は行いません (--cwagent-create-log-group を指定すると、設定ファイルの log_group_name で作成します)。"
     return 0
   fi
   cwagent_ensure_log_groups || true
@@ -7391,7 +7415,9 @@ verify_cwagent_log_delivery() {
     cwagent_show_stage_results "cwagent のログ送信検証"
     return 0
   fi
-  if ! require_observability_tools; then
+  # curl / Python 3 は送達レポートの問い合わせと JSON 整形にだけ使う。レポートを
+  # 行わない既定の実行では、コンテナ内設定の照合 (docker のみ) は続行できる。
+  if [ "$CWAGENT_DELIVERY_REPORT" = "true" ] && ! require_observability_tools; then
     cwagent_record_stage "送信状況チェックの前提ツール" "未確認" \
         "curl と Python 3 が利用できないため、送信状況を確認できません"
     cwagent_show_stage_results "cwagent のログ送信検証"
@@ -7435,7 +7461,13 @@ verify_cwagent_log_delivery() {
 
   target="$(cwagent_resolve_delivery_target)"
 
-  if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -eq 0 ]; then
+  if [ "$CWAGENT_DELIVERY_REPORT" != "true" ]; then
+    # 送達レポートは送信先への問い合わせと最大 CWAGENT_DELIVERY_TIMEOUT 秒の
+    # 待ち合わせを伴うため、明示指定した実行だけで行う。「未確認」にすると総合判定が
+    # 曇るので、実施していないことを「情報」として残すだけにする。
+    cwagent_record_stage "ログイベントの送達" "情報" \
+        "--cwagent-delivery-report が指定されていないため、送達レポートは実行していません (待ち合わせ 0 秒)"
+  elif [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -eq 0 ]; then
     # 送信先を 1 つも特定できていない状態で問い合わせても判定できないため、
     # 設定側の問題として扱う (静的チェックの NG が原因のことが多い)。
     cwagent_record_stage "ログイベントの送達" "未確認" \
