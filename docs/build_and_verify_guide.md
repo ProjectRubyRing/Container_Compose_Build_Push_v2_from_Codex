@@ -47,6 +47,7 @@
 | 11 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
+| 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -86,6 +87,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 中盤 | JVM パラメータ・OpenTelemetry 設定 | `/proc/<pid>/cmdline` の走査、JVM オプションの分類、OpenTelemetry 設定の突き合わせ |
 | 中盤 | 対話操作 | bash / HTTP / logs モードと、healthcheck・MySQL・可観測性の各ヘルパ |
 | 後半 | Docker 完全クリーンアップ | 対象の集計、確認フレーズ、削除、検証 |
+| 後半 | WAR デプロイ時 Java 例外解析 | 解析ヘルパー (Python 3) の埋め込みと、ログ収集・実行・表示・レポート追記 |
 | 後半 | 全量レポート | `write_build_report` |
 | 後半 | 後始末 (`cleanup_all`) | EXIT トラップ本体 |
 | 末尾 | メイン処理 | ビルド → 起動 → 起動確認 → URL 確認 → 対話 → 情報表示 |
@@ -108,7 +110,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | クリーンアップ | `cleanup_all_docker_data` / `teardown_container` / `cleanup_copied_files` | Docker 全体削除と通常後始末 |
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
-| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` | 全量レポートの生成 |
+| Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_deploy_exception_excel_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
+| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
 ### 2.3 EXIT トラップ (`cleanup_all`)
@@ -116,11 +119,13 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 処理のどの経路 (成功・失敗・中断) でも、次の順で実行されます。
 
 ```
-1. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
-2. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
-3. teardown_container        … compose down (--keep-container 指定時は残す)
-4. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
-5. 一時ファイル削除          … URL 応答本文・HTTP ボディ・healthcheck 診断の一時ファイル
+1. analyze_war_deploy_exceptions … デプロイ処理の Java 例外を解析 (削除より前・レポートより前)
+                                   成功経路で実行済みなら何もしない
+2. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
+3. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
+4. teardown_container        … compose down (--keep-container 指定時は残す)
+5. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
+6. 一時ファイル削除          … Java 例外解析結果・URL 応答本文・HTTP ボディ・healthcheck 診断
 ```
 
 終了コードは、本処理が既に失敗していれば**元の終了コードを優先**します。
@@ -170,12 +175,15 @@ flowchart TD
     AA --> AA2[JVM パラメータ一覧を表示<br/>/proc から Java プロセスを検出]
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
-    AA4 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
+    AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → Excel 出力]
+    AA5 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
 ```
 
 エラー終了時は、`EXIT` の後始末でレポートのログ本文を集める直前に
 `compose stop` (SIGTERM) を挟みます (3.6 参照)。
+Java 例外解析は成功経路では主処理の末尾で、失敗経路では `EXIT` の後始末で
+全量レポートを書く直前に実行します (いずれもコンテナ削除より前)。
 
 ### 3.2 ビルドフェーズの詳細
 
@@ -396,7 +404,11 @@ compose down (削除)
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする) |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析の Excel とテキストも同じディレクトリへ追加出力 |
+| `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。`--no-deploy-exception-analysis` とは排他 |
+| `--deploy-exception-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
+| `--deploy-exception-limit N` | 1 以上の整数 | `50` | 不可 | 詳細分析を行う例外の最大件数 |
+| `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析と Excel 出力を行わない |
 
 ### 4.8 終了時のクリーンアップ
 
@@ -613,7 +625,10 @@ services:
 | ファイル | 生成条件 | 内容 |
 | --- | --- | --- |
 | `--env-list-file` のパス | 指定時 | 環境変数一覧 |
-| `--report-dir/build_and_verify_<日時>.txt` | 指定時 | 全量レポート |
+| `--report-dir/build_and_verify_<日時>.txt` | 指定時 | 全量レポート (デプロイ結果ファイル) |
+| `--report-dir/build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | WAR デプロイ時 Java 例外エラー解析の Excel ブック |
+| `--report-dir/build_and_verify_<日時>_java_exceptions.txt` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | 同じ内容のテキスト版 (全スタックフレーム + 区分付きデプロイログ) |
+| `--deploy-exception-excel` / `--deploy-exception-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
 
 全量レポートのセクション構成は次のとおりです。
 
@@ -628,6 +643,7 @@ services:
 | `[7] JBoss マスターパスワードの伝搬検証` | `--verify-jboss-password` 指定時、段ごとの判定・パスワード文字列・16 進ダンプ | 段 1〜3 のみ記録し、残りは「未確認」 |
 | `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送信状況チェックの段ごとの判定 (送達の段は `--cwagent-delivery-report` 未指定なら「情報」) | 設定ファイルチェックのみ記録し、送達は「未確認」 |
 | `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
+| `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (画面と同じ全文) と、出力した Excel ブックのパス | 「コンテナを起動していないため…」と記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -911,6 +927,132 @@ NG を検出しても**既定では終了コードを変えません** (`--verif
 画面へ `[WARN]` を出し、全量レポートの `[8]` へ記録します。`--cwagent-required` を
 指定した場合のみ、NG があれば `exit 1` で終了します。
 
+### 6.7 WAR デプロイ時の Java 例外解析
+
+コンテナ起動を伴う実行では、専用オプションなしで自動実行されます。
+JBoss EAP のデプロイ処理 (WAR の展開 → 記述子の解析 → モジュール依存の解決 →
+CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そのデプロイユニットは
+`failed` となり `WFLYCTL0080` / `WFLYSRV0021` でロールバックされます。
+ログにはスタックトレースがそのまま出るものの、**どの例外が根本原因で、なぜそうなり、
+何を直せばよいのか**はログを読む側の知識に依存していました。この解析はその部分を
+スクリプト側へ持たせ、原因分析と対処提案までを出力します。
+
+#### 解析の流れ
+
+| 段階 | 内容 |
+| --- | --- |
+| ログ収集 | 全 Compose サービスのログをサービス単位で取得し、ANSI 色コードを除去する。サービスをまたいでデプロイ対象を取り違えないよう、区切りを入れて渡す |
+| 例外ブロックの切り出し | `at ...` のスタックフレームの並びを手掛かりに、ヘッダー行・フレーム・`Caused by:` / `Suppressed:` / `... N more` をひとまとまりとして抽出する |
+| 根本原因の特定 | `Caused by` の連鎖をたどり、**最終段**を根本原因とする。`org.jboss.msc.service.StartException` のような「入れ物」の例外に惑わされないようにするため |
+| 発生箇所の特定 | スタックフレームのうち、`java.` / `jakarta.` / `org.jboss.` などの基盤パッケージに属さない**最初のアプリケーションフレーム**を抜き出す |
+| 例外クラスの分類 | 完全修飾クラス名 → 単純名 → `Error` / `Exception` の順に照合し、分類・深刻度・分析文・対処手順を決める |
+| メッセージ本文の追加解析 | `Metaspace` / `Connection refused` / `Access denied` / `class file version` / `WELD-001408` など、本文から具体策が言えるパターンを追加所見として付ける |
+| デプロイ関連の判定 | `jboss.deployment.unit."<アーカイブ>"` の有無、`WFLYSRV0027` 以降かどうか、ロガーがデプロイヤかどうかで判定し、**判定の根拠も併記**する |
+| 出力 | 画面 (例外を検出したときのみ全文) / 全量レポート `[10]` / Excel ブック / 同じ内容のテキストファイル |
+
+#### 分類する例外クラス
+
+| 分類 | 主な例外クラス |
+| --- | --- |
+| クラスロード・依存関係 | `ClassNotFoundException`, `NoClassDefFoundError`, `ExceptionInInitializerError`, `NoSuchMethodError`, `NoSuchFieldError`, `IncompatibleClassChangeError`, `UnsupportedClassVersionError`, `ModuleNotFoundException`, `ModuleLoadException`, `ClassCastException` |
+| JNDI・リソース参照 | `NameNotFoundException`, `NamingException`, `NoInitialContextException` |
+| データソース・JDBC | `SQLException`, `SQLNonTransientConnectionException`, `SQLTransientConnectionException`, `SQLTimeoutException`, `SQLInvalidAuthorizationSpecException`, `PSQLException`, `CommunicationsException` |
+| ネットワーク接続 | `ConnectException`, `NoRouteToHostException`, `UnknownHostException`, `BindException` |
+| TLS・証明書 | `SSLHandshakeException`, `SSLException`, `SunCertPathBuilderException`, `CertificateException`, `SSLPeerUnverifiedException` |
+| CDI (Weld) | `org.jboss.weld.exceptions.DeploymentException`, `UnsatisfiedResolutionException`, `AmbiguousResolutionException`, `DefinitionException`, `CreationException` |
+| JPA・Hibernate | `PersistenceException`, `HibernateException`, `JDBCConnectionException`, `SchemaManagementException`, `MappingException`, `AnnotationException` |
+| MSC サービス起動 | `StartException`, `DuplicateServiceException`, `ServiceNotFoundException` |
+| デプロイ処理 | `DeploymentUnitProcessingException`, `OperationFailedException` |
+| デプロイメント記述子 (XML) | `SAXParseException`, `SAXException`, `XMLStreamException` |
+| Servlet・Web 層 | `ServletException`, `UnavailableException` |
+| メモリ・リソース | `OutOfMemoryError`, `StackOverflowError` |
+| ファイル・権限 | `FileNotFoundException`, `NoSuchFileException`, `AccessDeniedException`, `AccessControlException` |
+| セキュリティ・認証情報 | `CredentialStoreException`, `RealmUnavailableException`, `UnrecoverableKeyException` |
+| アプリケーション実装 | `NullPointerException`, `IllegalStateException`, `IllegalArgumentException`, `UnsupportedOperationException` |
+| 設定値 | `NumberFormatException`, `MissingResourceException` |
+| タイムアウト | `TimeoutException`, `SocketTimeoutException` |
+| ネイティブライブラリ | `UnsatisfiedLinkError` |
+
+18 分類・72 クラスを収録しています。一致しないクラスは `Error` / `Exception` の
+汎用項目へ落とし、根本原因のたどり方を示します。
+
+#### 例外 1 件あたりの出力
+
+```
+-------------------------------------------------------------------
+[例外 1/2] org.jboss.msc.service.StartException
+  判定: デプロイ失敗の原因 / 深刻度: 致命的 / 分類: CDI (Weld)
+-------------------------------------------------------------------
+発生日時 / サービス / デプロイ対象 / ログレベル / ロガー / スレッド / EAP コード
+例外クラス / 例外メッセージ / 根本原因 / アプリ内発生点 / 連鎖の段数
+
+■ 何が起きたか                     … 1〜2 文で結論
+■ 発生の仕組み (なぜこの例外になるのか) … JVM / EAP の内部動作
+■ ログから読み取れる事実           … 見つからないクラス名、JNDI 名、接続先、
+                                      枯渇した領域、SQLState など
+■ このログ特有の追加所見           … メッセージ本文から言える具体策
+■ デプロイ処理との関連 (判定の根拠) … なぜデプロイ関連と判定したか
+■ 前後に出ている EAP メッセージ    … WFLYSRV0021 などの意味
+■ 想定される原因 (可能性の高い順)  … 番号付き
+■ 確認手順                         … 実行できる docker exec / jboss-cli コマンド
+■ 対処方法                         … 効果の高い順。設定ファイルの記述例つき
+■ 再発防止
+■ 参考情報
+■ 例外の連鎖とスタックトレース     … 各段の先頭 12 フレーム
+```
+
+例外が 1 件も無い場合、画面へは
+`WAR デプロイ時の Java 例外は検出されませんでした。` の 1 行だけを出します。
+
+#### 出力ファイル (Excel とテキスト)
+
+`--report-dir` を指定していれば、デプロイ結果ファイル
+(`build_and_verify_<日時>.txt`) と**同じディレクトリへ追加で**次の 2 つを出力します。
+出力先は `--deploy-exception-excel FILE` / `--deploy-exception-text FILE` で
+個別に明示することもできます。
+
+| ファイル | 内容 |
+| --- | --- |
+| `build_and_verify_<日時>_java_exceptions.xlsx` | 後述の 6 シート構成の Excel ブック |
+| `build_and_verify_<日時>_java_exceptions.txt` | 同じ内容のテキスト版。Excel を開けない環境や、`grep` / `diff` で追いたい場合に使う |
+
+テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
+含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
+スタックトレースを各段 12 フレームまでに要約します)。
+
+| シート | 内容 | 使いどころ |
+| --- | --- | --- |
+| 概要 | 実行情報、検出サマリ (深刻度別・分類別)、総合判定、優先対応すべき例外、ブックの読み方 | まず開く |
+| 例外一覧 | 1 行 1 例外。判定 / 深刻度 / 分類 / デプロイ関連 / デプロイ対象 / サービス / 発生時刻 / ロガー / 例外クラス / 根本原因 / アプリ内発生点 など 21 列 | オートフィルタで絞り込む |
+| 原因分析 | 何が起きたか / 発生の仕組み / 想定される原因 / 読み取れる事実 / 判定根拠 / 関連 EAP メッセージ (1 項目 = 1 行) | 原因を理解する |
+| 対処方法 | 確認手順 / 対処方法 / 再発防止 / 参考情報 (1 手順 = 1 行) | 手順書として使う |
+| スタックトレース | 連鎖 (`Caused by`) の段ごとに全フレーム (1 フレーム = 1 行) | 失敗箇所を特定する |
+| デプロイログ | 解析対象ログを区分 (デプロイ開始 / 例外 / スタックフレーム / エラー / 警告 …) 付きで時系列に | 前後関係を確認する |
+
+**表示の作り**
+
+| 項目 | 内容 |
+| --- | --- |
+| フォント | すべて **Meiryo UI** (等幅箇所は 10pt、本文は 11pt) |
+| 行高 | 内容と列幅から必要な行数を計算し、行ごとに明示指定する。Excel の自動調整に頼らないため、開いた直後から折り返した本文が切れない |
+| 長文の扱い | 「原因分析」「対処方法」は 1 項目 = 1 行の縦持ち、「スタックトレース」は 1 フレーム = 1 行に展開する。1 セルへ長文を詰めて Excel の行高上限 (409.5pt) を超え、末尾が読めなくなるのを避けるため |
+| その他 | 見出し行の固定、オートフィルタ、列幅、折り返し、深刻度の色分けを設定済み |
+
+例外が 0 件でも Excel とテキストは出力し、「概要」に
+`OK (Java 例外は検出されませんでした)` と記録します。
+
+#### 実行タイミングと前提
+
+| 項目 | 内容 |
+| --- | --- |
+| 実行タイミング | 成功時は主処理の末尾 (OpenTelemetry 設定表示の後)、失敗時は EXIT トラップで全量レポートを書く直前。いずれも**コンテナを削除する前** |
+| 二重実行 | しない (成功経路で実行済みなら EXIT 側は何もしない) |
+| 前提ツール | Python 3 (`python3` / `python` / `/usr/libexec/platform-python` のいずれか)。Excel は標準ライブラリだけで生成するため `openpyxl` などは不要 |
+| Python 3 が無い場合 | 解析をスキップし `[WARN]` を出す。ビルドの成否は変えない |
+| 終了コードへの影響 | **なし**。例外を検出しても終了コードは変わらない (起動確認や URL 応答確認の結果で決まる) |
+| `--dry-run` | 解析しない |
+| コンテナ未起動 (ビルドのみ) | 解析しない。全量レポート `[10]` へ理由を記録する |
+
 ---
 
 ## 7. 環境変数
@@ -956,7 +1098,7 @@ NG を検出しても**既定では終了コードを変えません** (`--verif
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
 | `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 
@@ -1054,6 +1196,23 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 
 # 16) build_and_push.sh 経由での呼び出し (同じ処理)
 ./build_and_push.sh --build-only --verify-startup --log-dir ./logs
+
+# 17) デプロイ結果ファイルと Java 例外解析 (Excel + テキスト) をまとめて保存
+#     (reports/build_and_verify_<日時>.txt、
+#      reports/build_and_verify_<日時>_java_exceptions.xlsx、
+#      reports/build_and_verify_<日時>_java_exceptions.txt が出力される)
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# 17-2) Java 例外解析の Excel / テキストを任意のパスへ出力する
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --deploy-exception-excel ./reports/deploy-errors.xlsx \
+    --deploy-exception-text ./reports/deploy-errors.txt
+
+# 17-3) Java 例外解析を行わない (ログ量を抑えたい場合)
+./build_and_verify.sh --verify-startup --no-deploy-exception-analysis
 ```
 
 ---
@@ -1102,6 +1261,14 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `[NG] 収集対象パスが cwagent にマウントされていません` | `collect_list` の `file_path` が `cwagent` の `volumes` に無く、tail 対象が存在しない | ログ出力元と同じボリュームを `cwagent` へマウントする (読み取り専用で可) |
 | `[NG] log_group_name が CloudWatch Logs の命名規則に反します` | 空白など使用できない文字が含まれる | `[A-Za-z0-9_./#-]` の範囲・512 文字以内へ直す |
 | `[NG] リージョンが設定ファイルにも cwagent の environment にもありません` | `agent.region` も `AWS_REGION` も無く、送信先エンドポイントを決められない | 設定 JSON の `agent.region` か `cwagent` の `environment.AWS_REGION` を設定する |
+| `WAR デプロイ時に Java の例外を N 件検出しました` | デプロイ処理で例外が投げられた | 直前に出力された例外ごとの `■ 対処方法` を上から実施する。Excel の「対処方法」シートにも同じ内容がある |
+| `Java 例外解析をスキップしました: Python 3 が見つかりません` | `python3` / `python` / `/usr/libexec/platform-python` のいずれも無い | Python 3 を導入する (Excel 生成に標準ライブラリだけを使うため追加パッケージは不要) |
+| `WAR デプロイ時 Java 例外解析に失敗しました (exit=…)` | 解析ヘルパーが異常終了した | 続けて表示されるヘルパーのメッセージを確認。ビルドの成否には影響しない |
+| `Java 例外解析 Excel / テキストの出力先を作成できませんでした` | 出力先ディレクトリを作れない (権限不足) | 書き込み可能なパスを `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` に指定する |
+| `--deploy-exception-excel には .xlsx で終わるパスを指定してください` | 拡張子が `.xlsx` でない (exit 2) | `.xlsx` で終わるパスにする |
+| `--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `--deploy-exception-text と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません` | 両方へ同じパスを指定した (exit 2) | 別々のパスにする |
 | `[NG] コンテナ内に設定ファイルがありません` | マウントが効いていない (ディレクトリが作られた・パス違い) | 表示された設定ディレクトリの内容と `compose.yml` の `volumes` を突き合わせる |
 | `[NG] ホスト側の … とコンテナ内の … の内容が一致しません` | 設定ファイルを編集したがコンテナを作り直していない | `docker compose up -d --force-recreate <cwagent>` で作り直す |
 | `[NG] … 秒待っても送達を確認できない送信先があります` | 収集対象ファイルへ誰も書いていない、送信先が listen していない、認証・権限不足など | 表示された cwagent の警告・エラーログを確認し、`--cwagent-delivery-timeout` を `force_flush_interval` より十分長くして再実行 |

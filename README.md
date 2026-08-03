@@ -25,6 +25,8 @@
 **デプロイ済み Web アプリケーションの各ルート表示**、
 **Java の JVM パラメータ一覧表示**、**OpenTelemetry 環境変数・JVM パラメータ一覧表示**、
 **全量テキストレポートの保存**、
+**WAR デプロイ時 Java 例外エラー解析** (スタックトレースと例外クラスから原因分析と
+対処提案を生成し、Excel ブックとテキストファイルにも出力)、
 **JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 **CloudWatch Agent (cwagent) のログ送信検証** (設定ファイルのチェックと、
 `--cwagent-delivery-report` 指定時の設定済みロググループへの送達確認)、
@@ -121,7 +123,11 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt` (同じ内容) として同じディレクトリへ追加出力する | (なし) |
+| `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
+| `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
+| `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
+| `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -406,7 +412,13 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   レポートの構成は `[1] ビルド結果` / `[2] 環境変数一覧` / `[3] コンテナ内ディレクトリツリー` /
   `[4] JBoss EAP デプロイ構造` / `[5] Java JVM パラメータ` /
   `[6] OpenTelemetry 環境変数・JVM パラメータ` / `[7] JBoss マスターパスワードの伝搬検証` /
-  `[8] CloudWatch Logs 送信検証 (cwagent)` / `[9] Compose サービス別ログ` です。
+  `[8] CloudWatch Logs 送信検証 (cwagent)` / `[9] Compose サービス別ログ` /
+  `[10] WAR デプロイ時 Java 例外解析` です。
+- `--report-dir DIR` を指定すると、デプロイ結果ファイルとは**別に**
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` と、同じ内容の
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.txt` を追加出力します。
+  WAR のデプロイ処理で発生した Java 例外の解析結果をまとめたもので、
+  詳細は後述の [WAR デプロイ時の Java 例外エラー解析](#war-デプロイ時の-java-例外エラー解析) を参照してください。
 - ビルドや動作確認が失敗した場合、レポート末尾の
   **`[9] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
   起動確認対象だけでなく、adot collector などのサイドカーを含む
@@ -572,6 +584,118 @@ OpenTelemetry 環境変数・JVM パラメータ一覧 (サービス: app, コ�
   OTEL_PROPAGATORS (システムプロパティ -Dotel.propagators も未設定)
   OTEL_RESOURCE_ATTRIBUTES (システムプロパティ -Dotel.resource.attributes も未設定)
 ```
+
+### WAR デプロイ時の Java 例外エラー解析
+
+JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述子の解析 → モジュール依存の
+解決 → CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そのデプロイユニットは
+`failed` となり、`WFLYCTL0080` (Failed services) と `WFLYSRV0021` (rolled back) を伴って
+巻き戻されます。ログにはスタックトレースがそのまま出ますが、**どの例外が根本原因で、
+なぜそうなり、何を直せばよいのか**はログを読む側の知識に依存していました。
+
+`build_and_verify.sh` は、コンテナ起動を伴う実行で**専用オプションなしに**この解析を
+自動実行します。例外を検出した場合は画面へ詳細な分析と対処提案を出力し、
+全量レポートの `[10]` へ同じ内容を残し、さらに**デプロイ結果ファイルとは別に
+Excel ブックと、同じ内容のテキストファイルを追加出力**します。
+
+#### 解析の内容
+
+| 段階 | 内容 |
+| --- | --- |
+| 例外ブロックの切り出し | `at ...` のスタックフレームの並びを手掛かりに、ヘッダー行・フレーム・`Caused by:` / `Suppressed:` / `... N more` をひとまとまりとして抽出します。ログ本文とは別行に出た例外 (`APP000009: initialization failed` の次行に `java.lang.ClassNotFoundException: ...` が続く形) も、直前のログ行から発生時刻・ログレベル・ロガー・スレッドを引き継ぎます |
+| 根本原因の特定 | `Caused by` の連鎖をたどり、**最終段**を根本原因として扱います。`org.jboss.msc.service.StartException` のような「入れ物」の例外に惑わされないためです |
+| 発生箇所の特定 | スタックフレームのうち `java.` / `jakarta.` / `org.jboss.` などの基盤パッケージに属さない、**最初のアプリケーションフレーム**を抜き出します |
+| 例外クラスの分類 | クラスロード・依存関係 / JNDI・リソース参照 / データソース・JDBC / ネットワーク接続 / TLS・証明書 / CDI (Weld) / JPA・Hibernate / MSC サービス起動 / デプロイ処理 / デプロイメント記述子 (XML) / Servlet・Web 層 / メモリ・リソース / ファイル・権限 / セキュリティ・認証情報 / アプリケーション実装 / 設定値 / タイムアウト / ネイティブライブラリ の 18 分類・72 クラスを収録しています |
+| ログ固有の追加解析 | `Metaspace` / `Java heap space` / `Connection refused` / `Access denied` / `class file version` / `WELD-001408` / `unable to find valid certification path` など、メッセージ本文から具体策が言えるパターンを追加所見として付けます |
+| 事実の抽出 | 見つからないクラス名、引けなかった JNDI 名、接続先ホスト:ポート、枯渇したメモリ領域、`SQLState`、クラスファイルのバージョン (`61.0` → Java 17) などをログから取り出します |
+| デプロイ関連の判定 | `jboss.deployment.unit."<アーカイブ>"` の有無、`WFLYSRV0027` (Starting deployment) 以降かどうか、ロガーがデプロイヤかどうかで判定し、**判定の根拠も併記**します |
+
+例外 1 件ごとに、次の見出しで出力します。
+
+```
+■ 何が起きたか                          … 1〜2 文で結論
+■ 発生の仕組み (なぜこの例外になるのか) … JVM / JBoss EAP の内部動作
+■ ログから読み取れる事実                … 見つからないクラス名・JNDI 名・接続先など
+■ このログ特有の追加所見                … メッセージ本文から言える具体策
+■ デプロイ処理との関連 (この判定の根拠)
+■ 前後に出ている EAP メッセージ         … WFLYSRV0021 などの意味
+■ 想定される原因 (可能性の高い順)
+■ 確認手順                              … 実行できる docker exec / jboss-cli コマンド
+■ 対処方法                              … 効果の高い順。設定ファイルの記述例つき
+■ 再発防止
+■ 参考情報
+■ 例外の連鎖とスタックトレース
+```
+
+例外が 1 件も無い場合、画面へは
+`WAR デプロイ時の Java 例外は検出されませんでした。` の 1 行だけを出します。
+
+#### 出力ファイル (Excel とテキスト)
+
+`--report-dir DIR` を指定していれば、デプロイ結果ファイル
+`DIR/build_and_verify_<日時>.txt` と**同じディレクトリへ追加で**次の 2 つを出力します。
+出力先は `--deploy-exception-excel FILE` / `--deploy-exception-text FILE` で
+個別に明示することもできます。
+
+| ファイル | 内容 |
+| --- | --- |
+| `build_and_verify_<日時>_java_exceptions.xlsx` | 下表の 6 シート構成の Excel ブック |
+| `build_and_verify_<日時>_java_exceptions.txt` | **同じ内容のテキスト版**。Excel を開けない環境や、`grep` / `diff` で追跡したい場合に使う |
+
+テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
+含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
+スタックトレースを各段 12 フレームまでに要約します)。
+
+| シート | 内容 |
+| --- | --- |
+| 概要 | 実行情報、検出サマリ (深刻度別・分類別)、総合判定、優先対応すべき例外、ブックの読み方 |
+| 例外一覧 | 1 行 1 例外。判定 / 深刻度 / 分類 / デプロイ関連 / デプロイ対象 / サービス / 発生時刻 / ロガー / 例外クラス / 根本原因 / アプリ内発生点 など 21 列 |
+| 原因分析 | 何が起きたか / 発生の仕組み / 想定される原因 / 読み取れる事実 / 判定根拠 / 関連 EAP メッセージ (1 項目 = 1 行) |
+| 対処方法 | 確認手順 / 対処方法 / 再発防止 / 参考情報 (1 手順 = 1 行) |
+| スタックトレース | 連鎖 (`Caused by`) の段ごとに全フレーム (1 フレーム = 1 行) |
+| デプロイログ | 解析対象ログを区分 (デプロイ開始 / 例外 / スタックフレーム / エラー / 警告 …) 付きで時系列に |
+
+**表示の作り**
+
+- フォントはすべて **Meiryo UI**。
+- **行高は内容と列幅から計算して行ごとに明示**しています。Excel の自動調整に頼らないため、
+  開いた直後から折り返した本文が切れません。
+- 長文は 1 セルへ詰め込まず、「原因分析」「対処方法」は 1 項目 = 1 行の縦持ち、
+  「スタックトレース」は 1 フレーム = 1 行に展開しています。1 セルが Excel の
+  行高上限 (409.5pt) を超えて末尾が読めなくなるのを避けるためです。
+- 見出し行の固定・オートフィルタ・列幅・折り返し・深刻度の色分けを設定済みです。
+
+例外が 0 件でも Excel とテキストは出力し、「概要」へ
+`OK (Java 例外は検出されませんでした)` と記録します。
+
+```bash
+# デプロイ結果ファイルと Java 例外解析 (Excel + テキスト) をまとめて保存
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# Excel / テキストの出力先を明示する
+./build_and_verify.sh --verify-startup \
+    --deploy-exception-excel ./reports/deploy-errors.xlsx \
+    --deploy-exception-text ./reports/deploy-errors.txt
+
+# 解析を行わない
+./build_and_verify.sh --verify-startup --no-deploy-exception-analysis
+```
+
+#### 前提と影響範囲
+
+- 解析には **Python 3** (`python3` / `python` / `/usr/libexec/platform-python` の
+  いずれか) が必要です。Excel は Python の標準ライブラリだけで生成するため、
+  `openpyxl` などの追加パッケージは不要です。Python 3 が無い場合は解析を
+  スキップして `[WARN]` を出し、ビルドの成否は変えません。
+- 解析は成功時は主処理の末尾、失敗時は `EXIT` の後始末で全量レポートを書く直前に
+  実行します。いずれも**コンテナを削除する前**なので、起動確認に失敗した実行でも
+  解析結果が残ります。
+- **例外を検出しても終了コードは変わりません**。終了コードは従来どおり、
+  起動確認や URL 応答確認の結果で決まります。
+- `--dry-run` および起動確認を伴わないビルドのみの実行では解析しません
+  (全量レポートの `[10]` へ理由を記録します)。
 
 ### CloudWatch Logs 送信検証 (cwagent)
 

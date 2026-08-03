@@ -46,6 +46,17 @@
 #                          adot collector などサイドカーの graceful shutdown ログ
 #                          (シグナル受信 → パイプライン停止 → 終了) まで、画面と
 #                          全量レポートの双方へ残る。
+#  (12) Java 例外解析      : WAR のデプロイ処理で Java の例外が投げられた場合、
+#                          スタックトレースと Caused by の連鎖から根本原因の
+#                          例外クラスを特定し、発生の仕組み・想定される原因・
+#                          確認手順・対処方法・再発防止を生成して表示する。
+#                          解析結果は全量レポートへ保存するほか、Excel ブック
+#                          (build_and_verify_<日時>_java_exceptions.xlsx) と、
+#                          同じ内容のテキスト (同 _java_exceptions.txt) として
+#                          も出力する。ブックは 概要 / 例外一覧 / 原因分析 /
+#                          対処方法 / スタックトレース / デプロイログ の 6 シート
+#                          構成で、フォントは Meiryo UI、行高は内容と列幅から
+#                          計算して明示するため、折り返した本文が切れない。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -428,6 +439,37 @@ BUILD_RESULT_STATUS="未実行"
 BUILD_RESULT_DETAIL=""
 BUILD_IMAGE_INFO=""
 
+# ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
+# JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
+# 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
+# Java の例外が投げられると、当該デプロイユニットは failed となり WFLYCTL0080 /
+# WFLYSRV0021 でロールバックされる。ログにはスタックトレースがそのまま出るものの、
+# 「どの例外クラスが根本原因か」「なぜそうなるのか」「どう直すのか」はログを読む側の
+# 知識に依存していた。そこで、デプロイ処理のログから例外ブロック (Caused by の連鎖と
+# スタックフレーム) を切り出し、例外クラスごとの知識をもとに原因分析と対処提案を
+# 生成し、画面・全量レポート・Excel ブックの 3 か所へ出力する。
+DEPLOY_EXCEPTION_ANALYSIS="true"   # false: Java 例外の解析を行わない
+DEPLOY_EXCEPTION_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名する
+DEPLOY_EXCEPTION_EXCEL_SET="false" # 出力先が明示指定されたか (未指定時の警告条件)
+DEPLOY_EXCEPTION_TEXT=""           # テキストの出力先。空なら --report-dir 配下へ自動命名する
+DEPLOY_EXCEPTION_TEXT_SET="false"  # 出力先が明示指定されたか
+DEPLOY_EXCEPTION_MAX="50"          # 詳細分析を行う例外の最大件数
+DEPLOY_EXCEPTION_LOG_ROWS="3000"   # デプロイログの出力上限 (Excel シート・テキスト共通)
+DEPLOY_EXCEPTION_ANALYZED="false"  # 解析を実行済みか (成功経路と EXIT 経路の二重実行防止)
+# 画面表示と全量レポートへ転記する解析結果の一時ファイル (スタックトレースは要約)。
+# 独立して出力するテキストファイル (下の DEPLOY_EXCEPTION_TEXT_OUTPUT) とは別物で、
+# そちらは Excel と同じ情報量 (全フレーム + デプロイログ) を持つ。
+DEPLOY_EXCEPTION_TEXT_FILE=""
+DEPLOY_EXCEPTION_EXCEL_FILE=""     # 実際に出力した Excel のパス
+DEPLOY_EXCEPTION_TEXT_OUTPUT=""    # 実際に出力したテキストのパス
+DEPLOY_EXCEPTION_TOTAL="0"         # 検出した例外の総数
+DEPLOY_EXCEPTION_DEPLOY_TOTAL="0"  # うちデプロイ処理中に発生したもの
+DEPLOY_EXCEPTION_WORST=""          # 最も高い深刻度
+DEPLOY_EXCEPTION_VERDICT=""        # 解析の総合判定
+DEPLOY_EXCEPTION_SKIP_REASON=""    # 解析しなかった理由 (全量レポートへ記載する)
+# 解析ヘルパーへ渡すログのサービス区切り。ログ本文の行頭には現れない制御文字を使う。
+DEPLOY_EXCEPTION_SERVICE_MARKER=$'\037'
+
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
 now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
@@ -686,9 +728,46 @@ JBoss マスターパスワードの伝搬検証:
                            WEB-INF/classes と併せて、そのディレクトリ構造を表示する。
                            繰り返し指定またはカンマ区切りで複数指定できる
   --report-dir DIR         ビルド結果、環境変数一覧、コンテナ内ツリー、JBoss EAP
-                           デプロイ構造、JVM パラメータ、OpenTelemetry 設定を
+                           デプロイ構造、JVM パラメータ、OpenTelemetry 設定、
+                           WAR デプロイ時 Java 例外解析を
                            DIR/build_and_verify_<日時>.txt へ保存する。
-                           保存内容は画面の制限にかかわらず全深度・全ファイル名となる
+                           保存内容は画面の制限にかかわらず全深度・全ファイル名となる。
+                           あわせて Java 例外解析を
+                           DIR/build_and_verify_<日時>_java_exceptions.xlsx と
+                           DIR/build_and_verify_<日時>_java_exceptions.txt へ
+                           追加出力する (Excel とテキストは同じ内容)
+
+WAR デプロイ時の Java 例外解析:
+  (オプション指定不要。デプロイ処理のログに Java 例外があれば自動で解析する)
+  解析内容               コンテナ起動後のログから Java の例外ブロックを切り出し、
+                         Caused by の連鎖をたどって根本原因の例外クラスを特定する。
+                         例外クラスごとに「何が起きたか」「発生の仕組み」
+                         「想定される原因」「確認手順」「対処方法」「再発防止」を
+                         生成し、画面と全量レポートへ出力する。
+                         クラスロード / データソース / JNDI / CDI (Weld) /
+                         JPA / TLS / メモリなど、EAP のデプロイで起きやすい
+                         例外クラスを分類し、WFLYSRV0021・WFLYCTL0080 といった
+                         EAP のメッセージコードと突き合わせて、デプロイ失敗の
+                         直接原因かどうかまで判定する
+  --deploy-exception-excel FILE
+                         Java 例外解析の結果を Excel ブック (.xlsx) として
+                         FILE へ出力する。--report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_java_exceptions.xlsx へ
+                         自動出力する。ブックは「概要」「例外一覧」「原因分析」
+                         「対処方法」「スタックトレース」「デプロイログ」の
+                         6 シート構成 (フォントは Meiryo UI、列幅・行高・
+                         折り返しを内容から計算し、文字が切れないようにする)。
+                         出力には Python 3 が必要
+  --deploy-exception-text FILE
+                         Excel と同じ内容を、テキストファイルとして FILE へ
+                         出力する。--report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_java_exceptions.txt へ
+                         自動出力する。全スタックフレームと区分付きデプロイログ
+                         まで含むため、Excel を開けない環境でも同じ情報を追える
+  --deploy-exception-limit N
+                         詳細分析を行う例外の最大件数 (既定: 50)
+  --no-deploy-exception-analysis
+                         Java 例外の解析とファイル出力を行わない
 
   (オプション指定不要の自動表示)
   Java JVM パラメータ一覧  動作確認したコンテナ内の Java プロセスを /proc から検出し、
@@ -858,6 +937,10 @@ while [ $# -gt 0 ]; do
     --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
     --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
+    --deploy-exception-excel) need_value "$1" $#; DEPLOY_EXCEPTION_EXCEL="$2"; DEPLOY_EXCEPTION_EXCEL_SET="true"; shift 2 ;;
+    --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
+    --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
+    --no-deploy-exception-analysis) DEPLOY_EXCEPTION_ANALYSIS="false"; shift ;;
     --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
     --no-verify-cwagent)   VERIFY_CWAGENT="false"; shift ;;
     --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
@@ -923,6 +1006,40 @@ for _deployment_env in "${DEPLOYMENT_DIR_ENVS[@]}"; do
 done
 if [ "$BUILD_REPORT_DIR_SET" = "true" ] && { [ -z "$BUILD_REPORT_DIR" ] || [ "$BUILD_REPORT_DIR" = "-" ]; }; then
   err "--report-dir にはディレクトリパスを指定してください: $BUILD_REPORT_DIR"
+  exit 2
+fi
+validate_positive_integer "$DEPLOY_EXCEPTION_MAX" "--deploy-exception-limit" || exit 2
+if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ]; then
+  if [ -z "$DEPLOY_EXCEPTION_EXCEL" ] || [ "$DEPLOY_EXCEPTION_EXCEL" = "-" ]; then
+    err "--deploy-exception-excel にはファイルパスを指定してください: $DEPLOY_EXCEPTION_EXCEL"
+    exit 2
+  fi
+  # 拡張子が .xlsx でないと Excel が形式を判別できず、開けないファイルになる。
+  case "$DEPLOY_EXCEPTION_EXCEL" in
+    *.xlsx) ;;
+    *)
+      err "--deploy-exception-excel には .xlsx で終わるパスを指定してください: $DEPLOY_EXCEPTION_EXCEL"
+      exit 2
+      ;;
+  esac
+  if [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
+    err "--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
+  if [ -z "$DEPLOY_EXCEPTION_TEXT" ] || [ "$DEPLOY_EXCEPTION_TEXT" = "-" ]; then
+    err "--deploy-exception-text にはファイルパスを指定してください: $DEPLOY_EXCEPTION_TEXT"
+    exit 2
+  fi
+  if [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
+    err "--deploy-exception-text と --no-deploy-exception-analysis は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] && [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
+    && [ "$DEPLOY_EXCEPTION_EXCEL" = "$DEPLOY_EXCEPTION_TEXT" ]; then
+  err "--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません: $DEPLOY_EXCEPTION_EXCEL"
   exit 2
 fi
 
@@ -8608,6 +8725,3158 @@ cleanup_all_docker_data() {
 # 追記する。起動確認対象だけでなく adot collector などのサイドカーも含む全サービスを
 # 対象とし、どこからどこまでが 1 サービスのログかを見出しと罫線で区切る。
 # 画面表示用の行数上限 (--startup-log-lines) や抑制指定は適用しない。
+# =============================================================================
+# WAR デプロイ時 Java 例外解析
+# -----------------------------------------------------------------------------
+# JBoss EAP のデプロイ処理で投げられた Java 例外を、ログから機械的に切り出して
+# 分析する。ログの読み手が持っていた前提知識 (例外クラスごとの意味、Caused by の
+# たどり方、EAP のメッセージコードとの対応) をスクリプト側へ持たせ、
+#   - どの例外が根本原因か (Caused by の最終段)
+#   - なぜその例外になるのか (JVM / EAP の内部動作)
+#   - 何を確認し、どう直すのか (具体的なコマンドと設定例)
+# を出力する。解析ロジックとレポート生成は、複数行のスタックトレースを扱うため
+# Python 3 のヘルパーへ委譲する。Excel ブックも同ヘルパーが標準ライブラリだけで
+# 生成するため、openpyxl などの追加パッケージは不要。
+# =============================================================================
+
+# 解析ヘルパー本体。プログラムは標準入力から渡すため、コマンドライン長の制限
+# (Windows の Git Bash など) を受けない。
+read -r -d '' DEPLOY_EXCEPTION_ANALYZER_PY <<'DEPLOY_EXCEPTION_ANALYZER_PY_EOF' || true
+import argparse
+import datetime
+import math
+import os
+import re
+import sys
+import zipfile
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+RULE = "-" * 67
+HEAVY = "=" * 67
+SERVICE_MARKER = "\x1f"
+
+# =============================================================================
+# ログ解析
+# =============================================================================
+
+# compose logs の行頭に付くコンテナ名。"app-1  | 09:18:00,000 INFO ..." の形。
+CONTAINER_PREFIX_RE = re.compile(r"^(?P<container>[A-Za-z0-9][A-Za-z0-9_.-]*)\s+\|\s?(?P<body>.*)$")
+
+# JBoss EAP / WildFly のログ行。日付は付く構成と付かない構成の双方がある。
+LOG_LINE_RE = re.compile(
+    r"^(?:(?P<date>\d{4}-\d{2}-\d{2})[ T])?"
+    r"(?P<time>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+"
+    r"(?P<level>[A-Z]+)\s+"
+    r"\[(?P<logger>[^\]]+)\]\s*"
+    r"(?:\((?P<thread>[^)]*)\)\s*)?"
+    r"(?P<message>.*)$"
+)
+
+# WFLYSRV0025 / WFLYCTL0080 のような EAP のメッセージコード。
+MESSAGE_CODE_RE = re.compile(r"^(?P<code>[A-Z]{2,10}\d{3,6}):\s*(?P<rest>.*)$")
+
+# スタックフレーム。"at java.base/java.lang.Class.forName(Class.java:398)" や
+# 末尾の "~[jar:...]" が付く形にも合わせる。
+FRAME_RE = re.compile(r"^\s*at\s+\S.*\(.*\)\s*(?:~?\[[^\]]*\])?\s*$")
+MORE_RE = re.compile(r"^\s*\.\.\.\s+\d+\s+more\s*$")
+CAUSED_BY_RE = re.compile(r"^\s*Caused by:\s*(?P<rest>.*)$")
+SUPPRESSED_RE = re.compile(r"^\s*Suppressed:\s*(?P<rest>.*)$")
+
+# 例外クラスとみなす完全修飾クラス名。内部クラス (Foo$Bar) も拾う。
+THROWABLE_TOKEN_RE = re.compile(
+    r"(?<![\w$.])((?:[a-zA-Z_$][\w$]*\.){1,}[A-Z][\w$]*"
+    r"(?:Exception|Error|Throwable|Fault|Failure|Violation))(?![\w$])"
+)
+# 完全修飾でない例外クラス (先頭行が "NullPointerException: ..." の形)。
+BARE_THROWABLE_RE = re.compile(r"(?<![\w$.])([A-Z][\w$]*(?:Exception|Error|Throwable))(?![\w$])")
+
+# フレームからアプリケーション由来かを判定するための、基盤側パッケージ接頭辞。
+PLATFORM_PACKAGE_PREFIXES = (
+    "java.", "javax.", "jakarta.", "jdk.", "sun.", "com.sun.", "org.w3c.", "org.xml.",
+    "org.jboss.", "org.wildfly.", "io.undertow.", "org.hibernate.", "org.infinispan.",
+    "org.apache.", "io.smallrye.", "org.eclipse.", "com.oracle.", "org.glassfish.",
+    "org.slf4j.", "ch.qos.", "org.jgroups.", "io.netty.", "org.picketlink.",
+    "com.arjuna.", "org.omg.", "javassist.", "net.bytebuddy.", "org.objectweb.",
+)
+
+DEPLOY_START_RE = re.compile(r"WFLYSRV0027:\s*Starting deployment of\s*\"(?P<name>[^\"]+)\"")
+DEPLOY_ROLLBACK_RE = re.compile(r"WFLYSRV0021:\s*Deploy of deployment\s*\"(?P<name>[^\"]+)\"")
+DEPLOY_UNIT_RE = re.compile(r"jboss\.deployment\.(?:unit|subunit)\.\\?\"?(?P<name>[A-Za-z0-9_.\-]+\.(?:war|ear|jar|rar))")
+ARCHIVE_NAME_RE = re.compile(r"\"(?P<name>[A-Za-z0-9_.\-]+\.(?:war|ear|jar|rar))\"")
+
+BOOT_COMPLETE_RE = re.compile(r"WFLYSRV002[56]:")
+DEPLOY_FAILURE_CODES = ("WFLYSRV0021", "WFLYCTL0080", "WFLYSRV0026", "WFLYSRV0153",
+                        "WFLYCTL0412", "WFLYSRV0056", "WFLYDS0011")
+
+# デプロイ処理に関係すると判断するログ本文・ロガーの手掛かり。
+DEPLOY_CONTEXT_TOKENS = (
+    "jboss.deployment.unit", "jboss.deployment.subunit", "undertow-deployment",
+    "Starting deployment of", "Deploy of deployment", "Failed services",
+    "DeploymentUnitProcessingException", "org.jboss.as.server.deployment",
+    "WeldStartService", "persistenceunit", "PersistenceUnitService",
+    "Failed to start service", "MSC service thread", "ServerService Thread Pool",
+)
+
+
+class LogLine(object):
+    __slots__ = ("index", "service", "container", "raw", "body", "date", "time",
+                 "level", "logger", "thread", "message", "code", "message_rest")
+
+    def __init__(self, index, service, container, raw, body):
+        self.index = index
+        self.service = service
+        self.container = container
+        self.raw = raw
+        self.body = body
+        self.date = ""
+        self.time = ""
+        self.level = ""
+        self.logger = ""
+        self.thread = ""
+        self.message = body
+        self.code = ""
+        self.message_rest = body
+
+    def timestamp(self):
+        if self.date and self.time:
+            return "%s %s" % (self.date, self.time)
+        return self.time
+
+
+def read_log_lines(path):
+    """サービス区切り (US + サービス名) 付きのログファイルを LogLine の列へ変換する。"""
+    lines = []
+    service = "(unknown)"
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            raw = raw.rstrip("\r\n")
+            if raw.startswith(SERVICE_MARKER):
+                service = raw[len(SERVICE_MARKER):].strip() or "(unknown)"
+                continue
+            body = raw
+            container = ""
+            matched = CONTAINER_PREFIX_RE.match(raw)
+            if matched:
+                container = matched.group("container")
+                body = matched.group("body")
+            line = LogLine(len(lines), service, container, raw, body)
+            parsed = LOG_LINE_RE.match(body)
+            if parsed:
+                line.date = parsed.group("date") or ""
+                line.time = (parsed.group("time") or "").replace(".", ",")
+                line.level = parsed.group("level") or ""
+                line.logger = parsed.group("logger") or ""
+                line.thread = parsed.group("thread") or ""
+                line.message = parsed.group("message") or ""
+            coded = MESSAGE_CODE_RE.match(line.message)
+            if coded:
+                line.code = coded.group("code")
+                line.message_rest = coded.group("rest")
+            else:
+                line.message_rest = line.message
+            lines.append(line)
+    return lines
+
+
+def is_frame(line):
+    return bool(FRAME_RE.match(line.body)) and not LOG_LINE_RE.match(line.body)
+
+
+def is_more(line):
+    return bool(MORE_RE.match(line.body))
+
+
+def split_class_and_message(text):
+    """"<例外クラス>: <メッセージ>" 形式の文字列を分解する。
+
+    JBoss のログは "WFLYCTL0080: ... : java.lang.ClassNotFoundException: com.foo.Bar"
+    のように前置きが付くため、最後に現れた例外クラスを起点にする。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    found = list(THROWABLE_TOKEN_RE.finditer(text))
+    if not found:
+        found = list(BARE_THROWABLE_RE.finditer(text))
+    if not found:
+        return "", text
+    last = found[-1]
+    klass = last.group(1)
+    rest = text[last.end():]
+    if rest.startswith(":"):
+        rest = rest[1:]
+    return klass, rest.strip()
+
+
+class ChainElement(object):
+    def __init__(self, kind, klass, message, header_text):
+        self.kind = kind          # "top" / "caused-by" / "suppressed"
+        self.klass = klass
+        self.message = message
+        self.header_text = header_text
+        self.frames = []
+        self.more = 0
+
+    def simple_name(self):
+        return self.klass.rsplit(".", 1)[-1] if self.klass else "(不明)"
+
+
+class ExceptionEvent(object):
+    def __init__(self, header_line):
+        self.header_line = header_line
+        # 例外がログ本文とは別行 ("...\njava.lang.X: msg" の形) に出る場合、
+        # 発生時刻やロガーは直前のログ行が持っている。表示用にそれを引き継ぐ。
+        self.origin_line = header_line
+        self.chain = []
+        self.block_lines = []
+        self.deployment = ""
+        self.deploy_related = False
+        self.deploy_reasons = []
+        self.verdict = ""
+        self.knowledge = None
+        self.facts = []
+        self.related_codes = []
+
+    def top(self):
+        return self.chain[0] if self.chain else None
+
+    def root(self):
+        for element in reversed(self.chain):
+            if element.kind != "suppressed":
+                return element
+        return self.chain[-1] if self.chain else None
+
+    def all_frames(self):
+        frames = []
+        for element in self.chain:
+            frames.extend(element.frames)
+        return frames
+
+    def app_frame(self, platform_prefixes):
+        for element in reversed(self.chain):
+            for frame in element.frames:
+                target = frame_target(frame)
+                if target and not target.startswith(platform_prefixes):
+                    return frame.strip()
+        return ""
+
+    def frame_count(self):
+        return sum(len(element.frames) for element in self.chain)
+
+
+def event_text(event):
+    """例外ブロック本文に、その例外を導いたログ行 (別行に出る場合) を足した文字列。
+
+    "WFLYSRV0177: parse error in .../web.xml" のように、対象ファイル名や接続先が
+    例外ブロックではなくログ行側に書かれていることが多いため、両方を対象にする。
+    """
+    parts = [line.body for line in event.block_lines]
+    if event.origin_line is not event.header_line:
+        parts.insert(0, event.origin_line.body)
+    return "\n".join(parts)
+
+
+def frame_target(frame):
+    """"at java.base/java.lang.Class.forName(Class.java:398)" からクラス名部分を取り出す。"""
+    text = frame.strip()
+    if text.startswith("at "):
+        text = text[3:].strip()
+    text = text.split("(", 1)[0].strip()
+    if "/" in text:
+        # モジュール名付き (java.base/java.lang.Class.forName)
+        text = text.split("/", 1)[1]
+    return text
+
+
+def collect_exception_events(lines):
+    """スタックフレームの並びを手掛かりに、例外ブロックを切り出す。"""
+    events = []
+    index = 0
+    total = len(lines)
+    while index < total:
+        if not is_frame(lines[index]):
+            index += 1
+            continue
+        # フレームの直前行がヘッダー (例外クラス + メッセージ) になる。
+        header_index = index - 1
+        while header_index >= 0 and not lines[header_index].body.strip():
+            header_index -= 1
+        if header_index < 0:
+            index += 1
+            continue
+        header_line = lines[header_index]
+        klass, message = split_class_and_message(header_line.body)
+        event = ExceptionEvent(header_line)
+        element = ChainElement("top", klass, message, header_line.body)
+        event.chain.append(element)
+        event.block_lines.append(header_line)
+
+        cursor = index
+        while cursor < total:
+            line = lines[cursor]
+            if is_frame(line):
+                element.frames.append(line.body.strip())
+                event.block_lines.append(line)
+                cursor += 1
+                continue
+            if is_more(line):
+                digits = re.findall(r"\d+", line.body)
+                element.more = int(digits[0]) if digits else 0
+                event.block_lines.append(line)
+                cursor += 1
+                continue
+            caused = CAUSED_BY_RE.match(line.body)
+            suppressed = SUPPRESSED_RE.match(line.body)
+            if caused or suppressed:
+                rest = (caused or suppressed).group("rest")
+                sub_class, sub_message = split_class_and_message(rest)
+                element = ChainElement("caused-by" if caused else "suppressed",
+                                       sub_class, sub_message, line.body.strip())
+                event.chain.append(element)
+                event.block_lines.append(line)
+                cursor += 1
+                continue
+            break
+        event.origin_line = resolve_origin_line(lines, header_line)
+        events.append(event)
+        index = cursor if cursor > index else index + 1
+    return events
+
+
+def resolve_origin_line(lines, header_line, lookback=20):
+    """例外のヘッダー行が素の Java 出力の場合、直前のログ行から発生時刻等を引き継ぐ。"""
+    if header_line.time:
+        return header_line
+    cursor = header_line.index - 1
+    limit = max(0, header_line.index - lookback)
+    while cursor >= limit:
+        candidate = lines[cursor]
+        if candidate.service != header_line.service:
+            break
+        if candidate.time:
+            return candidate
+        cursor -= 1
+    return header_line
+
+
+def resolve_deployment_names(lines):
+    """行番号ごとに「その時点で処理中のデプロイ対象」を割り当てる。
+
+    Compose のログはサービスごとに独立しているため、あるサービスのデプロイ名が
+    別サービスの例外へ引き継がれないよう、サービス単位に状態を持つ。
+    """
+    current = {}
+    per_line = []
+    for line in lines:
+        started = DEPLOY_START_RE.search(line.message)
+        if started:
+            current[line.service] = started.group("name")
+        else:
+            rolled = DEPLOY_ROLLBACK_RE.search(line.message)
+            if rolled:
+                current[line.service] = rolled.group("name")
+        per_line.append(current.get(line.service, ""))
+    return per_line
+
+
+def deploy_phase_bounds(lines):
+    """サービスごとに、デプロイ開始行と起動完了 (WFLYSRV0025/0026) 行を求める。"""
+    bounds = {}
+    for line in lines:
+        start, end = bounds.get(line.service, (-1, -1))
+        if start < 0 and DEPLOY_START_RE.search(line.message):
+            start = line.index
+        if end < 0 and BOOT_COMPLETE_RE.search(line.message):
+            end = line.index
+        bounds[line.service] = (start, end)
+    for service, (start, end) in list(bounds.items()):
+        if end < 0:
+            # 起動完了ログが無い場合は、そのサービスの最終行までをデプロイ区間とする。
+            last = max(line.index for line in lines if line.service == service)
+            bounds[service] = (start, last)
+    return bounds
+
+
+def classify_deploy_relation(event, lines, deployment_names, phase_bounds):
+    reasons = []
+    name = ""
+    block_text = event_text(event)
+    phase_start, phase_end = phase_bounds.get(event.header_line.service, (-1, -1))
+
+    unit = DEPLOY_UNIT_RE.search(block_text)
+    if unit:
+        name = unit.group("name")
+        reasons.append("スタックトレース中に MSC サービス名 jboss.deployment.unit.\"%s\" を含む" % name)
+    if not name:
+        archive = ARCHIVE_NAME_RE.search(event.header_line.message)
+        if archive:
+            name = archive.group("name")
+            reasons.append("例外を出したログ行がアーカイブ \"%s\" を指している" % name)
+    header_index = event.header_line.index
+    in_phase = phase_start >= 0 and phase_start <= header_index <= phase_end
+    if not name and in_phase:
+        candidate = deployment_names[header_index] if deployment_names else ""
+        if candidate:
+            name = candidate
+            reasons.append("直前の WFLYSRV0027 (Starting deployment of \"%s\") 以降に発生している" % candidate)
+
+    if in_phase:
+        reasons.append("デプロイ開始から起動完了までの区間 (行 %d〜%d) で発生している"
+                       % (phase_start + 1, phase_end + 1))
+    logger = event.origin_line.logger or event.header_line.logger or ""
+    for token in DEPLOY_CONTEXT_TOKENS:
+        if token in block_text or token in logger:
+            reasons.append("デプロイ処理を示す文字列 \"%s\" を含む" % token)
+            break
+    if logger.startswith("org.jboss.as.server.deployment"):
+        reasons.append("ロガーがデプロイヤ (%s)" % logger)
+
+    event.deployment = name
+    event.deploy_reasons = reasons
+    event.deploy_related = bool(reasons)
+    return event
+
+
+def collect_related_codes(event, lines, window=8, limit=8):
+    """例外ブロックの前後にある EAP メッセージコードを、関連情報として集める。"""
+    service = event.header_line.service
+    start = max(0, event.header_line.index - window)
+    end = min(len(lines), event.block_lines[-1].index + window + 1)
+    seen = []
+    for line in lines[start:end]:
+        if line.service != service or not line.code or line.code in seen:
+            continue
+        seen.append(line.code)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+# =============================================================================
+# 例外クラス知識ベース
+# =============================================================================
+
+SEVERITY_ORDER = {"致命的": 0, "重大": 1, "警告": 2, "情報": 3}
+
+GENERIC_ERROR = {
+    "category": "その他 (JVM エラー)",
+    "severity": "致命的",
+    "headline": "JVM が回復不能と判断した Error 系の例外です。アプリケーションコードでは捕捉せず、原因そのものを取り除く必要があります。",
+    "mechanism": (
+        "java.lang.Error のサブクラスは、クラスのリンク・メモリ確保・ネイティブ連携など JVM 自身の前提が"
+        "崩れたときに投げられます。JBoss EAP はデプロイユニットの起動を担う MSC サービスの中でこれを受け取ると、"
+        "当該サービスを failed 状態にし、依存する全サービスを起動できないまま巻き戻します"
+        "(WFLYCTL0080 / WFLYSRV0021)。"
+    ),
+    "causes": [
+        "WAR に同梱したライブラリと EAP のモジュールでバージョンが食い違っている",
+        "コンテナへ割り当てたメモリやファイルディスクリプタが不足している",
+        "ビルド時とランタイムで JDK のバージョンが異なる",
+    ],
+    "checks": [
+        "起動ログで最初に出た Error を特定する (後続の Error は連鎖であることが多い)",
+        "docker exec <container> java -version でランタイムの JDK を確認する",
+        "docker exec <container> ls -l <デプロイ先>/<アーカイブ>/WEB-INF/lib で同梱ライブラリを確認する",
+    ],
+    "fixes": [
+        "根本原因 (Caused by の最終段) の例外に対応する。Error 自体を握り潰さない",
+        "ライブラリの重複がある場合は WAR 側の同梱を外すか、jboss-deployment-structure.xml で除外する",
+    ],
+    "prevention": [
+        "ビルドとランタイムで同じ JDK メジャーバージョンを使う",
+        "依存ライブラリの一覧 (mvn dependency:tree) を CI で固定・監視する",
+    ],
+    "refs": ["JBoss EAP 8.1 Configuration Guide - Class Loading and Modules"],
+}
+
+GENERIC_EXCEPTION = {
+    "category": "その他 (アプリケーション例外)",
+    "severity": "重大",
+    "headline": "アプリケーションまたはフレームワークが投げた例外です。根本原因 (Caused by の最終段) を辿って原因を特定します。",
+    "mechanism": (
+        "デプロイ中に投げられた例外は、JBoss EAP のデプロイヤ (MSC サービス) が捕捉して"
+        "org.jboss.msc.service.StartException で包み直し、該当デプロイユニットを失敗させます。"
+        "失敗したサービスに依存する全サービスも起動できず、WFLYCTL0080 の Failed services として一覧に出ます。"
+    ),
+    "causes": [
+        "初期化処理 (ServletContextListener / @PostConstruct / static 初期化子) の前提条件が満たされていない",
+        "外部リソース (DB・API・ファイル) へ接続できない、または権限が足りない",
+        "設定値 (環境変数・システムプロパティ・設定ファイル) が未設定か不正",
+    ],
+    "checks": [
+        "Caused by の最終段のクラスとメッセージを確認する",
+        "スタックトレースからアプリケーション自身のクラス (最初の自社パッケージ) を特定する",
+        "同時刻の他サービス (DB・キャッシュ等) のログに接続拒否が出ていないか確認する",
+    ],
+    "fixes": [
+        "根本原因の例外に応じた対処を行う",
+        "初期化処理へ、前提条件が満たされない場合に何が足りないかを示すログを追加する",
+    ],
+    "prevention": [
+        "起動時に必要な設定値をチェックし、欠落時は具体的な名前を出して失敗させる",
+        "外部依存の接続確認を healthcheck / depends_on の condition: service_healthy で担保する",
+    ],
+    "refs": ["JBoss EAP 8.1 Development Guide"],
+}
+
+
+def entry(category, severity, headline, mechanism, causes, checks, fixes, prevention, refs):
+    return {
+        "category": category,
+        "severity": severity,
+        "headline": headline,
+        "mechanism": mechanism,
+        "causes": causes,
+        "checks": checks,
+        "fixes": fixes,
+        "prevention": prevention,
+        "refs": refs,
+    }
+
+
+KNOWLEDGE = {}
+
+
+def register(names, data):
+    for name in names:
+        KNOWLEDGE[name] = data
+
+
+register(["java.lang.ClassNotFoundException"], entry(
+    "クラスロード・依存関係", "致命的",
+    "実行時にクラスを名前で探しましたが、そのデプロイユニットから見えるクラスローダー上に存在しませんでした。",
+    "Class.forName() や ServiceLoader、フレームワークのリフレクション呼び出しがクラス名の文字列からクラスを解決しようとして失敗した状態です。"
+    "JBoss EAP は WAR ごとに独立したモジュールクラスローダーを作り、参照できる範囲を "
+    "(1) WEB-INF/classes、(2) WEB-INF/lib の JAR、(3) EAP のグローバルモジュール、"
+    "(4) jboss-deployment-structure.xml / MANIFEST.MF の Dependencies で明示した module、"
+    "の 4 つに限定します。この 4 つのいずれにも該当クラスが無い場合に発生します。"
+    "「コンパイルは通るのに実行時だけ失敗する」場合は、ビルド時のスコープ (provided / test) と"
+    "ランタイムに配置されるものが食い違っている典型例です。",
+    [
+        "依存ライブラリの JAR が WEB-INF/lib に含まれていない (Maven の scope が provided / test のまま)",
+        "EAP のモジュールとして提供される想定だが、jboss-deployment-structure.xml に依存を宣言していない",
+        "JAR は存在するがバージョンが古く、そのクラスがまだ存在しない",
+        "サブデプロイ (EAR 内の WAR) から、別サブデプロイのクラスを参照している",
+        "Dockerfile の COPY 対象漏れ・マルチステージビルドでの成果物の取りこぼし",
+    ],
+    [
+        "docker exec <container> ls <デプロイ先>/<アーカイブ>/WEB-INF/lib で JAR の有無を確認する",
+        "docker exec <container> sh -c 'cd <デプロイ先>/<アーカイブ>/WEB-INF/lib && for f in *.jar; do unzip -l \"$f\" | grep -q \"<クラスのパス>.class\" && echo \"$f\"; done'",
+        "mvn dependency:tree -Dincludes=<groupId>:<artifactId> でスコープと到達経路を確認する",
+        "docker exec <container> ls /opt/jboss-eap/modules/ で EAP 側モジュールの有無を確認する",
+    ],
+    [
+        "必要な JAR を WEB-INF/lib へ含める (Maven なら scope を compile / runtime に変更して再ビルド)",
+        "EAP のモジュールを使う場合は WEB-INF/jboss-deployment-structure.xml へ依存を追加する:\n"
+        "  <jboss-deployment-structure>\n"
+        "    <deployment>\n"
+        "      <dependencies>\n"
+        "        <module name=\"<モジュール名>\" services=\"import\"/>\n"
+        "      </dependencies>\n"
+        "    </deployment>\n"
+        "  </jboss-deployment-structure>",
+        "MANIFEST.MF へ Dependencies: <モジュール名> を書く方法でも同じ効果が得られる",
+        "自前の共有ライブラリは module.xml を作って EAP のモジュールとして登録し、複数 WAR から参照する",
+        "ビルド成果物 (target/*.war) を展開し、意図した JAR が入っているかを CI で検証する",
+    ],
+    [
+        "WAR の中身 (WEB-INF/lib の一覧) をビルド成果物として保存し、差分を追跡する",
+        "provided スコープにするのは EAP が確実に提供するもの (Jakarta EE API など) だけに限定する",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Class Loading in Deployments",
+     "JBoss EAP 8.1 - jboss-deployment-structure.xml"],
+))
+
+register(["java.lang.NoClassDefFoundError"], entry(
+    "クラスロード・依存関係", "致命的",
+    "一度は解決できたはずのクラス定義が、実際にロードしようとした時点で見つかりませんでした。ClassNotFoundException と似ていますが、原因は別のことが多いです。",
+    "NoClassDefFoundError には 2 つの発生経路があります。"
+    "(A) コンパイル時には存在したクラスが実行時のクラスパスに無い。"
+    "(B) そのクラスの static 初期化子 (static ブロック / static フィールドの初期化) が例外を投げて"
+    "クラスの初期化に失敗し、以後そのクラスを参照するたびに NoClassDefFoundError が投げられる。"
+    "(B) の場合、最初の 1 回目だけは ExceptionInInitializerError が出ており、2 回目以降が "
+    "NoClassDefFoundError になります。したがってログを時系列で遡り、"
+    "「そのクラスに関する最初のエラー」を見ることが決め手になります。",
+    [
+        "依存 JAR がランタイムに存在しない (ClassNotFoundException と同じ原因)",
+        "static 初期化子が例外を投げてクラス初期化に失敗している (直前に ExceptionInInitializerError がある)",
+        "同じクラスが複数のクラスローダーに存在し、リンクに失敗している",
+        "ライブラリのバージョン差で、参照先クラスが別パッケージへ移動した (javax → jakarta の移行漏れなど)",
+    ],
+    [
+        "同じクラス名で ExceptionInInitializerError がログの上方に出ていないか検索する",
+        "docker exec <container> grep -R \"<クラス名>\" <デプロイ先>/<アーカイブ>/WEB-INF/lib で JAR を特定する",
+        "javax.* / jakarta.* の混在がないか、WEB-INF/lib の JAR 名を確認する (EAP 8.1 は Jakarta EE 10 = jakarta.* が正)",
+    ],
+    [
+        "直前に ExceptionInInitializerError がある場合は、そちらの Caused by を根本原因として対処する (このエラーは結果に過ぎない)",
+        "クラスパス不足の場合は ClassNotFoundException と同じ対処 (WEB-INF/lib へ JAR を追加 / モジュール依存を宣言)",
+        "javax.* を参照している古いライブラリは、Jakarta EE 10 対応版へ差し替えるか、Eclipse Transformer で変換する",
+    ],
+    [
+        "static 初期化子では外部リソースへアクセスしない (初期化失敗が後段で原因不明のエラーになるため)",
+        "EAP 8.1 では jakarta.* 系ライブラリで揃える方針を依存管理 (BOM) で固定する",
+    ],
+    ["JBoss EAP 8.1 Migration Guide - Jakarta EE 10"],
+))
+
+register(["java.lang.ExceptionInInitializerError"], entry(
+    "クラスロード・依存関係", "致命的",
+    "クラスの static 初期化子 (static ブロック / static フィールド初期化) が例外を投げ、クラスの初期化に失敗しました。",
+    "JVM はクラスを初めて使うときに一度だけ static 初期化子を実行します。ここで未検査例外が投げられると、"
+    "JVM はその例外を ExceptionInInitializerError で包み、当該クラスを「初期化失敗」として記録します。"
+    "以後、同じクラスに触れるたびに NoClassDefFoundError が投げられ続けます。"
+    "本当の原因は必ず Caused by の側にあります。",
+    [
+        "static 初期化子から設定ファイル・環境変数を読んでおり、値が無い/不正",
+        "static 初期化子で DB や外部 API へ接続しており、デプロイ時点ではまだ到達できない",
+        "ロガーや暗号プロバイダの初期化に失敗している",
+    ],
+    [
+        "Caused by に出ている本来の例外を確認する (これが唯一の手掛かり)",
+        "対象クラスの static ブロック / static final フィールドの初期化処理を読む",
+        "参照している環境変数がコンテナに設定されているか docker exec <container> env で確認する",
+    ],
+    [
+        "Caused by の例外に応じて対処する (未設定の環境変数を設定する、接続先を healthcheck 待ちにする など)",
+        "static 初期化子から外部依存を外し、@PostConstruct や遅延初期化へ移す",
+        "設定値が必須なら、欠落時に「どの設定が無いか」を明示するメッセージで失敗させる",
+    ],
+    [
+        "static 初期化子は定数の組み立てだけに留める",
+        "外部リソースへの接続はコンテナのライフサイクル (@PostConstruct / ServletContextListener) に載せる",
+    ],
+    ["Java Language Specification - Class Initialization"],
+))
+
+register(["java.lang.NoSuchMethodError", "java.lang.NoSuchFieldError",
+          "java.lang.IncompatibleClassChangeError"], entry(
+    "クラスロード・依存関係", "致命的",
+    "クラスは見つかりましたが、期待したメソッド/フィールドがそのクラスにありませんでした。ライブラリのバージョン不整合を示す決定的な証拠です。",
+    "コンパイル時に見えていたクラス定義と、実行時にロードされたクラス定義が違う場合に発生します。"
+    "JBoss EAP では、WAR 内の WEB-INF/lib に同梱した JAR と、EAP がモジュールとして提供する同名ライブラリの"
+    "どちらが優先されるかで、実行時にロードされるクラスが変わります。既定では WAR 内が優先されますが、"
+    "EAP のサブシステムが暗黙で追加するモジュール依存 (Jakarta EE API、Hibernate、Jackson など) が"
+    "先に効くケースがあり、そこで版が入れ替わります。メッセージに出るシグネチャが、"
+    "どの版のライブラリのものかを突き合わせるのが最短の切り分けです。",
+    [
+        "同じライブラリの複数バージョンが WAR 内と EAP モジュールの双方に存在する",
+        "推移的依存で、意図しないバージョンへ収束している (Maven の dependency mediation)",
+        "EAP が提供する Hibernate / Jackson / JAX-RS 実装と、WAR 同梱版が競合している",
+    ],
+    [
+        "mvn dependency:tree -Dverbose で同一 artifact の複数バージョンを洗い出す",
+        "docker exec <container> ls <デプロイ先>/<アーカイブ>/WEB-INF/lib | sort で同名ライブラリの重複を確認する",
+        "エラーになったシグネチャを含むクラスがどの JAR にあるか、unzip -l で特定する",
+        "-verbose:class を JVM 引数に加えて起動し、どの JAR からロードされたかを確認する",
+    ],
+    [
+        "バージョンを揃える。Maven なら <dependencyManagement> か BOM でバージョンを固定する",
+        "EAP 提供モジュールを使う場合は WAR 同梱を除外する (Maven の <scope>provided</scope>)",
+        "WAR 同梱版を使う場合は jboss-deployment-structure.xml で EAP のモジュールを除外する:\n"
+        "  <jboss-deployment-structure>\n"
+        "    <deployment>\n"
+        "      <exclusions>\n"
+        "        <module name=\"<除外するモジュール名>\"/>\n"
+        "      </exclusions>\n"
+        "    </deployment>\n"
+        "  </jboss-deployment-structure>",
+        "クラスローダーの優先順位を変える場合は <local-last value=\"true\"/> を検討する",
+    ],
+    [
+        "BOM でライブラリ群のバージョンを一括管理する",
+        "mvn enforcer-plugin の dependencyConvergence ルールでバージョン衝突を CI で検出する",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Class Loading and Subdeployment Isolation"],
+))
+
+register(["java.lang.UnsupportedClassVersionError"], entry(
+    "クラスロード・依存関係", "致命的",
+    "クラスファイルのバージョンが、実行中の JVM が読める上限を超えています。ビルドに使った JDK が、実行に使う JDK より新しい状態です。",
+    "class ファイルの先頭にはメジャーバージョン番号が入っており、JVM は自分が対応する範囲を超えるものを拒否します。"
+    "対応表は Java 8=52、11=55、17=61、21=65 です。JBoss EAP 8.1 は Java 11/17/21 をサポートしますが、"
+    "コンテナイメージに入っている JDK と、CI でコンパイルした JDK が食い違うとこのエラーになります。"
+    "WAR 同梱のサードパーティ JAR が新しい JDK 向けにビルドされている場合も同じです。",
+    [
+        "Maven の maven.compiler.release とコンテナの JDK が一致していない",
+        "マルチステージ Dockerfile のビルドステージとランタイムステージで JDK が違う",
+        "依存ライブラリが、実行環境より新しい Java 向けにビルドされている",
+    ],
+    [
+        "docker exec <container> java -version でランタイムの JDK を確認する",
+        "Dockerfile のビルドステージで使っている JDK イメージのタグを確認する",
+        "エラーメッセージの class file version から、必要な JDK を割り出す (61.0=Java 17 / 65.0=Java 21)",
+    ],
+    [
+        "コンテナの JDK をビルドと同じメジャーバージョンへ揃える",
+        "またはコンパイル側を下げる: Maven なら <maven.compiler.release>17</maven.compiler.release>",
+        "ライブラリ側が原因なら、実行環境の Java バージョンに対応した版へ差し替える",
+    ],
+    [
+        "Dockerfile のビルド/ランタイム双方の JDK タグを同じ変数から与える",
+        "maven-enforcer-plugin の requireJavaVersion でビルド JDK を固定する",
+    ],
+    ["JBoss EAP 8.1 Supported Configurations - Java Virtual Machines"],
+))
+
+register(["org.jboss.modules.ModuleNotFoundException",
+          "org.jboss.modules.ModuleLoadException"], entry(
+    "クラスロード・依存関係", "致命的",
+    "jboss-deployment-structure.xml や MANIFEST.MF で宣言したモジュールが、EAP のモジュールリポジトリに存在しません。",
+    "JBoss Modules は $JBOSS_HOME/modules 配下のディレクトリ構造と module.xml でモジュールを解決します。"
+    "モジュール名 com.example.foo は modules/com/example/foo/main/module.xml へ対応します。"
+    "宣言した名前が 1 文字でも違う、slot 名 (既定は main) が違う、module.xml の resource-root が"
+    "実 JAR を指していない、のいずれでもこの例外になります。",
+    [
+        "モジュール名のタイプミス、または slot の指定漏れ",
+        "カスタムモジュールをイメージへ COPY し忘れている",
+        "module.xml の <resource-root path=\"...\"/> が実際の JAR 名と一致していない",
+        "EAP 8.1 で名前が変わった/廃止されたモジュールを参照している",
+    ],
+    [
+        "docker exec <container> ls -R /opt/jboss-eap/modules/<モジュールをパスにしたディレクトリ>",
+        "docker exec <container> cat /opt/jboss-eap/modules/.../main/module.xml",
+        "宣言側 (WEB-INF/jboss-deployment-structure.xml) の module name を確認する",
+    ],
+    [
+        "モジュール名を正しい値へ修正する",
+        "カスタムモジュールを Dockerfile で配置する:\n"
+        "  COPY modules/ /opt/jboss-eap/modules/\n"
+        "  または jboss-cli の module add --name=... --resources=... を使う",
+        "module.xml の resource-root の path を実 JAR 名へ合わせる",
+        "任意依存で良ければ <module name=\"...\" optional=\"true\"/> にする",
+    ],
+    [
+        "カスタムモジュールの配置をイメージビルドのテストで検証する",
+        "EAP のバージョンアップ時はモジュール名の変更点を Migration Guide で確認する",
+    ],
+    ["JBoss EAP 8.1 Configuration Guide - Modules"],
+))
+
+register(["javax.naming.NameNotFoundException", "javax.naming.NamingException",
+          "javax.naming.NoInitialContextException"], entry(
+    "JNDI・リソース参照", "致命的",
+    "JNDI 名前空間から目的のリソース (データソース・JMS・EJB など) を引けませんでした。名前の綴りか、リソースの定義漏れが原因です。",
+    "JBoss EAP は起動時にサブシステムが JNDI へリソースをバインドし (WFLYJCA0001 / WFLYJCA0098 などのログ)、"
+    "アプリケーションはその名前で lookup または @Resource で注入を受けます。"
+    "バインドが行われていない、または名前空間が違う (java:/ と java:jboss/ と java:comp/env/ は別物) と、"
+    "この例外になります。EAP は MSC サービス jboss.naming.context.java.* として管理するため、"
+    "WFLYCTL0412 の \"Required services that are not installed\" にも同じ名前が現れます。",
+    [
+        "standalone.xml / compose 環境変数で定義したデータソースの JNDI 名と、アプリの参照名が一致していない",
+        "データソース自体の起動に失敗している (直前に WFLYJCA0031 などが出ていないか)",
+        "java:comp/env/ を使うのに web.xml / @Resource の name 定義が無い",
+        "EAP 8.1 でグローバル JNDI を参照するのに java:jboss/exported/ の付与を誤っている",
+    ],
+    [
+        "起動ログで \"Bound data source\" (WFLYJCA0001) の行を探し、実際にバインドされた名前を確認する",
+        "docker exec <container> /opt/jboss-eap/bin/jboss-cli.sh --connect --command=\"/subsystem=naming:jndi-view\"",
+        "docker exec <container> grep -n \"jndi-name\" /opt/jboss-eap/standalone/configuration/standalone.xml",
+    ],
+    [
+        "アプリ側の lookup 名を、起動ログに出ている実際の JNDI 名へ合わせる",
+        "データソースが未定義なら standalone.xml か jboss-cli で追加する:\n"
+        "  data-source add --name=<名前> --jndi-name=java:jboss/datasources/<名前> \\\n"
+        "    --driver-name=<ドライバ> --connection-url=<URL> --user-name=<ユーザ> --password=<パスワード>",
+        "データソースの起動失敗が原因なら、そちらのエラー (接続不可・認証失敗) を先に解消する",
+        "@Resource(lookup = \"java:jboss/datasources/...\") のように lookup 属性で完全名を指定する",
+    ],
+    [
+        "JNDI 名を環境変数から与え、compose.yml とアプリで同じ値を共有する",
+        "起動確認で jndi-view を取得し、期待する名前がバインドされていることを検証する",
+    ],
+    ["JBoss EAP 8.1 Configuration Guide - Java Naming and Directory Interface"],
+))
+
+register(["java.sql.SQLException", "java.sql.SQLNonTransientConnectionException",
+          "java.sql.SQLTransientConnectionException", "java.sql.SQLTimeoutException",
+          "java.sql.SQLInvalidAuthorizationSpecException",
+          "org.postgresql.util.PSQLException",
+          "com.mysql.cj.jdbc.exceptions.CommunicationsException",
+          "com.mysql.cj.exceptions.CJCommunicationsException"], entry(
+    "データソース・JDBC", "致命的",
+    "JDBC ドライバが DB へ接続できない、または DB がエラーを返しました。デプロイ時は接続プールの初期化で発生することが多いです。",
+    "EAP のデータソースは、min-pool-size やバリデーション設定に応じてデプロイ時に接続を張ります。"
+    "接続 URL のホスト名解決、TCP 到達性、認証、DB 側の起動完了のいずれかが欠けると、"
+    "IronJacamar が WFLYJCA0031 (unable to validate and deploy ds or xads) を出し、"
+    "そのデータソースに依存する WAR のデプロイも巻き戻されます。"
+    "Compose 構成では「DB コンテナはまだ初期化中なのにアプリが先に起動した」ケースが最も多い原因です。",
+    [
+        "DB コンテナがまだ受付可能になっていない (depends_on の condition: service_healthy が未設定)",
+        "接続 URL のホスト名が Compose のサービス名と一致していない",
+        "ユーザ名/パスワードが違う (パスワードに $ や \" が含まれ、展開・エスケープで壊れている)",
+        "DB 側でデータベース/スキーマがまだ作られていない",
+        "ネットワーク分離により、アプリと DB が別ネットワークに属している",
+    ],
+    [
+        "docker exec <container> sh -c 'getent hosts <DBホスト名>' で名前解決を確認する",
+        "docker compose logs <DBサービス> で DB 側が受付可能になった時刻を確認する",
+        "docker exec <container> grep -n \"connection-url\" /opt/jboss-eap/standalone/configuration/standalone.xml",
+        "docker exec <container> /opt/jboss-eap/bin/jboss-cli.sh --connect --command=\"/subsystem=datasources/data-source=<名前>:test-connection-in-pool\"",
+    ],
+    [
+        "compose.yml で DB に healthcheck を定義し、アプリ側へ depends_on: { <DB>: { condition: service_healthy } } を設定する",
+        "接続 URL のホスト名を Compose のサービス名 (または container_name) へ合わせる",
+        "認証情報を環境変数経由に統一し、パスワードの特殊文字は $ を $$ にエスケープする (compose.yml の変数展開対策)",
+        "初期接続の失敗を許容する場合は、データソースへ <initial-pool-size>0</initial-pool-size> と "
+        "validate-on-match / background-validation を設定して遅延接続にする",
+        "本スクリプトの --wait-healthy を付け、依存サービスが healthy になってから起動確認へ進める",
+    ],
+    [
+        "DB の healthcheck を compose.yml に必ず定義する",
+        "接続情報を 1 か所 (環境変数) に集約し、アプリと DB の双方から同じ値を参照する",
+    ],
+    ["JBoss EAP 8.1 Configuration Guide - Datasource Management"],
+))
+
+register(["java.net.ConnectException", "java.net.NoRouteToHostException"], entry(
+    "ネットワーク接続", "致命的",
+    "TCP 接続が拒否されました。相手が起動していないか、ポートが違うか、ネットワークが繋がっていません。",
+    "Connection refused は「名前解決には成功したが、そのポートで待ち受けているプロセスが無い」状態です。"
+    "Compose 構成では、依存コンテナがまだ起動途中、あるいはコンテナ内のプロセスが 127.0.0.1 のみで"
+    "listen していて他コンテナから到達できない、というのが典型です。"
+    "また、ホスト側の localhost をコンテナ内から参照している場合も必ず失敗します。",
+    [
+        "接続先コンテナがまだ listen していない (起動順序の問題)",
+        "接続先プロセスが 0.0.0.0 ではなく 127.0.0.1 で listen している",
+        "ポート番号が違う (ホスト側の公開ポートとコンテナ側ポートを取り違えている)",
+        "コンテナ間で同じ Docker ネットワークに属していない",
+    ],
+    [
+        "docker compose ps で接続先サービスの状態と公開ポートを確認する",
+        "docker exec <container> sh -c 'command -v nc >/dev/null && nc -z -v <ホスト> <ポート>'",
+        "docker exec <接続先container> sh -c 'ss -ltn || netstat -ltn' で listen アドレスを確認する",
+        "docker network inspect <ネットワーク名> で両コンテナが同じネットワークにいるか確認する",
+    ],
+    [
+        "compose.yml で healthcheck + depends_on: condition: service_healthy を設定し、起動順序を保証する",
+        "接続先プロセスの bind アドレスを 0.0.0.0 にする",
+        "コンテナ間通信では、公開ポートではなくコンテナ側のポートを使う",
+        "接続先ホスト名は Compose のサービス名を使う (localhost は自コンテナを指す)",
+    ],
+    [
+        "起動時のリトライ (指数バックオフ) を接続処理へ入れる",
+        "本スクリプトの --wait-healthy を常用し、依存サービスの準備完了を待つ",
+    ],
+    ["Docker Compose - Control startup order"],
+))
+
+register(["java.net.UnknownHostException"], entry(
+    "ネットワーク接続", "致命的",
+    "ホスト名を IP アドレスへ解決できませんでした。接続先の名前が間違っているか、そのサービスが Compose に存在しません。",
+    "コンテナ内の名前解決は Docker の内蔵 DNS が担当し、同じネットワークに属する Compose サービス名と "
+    "container_name、および network の alias を解決できます。ここに無い名前は解決できません。"
+    "AWS のエンドポイント (例: logs.ap-northeast-1.amazonaws.com) を引けない場合は、"
+    "コンテナに外部 DNS が届いていないか、プロキシ設定が必要な環境である可能性があります。",
+    [
+        "接続先名が compose.yml のサービス名・container_name のいずれとも一致していない",
+        "接続先が別の Docker ネットワークに属している",
+        "外部ホストへの名前解決に失敗している (DNS 未到達・プロキシ環境)",
+        "環境変数の値が空で、URL が \"http://:8080/\" のように壊れている",
+    ],
+    [
+        "docker exec <container> sh -c 'getent hosts <ホスト名>' で解決可否を確認する",
+        "docker exec <container> cat /etc/resolv.conf で DNS 設定を確認する",
+        "docker compose config --services で定義済みサービス名の一覧を確認する",
+        "docker exec <container> env | grep -i <該当の環境変数名> で値が空でないか確認する",
+    ],
+    [
+        "接続先ホスト名を compose.yml のサービス名へ合わせる",
+        "同じ networks に所属させる、または networks の aliases で別名を付ける",
+        "外部ホストが必要な場合は、DNS / プロキシ設定 (HTTP_PROXY, NO_PROXY) をコンテナへ渡す",
+        "URL を組み立てる環境変数が未設定でないか確認し、既定値を用意する",
+    ],
+    [
+        "接続先ホスト名を環境変数化し、compose.yml のサービス名と同じ値を一元管理する",
+    ],
+    ["Docker Compose - Networking"],
+))
+
+register(["java.net.BindException"], entry(
+    "ネットワーク接続", "致命的",
+    "指定したポートを確保できませんでした。すでに他のプロセスが同じポートを使っています。",
+    "JBoss EAP は起動時に HTTP リスナー (既定 8080)、管理ポート (9990) などを bind します。"
+    "コンテナ内で同じポートを使う別プロセスがある、あるいは port-offset を付けた複数インスタンスが"
+    "同一ネットワーク名前空間に同居していると、この例外で起動が止まります。"
+    "ホスト側の公開ポート衝突は Compose 側のエラーになるため、この例外はコンテナ内部での衝突を示します。",
+    [
+        "同じコンテナ内で 2 つ目の EAP インスタンスを起動しようとしている",
+        "network_mode: host でホスト側のポートと衝突している",
+        "アプリケーションが独自に同じポートで listen している",
+    ],
+    [
+        "docker exec <container> sh -c 'ss -ltnp || netstat -ltnp' で使用中ポートを確認する",
+        "起動ログの WFLYUT0006 (Undertow HTTP listener listening on ...) を確認する",
+        "compose.yml の ports / network_mode を確認する",
+    ],
+    [
+        "重複して起動しているプロセスを止める",
+        "jboss.socket.binding.port-offset を指定してポートをずらす:\n"
+        "  JAVA_OPTS_APPEND=\"-Djboss.socket.binding.port-offset=100\"",
+        "アプリ側の listen ポートを変更する",
+    ],
+    [
+        "1 コンテナ 1 プロセスの構成を守る",
+    ],
+    ["JBoss EAP 8.1 Configuration Guide - Socket Bindings"],
+))
+
+register(["javax.net.ssl.SSLHandshakeException", "javax.net.ssl.SSLException",
+          "sun.security.provider.certpath.SunCertPathBuilderException",
+          "java.security.cert.CertificateException",
+          "javax.net.ssl.SSLPeerUnverifiedException"], entry(
+    "TLS・証明書", "致命的",
+    "TLS ハンドシェイクに失敗しました。サーバ証明書を信頼できないか、プロトコル/暗号スイートが噛み合っていません。",
+    "JVM は接続先のサーバ証明書を、トラストストア ($JAVA_HOME/lib/security/cacerts または "
+    "-Djavax.net.ssl.trustStore で指定したファイル) 内の CA 証明書で検証します。"
+    "社内 CA や自己署名証明書はここに無いため、\"unable to find valid certification path to requested target\" となります。"
+    "また EAP 8.1 / JDK 17 以降は TLS 1.0/1.1 と弱い暗号スイートが既定で無効のため、"
+    "古い相手とは \"no appropriate protocol\" や handshake_failure になります。",
+    [
+        "社内 CA / 自己署名証明書がトラストストアに登録されていない",
+        "証明書の有効期限切れ、またはホスト名 (SAN) の不一致",
+        "接続先が TLS 1.0/1.1 しか対応しておらず、JDK 側で無効化されている",
+        "中間 CA 証明書がサーバ側で配信されていない",
+    ],
+    [
+        "docker exec <container> sh -c 'command -v openssl >/dev/null && openssl s_client -connect <ホスト>:<ポート> -showcerts </dev/null'",
+        "docker exec <container> keytool -list -cacerts -storepass changeit | head で登録済み CA を確認する",
+        "JVM 引数へ -Djavax.net.debug=ssl:handshake を一時的に足して詳細ログを取る",
+    ],
+    [
+        "CA 証明書をイメージのトラストストアへ登録する:\n"
+        "  RUN keytool -importcert -noprompt -cacerts -storepass changeit \\\n"
+        "      -alias corp-ca -file /tmp/corp-ca.crt",
+        "OS のトラストストアへ入れる場合: COPY corp-ca.crt /etc/pki/ca-trust/source/anchors/ && RUN update-ca-trust extract",
+        "本スクリプトの --copy-file で CA 証明書をビルドコンテキストへ一時配置してから COPY する",
+        "プロトコル不一致の場合は、接続先を TLS 1.2 以上へ更新する (JDK 側の無効化解除は最終手段)",
+    ],
+    [
+        "CA 証明書の配置をイメージビルドの手順として固定し、期限管理を行う",
+    ],
+    ["JBoss EAP 8.1 Security Architecture - Truststore"],
+))
+
+register(["org.jboss.weld.exceptions.DeploymentException",
+          "org.jboss.weld.exceptions.DefinitionException",
+          "jakarta.enterprise.inject.UnsatisfiedResolutionException",
+          "jakarta.enterprise.inject.AmbiguousResolutionException",
+          "jakarta.enterprise.inject.spi.DefinitionException",
+          "jakarta.enterprise.inject.CreationException"], entry(
+    "CDI (Weld)", "致命的",
+    "CDI コンテナ (Weld) が Bean の依存関係を解決できませんでした。注入先に対して候補が 0 個か、2 個以上あります。",
+    "Weld はデプロイ時に全 Bean アーカイブを走査し、@Inject の注入点ごとに型と修飾子から候補 Bean を決定します。"
+    "候補が 0 個なら WELD-001408 (Unsatisfied dependencies)、2 個以上なら WELD-001409 (Ambiguous dependencies) となり、"
+    "いずれもデプロイ時点で失敗させます (実行時まで持ち越しません)。"
+    "beans.xml の bean-discovery-mode が annotated の場合、Bean 定義アノテーションの無いクラスは"
+    "そもそも候補になりません。EAP 8.1 (Jakarta EE 10) では既定が annotated です。",
+    [
+        "実装クラスに @ApplicationScoped 等の Bean 定義アノテーションが無い (discovery-mode=annotated のため候補外)",
+        "実装クラスを含む JAR に beans.xml が無く、Bean アーカイブとして認識されていない",
+        "同じインタフェースの実装が複数あり、@Qualifier や @Default/@Alternative で絞れていない",
+        "javax.* と jakarta.* のアノテーションが混在している",
+        "@Produces メソッドの戻り型が注入点の型と一致していない",
+    ],
+    [
+        "ログの WELD-XXXXXX 番号と \"Unsatisfied/Ambiguous dependencies for type ... with qualifiers ...\" 行を読む",
+        "docker exec <container> sh -c 'ls <デプロイ先>/<アーカイブ>/WEB-INF/beans.xml <デプロイ先>/<アーカイブ>/WEB-INF/classes/META-INF/beans.xml'",
+        "実装クラスの import が jakarta.enterprise.* になっているか確認する",
+    ],
+    [
+        "実装クラスへスコープアノテーションを付ける (@ApplicationScoped / @RequestScoped / @Dependent)",
+        "beans.xml を WEB-INF/ (または JAR の META-INF/) へ置き、必要なら bean-discovery-mode=\"all\" にする:\n"
+        "  <beans xmlns=\"https://jakarta.ee/xml/ns/jakartaee\" version=\"4.0\" bean-discovery-mode=\"all\"/>",
+        "候補が複数ある場合は片方へ @Alternative を付けるか、独自 @Qualifier で注入点を特定する",
+        "javax.inject.* / javax.enterprise.* の import を jakarta.* へ置換する",
+    ],
+    [
+        "CDI の Bean 定義アノテーションを必須とするコーディング規約にする",
+        "Arquillian などでデプロイ検証を CI に組み込む",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Contexts and Dependency Injection",
+     "Weld Reference Guide - WELD-001408 / WELD-001409"],
+))
+
+register(["jakarta.persistence.PersistenceException",
+          "org.hibernate.HibernateException",
+          "org.hibernate.exception.JDBCConnectionException",
+          "org.hibernate.tool.schema.spi.SchemaManagementException",
+          "org.hibernate.MappingException",
+          "org.hibernate.AnnotationException",
+          "org.hibernate.service.spi.ServiceException"], entry(
+    "JPA・Hibernate", "致命的",
+    "永続化ユニット (persistence unit) の初期化に失敗しました。DB 接続・マッピング・スキーマ検証のいずれかで止まっています。",
+    "EAP は persistence.xml ごとに PersistenceUnitService を作り、デプロイの一部として起動します。"
+    "この中で Hibernate は (1) データソースの取得、(2) エンティティのマッピング構築、"
+    "(3) hibernate.hbm2ddl.auto の設定に応じたスキーマ処理、を順に行います。"
+    "どこで失敗しても永続化ユニットのサービスが failed になり、それに依存する WAR 全体のデプロイが巻き戻ります。"
+    "特に validate 設定では、テーブル/カラムが 1 つでも欠けるとデプロイが失敗します。",
+    [
+        "persistence.xml の jta-data-source が指す JNDI 名が存在しない",
+        "DB へ接続できない (Caused by に SQLException / ConnectException がある)",
+        "hibernate.hbm2ddl.auto=validate でスキーマが一致していない",
+        "エンティティのアノテーション不備 (@Id 無し、関連の mappedBy 誤り)",
+        "方言 (dialect) が DB 製品と合っていない",
+    ],
+    [
+        "Caused by を最後まで辿り、DB 接続系かマッピング系かを切り分ける",
+        "docker exec <container> cat <デプロイ先>/<アーカイブ>/WEB-INF/classes/META-INF/persistence.xml",
+        "起動ログで WFLYJPA / HHH で始まるメッセージを確認する",
+        "DB 側で対象テーブルの定義を確認する",
+    ],
+    [
+        "jta-data-source の JNDI 名を、起動ログでバインドされた実際の名前へ合わせる",
+        "DB 接続が原因なら、データソース側の対処 (healthcheck 待ち・認証情報) を先に行う",
+        "スキーマ不一致なら、マイグレーション (Flyway / Liquibase) を適用してから起動する",
+        "開発中に限り hibernate.hbm2ddl.auto を update / none へ変更して切り分ける",
+        "方言を明示する: <property name=\"hibernate.dialect\" value=\"org.hibernate.dialect.PostgreSQLDialect\"/>",
+    ],
+    [
+        "スキーマ変更はマイグレーションツールで管理し、起動前に適用する",
+        "本番相当のスキーマに対する validate を CI で実行する",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Jakarta Persistence"],
+))
+
+register(["org.jboss.msc.service.StartException",
+          "org.jboss.msc.service.DuplicateServiceException",
+          "org.jboss.msc.service.ServiceNotFoundException"], entry(
+    "MSC サービス起動", "致命的",
+    "JBoss の内部サービスコンテナ (MSC) がサービスを起動できませんでした。包まれている実際の原因は Caused by 側にあります。",
+    "JBoss EAP のデプロイは、デプロイユニットを構成する多数の MSC サービス "
+    "(クラスローダー、Undertow デプロイメント、Weld、永続化ユニット等) の起動として実行されます。"
+    "いずれかの start() が例外を投げると StartException で包まれ、"
+    "そのサービスに依存するサービス群がすべて起動できないまま WFLYCTL0080 (Failed services) として報告され、"
+    "WFLYSRV0021 でデプロイ全体が巻き戻されます。"
+    "したがって StartException 自体は「入れ物」であり、対処すべきは Caused by の最終段です。",
+    [
+        "包まれている例外 (Caused by) が示す原因そのもの",
+        "同名のサービスを二重登録している (DuplicateServiceException)",
+        "依存サービスが先に失敗している (連鎖的な失敗)",
+    ],
+    [
+        "Failed services のサービス名から、どのデプロイユニットのどの機能かを読み取る",
+        "Caused by の最終段まで辿る",
+        "docker exec <container> /opt/jboss-eap/bin/jboss-cli.sh --connect --command=\"/core-service=management:read-boot-errors\"",
+        "docker exec <container> /opt/jboss-eap/bin/jboss-cli.sh --connect --command=\"/deployment=<アーカイブ名>:read-resource(include-runtime=true)\"",
+    ],
+    [
+        "Caused by の根本原因に応じた対処を行う",
+        "二重登録なら、重複しているデプロイ (同じ WAR が deployments 配下と CLI の両方で登録されていないか) を解消する",
+    ],
+    [
+        "デプロイ前に read-boot-errors を確認する運用にする",
+    ],
+    ["JBoss EAP 8.1 - Managing Deployments"],
+))
+
+register(["org.jboss.as.server.deployment.DeploymentUnitProcessingException",
+          "org.jboss.as.controller.OperationFailedException"], entry(
+    "デプロイ処理", "致命的",
+    "デプロイユニットの処理チェーン (アーカイブ解析・記述子読み込み・アノテーション走査など) で失敗しました。",
+    "EAP はデプロイを複数フェーズの DeploymentUnitProcessor の連鎖として処理します。"
+    "STRUCTURE (アーカイブ構造の把握) → PARSE (web.xml 等の記述子解析) → DEPENDENCIES (モジュール依存の解決) → "
+    "CONFIGURE_MODULE → POST_MODULE (アノテーション走査) → INSTALL (MSC サービス登録) の順です。"
+    "どのフェーズで落ちたかは、スタックトレース中の Processor クラス名から読み取れます。",
+    [
+        "web.xml / beans.xml / persistence.xml など記述子の構文エラー・スキーマ違反",
+        "WAR の構造が不正 (WEB-INF が無い、壊れた ZIP)",
+        "アノテーション走査中に参照クラスを解決できない",
+        "jboss-deployment-structure.xml の記述誤り",
+    ],
+    [
+        "スタックトレース中の *Processor クラス名から、失敗したフェーズを特定する",
+        "docker exec <container> ls -l <デプロイ先>/ でアーカイブの配置とサイズを確認する",
+        "記述子を取り出して XML の妥当性を確認する (xmllint --noout <ファイル>)",
+    ],
+    [
+        "記述子の構文・名前空間・スキーマバージョンを修正する (EAP 8.1 は Jakarta EE 10 の名前空間 https://jakarta.ee/xml/ns/jakartaee)",
+        "アーカイブが壊れている場合はビルドをやり直し、転送経路 (COPY / volume) を見直す",
+        "jboss-deployment-structure.xml のモジュール名・除外指定を見直す",
+    ],
+    [
+        "記述子を CI で XML スキーマ検証する",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Deployment Descriptors"],
+))
+
+register(["org.xml.sax.SAXParseException", "javax.xml.stream.XMLStreamException",
+          "org.xml.sax.SAXException"], entry(
+    "デプロイメント記述子 (XML)", "致命的",
+    "XML の解析に失敗しました。記述子ファイルの構文エラーか、スキーマ/名前空間の不一致です。",
+    "メッセージには通常 lineNumber と columnNumber が含まれ、該当ファイルの何行目で失敗したかが分かります。"
+    "EAP 8.1 は Jakarta EE 10 のスキーマを使うため、Java EE 8 時代の "
+    "http://xmlns.jcp.org/xml/ns/javaee 名前空間や version=\"4.0\" の web-app は受け付けません。"
+    "BOM 付き UTF-8 や、コンテナへコピーする際の CRLF 変換で壊れる例もあります。",
+    [
+        "タグの閉じ忘れ・属性のクォート漏れなどの構文エラー",
+        "名前空間が Jakarta EE 10 (https://jakarta.ee/xml/ns/jakartaee) になっていない",
+        "スキーマバージョンの指定が EAP のサポート範囲外",
+        "ファイル先頭に BOM が付いている / 文字コードが宣言と違う",
+    ],
+    [
+        "エラーメッセージの行番号・列番号を確認する",
+        "docker exec <container> cat -A <記述子のパス> | head で BOM や CR を確認する",
+        "xmllint --noout <記述子> でローカル検証する",
+    ],
+    [
+        "指摘された行を修正する",
+        "web.xml を Jakarta EE 10 の形式へ更新する:\n"
+        "  <web-app xmlns=\"https://jakarta.ee/xml/ns/jakartaee\"\n"
+        "           xsi:schemaLocation=\"https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd\"\n"
+        "           version=\"6.0\">",
+        "BOM を除去し、ファイルを UTF-8 (BOM 無し) / LF で保存する",
+    ],
+    [
+        "記述子を CI で XML スキーマ検証する",
+        ".gitattributes で XML ファイルの改行コードを LF に固定する",
+    ],
+    ["Jakarta EE 10 Schemas"],
+))
+
+register(["jakarta.servlet.ServletException", "jakarta.servlet.UnavailableException",
+          "javax.servlet.ServletException"], entry(
+    "Servlet・Web 層", "重大",
+    "サーブレット/フィルタ/リスナーの初期化または処理で例外が発生しました。デプロイ時なら init() 系の失敗です。",
+    "Undertow はデプロイの最終段でサーブレットコンテキストを起動し、"
+    "load-on-startup 指定のサーブレットや ServletContextListener の contextInitialized() を実行します。"
+    "ここで例外が出ると Web デプロイメントの MSC サービスが failed となり、"
+    "WFLYUT0021 (Registered web context) が出ないまま巻き戻されます。"
+    "起動ログに WFLYUT0021 が無いことが、Web 層で止まった証拠になります。",
+    [
+        "ServletContextListener / @WebListener の初期化処理が例外を投げた",
+        "load-on-startup サーブレットの init() が失敗した",
+        "フレームワーク (JSF / JAX-RS) の初期化で設定不足がある",
+        "javax.servlet.* と jakarta.servlet.* の混在",
+    ],
+    [
+        "起動ログに WFLYUT0021 (Registered web context) が出ているか確認する",
+        "Caused by の最終段を確認する",
+        "docker exec <container> cat <デプロイ先>/<アーカイブ>/WEB-INF/web.xml",
+    ],
+    [
+        "Caused by の根本原因に応じて対処する",
+        "javax.servlet.* の import を jakarta.servlet.* へ置換する (EAP 8.1 は Jakarta EE 10)",
+        "初期化順序に依存する処理は、@WebListener の代わりに CDI の @Observes @Initialized(ApplicationScoped.class) を使う",
+    ],
+    [
+        "初期化処理は失敗時に原因を明示するログを出す",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Jakarta Servlet"],
+))
+
+register(["java.lang.OutOfMemoryError"], entry(
+    "メモリ・リソース", "致命的",
+    "JVM がメモリを確保できませんでした。ヒープ・Metaspace・ネイティブスレッドのどれが枯渇したかで対処が変わります。",
+    "メッセージの後半が枯渇した領域を示します。"
+    "\"Java heap space\" はヒープ、\"Metaspace\" はクラスメタデータ領域、"
+    "\"unable to create native thread\" はスレッド数/メモリ上限、"
+    "\"Direct buffer memory\" は NIO のダイレクトバッファです。"
+    "コンテナでは、コンテナのメモリ上限 (compose の deploy.resources.limits.memory / mem_limit) と"
+    "JVM の最大ヒープの関係が重要で、JVM は既定でコンテナ上限の 25% しかヒープに使いません。"
+    "デプロイ時の OOM は、多数のクラスをロードする Metaspace 枯渇が典型です。",
+    [
+        "コンテナのメモリ上限が小さすぎる",
+        "-Xmx / -XX:MaxMetaspaceSize が実態に合っていない",
+        "大量のクラスを持つライブラリを同梱しており Metaspace が不足",
+        "スレッドプールの設定が過大で native thread を作れない",
+    ],
+    [
+        "docker stats <container> でメモリ使用量と上限を確認する",
+        "docker exec <container> sh -c 'cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes'",
+        "本スクリプトの JVM パラメータ一覧で -Xmx / -XX:MaxMetaspaceSize / -XX:MaxRAMPercentage を確認する",
+        "docker exec <container> sh -c 'jcmd 1 GC.heap_info'",
+    ],
+    [
+        "compose.yml のメモリ上限を引き上げる",
+        "コンテナ上限に追随させる: JAVA_OPTS_APPEND=\"-XX:MaxRAMPercentage=75.0\"",
+        "Metaspace 枯渇なら: JAVA_OPTS_APPEND=\"-XX:MaxMetaspaceSize=512m\"",
+        "ヒープダンプを取得して原因を特定する: -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp",
+        "不要な同梱ライブラリを削り、ロードするクラス数を減らす",
+    ],
+    [
+        "コンテナのメモリ上限と JVM 設定を必ずセットで管理する",
+        "起動時の JVM パラメータをレポートで確認する運用にする",
+    ],
+    ["JBoss EAP 8.1 Performance Tuning Guide"],
+))
+
+register(["java.lang.StackOverflowError"], entry(
+    "メモリ・リソース", "致命的",
+    "スタックが溢れました。無限再帰か、極端に深い呼び出しが起きています。",
+    "同じメソッド群がスタックトレース中で繰り返し現れていれば再帰、"
+    "そうでなければスレッドスタックサイズ (-Xss) の不足です。"
+    "デプロイ時は、相互参照する CDI Bean の初期化や、循環する JPA 関連の解決で起きることがあります。",
+    [
+        "循環参照によるコンストラクタ/初期化の無限再帰",
+        "toString() / equals() の相互呼び出し",
+        "-Xss が小さすぎる",
+    ],
+    [
+        "スタックトレース中で繰り返されているメソッドの並びを特定する",
+        "本スクリプトの JVM パラメータ一覧で -Xss の値を確認する",
+    ],
+    [
+        "循環参照を解消する (遅延注入 Provider<T> / @Inject Instance<T> を使う)",
+        "再帰の終了条件を修正する",
+        "深い呼び出しが正当なら JAVA_OPTS_APPEND=\"-Xss1m\" などで拡張する",
+    ],
+    [
+        "循環依存を検出する静的解析を CI に入れる",
+    ],
+    ["Java Troubleshooting Guide - StackOverflowError"],
+))
+
+register(["java.io.FileNotFoundException", "java.nio.file.NoSuchFileException"], entry(
+    "ファイル・権限", "重大",
+    "ファイルを開けませんでした。パスが存在しないか、読み書きの権限がありません。",
+    "メッセージ末尾の括弧内が決め手です。\"(No such file or directory)\" はパスの誤りかコピー漏れ、"
+    "\"(Permission denied)\" は権限不足です。"
+    "コンテナでは、Dockerfile の COPY 漏れ、bind mount 先の不一致、"
+    "および OpenShift/EAP イメージが非 root (jboss ユーザ、任意 UID) で動くことによる権限不足が典型です。"
+    "存在しないホストパスを bind mount すると Docker が空ディレクトリを作るため、"
+    "「ディレクトリはあるがファイルが無い」状態にもなります。",
+    [
+        "Dockerfile の COPY 対象漏れ・パスの綴り違い",
+        "compose.yml の volumes で指定したホスト側パスが存在しない",
+        "非 root ユーザで動作しており、対象ファイル/ディレクトリに権限が無い",
+        "相対パスで開いており、作業ディレクトリが想定と違う",
+    ],
+    [
+        "docker exec <container> ls -l <対象パス> で存在と権限を確認する",
+        "docker exec <container> id で実行ユーザを確認する",
+        "docker inspect -f '{{ json .Mounts }}' <container> でマウント状況を確認する",
+        "docker exec <container> pwd -P で作業ディレクトリを確認する",
+    ],
+    [
+        "Dockerfile へ COPY を追加する、または compose.yml のホスト側パスを実在するものへ直す",
+        "権限を付与する: RUN chown -R jboss:root <パス> && chmod -R g+rw <パス>",
+        "任意 UID で動く前提なら、グループ root へ書き込み権限を付ける (OpenShift の慣例)",
+        "ファイルパスは絶対パスか、環境変数で明示的に与える",
+        "本スクリプトの --copy-file で、ビルド時だけ必要なファイルを一時配置する",
+    ],
+    [
+        "必要なファイルの存在確認をイメージビルド時 (RUN test -f ...) に入れる",
+        "本スクリプトのコンテナ内ディレクトリツリー出力で配置を確認する",
+    ],
+    ["JBoss EAP 8.1 - Running as a non-root user"],
+))
+
+register(["java.nio.file.AccessDeniedException", "java.security.AccessControlException"], entry(
+    "ファイル・権限", "重大",
+    "アクセスが拒否されました。OS の権限、または Java のセキュリティポリシーで拒否されています。",
+    "コンテナ内の EAP は通常 jboss ユーザ (UID 185) で動作します。"
+    "root で作成したファイルや、ホストからマウントしたディレクトリの所有者が合わないと書き込めません。"
+    "SELinux 有効ホストでは、bind mount に :z / :Z を付けないとアクセスを拒否されることがあります。",
+    [
+        "対象ディレクトリの所有者/パーミッションが実行ユーザと合っていない",
+        "SELinux のラベル不一致 (RHEL ホストで頻出)",
+        "読み取り専用マウント (:ro) へ書き込もうとしている",
+    ],
+    [
+        "docker exec <container> id と ls -ln <対象パス> を突き合わせる",
+        "compose.yml の volumes に :z / :Z / :ro が付いているか確認する",
+        "ホスト側で ls -lZ <パス> を実行し SELinux ラベルを確認する",
+    ],
+    [
+        "Dockerfile で所有権を合わせる: RUN chown -R jboss:root <パス> && chmod -R g+rwX <パス>",
+        "SELinux 環境では volumes へ :z (共有) または :Z (専有) を付ける",
+        "書き込みが必要なパスを :ro でマウントしない",
+    ],
+    [
+        "書き込み先はコンテナ内の専用ディレクトリか名前付きボリュームにする",
+    ],
+    ["Docker - Configure the SELinux label"],
+))
+
+register(["java.lang.NullPointerException"], entry(
+    "アプリケーション実装", "重大",
+    "null の参照に対して操作を行いました。デプロイ時なら、初期化前の値や未設定の設定値を使っている可能性が高いです。",
+    "Java 14 以降の Helpful NullPointerException により、メッセージには "
+    "\"Cannot invoke \\\"X.y()\\\" because \\\"z\\\" is null\" のように、どの参照が null かが具体的に記載されます。"
+    "EAP 8.1 のサポート JDK ではこの機能が既定で有効なので、メッセージをそのまま読むのが最短です。"
+    "デプロイ時の NPE は、注入がまだ完了していないフィールドをコンストラクタで使う、"
+    "環境変数から取得した値が null のまま使われる、というパターンが大半です。",
+    [
+        "@Inject / @Resource のフィールドをコンストラクタや static 初期化子で使っている",
+        "System.getenv(...) / getProperty(...) の戻り値が null のまま使われている",
+        "設定ファイルの読み込みに失敗し、戻り値が null になっている",
+        "外部呼び出しの結果 (Optional にしていない) が null",
+    ],
+    [
+        "メッセージの \"because ... is null\" 部分で null の対象を特定する",
+        "スタックトレースの最上位にあるアプリケーションのクラス/行番号を見る",
+        "docker exec <container> env | sort で参照している環境変数の有無を確認する",
+    ],
+    [
+        "注入されたフィールドを使う処理は @PostConstruct へ移す (コンストラクタでは未注入)",
+        "環境変数の既定値を用意し、必須なら起動時に検証して明示的なメッセージで失敗させる",
+        "null を返しうる API は Optional で受けるか、null チェックを入れる",
+    ],
+    [
+        "必須設定値のバリデーションを起動処理の先頭に置く",
+        "静的解析 (SpotBugs / ErrorProne) で null 到達を検出する",
+    ],
+    ["Java - Helpful NullPointerExceptions (JEP 358)"],
+))
+
+register(["java.lang.IllegalStateException", "java.lang.IllegalArgumentException",
+          "java.lang.UnsupportedOperationException"], entry(
+    "アプリケーション実装", "重大",
+    "呼び出しの前提条件が満たされていません。設定値の不正か、ライフサイクルに合わない呼び出しです。",
+    "フレームワークは前提条件違反をこれらの例外で通知します。デプロイ時に出る場合は、"
+    "設定値のフォーマット不正 (数値のはずが文字列、URL の書式違反)、"
+    "またはコンテナのライフサイクル上まだ利用できない機能を呼び出している状態です。"
+    "メッセージ本文が最も具体的な手掛かりになります。",
+    [
+        "環境変数/システムプロパティの値が想定の書式でない",
+        "初期化前のコンポーネントを呼び出している",
+        "同じリソースを二重に登録している",
+    ],
+    [
+        "例外メッセージ本文をそのまま読む (対象の設定名が書かれていることが多い)",
+        "スタックトレースの最上位のアプリケーションクラスを特定する",
+        "docker exec <container> env | sort と本スクリプトの JVM パラメータ一覧で値を確認する",
+    ],
+    [
+        "設定値を正しい書式へ修正する",
+        "初期化順序に依存する処理を @PostConstruct や起動イベントへ移す",
+        "重複登録している定義 (web.xml とアノテーションの二重定義など) を一方に寄せる",
+    ],
+    [
+        "設定値のバリデーションを起動時に行う",
+    ],
+    ["JBoss EAP 8.1 Development Guide"],
+))
+
+register(["java.lang.NumberFormatException"], entry(
+    "設定値", "重大",
+    "数値として解釈できない文字列を数値へ変換しようとしました。設定値の未設定・書式違いが原因です。",
+    "Integer.parseInt(null) は NumberFormatException: null となるため、"
+    "「環境変数が未設定」がそのままこの例外として現れます。"
+    "compose.yml で ${VAR} を使いつつホスト側に定義が無い場合、空文字が渡って同じ結果になります。"
+    "単位付きの値 (\"30s\"、\"512m\") をそのまま parseInt している場合も該当します。",
+    [
+        "環境変数が未設定で null / 空文字が渡っている",
+        "単位付きの文字列を数値として解釈しようとしている",
+        "全角数字・空白・カンマ区切りが混ざっている",
+    ],
+    [
+        "例外メッセージの入力値 (For input string: \"...\") を確認する",
+        "docker exec <container> env | grep <該当の環境変数名>",
+        "compose.yml の environment で既定値付き展開 ${VAR:-既定値} になっているか確認する",
+    ],
+    [
+        "compose.yml で既定値を与える: MY_TIMEOUT: \"${MY_TIMEOUT:-30}\"",
+        "アプリ側で未設定時の既定値と、書式チェックを実装する",
+        "単位付きの値は専用のパーサ (Duration.parse など) で扱う",
+    ],
+    [
+        "必須の環境変数を一覧化し、起動時に検証する",
+    ],
+    ["Docker Compose - Environment variables"],
+))
+
+register(["java.lang.ClassCastException"], entry(
+    "クラスロード・依存関係", "重大",
+    "型変換に失敗しました。同じ名前のクラスが別のクラスローダーから 2 つロードされている可能性があります。",
+    "メッセージが \"class X cannot be cast to class X\" のように同じクラス名で出る場合は、"
+    "クラスローダーが異なる 2 つの同名クラスが存在する状態です。"
+    "JBoss EAP では、同じ JAR が WAR 内 (WEB-INF/lib) と EAP モジュールの双方にあるとこれが起きます。"
+    "メッセージ末尾に括弧でクラスローダー名が併記されるため、そこで判別できます。",
+    [
+        "同一クラスが複数のクラスローダーからロードされている",
+        "実装クラスの取り違え (設定で指定したクラス名が想定の型でない)",
+        "ジェネリクスの型消去により、実行時に想定外の型が入っている",
+    ],
+    [
+        "メッセージ末尾の括弧内のクラスローダー名を比較する",
+        "docker exec <container> ls <デプロイ先>/<アーカイブ>/WEB-INF/lib で重複 JAR を探す",
+        "-verbose:class を付けて起動し、ロード元を確認する",
+    ],
+    [
+        "WAR 同梱と EAP モジュールの重複を解消する (どちらか一方にする)",
+        "jboss-deployment-structure.xml で該当モジュールを除外する、または <local-last value=\"true\"/> を設定する",
+        "設定で指定するクラス名を正しい実装へ修正する",
+    ],
+    [
+        "WEB-INF/lib の内容を CI で検証し、EAP 提供ライブラリの重複を禁止する",
+    ],
+    ["JBoss EAP 8.1 Development Guide - Class Loading"],
+))
+
+register(["java.lang.UnsatisfiedLinkError"], entry(
+    "ネイティブライブラリ", "致命的",
+    "ネイティブライブラリ (.so) をロードできませんでした。ファイルが無いか、アーキテクチャが合っていません。",
+    "System.loadLibrary は java.library.path とシステムのライブラリ検索パスから .so を探します。"
+    "コンテナでは、ベースイメージに必要な OS パッケージが入っていない、"
+    "あるいはビルドホスト (arm64 の Apple Silicon 等) と実行環境 (amd64) でアーキテクチャが異なるのが典型です。",
+    [
+        "必要な OS パッケージ (glibc 以外の共有ライブラリ) がイメージに入っていない",
+        "イメージのアーキテクチャが実行環境と異なる",
+        "java.library.path に配置先が含まれていない",
+    ],
+    [
+        "docker exec <container> sh -c 'ldd <ライブラリのパス>' で不足している依存を確認する",
+        "docker image inspect --format '{{.Architecture}}' <イメージ> を確認する",
+        "docker exec <container> sh -c 'echo $LD_LIBRARY_PATH'",
+    ],
+    [
+        "Dockerfile へ必要なパッケージを追加する (RUN dnf install -y <パッケージ>)",
+        "マルチアーキテクチャでビルドする、または --platform linux/amd64 を指定する",
+        "JAVA_OPTS_APPEND=\"-Djava.library.path=/usr/lib64:/opt/native\" で検索パスを追加する",
+    ],
+    [
+        "イメージのアーキテクチャをビルドパイプラインで固定する",
+    ],
+    ["Docker - Multi-platform images"],
+))
+
+register(["org.wildfly.security.credential.store.CredentialStoreException",
+          "org.wildfly.security.auth.server.RealmUnavailableException",
+          "java.security.UnrecoverableKeyException"], entry(
+    "セキュリティ・認証情報", "致命的",
+    "Elytron の資格情報ストアやセキュリティレルムを利用できませんでした。マスターパスワードやキーストアの不一致が原因です。",
+    "EAP 8.1 は Elytron の CredentialStore にパスワード等を保管し、standalone.xml からは "
+    "credential-reference で参照します。ストアを開くにはマスターパスワードが必要で、"
+    "ビルド時に注入した値と実行時に渡される値が 1 バイトでも違うと開けません。"
+    "$ や \" を含むパスワードは、compose の変数展開 / XML エスケープ / WildFly の式解決 (${...}) の"
+    "いずれかで壊れることがあります。",
+    [
+        "マスターパスワードがビルド時と実行時で一致していない",
+        "パスワードに $ が含まれ、WildFly の式として解決されてしまっている",
+        "資格情報ストアのファイルがイメージに含まれていない、または権限不足",
+        "キーストアのパスワード/別名が違う",
+    ],
+    [
+        "本スクリプトの --verify-jboss-password を付けて、各段での値の一致を確認する",
+        "docker exec <container> ls -l <資格情報ストアのパス>",
+        "docker exec <container> grep -n \"credential-reference\" /opt/jboss-eap/standalone/configuration/standalone.xml",
+    ],
+    [
+        "本スクリプトの --verify-jboss-password で不一致の段を特定し、その段の受け渡しを修正する",
+        "パスワード中の $ は jboss-cli 登録時に $$ へエスケープする",
+        "資格情報ストアのファイルをイメージへ含め、jboss ユーザから読める権限にする",
+    ],
+    [
+        "--verify-jboss-password をビルド検証の標準手順に組み込む",
+    ],
+    ["JBoss EAP 8.1 Security Architecture - Credential Stores"],
+))
+
+register(["java.util.MissingResourceException"], entry(
+    "設定値", "重大",
+    "リソースバンドル (プロパティファイル) が見つかりませんでした。配置場所かロケールの指定が原因です。",
+    "ResourceBundle.getBundle(\"messages\") は、クラスパス直下の messages.properties や "
+    "messages_ja.properties を探します。Maven なら src/main/resources 配下に置くと "
+    "WEB-INF/classes へ入ります。ビルド設定で resources が除外されていると欠落します。",
+    [
+        "プロパティファイルが WEB-INF/classes に含まれていない",
+        "バンドル名・パッケージ階層の指定誤り",
+        "既定ロケール用のファイル (サフィックス無し) が無い",
+    ],
+    [
+        "docker exec <container> ls <デプロイ先>/<アーカイブ>/WEB-INF/classes",
+        "Maven の <resources> 設定と src/main/resources の内容を確認する",
+    ],
+    [
+        "プロパティファイルを src/main/resources へ配置して再ビルドする",
+        "既定ロケール用のファイル (例: messages.properties) を必ず用意する",
+    ],
+    [
+        "リソースの存在確認をビルド後の検証に入れる",
+    ],
+    ["Java - ResourceBundle"],
+))
+
+register(["java.util.concurrent.TimeoutException", "java.net.SocketTimeoutException"], entry(
+    "タイムアウト", "重大",
+    "処理が制限時間内に完了しませんでした。接続先の遅延か、タイムアウト値が短すぎます。",
+    "デプロイ時のタイムアウトは、外部サービスへの初期化リクエストや、"
+    "DB の接続確立待ちで発生します。Compose 環境では依存サービスの初期化 (DB のスキーマ作成など) が"
+    "想定より長引くと、アプリ側が先にタイムアウトします。",
+    [
+        "依存サービスの初期化が完了していない",
+        "タイムアウト値が環境に対して短い",
+        "ネットワーク経路の遅延 (プロキシ経由など)",
+    ],
+    [
+        "docker compose logs <依存サービス> で準備完了までの所要時間を確認する",
+        "本スクリプトの --startup-timeout を伸ばして再現するか確認する",
+    ],
+    [
+        "compose.yml の healthcheck の start_period / interval を実態に合わせる",
+        "アプリ側のタイムアウト値を環境変数で調整可能にする",
+        "本スクリプトの --wait-healthy と --startup-timeout を併用する",
+    ],
+    [
+        "依存サービスの起動所要時間を計測し、余裕を持った設定値にする",
+    ],
+    ["Docker Compose - healthcheck"],
+))
+
+
+# メッセージ本文で追加の具体策が言えるケース。
+MESSAGE_HINTS = [
+    (r"Metaspace",
+     "枯渇したのは Metaspace (クラスメタデータ領域) です。ヒープではなくクラスの多さが原因です。",
+     ["JAVA_OPTS_APPEND=\"-XX:MaxMetaspaceSize=512m\" を設定し、コンテナのメモリ上限もあわせて引き上げる",
+      "同梱ライブラリを削減し、ロードするクラス数を減らす"]),
+    (r"Java heap space",
+     "枯渇したのは Java ヒープです。デプロイ時にヒープを大量に使う処理 (大きなデータの読み込み等) を疑います。",
+     ["JAVA_OPTS_APPEND=\"-XX:MaxRAMPercentage=75.0\" でコンテナ上限に追随させる",
+      "compose.yml のメモリ上限を引き上げる",
+      "-XX:+HeapDumpOnOutOfMemoryError でヒープダンプを取得して原因を特定する"]),
+    (r"unable to create (?:new )?native thread",
+     "スレッドを新規作成できませんでした。スレッド数上限かメモリ上限に達しています。",
+     ["compose.yml の pids_limit / メモリ上限を引き上げる",
+      "スレッドプールの最大数を見直す"]),
+    (r"Direct buffer memory",
+     "NIO のダイレクトバッファが枯渇しました。",
+     ["JAVA_OPTS_APPEND=\"-XX:MaxDirectMemorySize=256m\" を設定する"]),
+    (r"Connection refused",
+     "TCP 接続が明確に拒否されました (名前解決までは成功しています)。相手プロセスがそのポートで待ち受けていません。",
+     ["接続先サービスのログで、待ち受け開始の時刻と例外の発生時刻を突き合わせる"]),
+    (r"Access denied for user|password authentication failed|invalid authorization|"
+     r"ORA-01017|28P01|1045",
+     "DB の認証に失敗しています。ユーザ名/パスワードが届いていないか、値が壊れています。",
+     ["環境変数の値を docker exec <container> env で確認する",
+      "パスワードに $ が含まれる場合、compose.yml では $$ にエスケープする",
+      "本スクリプトの --verify-jboss-password で受け渡し経路の各段を検証する"]),
+    (r"database .* does not exist|Unknown database",
+     "接続先の DB (スキーマ) がまだ作成されていません。",
+     ["DB コンテナの初期化スクリプト (docker-entrypoint-initdb.d) で作成する",
+      "DB の healthcheck を「対象 DB へ接続できること」まで含めて定義する"]),
+    (r"Permission denied",
+     "OS の権限で拒否されています。コンテナの実行ユーザと対象パスの所有者を突き合わせます。",
+     ["docker exec <container> id と ls -l <対象パス> を比較する",
+      "Dockerfile で chown -R jboss:root <パス> && chmod -R g+rwX <パス> を行う"]),
+    (r"No space left on device",
+     "ディスク容量が不足しています。",
+     ["docker system df で使用量を確認し、不要なイメージ/ボリュームを削除する",
+      "本スクリプトの --cleanup-all-docker-data で環境をリセットする (削除対象を確認のうえ実行)"]),
+    (r"class file version (\d+)\.\d+",
+     "クラスファイルのバージョンが実行 JVM の対応範囲を超えています。",
+     ["ランタイムの JDK をビルドと同じメジャーバージョンへ揃える",
+      "または Maven の <maven.compiler.release> を実行環境の JDK に合わせる"]),
+    (r"WELD-001408|Unsatisfied dependencies",
+     "CDI の注入候補が 1 つも見つかりませんでした (WELD-001408)。ログ中の \"for type ... with qualifiers ...\" が、"
+     "解決できなかった型と修飾子そのものです。",
+     ["ログに出ている型名で WAR 内を検索し、実装クラスが同梱されているかを確かめる"]),
+    (r"WELD-001409|Ambiguous dependencies",
+     "CDI の注入候補が複数見つかりました (WELD-001409)。ログに候補 Bean が列挙されています。",
+     ["ログに列挙された候補のうち、どれを使うかを決めてから @Alternative / @Qualifier で選別する"]),
+    (r"Address already in use",
+     "そのポートはすでに使用中です。",
+     ["JAVA_OPTS_APPEND=\"-Djboss.socket.binding.port-offset=100\" でポートをずらす",
+      "重複起動しているプロセスを停止する"]),
+    (r"unable to find valid certification path",
+     "サーバ証明書を検証できるルート CA がトラストストアにありません。",
+     ["CA 証明書を keytool -importcert -cacerts でイメージへ登録する",
+      "OS のトラストストアへ入れる場合は update-ca-trust extract も実行する"]),
+    (r"javax\.(servlet|inject|enterprise|persistence|ws\.rs|annotation)",
+     "javax.* 名前空間を参照しています。JBoss EAP 8.1 は Jakarta EE 10 のため jakarta.* が正です。",
+     ["import と依存ライブラリを jakarta.* 対応版へ移行する",
+      "移行できないライブラリは Eclipse Transformer で変換する"]),
+]
+
+
+def lookup_knowledge(chain_classes):
+    """例外クラス群 (根本原因を優先) から知識ベースの項目を選ぶ。"""
+    for klass in chain_classes:
+        if not klass:
+            continue
+        if klass in KNOWLEDGE:
+            return klass, KNOWLEDGE[klass]
+    # 単純名での一致 (パッケージが異なる同名例外)
+    for klass in chain_classes:
+        if not klass:
+            continue
+        simple = klass.rsplit(".", 1)[-1]
+        for known, data in KNOWLEDGE.items():
+            if known.rsplit(".", 1)[-1] == simple:
+                return klass, data
+    for klass in chain_classes:
+        if klass and klass.endswith("Error"):
+            return klass, GENERIC_ERROR
+    for klass in chain_classes:
+        if klass:
+            return klass, GENERIC_EXCEPTION
+    return "", GENERIC_EXCEPTION
+
+
+JAVA_CLASS_FILE_VERSIONS = {
+    "45": "1.1", "46": "1.2", "47": "1.3", "48": "1.4", "49": "5", "50": "6",
+    "51": "7", "52": "8", "53": "9", "54": "10", "55": "11", "56": "12",
+    "57": "13", "58": "14", "59": "15", "60": "16", "61": "17", "62": "18",
+    "63": "19", "64": "20", "65": "21", "66": "22", "67": "23", "68": "24",
+}
+
+
+def extract_facts(event):
+    """例外の種類に応じて、ログから具体的な値を取り出す。"""
+    facts = []
+    root = event.root()
+    root_class = root.klass if root else ""
+    root_message = root.message if root else ""
+    simple = root_class.rsplit(".", 1)[-1] if root_class else ""
+    block_text = event_text(event)
+
+    if simple in ("ClassNotFoundException", "NoClassDefFoundError"):
+        candidate = root_message.strip().split()[0] if root_message.strip() else ""
+        candidate = candidate.replace("/", ".").strip(":;")
+        if candidate:
+            facts.append(("見つからないクラス", candidate))
+            package = candidate.rsplit(".", 1)[0] if "." in candidate else ""
+            if package:
+                facts.append(("所属パッケージ", package))
+                facts.append(("推定される提供元",
+                              "自社パッケージであれば WAR への同梱漏れ、外部パッケージであれば依存 JAR の不足"
+                              if not package.startswith(PLATFORM_PACKAGE_PREFIXES)
+                              else "基盤側 (Jakarta EE / EAP) のクラス。モジュール依存の宣言漏れが疑わしい"))
+    if simple in ("NoSuchMethodError", "NoSuchFieldError"):
+        if root_message:
+            facts.append(("解決できなかったシグネチャ", root_message.strip()))
+            owner = root_message.strip().split(".")
+            if len(owner) > 1:
+                facts.append(("対象クラス", ".".join(owner[:-1]).split("(")[0]))
+    if simple == "UnsupportedClassVersionError":
+        found = re.search(r"class file version (\d+)\.", root_message)
+        if found:
+            major = found.group(1)
+            facts.append(("クラスファイルのバージョン",
+                          "%s (Java %s 相当)" % (major, JAVA_CLASS_FILE_VERSIONS.get(major, "不明"))))
+        supported = re.search(r"up to (\d+)\.", root_message)
+        if supported:
+            major = supported.group(1)
+            facts.append(("実行中 JVM の上限",
+                          "%s (Java %s 相当)" % (major, JAVA_CLASS_FILE_VERSIONS.get(major, "不明"))))
+    if simple in ("NameNotFoundException", "NamingException"):
+        found = re.search(r"([\w:./$-]*java:[\w:./$-]+)", root_message + " " + block_text)
+        if found:
+            facts.append(("引けなかった JNDI 名", found.group(1)))
+    if simple in ("ModuleNotFoundException", "ModuleLoadException"):
+        found = re.search(r"([\w.\-]+):([\w.\-]+)", root_message)
+        if found:
+            facts.append(("見つからないモジュール", found.group(0)))
+        elif root_message:
+            facts.append(("見つからないモジュール", root_message.strip()))
+    if simple in ("UnknownHostException",):
+        if root_message:
+            facts.append(("解決できないホスト名", root_message.strip().split(":")[0]))
+    if simple in ("ConnectException", "SocketTimeoutException", "NoRouteToHostException"):
+        target = find_connect_target(block_text)
+        if target:
+            facts.append(("接続先", target))
+    if simple == "OutOfMemoryError":
+        facts.append(("枯渇した領域", root_message.strip() or "(メッセージなし)"))
+    if "SQL" in simple or simple.endswith("PSQLException"):
+        state = re.search(r"SQLState:?\s*[:=]?\s*\"?([0-9A-Za-z]{5})\"?", block_text)
+        if state:
+            facts.append(("SQLState", state.group(1)))
+        code = re.search(r"ErrorCode:?\s*[:=]?\s*(-?\d+)", block_text)
+        if code and code.group(1) != "0":
+            facts.append(("ベンダーエラーコード", code.group(1)))
+    if simple in ("SAXParseException", "SAXException", "XMLStreamException"):
+        position = re.search(r"lineNumber:\s*(\d+);\s*columnNumber:\s*(\d+)", block_text)
+        if not position:
+            position = re.search(r"\[row,col[^\]]*\]:\s*\[(\d+),(\d+)\]", block_text)
+        if position:
+            facts.append(("XML の該当位置", "%s 行 %s 列" % (position.group(1), position.group(2))))
+        descriptor = find_descriptor_file(block_text)
+        if descriptor:
+            facts.append(("対象ファイル (推定)", descriptor))
+    if simple == "BindException":
+        found = re.search(r"(\d{2,5})", block_text)
+        if found:
+            facts.append(("確保できなかったポート (推定)", found.group(1)))
+
+    if event.deployment:
+        facts.append(("対象デプロイユニット", event.deployment))
+    return facts
+
+
+def merge_fixes(base_fixes, hints):
+    """知識ベースの対処と、ログ固有の追加所見の対処を、重複を除いて連結する。"""
+    merged = list(base_fixes)
+    seen = set(normalize_fix(item) for item in merged)
+    for _summary, extra in hints:
+        for item in extra:
+            key = normalize_fix(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def normalize_fix(text):
+    return re.sub(r"[\s　]+", "", str(text))[:24]
+
+
+# "ホスト:ポート" の誤検出を避けるために除外する拡張子。スタックフレームの
+# "(Pool.java:88)" や記述子名がホスト名として拾われるのを防ぐ。
+NON_HOST_SUFFIXES = (".java", ".kt", ".scala", ".groovy", ".jsp", ".xml", ".class")
+HOST_PORT_RE = re.compile(r"(?<![\w.:\-])([A-Za-z][\w.\-]*)[:/](\d{1,5})(?![\d.:])")
+
+
+def find_connect_target(text):
+    """接続エラーの本文から "ホスト:ポート" を取り出す。
+
+    ログ行の時刻 (09:17:41) やスタックフレームの行番号 (Pool.java:88) を
+    接続先と取り違えないよう、ホスト側の形と後続文字で絞り込む。
+    """
+    for match in HOST_PORT_RE.finditer(text):
+        host, port = match.group(1), match.group(2)
+        if host.lower().endswith(NON_HOST_SUFFIXES):
+            continue
+        if text[match.end():match.end() + 1] == ")":
+            continue
+        if not 1 <= int(port) <= 65535:
+            continue
+        return "%s:%s" % (host, port)
+    return ""
+
+
+# デプロイメント記述子として扱う既知のファイル名。org.xml.sax.SAXParseException の
+# ようなクラス名を「.xml のファイル」と誤検出しないよう、名前で絞り込む。
+KNOWN_DESCRIPTOR_NAMES = (
+    "web.xml", "beans.xml", "persistence.xml", "ejb-jar.xml", "application.xml",
+    "jboss-web.xml", "jboss-ejb3.xml", "jboss-deployment-structure.xml",
+    "jboss-app.xml", "faces-config.xml", "webservices.xml", "ra.xml",
+    "standalone.xml", "module.xml", "pom.xml", "validation.xml",
+)
+
+
+def find_descriptor_file(text):
+    """XML 解析エラーの本文から、対象となった記述子ファイル名を取り出す。"""
+    for candidate in re.findall(r"[\w.\-/]+\.xml", text):
+        basename = candidate.rsplit("/", 1)[-1]
+        if basename in KNOWN_DESCRIPTOR_NAMES:
+            return candidate
+    # 既知の名前に一致しなくても、パス表記であればファイルとみなす。
+    for candidate in re.findall(r"/[\w.\-/]+\.xml", text):
+        return candidate
+    return ""
+
+
+def matched_hints(event):
+    block_text = event_text(event)
+    hints = []
+    for pattern, summary, fixes in MESSAGE_HINTS:
+        if re.search(pattern, block_text, re.IGNORECASE):
+            hints.append((summary, fixes))
+    return hints
+
+
+WFLY_CODE_NOTES = {
+    "WFLYSRV0025": "サーバーが正常に起動しました。",
+    "WFLYSRV0026": "サーバーは起動しましたがエラーがあります。デプロイの一部が失敗しています。",
+    "WFLYSRV0027": "デプロイの開始。この直後の例外はそのアーカイブの処理中に発生しています。",
+    "WFLYSRV0010": "デプロイが正常に完了しました。",
+    "WFLYSRV0021": "デプロイが巻き戻されました。同じ行の failure message が直接の理由です。",
+    "WFLYSRV0056": "起動処理でエラーが発生しました。",
+    "WFLYSRV0153": "デプロイの起動に失敗しました。",
+    "WFLYCTL0080": "起動できなかったサービス (Failed services) の一覧です。サービス名からどの機能かが分かります。",
+    "WFLYCTL0412": "必要なサービスが未インストールです。参照先の名前 (JNDI 名等) の綴りを確認します。",
+    "WFLYJCA0031": "データソースの検証・デプロイに失敗しました。DB への接続を確認します。",
+    "WFLYJCA0018": "JDBC ドライバが登録されました。",
+    "WFLYJCA0001": "データソースが JNDI へバインドされました。ここに出る名前がアプリの参照名と一致する必要があります。",
+    "WFLYJCA0098": "非トランザクションのデータソースがバインドされました。",
+    "WFLYUT0006": "Undertow の HTTP リスナーが待ち受けを開始しました。",
+    "WFLYUT0021": "Web コンテキストが登録されました。これが出ていない場合、Web 層の起動前に失敗しています。",
+    "WFLYDS0013": "デプロイスキャナが起動しました。監視対象ディレクトリが表示されます。",
+    "WFLYSRV0049": "サーバーの起動を開始しました。",
+    "WELD-001408": "CDI の注入候補が 0 件です。",
+    "WELD-001409": "CDI の注入候補が複数あります。",
+    "MSC000001": "MSC サービスの起動に失敗しました。サービス名から失敗した機能を特定できます。",
+    "WFLYDR0001": "デプロイ内容がリポジトリへ登録されました。",
+    "WFLYSRV0009": "デプロイが解除されました。",
+    "WFLYJPA0002": "永続化ユニットの処理を開始しました。",
+    "WFLYWELD0003": "CDI のデプロイ処理を開始しました。",
+}
+
+
+def determine_verdict(event, deploy_failed):
+    level = (event.origin_line.level or "").upper()
+    if event.deploy_related and level in ("ERROR", "FATAL", "SEVERE"):
+        return "デプロイ失敗の原因" if deploy_failed else "デプロイ中のエラー (要対処)"
+    if event.deploy_related and level in ("WARN", "WARNING"):
+        return "デプロイ中の警告 (要確認)"
+    if event.deploy_related:
+        return "デプロイ中の例外 (要確認)"
+    if level in ("ERROR", "FATAL", "SEVERE"):
+        return "デプロイ外のエラー"
+    return "参考 (デプロイ外)"
+
+
+def one_line_summary(event):
+    root = event.root()
+    knowledge = event.knowledge or GENERIC_EXCEPTION
+    simple = root.simple_name() if root else "(不明)"
+    message = (root.message if root else "").strip()
+    if len(message) > 80:
+        message = message[:77] + "..."
+    if message:
+        return "%s: %s (%s)" % (simple, message, knowledge["category"])
+    return "%s (%s)" % (simple, knowledge["category"])
+
+
+# =============================================================================
+# テキストレポート
+# =============================================================================
+
+def bullet_lines(items, indent="  ", marker="- "):
+    out = []
+    for item in items:
+        parts = str(item).split("\n")
+        out.append("%s%s%s" % (indent, marker, parts[0]))
+        for extra in parts[1:]:
+            out.append("%s%s%s" % (indent, " " * len(marker), extra))
+    return out
+
+
+def numbered_lines(items, indent="  "):
+    out = []
+    for number, item in enumerate(items, 1):
+        head = "%s%d) " % (indent, number)
+        parts = str(item).split("\n")
+        out.append("%s%s" % (head, parts[0]))
+        for extra in parts[1:]:
+            out.append("%s%s" % (" " * len(head), extra))
+    return out
+
+
+def build_text_report(meta, events, stats, scanned_services, line_count, truncated,
+                      lines=None, full=False, max_log_rows=3000):
+    """解析結果のテキストを組み立てる。
+
+    full=False : 画面と全量レポート向け。スタックトレースは先頭だけに省略する。
+    full=True  : 独立したテキストファイル向け。Excel と同じ情報量にするため、
+                 全スタックフレームとデプロイログまで含める。
+    """
+    out = []
+    add = out.append
+    add(HEAVY)
+    add("WAR デプロイ時 Java 例外解析")
+    add(HEAVY)
+    add("解析日時      : %s" % meta.get("analyzed_at", ""))
+    add("処理開始日時  : %s" % meta.get("run_started_at", ""))
+    add("Compose 定義  : %s" % meta.get("compose_file", ""))
+    add("解析対象      : %s (%d サービス)" % (" ".join(scanned_services) or "(なし)", len(scanned_services)))
+    add("解析ログ行数  : %d 行" % line_count)
+    add("検出した例外  : %d 件 (デプロイ処理中: %d 件 / デプロイ外: %d 件)"
+        % (stats["total"], stats["deploy"], stats["other"]))
+    if stats["by_severity"]:
+        add("深刻度の内訳  : %s"
+            % " / ".join("%s %d 件" % (name, count) for name, count in stats["by_severity"]))
+    if stats["by_category"]:
+        add("分類の内訳    : %s"
+            % " / ".join("%s %d 件" % (name, count) for name, count in stats["by_category"]))
+    add("総合判定      : %s" % stats["verdict"])
+    if truncated:
+        add("注意          : 詳細分析は上限の %d 件までです。残りは件数のみ集計しています"
+            % truncated)
+        add("                (--deploy-exception-limit で上限を変更できます)。")
+
+    if not events:
+        add("")
+        add("Java の例外スタックトレースは検出されませんでした。")
+        add("デプロイ処理でスローされた例外が無いか、対象サービスのログに出力されていません。")
+        # 例外が無くても、Excel の「デプロイログ」シートと内容を揃える。
+        if full and lines:
+            out.extend(build_log_section(lines, events, max_log_rows))
+        add("")
+        add(HEAVY)
+        return "\n".join(out) + "\n"
+
+    add("")
+    add("読み方        : 「根本原因」= Caused by の最終段。ここが実際に直すべき対象です。")
+    add("                各例外の [対処方法] は上から順に効果の高い順で並べています。")
+
+    for number, event in enumerate(events, 1):
+        knowledge = event.knowledge
+        top = event.top()
+        root = event.root()
+        add("")
+        add(RULE)
+        add("[例外 %d/%d] %s" % (number, len(events), top.klass or "(クラス不明)"))
+        add("  判定: %s / 深刻度: %s / 分類: %s"
+            % (event.verdict, knowledge["severity"], knowledge["category"]))
+        add(RULE)
+        origin = event.origin_line
+        add("発生日時      : %s" % (origin.timestamp() or "(不明)"))
+        add("サービス      : %s%s" % (origin.service,
+                                      " (コンテナ: %s)" % origin.container
+                                      if origin.container else ""))
+        add("デプロイ対象  : %s" % (event.deployment or "(特定できず)"))
+        add("ログレベル    : %s" % (origin.level or "(不明)"))
+        add("ロガー        : %s" % (origin.logger or "(不明)"))
+        add("スレッド      : %s" % (origin.thread or "(不明)"))
+        if origin.code:
+            note = WFLY_CODE_NOTES.get(origin.code, "")
+            add("EAP コード    : %s%s" % (origin.code, " - %s" % note if note else ""))
+        add("例外クラス    : %s" % (top.klass or "(不明)"))
+        add("例外メッセージ: %s" % (top.message or "(なし)"))
+        if root is not top:
+            add("根本原因      : %s" % (root.klass or "(不明)"))
+            add("  メッセージ  : %s" % (root.message or "(なし)"))
+        app_frame = event.app_frame(PLATFORM_PACKAGE_PREFIXES)
+        add("アプリ内発生点: %s" % (app_frame or "(アプリケーション由来のフレームなし)"))
+        add("連鎖の段数    : %d 段 / スタックフレーム %d 行"
+            % (len(event.chain), event.frame_count()))
+
+        add("")
+        add("■ 何が起きたか")
+        for line in wrap_text(knowledge["headline"], 63):
+            add("  " + line)
+
+        add("")
+        add("■ 発生の仕組み (なぜこの例外になるのか)")
+        for line in wrap_text(knowledge["mechanism"], 63):
+            add("  " + line)
+
+        if event.facts:
+            add("")
+            add("■ ログから読み取れる事実")
+            width = max(display_width(label) for label, _ in event.facts)
+            for label, value in event.facts:
+                padding = " " * (width - display_width(label))
+                add("  - %s%s : %s" % (label, padding, value))
+
+        hints = matched_hints(event)
+        if hints:
+            add("")
+            add("■ このログ特有の追加所見")
+            for summary, _fixes in hints:
+                for index, line in enumerate(wrap_text(summary, 61)):
+                    add("  %s%s" % ("- " if index == 0 else "  ", line))
+
+        if event.deploy_reasons:
+            add("")
+            add("■ デプロイ処理との関連 (この判定の根拠)")
+            out.extend(bullet_lines(event.deploy_reasons))
+
+        if event.related_codes:
+            add("")
+            add("■ 前後に出ている EAP メッセージ")
+            for code in event.related_codes:
+                add("  - %s: %s" % (code, WFLY_CODE_NOTES.get(code, "(説明なし)")))
+
+        add("")
+        add("■ 想定される原因 (可能性の高い順)")
+        out.extend(numbered_lines(knowledge["causes"]))
+
+        add("")
+        add("■ 確認手順")
+        out.extend(numbered_lines(knowledge["checks"]))
+
+        add("")
+        add("■ 対処方法")
+        out.extend(numbered_lines(merge_fixes(knowledge["fixes"], hints)))
+
+        add("")
+        add("■ 再発防止")
+        out.extend(bullet_lines(knowledge["prevention"]))
+
+        if knowledge["refs"]:
+            add("")
+            add("■ 参考情報")
+            out.extend(bullet_lines(knowledge["refs"]))
+
+        add("")
+        add("■ 例外の連鎖とスタックトレース")
+        for depth, element in enumerate(event.chain):
+            label = chain_label(depth, element)
+            add("  [%s] %s%s" % (label, element.klass or "(不明)",
+                                 ": %s" % element.message if element.message else ""))
+            shown = element.frames if full else element.frames[:12]
+            for frame in shown:
+                add("      %s" % frame)
+            if len(element.frames) > len(shown):
+                add("      ... 他 %d フレーム (全文は Excel の「スタックトレース」シート、"
+                    "または Java 例外解析テキストを参照)"
+                    % (len(element.frames) - len(shown)))
+            if element.more:
+                add("      ... %d more (呼び出し元は上位の段と共通)" % element.more)
+
+    if full and lines:
+        out.extend(build_log_section(lines, events, max_log_rows))
+
+    add("")
+    add(HEAVY)
+    return "\n".join(out) + "\n"
+
+
+def build_log_section(lines, events, max_log_rows):
+    """Excel の「デプロイログ」シートと同じ内容をテキストで出力する。"""
+    out = ["", RULE, "デプロイログ (行番号 / サービス / 区分 / 本文)", RULE]
+    exception_indexes, frame_indexes = exception_line_indexes(events)
+    rows = []
+    for line in lines:
+        if len(rows) >= max_log_rows:
+            break
+        rows.append((line, classify_log_line(line, exception_indexes, frame_indexes)))
+
+    if not rows:
+        out.append("ログを取得できませんでした。")
+        return out
+
+    # 区分・サービス名は全角を含むため、桁揃えは表示幅で計算する。
+    service_width = max(display_width(line.service) for line, _kind in rows)
+    kind_width = max(display_width(kind) for _line, kind in rows)
+    for line, kind in rows:
+        out.append("%6d  %s%s  %s%s  %s" % (
+            line.index + 1,
+            line.service, " " * (service_width - display_width(line.service)),
+            kind, " " * (kind_width - display_width(kind)),
+            line.body,
+        ))
+    if len(rows) >= max_log_rows and len(lines) > len(rows):
+        out.append("... 出力上限 (%d 行) に達したため、残り %d 行は省略しました。"
+                   "全文はデプロイ結果ファイルを参照してください。"
+                   % (max_log_rows, len(lines) - len(rows)))
+    return out
+
+
+def exception_line_indexes(events):
+    """例外ヘッダー行と、それに続くスタックフレーム行の行番号を集める。"""
+    exception_indexes = set()
+    frame_indexes = set()
+    for event in events:
+        exception_indexes.add(event.header_line.index)
+        for line in event.block_lines[1:]:
+            frame_indexes.add(line.index)
+    return exception_indexes, frame_indexes
+
+
+def wrap_text(text, width):
+    """全角を 2 幅として折り返す。ASCII の語は途中で切らない。"""
+    lines = []
+    for paragraph in str(text).split("\n"):
+        current = ""
+        current_width = 0
+        for token in tokenize_for_wrap(paragraph):
+            token_width = display_width(token)
+            if current_width + token_width > width and current:
+                lines.append(current.rstrip())
+                # 行頭に空白だけのトークンが残らないようにする。
+                if not token.strip():
+                    current = ""
+                    current_width = 0
+                    continue
+                current = token
+                current_width = token_width
+                continue
+            current += token
+            current_width += token_width
+        lines.append(current.rstrip())
+    return lines or [""]
+
+
+def tokenize_for_wrap(text):
+    """ASCII の語・空白はひとまとまり、全角文字は 1 文字ずつのトークンにする。"""
+    tokens = []
+    buffer = ""
+    for char in text:
+        if east_asian_wide(char):
+            if buffer:
+                tokens.append(buffer)
+                buffer = ""
+            tokens.append(char)
+        elif char == " ":
+            if buffer:
+                tokens.append(buffer)
+                buffer = ""
+            tokens.append(char)
+        else:
+            buffer += char
+    if buffer:
+        tokens.append(buffer)
+    return tokens
+
+
+def display_width(text):
+    return sum(2 if east_asian_wide(char) else 1 for char in text)
+
+
+def east_asian_wide(char):
+    code = ord(char)
+    return (
+        0x1100 <= code <= 0x115F or 0x2E80 <= code <= 0xA4CF or
+        0xAC00 <= code <= 0xD7A3 or 0xF900 <= code <= 0xFAFF or
+        0xFE30 <= code <= 0xFE6F or 0xFF00 <= code <= 0xFF60 or
+        0xFFE0 <= code <= 0xFFE6 or 0x20000 <= code <= 0x3FFFD
+    )
+
+
+# =============================================================================
+# xlsx 出力 (標準ライブラリのみ)
+# =============================================================================
+
+XML_INVALID_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CELL_LIMIT = 32000
+
+
+def xml_escape(text):
+    text = XML_INVALID_RE.sub("", str(text))
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("\"", "&quot;")
+
+
+def column_name(index):
+    """0 起点の列番号を A, B, ... AA へ変換する。"""
+    name = ""
+    index += 1
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name
+
+
+class Cell(object):
+    __slots__ = ("value", "style", "numeric")
+
+    def __init__(self, value, style=0, numeric=False):
+        self.value = value
+        self.style = style
+        self.numeric = numeric
+
+
+class Sheet(object):
+    def __init__(self, name, widths=None, freeze_rows=0, autofilter_row=0, autofilter_cols=0):
+        self.name = name
+        self.widths = widths or []
+        self.freeze_rows = freeze_rows
+        self.autofilter_row = autofilter_row
+        self.autofilter_cols = autofilter_cols
+        self.rows = []
+        self.merges = []          # (行番号, 開始列, 終了列)
+
+    def add(self, cells):
+        self.rows.append(cells)
+
+    def add_notice(self, message, style=None):
+        """全列を結合した 1 行のお知らせを追加する (狭い列で縦長にならないように)。"""
+        span = max(len(self.widths), 1)
+        self.add([Cell(message, S_BODY if style is None else style)]
+                 + [Cell("", S_BODY) for _ in range(span - 1)])
+        self.merges.append((len(self.rows), 0, span - 1))
+
+    def merged_width(self, row_number):
+        """結合行の実効的な列幅 (結合した列の幅の合計) を返す。結合が無ければ None。"""
+        for number, start, end in self.merges:
+            if number == row_number:
+                return sum(float(self.widths[index])
+                           for index in range(start, min(end + 1, len(self.widths))))
+        return None
+
+
+# スタイル番号 (styles.xml の cellXfs の並びと一致させる)
+S_DEFAULT = 0
+S_TITLE = 1
+S_HEADER = 2
+S_BODY = 3
+S_LABEL = 4
+S_FATAL = 5
+S_MAJOR = 6
+S_WARN = 7
+S_MONO = 8
+S_CENTER = 9
+S_SECTION = 10
+S_OK = 11
+
+SEVERITY_STYLE = {"致命的": S_FATAL, "重大": S_MAJOR, "警告": S_WARN, "情報": S_BODY}
+
+STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="0"/>
+<fonts count="8">
+<font><sz val="11"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="16"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF9C0006"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF9C5700"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><sz val="10"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="12"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF006100"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+</fonts>
+<fills count="8">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border><left/><right/><top/><bottom/><diagonal/></border>
+<border>
+<left style="thin"><color rgb="FFBFBFBF"/></left>
+<right style="thin"><color rgb="FFBFBFBF"/></right>
+<top style="thin"><color rgb="FFBFBFBF"/></top>
+<bottom style="thin"><color rgb="FFBFBFBF"/></bottom>
+<diagonal/></border>
+</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="12">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="6" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+<xf numFmtId="0" fontId="7" fillId="7" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+<dxfs count="0"/>
+<tableStyles count="0"/>
+</styleSheet>
+"""
+
+
+# 行の高さは Excel の自動調整に任せず、内容と列幅から計算して明示する。
+# 自動調整は環境によって働かず、折り返した本文が既定の高さで切れて読めなくなるため。
+# Meiryo UI 11pt の 1 行は約 15.0pt。折り返し計算の誤差を吸収できるよう余裕を持たせる。
+ROW_LINE_HEIGHT = 16.5
+ROW_HEIGHT_MIN = 19.5
+# Excel の行高の上限 (409.5pt)。これを超える内容は 1 セルに詰め込まないよう、
+# 長文のシートは「項目ごとに 1 行」の縦持ちにして 1 セルあたりの分量を抑えている。
+ROW_HEIGHT_MAX = 409.0
+HEADER_ROW_HEIGHT = 33.0
+
+
+def wrapped_line_count(text, column_width):
+    """列幅 (Excel の文字数単位) で折り返したときに必要な行数を求める。"""
+    if text is None or text == "":
+        return 1
+    # 左右の余白とグリッド線のぶん、実際に使える幅は列幅よりわずかに狭い。
+    usable = max(float(column_width) - 1.0, 4.0)
+    total = 0
+    for line in str(text).split("\n"):
+        width = display_width(line)
+        total += 1 if width <= 0 else int(math.ceil(width / usable))
+    return max(total, 1)
+
+
+def calculate_row_height(cells, widths):
+    """行内で最も背の高いセルに合わせた行高 (pt) を返す。"""
+    lines = 1
+    for index, cell in enumerate(cells):
+        if cell is None or cell.numeric:
+            continue
+        width = widths[index] if index < len(widths) else 20
+        lines = max(lines, wrapped_line_count(cell.value, width))
+    return min(max(lines * ROW_LINE_HEIGHT, ROW_HEIGHT_MIN), ROW_HEIGHT_MAX)
+
+
+def sheet_xml(sheet):
+    out = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+           "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"]
+    if sheet.freeze_rows:
+        out.append(
+            "<sheetViews><sheetView workbookViewId=\"0\">"
+            "<pane ySplit=\"%d\" topLeftCell=\"A%d\" activePane=\"bottomLeft\" state=\"frozen\"/>"
+            "</sheetView></sheetViews>" % (sheet.freeze_rows, sheet.freeze_rows + 1)
+        )
+    out.append("<sheetFormatPr defaultRowHeight=\"%s\"/>" % ROW_HEIGHT_MIN)
+    if sheet.widths:
+        cols = ["<cols>"]
+        for index, width in enumerate(sheet.widths):
+            cols.append("<col min=\"%d\" max=\"%d\" width=\"%s\" customWidth=\"1\"/>"
+                        % (index + 1, index + 1, width))
+        cols.append("</cols>")
+        out.append("".join(cols))
+    out.append("<sheetData>")
+    for row_index, cells in enumerate(sheet.rows, 1):
+        merged_width = sheet.merged_width(row_index)
+        if sheet.freeze_rows and row_index <= sheet.freeze_rows:
+            height = HEADER_ROW_HEIGHT
+        elif merged_width is not None:
+            # 結合セルは Excel の自動調整が効かないため、結合後の幅で計算する。
+            height = calculate_row_height(cells[:1], [merged_width])
+        else:
+            height = calculate_row_height(cells, sheet.widths)
+        parts = ["<row r=\"%d\" ht=\"%.1f\" customHeight=\"1\">" % (row_index, height)]
+        for col_index, cell in enumerate(cells):
+            if cell is None:
+                continue
+            ref = "%s%d" % (column_name(col_index), row_index)
+            if cell.numeric:
+                parts.append("<c r=\"%s\" s=\"%d\"><v>%s</v></c>" % (ref, cell.style, cell.value))
+                continue
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > CELL_LIMIT:
+                value = value[:CELL_LIMIT] + "\n... (以降は省略)"
+            if not value:
+                parts.append("<c r=\"%s\" s=\"%d\"/>" % (ref, cell.style))
+                continue
+            parts.append("<c r=\"%s\" s=\"%d\" t=\"inlineStr\"><is><t xml:space=\"preserve\">%s</t></is></c>"
+                         % (ref, cell.style, xml_escape(value)))
+        parts.append("</row>")
+        out.append("".join(parts))
+    out.append("</sheetData>")
+    if sheet.autofilter_row and sheet.autofilter_cols:
+        out.append("<autoFilter ref=\"A%d:%s%d\"/>"
+                   % (sheet.autofilter_row, column_name(sheet.autofilter_cols - 1),
+                      max(len(sheet.rows), sheet.autofilter_row)))
+    # mergeCells は OOXML のスキーマ上 autoFilter の後に置く。
+    if sheet.merges:
+        merges = ["<mergeCells count=\"%d\">" % len(sheet.merges)]
+        for row_number, start, end in sheet.merges:
+            merges.append("<mergeCell ref=\"%s%d:%s%d\"/>"
+                          % (column_name(start), row_number, column_name(end), row_number))
+        merges.append("</mergeCells>")
+        out.append("".join(merges))
+    out.append("</worksheet>")
+    return "".join(out)
+
+
+def write_xlsx(path, sheets, title, creator):
+    content_types = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+                     "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+                     "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+                     "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
+                     "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+                     "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>",
+                     "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"]
+    for index in range(len(sheets)):
+        content_types.append("<Override PartName=\"/xl/worksheets/sheet%d.xml\" "
+                             "ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+                             % (index + 1))
+    content_types.append("</Types>")
+
+    root_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+        "</Relationships>"
+    )
+
+    sheet_entries = "".join(
+        "<sheet name=\"%s\" sheetId=\"%d\" r:id=\"rId%d\"/>" % (xml_escape(sheet.name), index + 1, index + 1)
+        for index, sheet in enumerate(sheets)
+    )
+    workbook = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<sheets>%s</sheets></workbook>" % sheet_entries
+    )
+
+    workbook_rels = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"]
+    for index in range(len(sheets)):
+        workbook_rels.append(
+            "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" "
+            "Target=\"worksheets/sheet%d.xml\"/>" % (index + 1, index + 1)
+        )
+    workbook_rels.append(
+        "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
+        "Target=\"styles.xml\"/>" % (len(sheets) + 1)
+    )
+    workbook_rels.append("</Relationships>")
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    core = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+        "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+        "<dc:title>%s</dc:title><dc:creator>%s</dc:creator><cp:lastModifiedBy>%s</cp:lastModifiedBy>"
+        "<dcterms:created xsi:type=\"dcterms:W3CDTF\">%s</dcterms:created>"
+        "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">%s</dcterms:modified>"
+        "</cp:coreProperties>" % (xml_escape(title), xml_escape(creator), xml_escape(creator), now, now)
+    )
+    app = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+        "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+        "<Application>%s</Application></Properties>" % xml_escape(creator)
+    )
+
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", "".join(content_types))
+        book.writestr("_rels/.rels", root_rels)
+        book.writestr("docProps/core.xml", core)
+        book.writestr("docProps/app.xml", app)
+        book.writestr("xl/workbook.xml", workbook)
+        book.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
+        book.writestr("xl/styles.xml", STYLES_XML)
+        for index, sheet in enumerate(sheets):
+            book.writestr("xl/worksheets/sheet%d.xml" % (index + 1), sheet_xml(sheet))
+
+
+def header_row(labels):
+    return [Cell(label, S_HEADER) for label in labels]
+
+
+def build_summary_sheet(meta, events, stats, scanned_services, line_count, truncated):
+    sheet = Sheet("概要", widths=[26, 92, 46], freeze_rows=0)
+    sheet.add([Cell("WAR デプロイ時 Java 例外エラー解析レポート", S_TITLE)])
+    sheet.add([])
+
+    def kv(label, value):
+        sheet.add([Cell(label, S_LABEL), Cell(value, S_BODY)])
+
+    sheet.add([Cell("1. 実行情報", S_SECTION)])
+    kv("解析日時", meta.get("analyzed_at", ""))
+    kv("処理開始日時", meta.get("run_started_at", ""))
+    kv("スクリプト", meta.get("script", "build_and_verify.sh"))
+    kv("Compose 定義", meta.get("compose_file", ""))
+    kv("ビルド対象サービス", meta.get("build_services", ""))
+    kv("起動対象サービス", meta.get("target_services", ""))
+    kv("全体結果", meta.get("overall_status", ""))
+    kv("デプロイ結果ファイル", meta.get("report_file", "") or "(未出力)")
+    kv("解析対象サービス", " ".join(scanned_services) or "(なし)")
+    kv("解析ログ行数", "%d 行" % line_count)
+    kv("ログ取得範囲", meta.get("log_scope", ""))
+    sheet.add([])
+
+    sheet.add([Cell("2. 検出サマリ", S_SECTION)])
+    kv("検出した例外", "%d 件" % stats["total"])
+    kv("デプロイ処理中の例外", "%d 件" % stats["deploy"])
+    kv("デプロイ外の例外", "%d 件" % stats["other"])
+    kv("深刻度の内訳",
+       " / ".join("%s %d 件" % (name, count) for name, count in stats["by_severity"]) or "(なし)")
+    kv("分類の内訳",
+       " / ".join("%s %d 件" % (name, count) for name, count in stats["by_category"]) or "(なし)")
+    verdict_style = S_OK if stats["total"] == 0 else SEVERITY_STYLE.get(stats["worst"], S_BODY)
+    sheet.add([Cell("総合判定", S_LABEL), Cell(stats["verdict"], verdict_style)])
+    if truncated:
+        kv("注意", "詳細分析は上限の %d 件までです。残りは件数のみ集計しています "
+                  "(--deploy-exception-limit で上限を変更できます)。" % truncated)
+    sheet.add([])
+
+    sheet.add([Cell("3. 優先して対応すべき例外", S_SECTION)])
+    if not events:
+        sheet.add([Cell("(なし)", S_BODY), Cell("Java の例外スタックトレースは検出されませんでした。", S_BODY)])
+    else:
+        sheet.add(header_row(["No", "例外クラス (根本原因)", "対応の要点"]))
+        for number, event in enumerate(events[:10], 1):
+            root = event.root()
+            knowledge = event.knowledge
+            top_fix = knowledge["fixes"][0] if knowledge["fixes"] else ""
+            sheet.add([
+                Cell(number, S_CENTER, numeric=True),
+                Cell("%s\n%s" % (root.klass or "(不明)", root.message or ""), S_BODY),
+                Cell(top_fix, S_BODY),
+            ])
+    sheet.add([])
+
+    sheet.add([Cell("4. このブックの読み方", S_SECTION)])
+    sheet.add(header_row(["シート", "内容", "使いどころ"]))
+    for name, content, usage in (
+        ("例外一覧", "検出した例外を 1 行 1 件で一覧化 (発生時刻・サービス・デプロイ対象・例外クラス・根本原因)",
+         "まず全体像を掴む。オートフィルタで深刻度やデプロイ関連を絞り込む"),
+        ("原因分析", "例外ごとの「何が起きたか」「発生の仕組み」「想定される原因」「読み取れる事実」",
+         "なぜ失敗したのかを理解する"),
+        ("対処方法", "例外ごとの確認手順・対処方法・設定例・再発防止",
+         "実際に直すときの手順書として使う"),
+        ("スタックトレース", "例外の連鎖 (Caused by) ごとの全スタックフレーム",
+         "コードのどこで失敗したかを特定する"),
+        ("デプロイログ", "デプロイ処理に関係するログ行と、その区分",
+         "時系列で前後関係を確認する"),
+    ):
+        sheet.add([Cell(name, S_LABEL), Cell(content, S_BODY), Cell(usage, S_BODY)])
+    return sheet
+
+
+LIST_COLUMNS = [
+    ("No", 6), ("判定", 20), ("深刻度", 10), ("分類", 20), ("デプロイ関連", 12),
+    ("デプロイ対象", 18), ("サービス", 14), ("コンテナ", 18), ("発生時刻", 22),
+    ("レベル", 8), ("ロガー", 34), ("スレッド", 26), ("EAP コード", 12),
+    ("例外クラス (最上位)", 40), ("例外メッセージ", 52), ("根本原因クラス", 40),
+    ("根本原因メッセージ", 52), ("アプリ内発生点", 46), ("連鎖段数", 10),
+    ("フレーム数", 10), ("一言サマリ", 60),
+]
+
+
+def build_list_sheet(events):
+    sheet = Sheet("例外一覧", widths=[width for _label, width in LIST_COLUMNS],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=len(LIST_COLUMNS))
+    sheet.add(header_row([label for label, _width in LIST_COLUMNS]))
+    for number, event in enumerate(events, 1):
+        top = event.top()
+        root = event.root()
+        knowledge = event.knowledge
+        line = event.origin_line
+        sheet.add([
+            Cell(number, S_CENTER, numeric=True),
+            Cell(event.verdict, S_CENTER),
+            Cell(knowledge["severity"], SEVERITY_STYLE.get(knowledge["severity"], S_BODY)),
+            Cell(knowledge["category"], S_BODY),
+            Cell("はい" if event.deploy_related else "いいえ", S_CENTER),
+            Cell(event.deployment or "(特定できず)", S_BODY),
+            Cell(line.service, S_BODY),
+            Cell(line.container or "(不明)", S_BODY),
+            Cell(line.timestamp() or "(不明)", S_BODY),
+            Cell(line.level or "", S_CENTER),
+            Cell(line.logger or "", S_BODY),
+            Cell(line.thread or "", S_BODY),
+            Cell(line.code or "", S_CENTER),
+            Cell(top.klass or "(不明)", S_BODY),
+            Cell(top.message or "", S_BODY),
+            Cell(root.klass or "(不明)", S_BODY),
+            Cell(root.message or "", S_BODY),
+            Cell(event.app_frame(PLATFORM_PACKAGE_PREFIXES) or "(なし)", S_BODY),
+            Cell(len(event.chain), S_CENTER, numeric=True),
+            Cell(event.frame_count(), S_CENTER, numeric=True),
+            Cell(one_line_summary(event), S_BODY),
+        ])
+    if not events:
+        sheet.add_notice("例外は検出されませんでした。")
+    return sheet
+
+
+def chain_label(depth, element):
+    if depth == 0:
+        return "最上位"
+    if element.kind == "suppressed":
+        return "Suppressed"
+    return "Caused by (%d 段目)" % depth
+
+
+def build_analysis_sheet(events):
+    """原因分析は「1 例外 × 1 項目 = 1 行」の縦持ちにする。
+
+    横持ちで 1 セルへ長文を詰めると、Excel の行高上限 (409.5pt) を超えた分が
+    表示されず読めなくなる。項目ごとに行を分けることで、どの内容も必ず収まる。
+    """
+    columns = [("No", 6), ("例外クラス (根本原因)", 42), ("分類", 22), ("深刻度", 10),
+               ("項目", 26), ("内容", 104)]
+    sheet = Sheet("原因分析", widths=[width for _label, width in columns],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=len(columns))
+    sheet.add(header_row([label for label, _width in columns]))
+
+    for number, event in enumerate(events, 1):
+        knowledge = event.knowledge
+        root = event.root()
+        entries = [("何が起きたか", knowledge["headline"]),
+                   ("発生の仕組み", knowledge["mechanism"])]
+        for index, cause in enumerate(knowledge["causes"], 1):
+            entries.append(("想定される原因 %d" % index, cause))
+        for label, value in event.facts:
+            entries.append(("ログから読み取れる事実", "%s: %s" % (label, value)))
+        for summary, _fixes in matched_hints(event):
+            entries.append(("このログ特有の所見", summary))
+        for reason in event.deploy_reasons:
+            entries.append(("デプロイとの関連 (判定根拠)", reason))
+        for code in event.related_codes:
+            entries.append(("前後の EAP メッセージ",
+                            "%s: %s" % (code, WFLY_CODE_NOTES.get(code, "(説明なし)"))))
+
+        for label, value in entries:
+            sheet.add([
+                Cell(number, S_CENTER, numeric=True),
+                Cell(root.klass or "(不明)", S_BODY),
+                Cell(knowledge["category"], S_BODY),
+                Cell(knowledge["severity"], SEVERITY_STYLE.get(knowledge["severity"], S_BODY)),
+                Cell(label, S_LABEL),
+                Cell(value, S_BODY),
+            ])
+    if not events:
+        sheet.add_notice("例外は検出されませんでした。")
+    return sheet
+
+
+def build_fix_sheet(events):
+    """対処方法も「1 手順 = 1 行」の縦持ちにし、設定例が切れないようにする。"""
+    columns = [("No", 6), ("例外クラス (根本原因)", 42), ("優先度", 10),
+               ("区分", 16), ("順番", 8), ("内容", 116)]
+    sheet = Sheet("対処方法", widths=[width for _label, width in columns],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=len(columns))
+    sheet.add(header_row([label for label, _width in columns]))
+
+    for number, event in enumerate(events, 1):
+        knowledge = event.knowledge
+        root = event.root()
+        groups = [
+            ("確認手順", knowledge["checks"]),
+            ("対処方法", merge_fixes(knowledge["fixes"], matched_hints(event))),
+            ("再発防止", knowledge["prevention"]),
+            ("参考情報", knowledge["refs"]),
+        ]
+        for kind, items in groups:
+            for index, item in enumerate(items, 1):
+                sheet.add([
+                    Cell(number, S_CENTER, numeric=True),
+                    Cell(root.klass or "(不明)", S_BODY),
+                    Cell(knowledge["severity"], SEVERITY_STYLE.get(knowledge["severity"], S_BODY)),
+                    Cell(kind, S_LABEL),
+                    Cell(index, S_CENTER, numeric=True),
+                    Cell(item, S_BODY),
+                ])
+    if not events:
+        sheet.add_notice("例外は検出されませんでした。")
+    return sheet
+
+
+def build_stacktrace_sheet(events):
+    """スタックトレースは 1 フレーム 1 行に展開する (長いトレースでも切れない)。"""
+    columns = [("No", 6), ("連鎖", 18), ("例外クラス", 44), ("例外メッセージ", 56),
+               ("フレーム", 8), ("スタックフレーム", 116)]
+    sheet = Sheet("スタックトレース", widths=[width for _label, width in columns],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=len(columns))
+    sheet.add(header_row([label for label, _width in columns]))
+
+    for number, event in enumerate(events, 1):
+        for depth, element in enumerate(event.chain):
+            label = chain_label(depth, element)
+            rows = [(str(index), frame) for index, frame in enumerate(element.frames, 1)]
+            if element.more:
+                rows.append(("…", "... %d more (呼び出し元は上位の段と共通)" % element.more))
+            if not rows:
+                rows.append(("-", "(フレームなし)"))
+            for position, frame in rows:
+                sheet.add([
+                    Cell(number, S_CENTER, numeric=True),
+                    Cell(label, S_CENTER),
+                    Cell(element.klass or "(不明)", S_BODY),
+                    Cell(element.message or "", S_BODY),
+                    Cell(position, S_CENTER),
+                    Cell(frame, S_MONO),
+                ])
+    if not events:
+        sheet.add_notice("例外は検出されませんでした。")
+    return sheet
+
+
+LOG_KIND_STYLES = {
+    "デプロイ失敗": S_FATAL,
+    "エラー": S_FATAL,
+    "警告": S_WARN,
+    "デプロイ完了": S_OK,
+    "起動完了": S_OK,
+}
+
+
+def classify_log_line(line, exception_indexes, frame_indexes):
+    if line.index in frame_indexes:
+        return "スタックフレーム"
+    if line.index in exception_indexes:
+        return "例外"
+    if line.code in DEPLOY_FAILURE_CODES:
+        return "デプロイ失敗"
+    if line.code == "WFLYSRV0027":
+        return "デプロイ開始"
+    if line.code == "WFLYSRV0010":
+        return "デプロイ完了"
+    if line.code == "WFLYSRV0025":
+        return "起動完了"
+    if line.code in ("WFLYUT0021", "WFLYUT0006", "WFLYJCA0001", "WFLYJCA0018", "WFLYJCA0098"):
+        return "デプロイ関連"
+    level = (line.level or "").upper()
+    if level in ("ERROR", "FATAL", "SEVERE"):
+        return "エラー"
+    if level in ("WARN", "WARNING"):
+        return "警告"
+    return "通常"
+
+
+def build_log_sheet(lines, events, max_rows):
+    columns = [("行番号", 8), ("サービス", 14), ("コンテナ", 18), ("時刻", 18),
+               ("レベル", 8), ("区分", 14), ("EAP コード", 12), ("ログ本文", 150)]
+    sheet = Sheet("デプロイログ", widths=[width for _label, width in columns],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=len(columns))
+    sheet.add(header_row([label for label, _width in columns]))
+
+    exception_indexes, frame_indexes = exception_line_indexes(events)
+
+    written = 0
+    for line in lines:
+        kind = classify_log_line(line, exception_indexes, frame_indexes)
+        if written >= max_rows:
+            sheet.add([Cell("", S_BODY), Cell("", S_BODY), Cell("", S_BODY), Cell("", S_BODY),
+                       Cell("", S_BODY), Cell("", S_BODY), Cell("", S_BODY),
+                       Cell("... 出力上限 (%d 行) に達したため以降は省略しました。全文はデプロイ結果ファイルを参照してください。"
+                            % max_rows, S_BODY)])
+            break
+        style = LOG_KIND_STYLES.get(kind, S_BODY)
+        sheet.add([
+            Cell(line.index + 1, S_CENTER, numeric=True),
+            Cell(line.service, S_BODY),
+            Cell(line.container or "", S_BODY),
+            Cell(line.timestamp() or "", S_BODY),
+            Cell(line.level or "", S_CENTER),
+            Cell(kind, style if kind in LOG_KIND_STYLES else S_CENTER),
+            Cell(line.code or "", S_CENTER),
+            Cell(line.body, S_MONO),
+        ])
+        written += 1
+    if not lines:
+        sheet.add_notice("ログを取得できませんでした。")
+    return sheet
+
+
+# =============================================================================
+# エントリポイント
+# =============================================================================
+
+def write_text_file(path, text):
+    """UTF-8 / LF でテキストを書き出す (Windows でも CRLF へ変換させない)。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def read_meta(path):
+    meta = {}
+    if not path or not os.path.exists(path):
+        return meta
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            raw = raw.rstrip("\r\n")
+            if not raw or "\t" not in raw:
+                continue
+            key, value = raw.split("\t", 1)
+            meta[key] = value
+    return meta
+
+
+def compute_stats(events):
+    severity_counts = {}
+    category_counts = {}
+    deploy = 0
+    for event in events:
+        severity = event.knowledge["severity"]
+        category = event.knowledge["category"]
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if event.deploy_related:
+            deploy += 1
+    by_severity = sorted(severity_counts.items(),
+                         key=lambda item: SEVERITY_ORDER.get(item[0], 9))
+    by_category = sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+    worst = by_severity[0][0] if by_severity else ""
+    total = len(events)
+    if total == 0:
+        verdict = "OK (Java 例外は検出されませんでした)"
+    elif deploy and worst == "致命的":
+        verdict = "NG (デプロイ処理中に致命的な例外が発生しています)"
+    elif deploy:
+        verdict = "要確認 (デプロイ処理中に例外が発生しています)"
+    else:
+        verdict = "要確認 (デプロイ処理外で例外が発生しています)"
+    return {
+        "total": total,
+        "deploy": deploy,
+        "other": total - deploy,
+        "by_severity": by_severity,
+        "by_category": by_category,
+        "worst": worst,
+        "verdict": verdict,
+    }
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--log-file", required=True)
+    parser.add_argument("--meta-file", default="")
+    parser.add_argument("--text-out", default="")
+    parser.add_argument("--full-text-out", default="")
+    parser.add_argument("--excel-out", default="")
+    parser.add_argument("--max-exceptions", type=int, default=50)
+    parser.add_argument("--max-log-rows", type=int, default=3000)
+    args = parser.parse_args(argv)
+
+    meta = read_meta(args.meta_file)
+    meta.setdefault("analyzed_at", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    lines = read_log_lines(args.log_file)
+
+    scanned = []
+    for line in lines:
+        if line.service not in scanned:
+            scanned.append(line.service)
+
+    events = collect_exception_events(lines)
+    deployment_names = resolve_deployment_names(lines)
+    phase_bounds = deploy_phase_bounds(lines)
+    deploy_failed = any(line.code in DEPLOY_FAILURE_CODES for line in lines)
+
+    for event in events:
+        classify_deploy_relation(event, lines, deployment_names, phase_bounds)
+        chain_classes = [element.klass for element in reversed(event.chain)]
+        _matched, knowledge = lookup_knowledge(chain_classes)
+        event.knowledge = knowledge
+        event.facts = extract_facts(event)
+        event.related_codes = collect_related_codes(event, lines)
+        event.verdict = determine_verdict(event, deploy_failed)
+
+    # デプロイ関連・深刻度の高いものを先に並べ、同順位は発生順に保つ。
+    events.sort(key=lambda item: (
+        0 if item.deploy_related else 1,
+        SEVERITY_ORDER.get(item.knowledge["severity"], 9),
+        item.header_line.index,
+    ))
+    # 集計は検出した全件から求め、詳細分析だけを上限までに絞る。
+    # (件数そのものを取りこぼすと、レポートの総合判定が実態とずれるため)
+    stats = compute_stats(events)
+    truncated = 0
+    if len(events) > args.max_exceptions:
+        truncated = args.max_exceptions
+        events = events[:args.max_exceptions]
+    text = build_text_report(meta, events, stats, scanned, len(lines), truncated)
+
+    if args.text_out:
+        write_text_file(args.text_out, text)
+    elif not args.full_text_out:
+        sys.stdout.write(text)
+
+    # Excel と同じ情報量 (全スタックフレーム + デプロイログ) のテキストを別に出す。
+    if args.full_text_out:
+        full_text = build_text_report(meta, events, stats, scanned, len(lines), truncated,
+                                      lines=lines, full=True, max_log_rows=args.max_log_rows)
+        write_text_file(args.full_text_out, full_text)
+
+    if args.excel_out:
+        sheets = [
+            build_summary_sheet(meta, events, stats, scanned, len(lines), truncated),
+            build_list_sheet(events),
+            build_analysis_sheet(events),
+            build_fix_sheet(events),
+            build_stacktrace_sheet(events),
+            build_log_sheet(lines, events, args.max_log_rows),
+        ]
+        write_xlsx(args.excel_out, sheets,
+                   "WAR デプロイ時 Java 例外エラー解析", "build_and_verify.sh")
+
+    # 検出件数を呼び出し元 (シェル) へ返す。
+    sys.stderr.write("DEPLOY_EXCEPTION_TOTAL=%d\n" % stats["total"])
+    sys.stderr.write("DEPLOY_EXCEPTION_DEPLOY=%d\n" % stats["deploy"])
+    sys.stderr.write("DEPLOY_EXCEPTION_WORST=%s\n" % (stats["worst"] or "-"))
+    sys.stderr.write("DEPLOY_EXCEPTION_VERDICT=%s\n" % stats["verdict"])
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception as exc:  # 解析の失敗でビルド全体を止めない
+        sys.stderr.write("[ERROR] Java 例外解析に失敗しました: %s\n" % exc)
+        raise SystemExit(3)
+DEPLOY_EXCEPTION_ANALYZER_PY_EOF
+
+# 解析に使う Python 3 を探す。可観測性ヘルパーと同じ候補・同じ変数を使うが、
+# 見つからない場合もビルドは止めず、解析だけを省略する。
+resolve_deploy_exception_python() {
+  local candidate
+
+  [ -n "$OBSERVABILITY_PYTHON" ] && return 0
+  for candidate in python3 python /usr/libexec/platform-python; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)' \
+          >/dev/null 2>&1; then
+      OBSERVABILITY_PYTHON="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# メタ情報 1 行分を "キー<TAB>値" で書き出す。値に含まれるタブ・改行は、
+# ヘルパー側の行単位パースを壊すため空白へ置き換える。
+deploy_exception_meta_entry() {
+  local key="$1" value="$2"
+  value="$(printf '%s' "$value" | tr '\t\n\r' '   ')"
+  printf '%s\t%s\n' "$key" "$value"
+}
+
+# 解析ヘルパーへ渡すメタ情報を書き出す。Excel の「概要」シートに載る。
+write_deploy_exception_meta() {
+  local meta_file="$1" exit_status="$2" overall_status log_scope report_file
+
+  # 解析は全量レポートを書く直前に走るため、この時点ではレポートのファイル名が
+  # まだ確定していない。対で参照できるよう、確定前は予定のパスを記載する。
+  if [ -n "$BUILD_REPORT_FILE" ]; then
+    report_file="$BUILD_REPORT_FILE"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    report_file="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}.txt (出力予定)"
+  else
+    report_file=""
+  fi
+
+  if [ "$exit_status" -eq 0 ]; then
+    overall_status="成功"
+  else
+    overall_status="失敗 (exit=${exit_status})"
+  fi
+  if [ -n "$CONTAINER_LOG_SINCE" ]; then
+    log_scope="今回の compose up 以降 (--since ${CONTAINER_LOG_SINCE})"
+  else
+    log_scope="コンテナ作成時からの全期間"
+  fi
+
+  {
+    deploy_exception_meta_entry "analyzed_at" "$(now_display_time)"
+    deploy_exception_meta_entry "run_started_at" "$RUN_STARTED_AT"
+    deploy_exception_meta_entry "script" "build_and_verify.sh"
+    deploy_exception_meta_entry "compose_file" "$COMPOSE_FILE"
+    if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
+      deploy_exception_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
+    else
+      deploy_exception_meta_entry "build_services" "全サービス"
+    fi
+    if [ ${#COMPOSE_TARGET_SERVICES[@]} -gt 0 ]; then
+      deploy_exception_meta_entry "target_services" "${COMPOSE_TARGET_SERVICES[*]}"
+    else
+      deploy_exception_meta_entry "target_services" "全サービス"
+    fi
+    deploy_exception_meta_entry "overall_status" "$overall_status"
+    deploy_exception_meta_entry "report_file" "$report_file"
+    deploy_exception_meta_entry "log_scope" "$log_scope"
+  } > "$meta_file"
+}
+
+# 解析対象のログを、サービス区切り付きの 1 ファイルへ書き出す。
+# サービスをまたいでデプロイ対象や起動完了ログを取り違えないよう、
+# サービス単位に取得して区切り行を挟む。
+collect_deploy_exception_logs() {
+  local output_file="$1" service_name
+  local -a services=()
+
+  mapfile -t services < <(compose_all_service_names)
+  [ ${#services[@]} -gt 0 ] || return 1
+  : > "$output_file" || return 1
+  for service_name in "${services[@]}"; do
+    [ -n "$service_name" ] || continue
+    printf '%s%s\n' "$DEPLOY_EXCEPTION_SERVICE_MARKER" "$service_name" >> "$output_file"
+    compose_logs "$service_name" | strip_ansi_codes >> "$output_file"
+  done
+  [ -s "$output_file" ]
+}
+
+# 解析結果ファイル (Excel / テキスト) の出力先を決める。明示指定が最優先で、
+# 次に全量レポートと同じディレクトリ。どちらも無い場合は出力しない
+# (その場合も解析結果は画面と全量レポートへ出る)。
+resolve_deploy_exception_output_path() {
+  local explicit="$1" explicit_set="$2" extension="$3"
+  local report_dir base candidate counter=1
+
+  if [ "$explicit_set" = "true" ]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  [ -n "$BUILD_REPORT_DIR" ] || return 1
+  report_dir="${BUILD_REPORT_DIR%/}"
+  [ -n "$report_dir" ] || report_dir="/"
+  # 全量レポート (build_and_verify_<日時>.txt) と対で並ぶ名前にする。
+  base="build_and_verify_${RUN_TIMESTAMP}_java_exceptions"
+  candidate="${report_dir}/${base}.${extension}"
+  while [ -e "$candidate" ]; do
+    candidate="${report_dir}/${base}_${counter}.${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+# 出力先を解決し、親ディレクトリまで作成する。作成できない場合は空を返して
+# その形式の出力だけを諦める (解析そのものは継続する)。
+prepare_deploy_exception_output() {
+  local explicit="$1" explicit_set="$2" extension="$3" label="$4" path=""
+
+  if path="$(resolve_deploy_exception_output_path "$explicit" "$explicit_set" "$extension")" \
+      && [ -n "$path" ]; then
+    if ! mkdir -p -- "$(dirname -- "$path")" 2>/dev/null; then
+      warn "Java 例外解析${label}の出力先を作成できませんでした: $(dirname -- "$path")"
+      path=""
+    fi
+  else
+    path=""
+  fi
+  printf '%s\n' "$path"
+}
+
+# ヘルパーが標準エラーへ返す集計値を読み取る。
+read_deploy_exception_summary() {
+  local summary_file="$1" line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      DEPLOY_EXCEPTION_TOTAL=*)   DEPLOY_EXCEPTION_TOTAL="${line#*=}" ;;
+      DEPLOY_EXCEPTION_DEPLOY=*)  DEPLOY_EXCEPTION_DEPLOY_TOTAL="${line#*=}" ;;
+      DEPLOY_EXCEPTION_WORST=*)   DEPLOY_EXCEPTION_WORST="${line#*=}" ;;
+      DEPLOY_EXCEPTION_VERDICT=*) DEPLOY_EXCEPTION_VERDICT="${line#*=}" ;;
+    esac
+  done < "$summary_file"
+}
+
+# デプロイ処理のログから Java 例外を解析し、画面表示・Excel 出力を行う。
+# 成功経路 (主処理の末尾) と失敗経路 (EXIT トラップ) の双方から呼ばれるため、
+# 二重に実行しないよう DEPLOY_EXCEPTION_ANALYZED で守る。コンテナを削除する前に
+# 呼ぶ必要がある (compose logs が取得できなくなるため)。
+analyze_war_deploy_exceptions() {
+  local exit_status="${1:-0}"
+  local log_file="" meta_file="" summary_file="" excel_path="" text_path="" line=""
+  local analyzer_status=0
+  local -a analyzer_args=()
+
+  [ "$DEPLOY_EXCEPTION_ANALYZED" = "true" ] && return 0
+
+  if [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
+    DEPLOY_EXCEPTION_ANALYZED="true"
+    DEPLOY_EXCEPTION_SKIP_REASON="--no-deploy-exception-analysis が指定されたため解析していません。"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    DEPLOY_EXCEPTION_ANALYZED="true"
+    DEPLOY_EXCEPTION_SKIP_REASON="DRY-RUN のため解析していません。"
+    log "[DRY-RUN] WAR デプロイ時 Java 例外解析をスキップします。"
+    return 0
+  fi
+  if [ "$STARTED_CONTAINER" != "true" ]; then
+    DEPLOY_EXCEPTION_ANALYZED="true"
+    DEPLOY_EXCEPTION_SKIP_REASON="コンテナを起動していないため、デプロイ処理のログがありません。"
+    return 0
+  fi
+  if ! resolve_deploy_exception_python; then
+    DEPLOY_EXCEPTION_ANALYZED="true"
+    DEPLOY_EXCEPTION_SKIP_REASON="解析に必要な Python 3 が見つかりませんでした (python3 / python / /usr/libexec/platform-python)。"
+    warn "WAR デプロイ時 Java 例外解析をスキップしました: Python 3 が見つかりません。"
+    return 0
+  fi
+  DEPLOY_EXCEPTION_ANALYZED="true"
+
+  if ! log_file="$(mktemp 2>/dev/null)" \
+      || ! meta_file="$(mktemp 2>/dev/null)" \
+      || ! summary_file="$(mktemp 2>/dev/null)" \
+      || ! DEPLOY_EXCEPTION_TEXT_FILE="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$log_file" "$meta_file" "$summary_file" "$DEPLOY_EXCEPTION_TEXT_FILE"
+    DEPLOY_EXCEPTION_TEXT_FILE=""
+    DEPLOY_EXCEPTION_SKIP_REASON="解析用の一時ファイルを作成できませんでした。"
+    warn "WAR デプロイ時 Java 例外解析用の一時ファイルを作成できませんでした。"
+    return 1
+  fi
+
+  if ! collect_deploy_exception_logs "$log_file"; then
+    rm -f -- "$log_file" "$meta_file" "$summary_file" "$DEPLOY_EXCEPTION_TEXT_FILE"
+    DEPLOY_EXCEPTION_TEXT_FILE=""
+    DEPLOY_EXCEPTION_SKIP_REASON="Compose サービスのログを取得できなかったため解析していません。"
+    warn "WAR デプロイ時 Java 例外解析をスキップしました: Compose サービスのログを取得できません。"
+    return 1
+  fi
+  write_deploy_exception_meta "$meta_file" "$exit_status"
+
+  excel_path="$(prepare_deploy_exception_output \
+      "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel")"
+  text_path="$(prepare_deploy_exception_output \
+      "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト")"
+
+  analyzer_args=(
+    --log-file "$log_file"
+    --meta-file "$meta_file"
+    --text-out "$DEPLOY_EXCEPTION_TEXT_FILE"
+    --max-exceptions "$DEPLOY_EXCEPTION_MAX"
+    --max-log-rows "$DEPLOY_EXCEPTION_LOG_ROWS"
+  )
+  [ -n "$excel_path" ] && analyzer_args+=(--excel-out "$excel_path")
+  [ -n "$text_path" ] && analyzer_args+=(--full-text-out "$text_path")
+
+  # レポートは日本語と罫線文字を含むため、ロケール既定の文字コード (Windows の
+  # cp932 等) で出力が落ちないよう UTF-8 を明示する。
+  printf '%s' "$DEPLOY_EXCEPTION_ANALYZER_PY" \
+    | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" - "${analyzer_args[@]}" 2> "$summary_file"
+  analyzer_status=$?
+  if [ "$analyzer_status" -ne 0 ]; then
+    warn "WAR デプロイ時 Java 例外解析に失敗しました (exit=${analyzer_status})。"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] && diag "  $line"
+    done < "$summary_file"
+    DEPLOY_EXCEPTION_SKIP_REASON="解析ヘルパーの実行に失敗しました (exit=${analyzer_status})。"
+    rm -f -- "$log_file" "$meta_file" "$summary_file" "$DEPLOY_EXCEPTION_TEXT_FILE"
+    DEPLOY_EXCEPTION_TEXT_FILE=""
+    return 1
+  fi
+  read_deploy_exception_summary "$summary_file"
+  rm -f -- "$log_file" "$meta_file" "$summary_file"
+
+  if [ -n "$excel_path" ] && [ -s "$excel_path" ]; then
+    DEPLOY_EXCEPTION_EXCEL_FILE="$excel_path"
+  fi
+  if [ -n "$text_path" ] && [ -s "$text_path" ]; then
+    DEPLOY_EXCEPTION_TEXT_OUTPUT="$text_path"
+  fi
+
+  show_war_deploy_exception_analysis
+  return 0
+}
+
+# 解析結果を画面へ出す。例外を検出した場合のみ全文を表示し、
+# 0 件のときは 1 行の結果表示に留める (成功時のログを埋もれさせないため)。
+show_war_deploy_exception_analysis() {
+  # 検出件数は解析ヘルパーの集計をそのまま伝える。本文が空でも件数は隠さない。
+  if [ "${DEPLOY_EXCEPTION_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+    if [ -s "$DEPLOY_EXCEPTION_TEXT_FILE" ]; then
+      diag ""
+      cat -- "$DEPLOY_EXCEPTION_TEXT_FILE" >&2
+    fi
+    err "WAR デプロイ時に Java の例外を ${DEPLOY_EXCEPTION_TOTAL} 件検出しました (デプロイ処理中: ${DEPLOY_EXCEPTION_DEPLOY_TOTAL} 件)。"
+    err "  判定: ${DEPLOY_EXCEPTION_VERDICT}"
+  else
+    log "WAR デプロイ時の Java 例外は検出されませんでした。"
+  fi
+  if [ -n "$DEPLOY_EXCEPTION_EXCEL_FILE" ]; then
+    log "Java 例外解析の Excel ブックを出力しました: $DEPLOY_EXCEPTION_EXCEL_FILE"
+  fi
+  if [ -n "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ]; then
+    log "Java 例外解析のテキストを出力しました: $DEPLOY_EXCEPTION_TEXT_OUTPUT"
+  fi
+  if [ -z "$DEPLOY_EXCEPTION_EXCEL_FILE" ] && [ -z "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ] \
+      && [ -z "$BUILD_REPORT_DIR" ]; then
+    log "Java 例外解析のファイル出力は、--report-dir または --deploy-exception-excel / --deploy-exception-text の指定時に行います。"
+  fi
+  return 0
+}
+
+# 全量レポートへ Java 例外解析の結果を追記する。
+append_deploy_exception_report() {
+  local report_file="$1"
+
+  if [ -z "$DEPLOY_EXCEPTION_TEXT_FILE" ] || [ ! -s "$DEPLOY_EXCEPTION_TEXT_FILE" ]; then
+    printf '%s\n' "${DEPLOY_EXCEPTION_SKIP_REASON:-デプロイ処理のログを取得できなかったため解析していません。}" \
+        >> "$report_file"
+    return 0
+  fi
+  if [ -n "$DEPLOY_EXCEPTION_EXCEL_FILE" ]; then
+    printf 'Excel ブック  : %s\n' "$DEPLOY_EXCEPTION_EXCEL_FILE" >> "$report_file"
+  else
+    printf 'Excel ブック  : (未出力)\n' >> "$report_file"
+  fi
+  if [ -n "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ]; then
+    printf 'テキスト      : %s (Excel と同じ内容。全スタックフレームとデプロイログを含む)\n' \
+        "$DEPLOY_EXCEPTION_TEXT_OUTPUT" >> "$report_file"
+  else
+    printf 'テキスト      : (未出力)\n' >> "$report_file"
+  fi
+  printf '取得範囲      : 終了ログ (SIGTERM 後) を取得する前のデプロイ処理ログ\n' >> "$report_file"
+  printf '\n' >> "$report_file"
+  cat -- "$DEPLOY_EXCEPTION_TEXT_FILE" >> "$report_file"
+  return 0
+}
+
 append_compose_service_logs_report() {
   local report_file="$1"
   local service_name index=0 normalized_logs line_count containers log_scope
@@ -8809,6 +12078,7 @@ write_build_report() {
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
+    printf '                デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -8904,6 +12174,11 @@ write_build_report() {
     append_compose_service_logs_report "$report_tmp"
   fi
 
+  # WAR デプロイ時の Java 例外解析。解析自体はコンテナを停止する前 (cleanup_all が
+  # この関数を呼ぶ直前) に済ませてあり、ここではその結果を書き出すだけとする。
+  printf '\n[10] WAR デプロイ時 Java 例外解析\n' >> "$report_tmp"
+  append_deploy_exception_report "$report_tmp"
+
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートを確定できませんでした: $candidate"
@@ -8923,6 +12198,11 @@ cleanup_all() {
 
   # コンテナの停止・Docker 全体削除より前に、取得可能な全量情報を保存する。
   # (エラー時の終了ログ取得は、レポート内でログ本文を集める直前に実行される)
+  #
+  # WAR デプロイ時の Java 例外解析は、全量レポートへ結果を載せるため、
+  # レポート出力より先に実行する。成功経路では主処理の末尾で実行済みのため、
+  # ここでの呼び出しは何もしない (二重実行の防止は関数側で行う)。
+  analyze_war_deploy_exceptions "$original_status"
   if ! write_build_report "$original_status"; then
     cleanup_status=1
   fi
@@ -8941,6 +12221,8 @@ cleanup_all() {
   fi
   teardown_container
   cleanup_copied_files
+  # 解析結果の一時ファイルは、全量レポートへ転記し終えたここで削除する。
+  [ -n "$DEPLOY_EXCEPTION_TEXT_FILE" ] && rm -f "$DEPLOY_EXCEPTION_TEXT_FILE"
   [ -n "$URL_BODY_FILE" ] && rm -f "$URL_BODY_FILE"
   [ -n "$INTERACTIVE_HTTP_BODY_FILE" ] && rm -f "$INTERACTIVE_HTTP_BODY_FILE"
   [ -n "$HEALTHCHECK_DIAGNOSTIC_FILE" ] && rm -f "$HEALTHCHECK_DIAGNOSTIC_FILE"
@@ -9114,6 +12396,9 @@ if [ "$NEED_CONTAINER" != "true" ]; then
   if [ "$BUILD_REPORT_DIR_SET" = "true" ]; then
     warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
+  if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
+    warn "WAR デプロイ時 Java 例外解析はコンテナ起動を伴う動作確認時のみ実行されます。--verify-startup または --verify-url を併用してください。"
+  fi
   if [ "$CWAGENT_VERIFY_ACTIVE" = "true" ]; then
     # 送信先を特定できている場合のみ、送達が未確認であることを明示する。
     if [ ${#CWAGENT_EXPECTED_DESTINATIONS[@]} -gt 0 ]; then
@@ -9170,6 +12455,11 @@ show_verified_container_directory_trees
 show_verified_container_deployment_structures
 show_verified_container_jvm_parameters
 show_verified_container_otel_settings
+
+# WAR のデプロイ処理で Java の例外が投げられていないかを解析する。
+# 起動確認が成功していても、デプロイ済みアプリの初期化で例外が出ている
+# ことがあるため、成功経路でも必ず実行する。
+analyze_war_deploy_exceptions 0
 
 # jboss-cli が生成した standalone.xml と Elytron CredentialStore まで確認し、
 # ビルド前の段と合わせて伝搬検証の結果をまとめて出力する。

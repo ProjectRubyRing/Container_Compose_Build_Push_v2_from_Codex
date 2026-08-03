@@ -47,6 +47,21 @@ assert_matches() {
   grep -Eq -- "$pattern" "$file" || fail "expected /$pattern/ in $file"
 }
 
+# 全量レポート (build_and_verify_<日時>.txt) だけを DIR から取り出し、REPORT_FILES へ入れる。
+# 同じディレクトリには Java 例外解析のテキスト
+# (build_and_verify_<日時>_java_exceptions.txt) も出力されるため、素の glob では
+# 2 件に増えてしまう。レポートの件数を数えるテストはこの関数を使う。
+collect_report_files() {
+  local dir="$1" path
+  REPORT_FILES=()
+  for path in "$dir"/build_and_verify_*.txt; do
+    case "$path" in
+      *_java_exceptions.txt) continue ;;
+    esac
+    [ -f "$path" ] && REPORT_FILES+=("$path")
+  done
+}
+
 assert_before() {
   local file="$1" first="$2" second="$3" first_line second_line
   first_line="$(grep -nF -- "$first" "$file" | head -n 1 | cut -d: -f1 || true)"
@@ -218,7 +233,8 @@ assert_matches "$FAKE_DOCKER_CALLS" 'exec cid-app find / .* -path /afs .* -path 
 assert_not_contains "$FAKE_DOCKER_CALLS" "-path /share "
 assert_matches "$FAKE_DOCKER_CALLS" 'exec cid-app find / -maxdepth 3 .* -type f -print0'
 
-report_files=("$TEST_TMP/reports"/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/reports"
+report_files=("${REPORT_FILES[@]}")
 [ ${#report_files[@]} -eq 1 ] && [ -f "${report_files[0]}" ] \
   || fail "expected one timestamped full build report"
 full_report="${report_files[0]}"
@@ -476,7 +492,8 @@ assert_not_contains "$failure_output" "[デプロイエラー関連]"
 assert_not_contains "$failure_output" "JNDI データソースエラー:"
 assert_not_contains "$failure_output" "アプリケーションデプロイ結果ログ"
 assert_not_contains "$failure_output" "起動完了を確認しました"
-failure_report_files=("$TEST_TMP/failure-reports"/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/failure-reports"
+failure_report_files=("${REPORT_FILES[@]}")
 [ ${#failure_report_files[@]} -eq 1 ] && [ -f "${failure_report_files[0]}" ] \
   || fail "expected one report for failed verification"
 assert_contains "${failure_report_files[0]}" "全体結果     : 失敗 (exit=1)"
@@ -544,7 +561,8 @@ assert_contains "$shutdown_logs_output" "SIGTERM 受信後に追加されたロ�
 assert_before "$shutdown_logs_output" \
   "終了 (SIGTERM) 時のコンテナログ (サービス: app" \
   "終了 (SIGTERM) 時のコンテナログ (サービス: adot-collector"
-shutdown_reports=("$TEST_TMP/shutdown-reports"/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/shutdown-reports"
+shutdown_reports=("${REPORT_FILES[@]}")
 [ ${#shutdown_reports[@]} -eq 1 ] && [ -f "${shutdown_reports[0]}" ] \
   || fail "expected one report for unhealthy dependency scenario"
 # 全量レポートのログ本文も、SIGTERM 送出後に取得した終了処理込みのものとなる。
@@ -601,7 +619,8 @@ if (
 fi
 unset FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
 assert_contains "$build_failure_output" "compose build に失敗しました"
-build_failure_reports=("$TEST_TMP/build-failure-reports"/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/build-failure-reports"
+build_failure_reports=("${REPORT_FILES[@]}")
 [ ${#build_failure_reports[@]} -eq 1 ] && [ -f "${build_failure_reports[0]}" ] \
   || fail "expected one report for failed compose build"
 assert_contains "${build_failure_reports[0]}" "全体結果     : 失敗 (exit=1)"
@@ -1420,7 +1439,8 @@ assert_not_contains "$jboss_match_output" "[不一致"
 assert_contains "$jboss_match_output" "伝搬検証が完了しました (不一致なし)"
 
 # 全量レポートにも同じ内容が残ること
-jboss_report_files=("$TEST_TMP"/jboss-reports/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/jboss-reports"
+jboss_report_files=("${REPORT_FILES[@]}")
 [ -f "${jboss_report_files[0]}" ] || fail "jboss password report was not created"
 assert_contains "${jboss_report_files[0]}" "[7] JBoss マスターパスワードの伝搬検証"
 assert_contains "${jboss_report_files[0]}" "総合判定      : 全段一致"
@@ -1636,7 +1656,8 @@ assert_contains "$FAKE_DOCKER_CALLS" "exec cid-cwagent cat /etc/cwagentconfig/cw
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:18480/__admin/requests?limit=100"
 
 # 全量レポートにも検証結果が残ること
-cwagent_report_files=("$TEST_TMP"/cwagent-reports/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/cwagent-reports"
+cwagent_report_files=("${REPORT_FILES[@]}")
 [ -f "${cwagent_report_files[0]}" ] || fail "cwagent verification report was not created"
 assert_contains "${cwagent_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)"
 assert_contains "${cwagent_report_files[0]}" "  - log group=/local/myapp/efs/app-front / log stream=front-local / file=/mnt/logs/app-front*.log"
@@ -1681,7 +1702,8 @@ assert_not_contains "$cwagent_no_report_output" "[OK] ログイベントの送�
 assert_not_contains "$FAKE_CURL_CALLS" "__admin/requests"
 # 情報の段は総合判定を曇らせないこと
 assert_contains "$cwagent_no_report_output" "総合判定: 全段 OK"
-cwagent_no_report_files=("$TEST_TMP"/cwagent-no-report-reports/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/cwagent-no-report-reports"
+cwagent_no_report_files=("${REPORT_FILES[@]}")
 [ -f "${cwagent_no_report_files[0]}" ] || fail "cwagent no-delivery-report report was not created"
 assert_contains "${cwagent_no_report_files[0]}" "[情報] ログイベントの送達"
 
@@ -1770,7 +1792,8 @@ assert_contains "$cwagent_create_group_output" "[OK] ログイベントの送達
 assert_contains "$cwagent_create_group_output" "総合判定: 全段 OK"
 assert_contains "$cwagent_create_group_output" "request completed token=[REDACTED]"
 assert_not_contains "$cwagent_create_group_output" "dummy-secret"
-cwagent_create_report_files=("$TEST_TMP"/cwagent-create-reports/build_and_verify_*.txt)
+collect_report_files "$TEST_TMP/cwagent-create-reports"
+cwagent_create_report_files=("${REPORT_FILES[@]}")
 [ -f "${cwagent_create_report_files[0]}" ] || fail "cwagent auto creation report was not created"
 assert_contains "${cwagent_create_report_files[0]}" \
   "自動作成した log group: /local/myapp/efs/app-front /local/myapp/efs/app-back"
@@ -1987,4 +2010,287 @@ if (
 fi
 assert_contains "$cwagent_option_error_output" "--cwagent-delivery-target には auto、mock または aws を指定してください: other"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, and Docker cleanup scenarios\n'
+# =============================================================================
+# WAR デプロイ時の Java 例外解析
+# =============================================================================
+# デプロイ処理で Java の例外が投げられたログを与え、
+#   - 例外の連鎖 (Caused by) をたどって根本原因の例外クラスを特定すること
+#   - 例外クラスに応じた原因分析と対処提案を画面へ出すこと
+#   - 全量レポートの [10] へ同じ内容を残すこと
+#   - デプロイ結果ファイルとは別に Excel ブックを追加出力すること
+# を確認する。base はビルド専用でコンテナを持たないため、解析対象は app だけにする。
+deploy_exception_output="$TEST_TMP/deploy-exception.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-reports" \
+    --suppress-removed-logs
+) >"$deploy_exception_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_output" >&2
+  fail "java exception fixture unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+# 解析ヘルパーは Python 3 を必要とする。無い環境では解析を省略した旨だけを確認する。
+if grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_output"; then
+  printf 'SKIP: Java exception analysis assertions (Python 3 is unavailable)\n'
+else
+  # --- 画面出力: 検出サマリと判定 ---
+  assert_contains "$deploy_exception_output" "WAR デプロイ時 Java 例外解析"
+  assert_contains "$deploy_exception_output" "検出した例外  : 2 件 (デプロイ処理中: 2 件 / デプロイ外: 0 件)"
+  assert_contains "$deploy_exception_output" "総合判定      : NG (デプロイ処理中に致命的な例外が発生しています)"
+  assert_contains "$deploy_exception_output" "WAR デプロイ時に Java の例外を 2 件検出しました (デプロイ処理中: 2 件)。"
+
+  # --- 例外 1: StartException に包まれた Weld の未解決依存を根本原因として扱うこと ---
+  assert_contains "$deploy_exception_output" "[例外 1/2] org.jboss.msc.service.StartException"
+  assert_contains "$deploy_exception_output" "判定: デプロイ失敗の原因 / 深刻度: 致命的 / 分類: CDI (Weld)"
+  assert_contains "$deploy_exception_output" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  assert_contains "$deploy_exception_output" "デプロイ対象  : orders.war"
+  assert_contains "$deploy_exception_output" "アプリ内発生点: at com.example.orders.OrderService.<init>(OrderService.java:31)"
+  assert_contains "$deploy_exception_output" "■ 発生の仕組み (なぜこの例外になるのか)"
+  assert_contains "$deploy_exception_output" "■ 対処方法"
+  assert_contains "$deploy_exception_output" "実装クラスへスコープアノテーションを付ける"
+
+  # --- 例外 2: ログ本文とは別行に出た例外も、直前のログ行から発生時刻等を引き継ぐこと ---
+  assert_contains "$deploy_exception_output" "[例外 2/2] java.lang.ClassNotFoundException"
+  assert_contains "$deploy_exception_output" "分類: クラスロード・依存関係"
+  assert_contains "$deploy_exception_output" "発生日時      : 09:18:00,250"
+  assert_contains "$deploy_exception_output" "ロガー        : com.example.orders.Bootstrap"
+  assert_contains "$deploy_exception_output" "見つからないクラス"
+  assert_contains "$deploy_exception_output" "com.example.orders.jdbc.LegacyDriver"
+  assert_contains "$deploy_exception_output" "jboss-deployment-structure.xml"
+
+  # --- EAP のメッセージコードと突き合わせて、デプロイ失敗の根拠を示すこと ---
+  assert_contains "$deploy_exception_output" "WFLYCTL0080: 起動できなかったサービス (Failed services) の一覧です。"
+  assert_contains "$deploy_exception_output" "WFLYSRV0021: デプロイが巻き戻されました。"
+
+  # --- 全量レポート [10] へ同じ解析結果を残すこと ---
+  collect_report_files "$TEST_TMP/deploy-exception-reports"
+  deploy_exception_reports=("${REPORT_FILES[@]}")
+  [ ${#deploy_exception_reports[@]} -eq 1 ] && [ -f "${deploy_exception_reports[0]}" ] \
+    || fail "expected one report for the java exception scenario"
+  assert_contains "${deploy_exception_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
+  assert_contains "${deploy_exception_reports[0]}" "デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)"
+  assert_contains "${deploy_exception_reports[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  assert_before "${deploy_exception_reports[0]}" \
+    "[9] Compose サービス別ログ (全サービス・全行)" "[10] WAR デプロイ時 Java 例外解析"
+
+  # --- デプロイ結果ファイルとは別に Excel ブックを追加出力すること ---
+  deploy_exception_books=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#deploy_exception_books[@]} -eq 1 ] && [ -s "${deploy_exception_books[0]}" ] \
+    || fail "expected one java exception workbook next to the deploy report"
+  assert_contains "$deploy_exception_output" \
+    "Java 例外解析の Excel ブックを出力しました: ${deploy_exception_books[0]}"
+  assert_contains "${deploy_exception_reports[0]}" "Excel ブック  : ${deploy_exception_books[0]}"
+
+  # --- Excel と同じ内容をテキストファイルでも追加出力すること ---
+  deploy_exception_texts=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ${#deploy_exception_texts[@]} -eq 1 ] && [ -s "${deploy_exception_texts[0]}" ] \
+    || fail "expected one java exception text file next to the deploy report"
+  assert_contains "$deploy_exception_output" \
+    "Java 例外解析のテキストを出力しました: ${deploy_exception_texts[0]}"
+  assert_contains "${deploy_exception_reports[0]}" "テキスト      : ${deploy_exception_texts[0]}"
+  # テキストは画面表示と同じ分析に加えて、全スタックフレームと区分付きデプロイログを含む。
+  assert_contains "${deploy_exception_texts[0]}" "総合判定      : NG (デプロイ処理中に致命的な例外が発生しています)"
+  assert_contains "${deploy_exception_texts[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  assert_contains "${deploy_exception_texts[0]}" "■ 対処方法"
+  assert_contains "${deploy_exception_texts[0]}" "at com.example.orders.OrderService.<init>(OrderService.java:31)"
+  assert_contains "${deploy_exception_texts[0]}" "デプロイログ (行番号 / サービス / 区分 / 本文)"
+  assert_contains "${deploy_exception_texts[0]}" "デプロイ失敗"
+  assert_contains "${deploy_exception_texts[0]}" "スタックフレーム"
+  # 解析結果のテキストなので、ANSI 色コードは含めない。
+  assert_not_contains "${deploy_exception_texts[0]}" $'\033['
+
+  # xlsx は ZIP なので、必須パートとシート名が入っているかを中身で確認する。
+  workbook_entries="$(unzip -Z1 "${deploy_exception_books[0]}" 2>/dev/null || true)"
+  if [ -z "$workbook_entries" ]; then
+    printf 'SKIP: workbook content assertions (unzip is unavailable)\n'
+  else
+    for required_part in "[Content_Types].xml" "xl/workbook.xml" "xl/styles.xml" \
+        "xl/worksheets/sheet1.xml" "xl/worksheets/sheet6.xml"; do
+      printf '%s\n' "$workbook_entries" | grep -Fqx -- "$required_part" \
+        || fail "expected '$required_part' in ${deploy_exception_books[0]}"
+    done
+    workbook_xml="$(unzip -p "${deploy_exception_books[0]}" xl/workbook.xml)"
+    for required_sheet in "概要" "例外一覧" "原因分析" "対処方法" "スタックトレース" "デプロイログ"; do
+      case "$workbook_xml" in
+        *"name=\"${required_sheet}\""*) ;;
+        *) fail "expected sheet '$required_sheet' in ${deploy_exception_books[0]}" ;;
+      esac
+    done
+    # 「概要」シートには実行情報と判定が、「対処方法」シートには手順が入る。
+    summary_sheet_xml="$(unzip -p "${deploy_exception_books[0]}" xl/worksheets/sheet1.xml)"
+    for required_text in "WAR デプロイ時 Java 例外エラー解析レポート" \
+        "NG (デプロイ処理中に致命的な例外が発生しています)" \
+        "org.jboss.weld.exceptions.DeploymentException"; do
+      case "$summary_sheet_xml" in
+        *"$required_text"*) ;;
+        *) fail "expected '$required_text' in the summary sheet of ${deploy_exception_books[0]}" ;;
+      esac
+    done
+    fix_sheet_xml="$(unzip -p "${deploy_exception_books[0]}" xl/worksheets/sheet4.xml)"
+    case "$fix_sheet_xml" in
+      *"jboss-deployment-structure.xml"*) ;;
+      *) fail "expected remediation steps in the fix sheet of ${deploy_exception_books[0]}" ;;
+    esac
+    # フォントは Meiryo UI で統一し、他のフォント名は残さない。
+    styles_xml="$(unzip -p "${deploy_exception_books[0]}" xl/styles.xml)"
+    case "$styles_xml" in
+      *'<name val="Meiryo UI"/>'*) ;;
+      *) fail "expected Meiryo UI fonts in ${deploy_exception_books[0]}" ;;
+    esac
+    case "$styles_xml" in
+      *'Yu Gothic'*|*'Consolas'*|*'Calibri'*)
+        fail "unexpected non-Meiryo UI font in ${deploy_exception_books[0]}" ;;
+    esac
+    # 見切れ防止のため、各行に計算済みの行高を持たせる。
+    case "$summary_sheet_xml" in
+      *'customHeight="1"'*) ;;
+      *) fail "expected explicit row heights in ${deploy_exception_books[0]}" ;;
+    esac
+  fi
+fi
+
+# --- 例外が無いログでは、解析結果を 1 行にとどめ、Excel は出力すること ---
+deploy_exception_clean_output="$TEST_TMP/deploy-exception-clean.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-clean-reports" \
+    --suppress-removed-logs
+) >"$deploy_exception_clean_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_clean_output" >&2
+  fail "clean fixture unexpectedly returned non-zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_clean_output"; then
+  assert_contains "$deploy_exception_clean_output" "WAR デプロイ時の Java 例外は検出されませんでした。"
+  assert_not_contains "$deploy_exception_clean_output" "■ 発生の仕組み (なぜこの例外になるのか)"
+  clean_books=("$TEST_TMP/deploy-exception-clean-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#clean_books[@]} -eq 1 ] && [ -s "${clean_books[0]}" ] \
+    || fail "expected a java exception workbook even when no exception was found"
+  clean_texts=("$TEST_TMP/deploy-exception-clean-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ${#clean_texts[@]} -eq 1 ] && [ -s "${clean_texts[0]}" ] \
+    || fail "expected a java exception text file even when no exception was found"
+  assert_contains "${clean_texts[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
+  # 例外が無くても、Excel の「デプロイログ」シートと同じ内容をテキストへ残す。
+  assert_contains "${clean_texts[0]}" "デプロイログ (行番号 / サービス / 区分 / 本文)"
+  assert_contains "${clean_texts[0]}" "起動完了"
+  collect_report_files "$TEST_TMP/deploy-exception-clean-reports"
+  clean_reports=("${REPORT_FILES[@]}")
+  assert_contains "${clean_reports[0]}" "検出した例外  : 0 件"
+  assert_contains "${clean_reports[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
+fi
+
+# --- --no-deploy-exception-analysis で解析と Excel 出力を止められること ---
+deploy_exception_off_output="$TEST_TMP/deploy-exception-off.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-off-reports" \
+    --no-deploy-exception-analysis \
+    --suppress-removed-logs
+) >"$deploy_exception_off_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_off_output" >&2
+  fail "java exception fixture unexpectedly returned zero with analysis disabled"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+assert_not_contains "$deploy_exception_off_output" "WAR デプロイ時 Java 例外解析"
+off_books=("$TEST_TMP/deploy-exception-off-reports"/build_and_verify_*_java_exceptions.xlsx)
+[ ! -e "${off_books[0]}" ] || fail "did not expect a workbook with --no-deploy-exception-analysis"
+off_texts=("$TEST_TMP/deploy-exception-off-reports"/build_and_verify_*_java_exceptions.txt)
+[ ! -e "${off_texts[0]}" ] || fail "did not expect a text file with --no-deploy-exception-analysis"
+collect_report_files "$TEST_TMP/deploy-exception-off-reports"
+off_reports=("${REPORT_FILES[@]}")
+assert_contains "${off_reports[0]}" "--no-deploy-exception-analysis が指定されたため解析していません。"
+
+# --- オプション値の検証 ---
+deploy_exception_ext_output="$TEST_TMP/deploy-exception-ext.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --deploy-exception-excel "$TEST_TMP/report.xls"
+) >"$deploy_exception_ext_output" 2>&1; then
+  cat "$deploy_exception_ext_output" >&2
+  fail "--deploy-exception-excel accepted a non-.xlsx path"
+fi
+assert_contains "$deploy_exception_ext_output" "--deploy-exception-excel には .xlsx で終わるパスを指定してください"
+
+deploy_exception_conflict_output="$TEST_TMP/deploy-exception-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --deploy-exception-excel "$TEST_TMP/report.xlsx" \
+    --no-deploy-exception-analysis
+) >"$deploy_exception_conflict_output" 2>&1; then
+  cat "$deploy_exception_conflict_output" >&2
+  fail "--deploy-exception-excel accepted --no-deploy-exception-analysis"
+fi
+assert_contains "$deploy_exception_conflict_output" \
+  "--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません。"
+
+deploy_exception_text_conflict_output="$TEST_TMP/deploy-exception-text-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --deploy-exception-text "$TEST_TMP/report.txt" \
+    --no-deploy-exception-analysis
+) >"$deploy_exception_text_conflict_output" 2>&1; then
+  cat "$deploy_exception_text_conflict_output" >&2
+  fail "--deploy-exception-text accepted --no-deploy-exception-analysis"
+fi
+assert_contains "$deploy_exception_text_conflict_output" \
+  "--deploy-exception-text と --no-deploy-exception-analysis は同時に指定できません。"
+
+deploy_exception_same_path_output="$TEST_TMP/deploy-exception-same-path.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --deploy-exception-excel "$TEST_TMP/same.xlsx" \
+    --deploy-exception-text "$TEST_TMP/same.xlsx"
+) >"$deploy_exception_same_path_output" 2>&1; then
+  cat "$deploy_exception_same_path_output" >&2
+  fail "--deploy-exception-excel and --deploy-exception-text accepted the same path"
+fi
+assert_contains "$deploy_exception_same_path_output" \
+  "--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません"
+
+deploy_exception_limit_output="$TEST_TMP/deploy-exception-limit.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --deploy-exception-limit 0
+) >"$deploy_exception_limit_output" 2>&1; then
+  cat "$deploy_exception_limit_output" >&2
+  fail "--deploy-exception-limit accepted 0"
+fi
+assert_contains "$deploy_exception_limit_output" "--deploy-exception-limit には 1 以上の整数を指定してください: 0"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, and Docker cleanup scenarios\n'
