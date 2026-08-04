@@ -9,6 +9,9 @@
 - 関連ドキュメント: [compose 版ガイド](build_and_push_guide.md) / [buildx 版ガイド](buildx_build_and_push_guide.md)
 - Excel 版: [build_and_verify_guide.xlsx](build_and_verify_guide.xlsx) — 仕様 / パラメータ / 既定で有効な動作 / 設定例 の 5 シート構成 (Meiryo UI)。
   本ファイルを更新したら `python3 docs/generate_guide_xlsx.py` で再生成してください
+- 補足資料: [build_and_verify_disk_usage.xlsx](build_and_verify_disk_usage.xlsx) — 繰り返し実行 (特に `--no-cache`) で
+  ディスク使用量が増え続ける問題の原因と、`compose.yml` 側 / スクリプト側の対策をまとめた 7 シート構成。
+  内容の修正は `docs/generate_disk_usage_xlsx.py` を編集して再実行してください
 
 ---
 
@@ -47,6 +50,8 @@
 | 9 | 全量レポートのファイル保存 | `--report-dir` |
 | 10 | 起動後の対話操作 (bash / HTTP / ログ調査) | `--keep-container-mode` |
 | 11 | 終了時の Docker 完全クリーンアップ | `--cleanup-all-docker-data` |
+| 11-2 | 世代交代した旧イメージ (dangling) の回収 | (既定で有効。無効化は `--no-reclaim-old-image`) |
+| 11-3 | 終了時のビルドキャッシュ削除・使用量の計測 | `--prune-build-cache` / `--prune-build-cache-keep` / `--disk-usage-report` |
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
 | 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
@@ -126,10 +131,14 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 2. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
 3. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
 4. teardown_container        … compose down (--keep-container 指定時は残す)
-5. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
+5. prune_build_cache         … --prune-build-cache / --prune-build-cache-keep 指定時、
+                                   ビルドキャッシュを削除 (コンテナ削除の後)
+6. report_disk_usage_at_exit … --disk-usage-report 指定時、終了時の使用量と増減を表示
+                                   (3 が実際に削除を行った場合は重複するため出さない)
+7. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
                                    (既存ファイルを強制上書きした分は削除せず、
                                     退避しておいた上書き前のファイルを復元)
-6. 一時ファイル削除          … Java 例外解析結果・URL 応答本文・HTTP ボディ・healthcheck 診断
+8. 一時ファイル削除          … Java 例外解析結果・URL 応答本文・HTTP ボディ・healthcheck 診断
 ```
 
 終了コードは、本処理が既に失敗していれば**元の終了コードを優先**します。
@@ -215,6 +224,14 @@ Java 例外解析は成功経路では主処理の末尾で、失敗経路では
 ビルド後は `docker image inspect` でローカルイメージを確認し、
 `image=... id=... created=... size=... bytes` を JST 表記でログに残します。
 
+ビルドの前後では、ディスク使用量を抑えるために次を行います (5.8-2 参照)。
+
+| タイミング | 処理 |
+| --- | --- |
+| ビルド前 | `--disk-usage-report` 指定時に使用量を測定 (増減の基準にする) |
+| ビルド前 | 世代交代の判定に使う現在のローカルイメージ ID を控える |
+| ローカルイメージ確認の直後 | ID が変わっていれば、タグを失った旧世代イメージを削除する |
+
 ### 3.3 起動確認フェーズの詳細
 
 ```mermaid
@@ -264,6 +281,10 @@ curl -s -S -m 30 -o <一時ファイル> -w '%{http_code}' -X <URL_METHOD> \
 | `--keep-container` / `--keep-container-mode` 指定 | 残す (手動停止コマンドを案内) |
 | `--cleanup-all-docker-data` 指定 | 確認フレーズ入力後、Docker 全体を削除 |
 | `--suppress-removed-logs` 指定 | `compose down` / `compose stop` の出力を抑制 |
+
+コンテナの削除後に、`--prune-build-cache` / `--prune-build-cache-keep` 指定時はビルド
+キャッシュを削除し、`--disk-usage-report` 指定時は終了時の使用量と実行前からの増減を
+表示します (5.8-2 参照)。
 
 ### 3.6 エラー終了時の終了 (SIGTERM) ログ
 
@@ -426,6 +447,21 @@ compose down (削除)
 | オプション | 値の形式 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `--cleanup-all-docker-data` | フラグ | `false` | 終了時に確認フレーズ入力のうえ、Docker context の全データを削除。`--keep-container` とは排他 |
+
+### 4.8-2 ディスク使用量の抑制
+
+検証を繰り返すと、ローカルイメージの旧世代 (dangling) とビルドキャッシュが実行のたびに
+積み上がります。`--cleanup-all-docker-data` は Docker 全体を空にするため日常の検証には
+使えないので、増えた分だけを戻す細粒度の後始末をここに用意しています。
+詳細は補足資料 [build_and_verify_disk_usage.xlsx](build_and_verify_disk_usage.xlsx) を参照してください。
+
+| オプション | 値の形式 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| (オプション不要) | — | **有効** | 旧世代イメージの回収。ビルド前後で image ID を突き合わせ、世代交代した旧 ID がどのタグからも参照されていない場合だけ削除する |
+| `--no-reclaim-old-image` | フラグ | `false` | 旧世代イメージの回収を行わない (従来どおり残す) |
+| `--prune-build-cache` | フラグ | `false` | 終了時に `docker builder prune --all --force` を実行 |
+| `--prune-build-cache-keep SIZE` | サイズ (`10GB` / `512MB`) | (なし) | 終了時に `docker builder prune --force --keep-storage SIZE` を実行。指定すると `--prune-build-cache` も暗黙に有効化 |
+| `--disk-usage-report` | フラグ | `false` | ビルド前と終了時に Docker 管理対象の使用量を測定し、実行前からの増減を表示 (削除は行わない) |
 
 ### 4.9 その他
 
@@ -628,6 +664,85 @@ AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイ
 
 > 同じ Docker daemon を使う他プロジェクトにも影響し、元に戻せません。
 
+### 5.8-2 ディスク使用量の抑制 (旧イメージ回収 / キャッシュ削除 / 使用量計測)
+
+#### 何が実行のたびに積み上がるのか
+
+| 対象 | 増える理由 | `--no-cache` 指定時 |
+| --- | --- | --- |
+| 旧世代イメージ | `compose build` は `j1/base.local` のタグを新しいイメージへ付け替えるだけで、直前の世代はタグを失った `<none>:<none>` として残る | 全レイヤが作り直され、直前世代と共有するレイヤが 1 つも無いため、**イメージ 1 個分がまるごと**積み上がる |
+| ビルドキャッシュ | BuildKit が各レイヤの結果をキャッシュレコードとして書き込む | `--no-cache` は「既存のキャッシュを**読まない**」指定であって「**書かない**」指定ではないため、毎回まったく新しいレコードが全レイヤ分書き足される |
+
+`compose down` が消すのはコンテナと Compose が作ったネットワークだけで、イメージ・ボリューム・
+ビルドキャッシュには触れません。
+
+#### 旧世代イメージの回収 (既定で有効)
+
+ビルドの前後で `docker image inspect --format '{{.Id}}'` の結果を突き合わせ、次の条件を
+**すべて**満たすときだけ旧 ID を削除します。
+
+1. ビルド前に取得できた ID がある
+2. ビルド後の ID が、ビルド前の ID と異なる (= 世代交代した)
+3. 旧 ID に紐づく `RepoTags` が 0 件 (= dangling であり、他のタグから参照されていない)
+
+`docker image prune` と違い、**今回のビルドで生じた 1 件だけ**を対象とするため、同じ
+Docker daemon を使う他プロジェクトの dangling イメージには影響しません。削除に失敗しても
+警告のみで、ビルドの成否や終了コードは変えません。
+
+| 状況 | 表示 |
+| --- | --- |
+| 削除した | `世代交代した旧イメージを削除します: <ID>` |
+| ID が変わらなかった | `ローカルイメージは世代交代していないため、削除するイメージはありません: <イメージ名>` |
+| 旧 ID にタグが残っていた | `旧世代イメージは別のタグから参照されているため残します: <ID>` |
+| 削除に失敗した | `[WARN] 旧イメージを削除できませんでした (他から使用中の可能性があります): <ID>` |
+
+世代を比較したい調査時は `--no-reclaim-old-image` で無効化できます (このとき判定用の
+`image inspect` 自体を実行しません)。
+
+> **複数サービス構成での注意**
+> 他のサービスの Dockerfile が `FROM j1/base.local` でベースイメージを参照している場合、
+> 前回の実行で作られた子イメージが旧世代のベースイメージを参照したままです。この状態では
+> Docker が削除を拒否するため (`image has dependent child images`)、警告を表示して残します。
+> 旧世代のベースイメージまで確実に回収したい場合は、子イメージ側も削除するか
+> `--prune-build-cache` と併せて定期的に `docker image prune` を実行してください。
+
+#### ビルドキャッシュの削除
+
+| 指定 | 実行するコマンド |
+| --- | --- |
+| `--prune-build-cache` | `docker builder prune --force --all` |
+| `--prune-build-cache-keep 10GB` | `docker builder prune --force --keep-storage 10GB` |
+
+EXIT トラップの中で、コンテナ削除 (`compose down`) の**後**に実行します。
+
+- 値は `10GB` / `10G` / `512MB` / `1.5GB` / バイト数の形式のみ受け付けます (不正なら `exit 2`)
+- `--keep-storage` を持たない buildx (0.17 以降は `--max-used-space` へ改名) では、
+  削除を行わず警告のみを表示します
+- **同じ Docker daemon を使う他プロジェクトのビルドキャッシュも削除されます**。
+  常設したいだけなら、`/etc/docker/daemon.json` の `builder.gc` で上限を決める方が安全です
+
+#### 使用量の計測 (`--disk-usage-report`)
+
+`docker system df` の合計をビルド前と終了時に測り、実行前からの増減を表示します
+(削除は行いません)。Docker data root を特定できる場合は空き容量も併せて表示します。
+
+```
+[... JST] Docker 使用量 (ビルド前): 2.79 GiB (docker system df による概算)
+[... JST] Docker 使用量 (終了時): 3.17 GiB (docker system df による概算)
+[... JST]   実行前からの増減: +381.47 MiB
+```
+
+`--cleanup-all-docker-data` が実際に削除を行った場合は、そちらが削除前後の容量を表示するため
+終了時の計測は行いません (二重表示の防止)。
+
+#### 使い方の目安
+
+```bash
+# 日常の検証 (増えた分をその実行のうちに戻す)
+bash build_and_verify.sh --no-cache --verify-startup \
+  --disk-usage-report --prune-build-cache-keep 10GB
+```
+
 ### 5.9 `--dry-run` の挙動
 
 | 処理 | `--dry-run` 時の動作 |
@@ -640,6 +755,9 @@ AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイ
 | `--copy-file` | コピー・上書き・退避・復元・削除を行わず予定を表示 |
 | `--report-dir` | ファイル出力をスキップ |
 | ローカルイメージ確認 | スキップ |
+| 旧世代イメージの回収 | ID の取得・削除とも行わず `[DRY-RUN] 世代交代した旧イメージの削除は行いません` と表示 |
+| `--prune-build-cache` | 削除せず `[DRY-RUN] docker builder prune ...` と実行予定を表示 |
+| `--disk-usage-report` | `docker system df` は読み取りのみのため通常どおり測定・表示する |
 | AWS 未認証 (`--jboss-password-param` 時) | 中止せず警告のみ |
 
 ---
@@ -1283,6 +1401,18 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 
 # 15) 検証後に Docker を完全クリーンアップ (確認フレーズ入力が必要)
 ./build_and_verify.sh --verify-startup --cleanup-all-docker-data
+
+# 15-2) ディスクを増やさずに --no-cache の検証を回す
+#       旧世代イメージの回収は既定で有効。ビルドキャッシュは 10GB まで残して削除し、
+#       実行前からの増減を表示する
+./build_and_verify.sh --no-cache --verify-startup \
+    --disk-usage-report --prune-build-cache-keep 10GB
+
+# 15-3) 使用量の増減だけを先に測る (削除は行わない)
+./build_and_verify.sh --no-cache --disk-usage-report
+
+# 15-4) 世代を比較したいので旧イメージを残す (調査用)
+./build_and_verify.sh --no-cache --no-reclaim-old-image
 
 # 16) build_and_push.sh 経由での呼び出し (同じ処理)
 ./build_and_push.sh --build-only --verify-startup --log-dir ./logs

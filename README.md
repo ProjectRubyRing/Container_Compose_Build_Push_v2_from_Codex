@@ -158,6 +158,10 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
 | `--cleanup-all-docker-data` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。処理終了時に確認ダイアログを表示し、承認後、現在の Docker context の全コンテナ・全イメージ・全ローカルボリューム・未使用ネットワーク・現在の daemon で削除可能な全ビルドキャッシュを削除する | `false` |
+| `--no-reclaim-old-image` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。既定で有効な「世代交代した旧イメージ (dangling) の回収」を行わない。既定ではビルド前後の image ID を突き合わせ、タグを失った旧世代だけを削除する | `false` (= 回収する) |
+| `--prune-build-cache` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。処理終了時に `docker builder prune --all --force` でビルドキャッシュを削除する | `false` |
+| `--prune-build-cache-keep SIZE` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。処理終了時に `docker builder prune --force --keep-storage SIZE` を実行し、`SIZE` (例: `10GB`) だけ残してビルドキャッシュを削除する | (なし) |
+| `--disk-usage-report` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。ビルド前と処理終了時に `docker system df` の合計を測定し、実行前からの増減を表示する (削除は行わない) | `false` |
 | `--wait-healthy` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` に `--wait` を付け、起動対象サービスが healthy (healthcheck 未定義なら running) になるまで compose 側で待ってから起動確認へ進む。依存サービスの準備完了前にアプリが起動して失敗するのを防ぐ | `false` |
 | `--wait-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--wait` の最大待機秒数。指定すると `--wait-healthy` も暗黙に有効化する | `600` |
 | `--allow-service-exit NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。起動確認中に停止していても失敗扱いにしないサービス名。繰り返し指定またはカンマ区切りで複数指定できる | (なし) |
@@ -366,6 +370,54 @@ Docker data root のファイルシステムを参照できる場合は、ホス
   行いません。
 - ビルドまたは動作確認が失敗した場合も、実処理開始後であれば終了時に同じ確認を
   行います。元の処理が失敗していた場合、その終了コードを優先します。
+
+### 実行のたびに増えるディスク使用量を抑える
+
+検証を繰り返すと、`--cleanup-all-docker-data` を使わない限り次の 2 つが積み上がります。
+
+| 対象 | 増える理由 |
+| --- | --- |
+| 旧世代のローカルイメージ | `docker compose build` は `j1/base.local` のタグを新しいイメージへ付け替えるだけで、直前の世代はタグを失った `<none>:<none>` (dangling) として残ります。`--no-cache` では全レイヤが作り直され、直前世代と共有するレイヤが 1 つも無いため、**実行のたびにイメージ 1 個分がまるごと**積み上がります |
+| BuildKit のビルドキャッシュ | `--no-cache` は「既存のキャッシュを**読まない**」指定であって「**書かない**」指定ではありません。実行のたびに全レイヤ分の新しいキャッシュレコードが書き足されます |
+
+`docker compose down` が削除するのはコンテナと Compose が作ったネットワークだけで、
+イメージ・ボリューム・ビルドキャッシュには触れません。
+
+**旧世代イメージの回収は既定で有効**です。ビルドの前後で image ID を突き合わせ、
+世代交代した旧 ID がどのタグからも参照されていない (= dangling である) 場合だけ削除します。
+`docker image prune` と違い、今回のビルドで生じた 1 件だけを対象とするため、
+同じ Docker daemon を使う他プロジェクトの dangling イメージには影響しません。
+
+```bash
+# 推奨: 増えた分をその実行のうちに戻す
+./build_and_verify.sh --no-cache --verify-startup \
+    --disk-usage-report --prune-build-cache-keep 10GB
+
+# 使用量の増減だけ先に測る (削除は行わない)
+./build_and_verify.sh --no-cache --disk-usage-report
+
+# 世代を比較したいので旧イメージを残す (調査用)
+./build_and_verify.sh --no-cache --no-reclaim-old-image
+```
+
+`--disk-usage-report` は `docker system df` の合計をビルド前と終了時に測り、
+実行前からの増減を表示します。
+
+```
+[... JST] Docker 使用量 (ビルド前): 2.79 GiB (docker system df による概算)
+[... JST] Docker 使用量 (終了時): 3.17 GiB (docker system df による概算)
+[... JST]   実行前からの増減: +381.47 MiB
+```
+
+- `--prune-build-cache` / `--prune-build-cache-keep` は、**同じ Docker daemon を使う
+  他プロジェクトのビルドキャッシュも削除します**。常設したいだけなら、
+  `/etc/docker/daemon.json` の `builder.gc` で上限を決める方が安全です。
+- `--keep-storage` を持たない buildx (0.17 以降は `--max-used-space` へ改名) では、
+  削除を行わず警告のみを表示します。
+- `compose.yml` 側の対策 (イメージを作らないビルド検証、キャッシュのレジストリ退避、
+  ログ上限など) を含む詳細は、補足資料
+  [docs/build_and_verify_disk_usage.xlsx](docs/build_and_verify_disk_usage.xlsx)
+  にまとめています。
 
 ### 複数 Compose サービスのビルド・起動
 

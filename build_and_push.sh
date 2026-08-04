@@ -272,6 +272,7 @@ arg_takes_value() {
     --jboss-secret-id|--jboss-config-file|--jboss-cli-path|--jboss-elytron-tool) return 0 ;;
     --jboss-credential-store) return 0 ;;
     --directory-tree-depth|--directory-file-limit|--deployment-dir-env|--report-dir) return 0 ;;
+    --prune-build-cache-keep) return 0 ;;
     --deploy-exception-excel|--deploy-exception-text|--deploy-exception-limit) return 0 ;;
     --cwagent-service|--cwagent-config-dir|--cwagent-delivery-target) return 0 ;;
     --cwagent-delivery-timeout|--cwagent-delivery-interval) return 0 ;;

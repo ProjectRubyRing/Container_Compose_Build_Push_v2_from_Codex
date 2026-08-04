@@ -136,6 +136,23 @@ NO_CACHE="false"                  # true: キャッシュを破棄してビル�
 DRY_RUN="false"                   # true: 実際の変更は行わず、実行内容のプレビューのみ表示
 CLEANUP_ALL_DOCKER_DATA="false"   # true: 終了時に確認後、現在の Docker context の全データを削除
 DOCKER_CLEANUP_CONFIRM_PHRASE="DELETE ALL DOCKER DATA"
+
+# ---- ディスク使用量の抑制 ---------------------------------------------------
+# compose build はローカルイメージ名のタグを新しいイメージへ付け替えるだけで、
+# 直前の世代はタグを失った <none>:<none> (dangling) として残り続ける。
+# --no-cache では全レイヤが作り直され、直前世代と共有するレイヤが 1 つも無いため、
+# 実行のたびにイメージ 1 個分がそのまま積み上がる。既定で回収する。
+# docker image prune と違い、今回のビルドで世代交代した ID だけを削除するため、
+# 同じ Docker daemon を使う他プロジェクトの dangling イメージには影響しない。
+RECLAIM_OLD_IMAGE="true"          # false (--no-reclaim-old-image): 旧世代を残す
+PREVIOUS_IMAGE_ID=""              # ビルド前の $LOCAL_IMAGE の image ID
+# BuildKit のビルドキャッシュ。--no-cache は「既存のキャッシュを読まない」指定で
+# あって「書かない」指定ではないため、実行のたびに全レイヤ分のキャッシュが増える。
+PRUNE_BUILD_CACHE="false"         # true: 終了時にビルドキャッシュを削除する
+PRUNE_BUILD_CACHE_KEEP=""         # 空: 全削除 / "10GB" 等: その量まで残す
+DISK_USAGE_REPORT="false"         # true: Docker 管理対象の使用量と増減を表示する
+DISK_USAGE_BEFORE=""              # 最初に測定した使用量 (bytes)。増減の基準にする
+DISK_USAGE_REPORTED="false"       # 終了時レポートの二重実行を防ぐ
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-1}}"  # パラメータストア参照時に使用
 
 # JBoss マスターパスワード (BuildKit シークレット) 関連
@@ -595,6 +612,39 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
   --dry-run                実際のビルド/起動/URL 呼び出し/ファイル操作は行わず、
                            実行される内容のプレビューのみ表示する
 
+ディスク使用量の抑制:
+  (既定で有効) 旧世代イメージの回収
+                           compose build はローカルイメージ名のタグを新しいイメージへ
+                           付け替えるだけで、直前の世代はタグを失った <none>:<none>
+                           として残り続ける。--no-cache では共有レイヤが無いため、
+                           実行のたびにイメージ 1 個分がそのまま積み上がる。
+                           ビルドの前後で image ID を突き合わせ、世代交代した旧 ID が
+                           どのタグからも参照されていない場合のみ削除する。
+                           docker image prune と違い今回のビルドで生じた 1 件だけを
+                           対象とするため、同じ Docker daemon を使う他プロジェクトの
+                           dangling イメージには影響しない。
+  --no-reclaim-old-image   旧世代イメージの回収を行わない (従来どおり残す)。
+                           世代を比較したい調査時などに指定する。
+  --prune-build-cache      処理終了時 (成功・失敗を問わず) に、削除可能なビルド
+                           キャッシュをすべて削除する
+                           (docker builder prune --all --force)。
+                           --no-cache は「既存のキャッシュを読まない」指定であって
+                           「書かない」指定ではないため、指定した実行でも
+                           キャッシュは毎回増える点に注意する。
+                           ※ 同じ Docker daemon を使う他プロジェクトのビルド
+                             キャッシュも削除される。
+  --prune-build-cache-keep SIZE
+                           --prune-build-cache と同じ処理を、SIZE の容量を残して
+                           実行する (docker builder prune --force
+                           --keep-storage SIZE)。例: 10GB / 512MB
+                           ※ 環境の buildx が --keep-storage を持たない場合は
+                             警告を表示して削除を行わない。
+  --disk-usage-report      ビルド前と処理終了時に Docker 管理対象の使用量
+                           (docker system df の合計) を測定し、実行前からの増減を
+                           表示する。Docker data root を特定できる場合は、
+                           その空き容量も併せて表示する。
+                           容量を削除する処理は行わない (計測のみ)。
+
 終了時の Docker 完全クリーンアップ:
   --cleanup-all-docker-data
                            処理終了時 (成功・失敗を問わず)、現在の Docker context にある
@@ -953,6 +1003,14 @@ while [ $# -gt 0 ]; do
     --compose-file)        need_value "$1" $#; COMPOSE_FILE="$2"; shift 2 ;;
     --compose-service)     need_value "$1" $#; append_services COMPOSE_SERVICES "$2"; shift 2 ;;
     --no-cache)            NO_CACHE="true"; shift ;;
+    --no-reclaim-old-image) RECLAIM_OLD_IMAGE="false"; shift ;;
+    --prune-build-cache)   PRUNE_BUILD_CACHE="true"; shift ;;
+    --prune-build-cache-keep)
+                           need_value "$1" $#
+                           PRUNE_BUILD_CACHE="true"
+                           PRUNE_BUILD_CACHE_KEEP="$2"
+                           shift 2 ;;
+    --disk-usage-report)   DISK_USAGE_REPORT="true"; shift ;;
     --dry-run)             DRY_RUN="true"; shift ;;
     --cleanup-all-docker-data) CLEANUP_ALL_DOCKER_DATA="true"; shift ;;
     --copy-file)           need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
@@ -1185,6 +1243,16 @@ fi
 
 if [ "$CLEANUP_ALL_DOCKER_DATA" = "true" ] && [ "$KEEP_CONTAINER" = "true" ]; then
   err "--cleanup-all-docker-data と --keep-container は同時に指定できません"
+  exit 2
+fi
+
+# --prune-build-cache-keep は docker builder prune --keep-storage へそのまま渡すため、
+# ここで書式を検証する。誤記のまま渡すと docker 側のエラーになるだけで、
+# 「削除したつもりが削除されていない」状態に気付きにくい。
+# 受け付ける形式: 10GB / 10G / 512MB / 1.5GB / 10000000 (バイト数)
+if [ -n "$PRUNE_BUILD_CACHE_KEEP" ] \
+    && ! [[ "$PRUNE_BUILD_CACHE_KEEP" =~ ^[0-9]+(\.[0-9]+)?([KkMmGgTt][Bb]?|[Bb])?$ ]]; then
+  err "--prune-build-cache-keep にはサイズを指定してください (例: 10GB / 512MB): ${PRUNE_BUILD_CACHE_KEEP}"
   exit 2
 fi
 
@@ -8792,6 +8860,130 @@ verify_docker_list_empty() {
   return 1
 }
 
+# =============================================================================
+# ディスク使用量の抑制
+# -----------------------------------------------------------------------------
+# 検証を繰り返すと、ローカルイメージの旧世代 (dangling) とビルドキャッシュが
+# 実行のたびに積み上がる。--cleanup-all-docker-data は Docker 全体を空にするため
+# 日常の検証には使えないので、増えた分だけを戻す細粒度の後始末をここへ置く。
+# =============================================================================
+
+# ---- 旧世代イメージの回収 ---------------------------------------------------
+# ビルド直前のローカルイメージ ID を控える。ビルド後に ID が変わっていれば、
+# 直前の世代はタグを失った dangling イメージとして残っている。
+remember_current_image_id() {
+  PREVIOUS_IMAGE_ID=""
+  [ "$RECLAIM_OLD_IMAGE" = "true" ] || return 0
+  [ "$DRY_RUN" = "true" ] && return 0
+  PREVIOUS_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" 2>/dev/null || true)"
+}
+
+# ビルドで世代交代した旧イメージを削除する。docker image prune と違い、
+# 今回のビルドで生じた 1 件だけを対象とするため、同じ Docker daemon を使う
+# 他プロジェクトの dangling イメージには影響しない。
+reclaim_previous_image() {
+  [ "$RECLAIM_OLD_IMAGE" = "true" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] 世代交代した旧イメージの削除は行いません (docker image rm <旧 ID>)。"
+    return 0
+  fi
+  [ -n "$PREVIOUS_IMAGE_ID" ] || return 0
+
+  local current tags
+  current="$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" 2>/dev/null || true)"
+  # ID が変わっていなければ (キャッシュが完全にヒットした場合など) 対象は無い。
+  [ -n "$current" ] || return 0
+  if [ "$current" = "$PREVIOUS_IMAGE_ID" ]; then
+    log "ローカルイメージは世代交代していないため、削除するイメージはありません: ${LOCAL_IMAGE}"
+    return 0
+  fi
+
+  # 旧 ID が別のタグから参照されている場合は dangling ではないため触らない。
+  tags="$(docker image inspect --format '{{len .RepoTags}}' "$PREVIOUS_IMAGE_ID" 2>/dev/null || printf '0')"
+  if [ -n "$tags" ] && [ "$tags" != "0" ]; then
+    log "旧世代イメージは別のタグから参照されているため残します: $PREVIOUS_IMAGE_ID"
+    return 0
+  fi
+
+  log "世代交代した旧イメージを削除します: $PREVIOUS_IMAGE_ID"
+  if ! docker image rm "$PREVIOUS_IMAGE_ID" >/dev/null 2>&1; then
+    warn "旧イメージを削除できませんでした (他から使用中の可能性があります): $PREVIOUS_IMAGE_ID"
+    warn "  手動で削除する場合: docker image rm $PREVIOUS_IMAGE_ID"
+  fi
+}
+
+# ---- ビルドキャッシュの削除 -------------------------------------------------
+# --no-cache は「既存のキャッシュを読まない」指定であって「書かない」指定では
+# ないため、指定した実行でもキャッシュは毎回増える。終了時にまとめて片付ける。
+prune_build_cache() {
+  [ "$PRUNE_BUILD_CACHE" = "true" ] || return 0
+
+  local -a prune_opts=(--force)
+  if [ -n "$PRUNE_BUILD_CACHE_KEEP" ]; then
+    # --keep-storage は buildx の版によって非推奨・改名されている
+    # (0.17 以降は --max-used-space)。使えない環境では削除せず警告に留める。
+    if ! docker builder prune --help 2>&1 | grep -q -- '--keep-storage'; then
+      warn "この環境の docker builder prune は --keep-storage を持たないため、ビルドキャッシュを削除しません。"
+      warn "  docker builder prune --help で使用できるオプションを確認してください (--max-used-space など)。"
+      return 0
+    fi
+    prune_opts+=(--keep-storage "$PRUNE_BUILD_CACHE_KEEP")
+  else
+    prune_opts+=(--all)
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] docker builder prune ${prune_opts[*]}"
+    return 0
+  fi
+
+  log "ビルドキャッシュを削除します (docker builder prune ${prune_opts[*]}) ..."
+  if ! docker builder prune "${prune_opts[@]}"; then
+    warn "ビルドキャッシュの削除に失敗しました。手動で確認してください: docker builder prune ${prune_opts[*]}"
+  fi
+}
+
+# ---- 使用量の計測 -----------------------------------------------------------
+# 最初の呼び出しを基準として控え、以降は基準からの増減を併せて表示する。
+# 容量を削除する処理は行わない (何が効いたのかを判断するための計測のみ)。
+report_disk_usage() {
+  [ "$DISK_USAGE_REPORT" = "true" ] || return 0
+  local label="$1" now delta sign="+" docker_root free
+
+  if ! now="$(docker_storage_bytes)"; then
+    warn "Docker 管理対象の使用量を取得できませんでした (${label})。"
+    return 0
+  fi
+
+  if [ -z "$DISK_USAGE_BEFORE" ]; then
+    DISK_USAGE_BEFORE="$now"
+    log "Docker 使用量 (${label}): $(format_bytes "$now") (docker system df による概算)"
+  else
+    delta=$(( now - DISK_USAGE_BEFORE ))
+    if [ "$delta" -lt 0 ]; then
+      sign="-"
+      delta=$(( -delta ))
+    fi
+    log "Docker 使用量 (${label}): $(format_bytes "$now") (docker system df による概算)"
+    log "  実行前からの増減: ${sign}$(format_bytes "$delta")"
+  fi
+
+  # data root はローカル接続 (unix socket) のときだけ特定できる。
+  docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  if [ -n "$docker_root" ] && free="$(filesystem_free_bytes "$docker_root")"; then
+    log "  data root の空き容量: $(format_bytes "$free") (${docker_root})"
+  fi
+}
+
+# 終了時の計測。--cleanup-all-docker-data は自前で削除前後の容量を表示するため、
+# そちらが動いた場合は二重に出さない。
+report_disk_usage_at_exit() {
+  [ "$DISK_USAGE_REPORT" = "true" ] || return 0
+  [ "$DISK_USAGE_REPORTED" = "true" ] && return 0
+  DISK_USAGE_REPORTED="true"
+  report_disk_usage "終了時"
+}
+
 # 明示指定された場合だけ、現在の Docker context のローカルデータを全削除する。
 cleanup_all_docker_data() {
   [ "$CLEANUP_ALL_DOCKER_DATA" = "true" ] || return 0
@@ -12496,11 +12688,16 @@ cleanup_all() {
   if [ "$CLEANUP_ALL_DOCKER_DATA" = "true" ]; then
     if cleanup_all_docker_data; then
       [ "$DRY_RUN" = "true" ] || STARTED_CONTAINER="false"
+      # 全体クリーンアップが削除前後の容量を表示済みのため、重複させない。
+      DISK_USAGE_REPORTED="true"
     else
       cleanup_status=1
     fi
   fi
   teardown_container
+  # コンテナを削除した後に、今回増えたビルドキャッシュを片付けて容量を測る。
+  prune_build_cache
+  report_disk_usage_at_exit
   cleanup_copied_files
   # 解析結果の一時ファイルは、全量レポートへ転記し終えたここで削除する。
   [ -n "$DEPLOY_EXCEPTION_TEXT_FILE" ] && rm -f "$DEPLOY_EXCEPTION_TEXT_FILE"
@@ -12560,7 +12757,15 @@ BUILD_OPTS=()
 if [ "$NO_CACHE" = "true" ]; then
   BUILD_OPTS+=(--no-cache)
   log "キャッシュを破棄して (--no-cache) ビルドします。"
+  if [ "$PRUNE_BUILD_CACHE" != "true" ]; then
+    log "  ※ --no-cache は既存キャッシュを読まない指定で、書き込みは行われます。"
+    log "     終了時にキャッシュを片付けるには --prune-build-cache を併用してください。"
+  fi
 fi
+
+# ビルド前の使用量と、世代交代の判定に使う現在のイメージ ID を控える。
+report_disk_usage "ビルド前"
+remember_current_image_id
 
 # ローカルベースイメージが生成されたか確認する。
 # 複数サービス指定時は base の先行ビルド直後に確認し、問題があれば他サービスを
@@ -12602,6 +12807,7 @@ if [ ${#COMPOSE_SERVICES[@]} -gt 1 ]; then
   if ! verify_local_image; then
     exit 1
   fi
+  reclaim_previous_image
 
   # base が明示的な指定に含まれていても再ビルドしない。含まれていない場合も
   # base はビルド専用の前提サービスとして扱い、起動対象には追加しない。
@@ -12644,6 +12850,7 @@ else
   if ! verify_local_image; then
     exit 1
   fi
+  reclaim_previous_image
 fi
 
 if [ "$DRY_RUN" = "true" ]; then

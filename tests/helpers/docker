@@ -59,6 +59,13 @@ if [ "${1:-}" = "compose" ]; then
         printf 'fake compose build failed\n' >&2
         exit 42
       fi
+      # ビルドでローカルイメージが世代交代する様子の再現。
+      # FAKE_DOCKER_IMAGE_ID_FILE を指定したときだけ、image inspect が返す ID を
+      # ビルド後の値へ差し替える (未指定なら ID は変わらない = 従来どおり)。
+      if [ -n "${FAKE_DOCKER_IMAGE_ID_FILE:-}" ]; then
+        printf '%s\n' "${FAKE_DOCKER_IMAGE_ID_AFTER_BUILD:-sha256:image-after-build}" \
+          > "$FAKE_DOCKER_IMAGE_ID_FILE"
+      fi
       ;;
     up)
       # 依存サービス (adot collector) の healthcheck 失敗で
@@ -176,10 +183,19 @@ if [ "${1:-}" = "system" ] && [ "${2:-}" = "df" ]; then
     printf 'Local Volumes|0 B\n'
     printf 'Build Cache|0 B\n'
   else
+    # FAKE_DOCKER_DF_COUNTER を指定すると、呼び出しのたびにビルドキャッシュが
+    # 400MB ずつ増える (検証を繰り返して容量が増えていく状況の再現)。
+    df_build_cache=400
+    if [ -n "${FAKE_DOCKER_DF_COUNTER:-}" ]; then
+      df_call_count="$(cat "$FAKE_DOCKER_DF_COUNTER" 2>/dev/null || printf '0')"
+      df_call_count=$(( df_call_count + 1 ))
+      printf '%s\n' "$df_call_count" > "$FAKE_DOCKER_DF_COUNTER"
+      df_build_cache=$(( 400 * df_call_count ))
+    fi
     printf 'Images|2 GB\n'
     printf 'Containers|100 MB\n'
     printf 'Local Volumes|500 MB\n'
-    printf 'Build Cache|400 MB\n'
+    printf 'Build Cache|%s MB\n' "$df_build_cache"
   fi
   exit 0
 fi
@@ -231,7 +247,25 @@ if [ "${1:-}" = "container" ]; then
 fi
 
 if [ "${1:-}" = "builder" ] && [ "${2:-}" = "prune" ]; then
-  printf 'Total: 400MB\n'
+  # 実装側は --keep-storage が使えるかを --help で確認してから渡す。
+  # FAKE_DOCKER_NO_KEEP_STORAGE=true で、その指定を持たない buildx を再現する。
+  if [[ " $* " == *" --help "* ]]; then
+    printf 'Usage:  docker builder prune\n\nOptions:\n'
+    printf '  -a, --all                  Include internal/frontend images\n'
+    printf '      --filter filter        Provide filter values\n'
+    printf '  -f, --force                Do not prompt for confirmation\n'
+    if [ "${FAKE_DOCKER_NO_KEEP_STORAGE:-false}" = "true" ]; then
+      printf '      --max-used-space bytes Maximum amount of disk space allowed to keep for cache\n'
+    else
+      printf '      --keep-storage bytes   Amount of disk space to keep for cache\n'
+    fi
+    exit 0
+  fi
+  if [ "${FAKE_DOCKER_BUILDER_PRUNE_FAIL:-false}" = "true" ]; then
+    printf 'fake builder prune failed\n' >&2
+    exit 1
+  fi
+  printf 'Total reclaimed space: 400MB\n'
   exit 0
 fi
 
@@ -247,10 +281,35 @@ if [ "${1:-}" = "image" ] && [ "${2:-}" = "prune" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "rm" ]; then
+  if [ "${FAKE_DOCKER_IMAGE_RM_FAIL:-false}" = "true" ]; then
+    printf 'Error response from daemon: conflict: unable to delete %s\n' "${3:-}" >&2
+    exit 1
+  fi
+  printf 'Deleted: %s\n' "${3:-}"
+  exit 0
+fi
+
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
   case "$*" in
     *".Config.Env"*)
       printf 'PATH=/usr/bin\n'
+      ;;
+    *"len .RepoTags"*)
+      # 旧世代イメージに残っているタグの数。0 = dangling (削除対象)。
+      printf '%s\n' "${FAKE_DOCKER_IMAGE_REPOTAGS:-0}"
+      ;;
+    *"--format {{.Id}} "*)
+      # 世代交代の判定に使う ID 単体の取得。
+      # verify_local_image の '{{.Id}}|{{.Created}}|{{.Size}}' と区別するため、
+      # 書式が {{.Id}} だけ (直後が空白) の呼び出しに限定する。
+      # FAKE_DOCKER_IMAGE_ID_FILE があればその内容 (compose build で書き換わる)、
+      # 無ければ従来どおり固定値を返す (= 実行前後で変化しない)。
+      if [ -n "${FAKE_DOCKER_IMAGE_ID_FILE:-}" ] && [ -f "$FAKE_DOCKER_IMAGE_ID_FILE" ]; then
+        cat "$FAKE_DOCKER_IMAGE_ID_FILE"
+      else
+        printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:-sha256:test-image}"
+      fi
       ;;
     *)
       printf 'sha256:test-image|2026-07-18T00:00:00Z|12345\n'

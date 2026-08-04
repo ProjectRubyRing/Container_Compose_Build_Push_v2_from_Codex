@@ -1427,6 +1427,208 @@ assert_contains "$FAKE_DOCKER_CALLS" "network prune --force"
 assert_contains "$FAKE_DOCKER_CALLS" "system prune --all --volumes --force"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
+# ---- ディスク使用量の抑制 ---------------------------------------------------
+# 検証を繰り返すと、ローカルイメージの旧世代 (dangling) とビルドキャッシュが
+# 実行のたびに積み上がる。その回収と計測を行う 3 つの機能を確認する。
+#
+# 直前のクリーンアップシナリオが FAKE_DOCKER_CLEANED を export したままだと、
+# fake docker が「全削除済み」として system df に 0 B を返し、容量の計測結果が
+# 変わってしまう。自分のシナリオで使う fixture を明示的に設定し直す。
+unset FAKE_DOCKER_CLEANED FAKE_COMPOSE_SHUTDOWN_MARKER FAKE_COMPOSE_NO_CONTAINERS \
+      FAKE_COMPOSE_UP_FAIL FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES \
+      FAKE_COMPOSE_PS_SERVICES
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+
+# fake docker はこのファイルの内容を image inspect の {{.Id}} として返し、
+# compose build のたびに「ビルド後の ID」で上書きする (世代交代の再現)。
+disk_image_id_file="$TEST_TMP/image-id"
+export FAKE_DOCKER_IMAGE_ID_FILE="$disk_image_id_file"
+
+# (1) 既定でビルド前後の ID を突き合わせ、世代交代した旧イメージを削除する
+reclaim_image_output="$TEST_TMP/reclaim-image.out"
+printf 'sha256:image-before-build\n' > "$disk_image_id_file"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-cache
+) >"$reclaim_image_output" 2>&1; then
+  cat "$reclaim_image_output" >&2
+  fail "reclaiming the previous image returned a non-zero status"
+fi
+
+assert_contains "$reclaim_image_output" "世代交代した旧イメージを削除します: sha256:image-before-build"
+assert_contains "$FAKE_DOCKER_CALLS" "image rm sha256:image-before-build"
+# 削除するのは今回のビルドで生じた 1 件だけで、prune は使わない
+# (同じ Docker daemon を使う他プロジェクトの dangling を巻き込まないため)。
+assert_not_contains "$FAKE_DOCKER_CALLS" "image prune"
+# --no-cache 指定時は、キャッシュが書き込まれ続ける点を案内する
+assert_contains "$reclaim_image_output" "--no-cache は既存キャッシュを読まない指定で、書き込みは行われます"
+
+# (2) --no-reclaim-old-image を指定すると旧イメージを残す
+keep_image_output="$TEST_TMP/keep-old-image.out"
+printf 'sha256:image-before-build\n' > "$disk_image_id_file"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-cache --no-reclaim-old-image
+) >"$keep_image_output" 2>&1; then
+  cat "$keep_image_output" >&2
+  fail "--no-reclaim-old-image returned a non-zero status"
+fi
+
+assert_not_contains "$keep_image_output" "世代交代した旧イメージを削除します"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image rm"
+# 回収しないなら、判定用の ID 取得そのものを行わない
+assert_not_contains "$FAKE_DOCKER_CALLS" "image inspect --format {{.Id}} j1/base.local"
+
+# (3) 旧 ID が別のタグから参照されている場合は dangling ではないため削除しない
+tagged_image_output="$TEST_TMP/tagged-old-image.out"
+printf 'sha256:image-before-build\n' > "$disk_image_id_file"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_IMAGE_REPOTAGS=2 bash ./build_and_verify.sh
+) >"$tagged_image_output" 2>&1; then
+  cat "$tagged_image_output" >&2
+  fail "tagged previous image returned a non-zero status"
+fi
+
+assert_contains "$tagged_image_output" "旧世代イメージは別のタグから参照されているため残します: sha256:image-before-build"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image rm"
+
+# (4) ビルドしても ID が変わらなければ削除対象は無い
+same_image_output="$TEST_TMP/same-image.out"
+unset FAKE_DOCKER_IMAGE_ID_FILE
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh
+) >"$same_image_output" 2>&1; then
+  cat "$same_image_output" >&2
+  fail "unchanged image id returned a non-zero status"
+fi
+
+assert_contains "$same_image_output" "ローカルイメージは世代交代していないため、削除するイメージはありません: j1/base.local"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image rm"
+
+# (5) 削除に失敗しても警告のみで、ビルド自体は成功のまま終える
+rm_failed_output="$TEST_TMP/reclaim-image-failed.out"
+export FAKE_DOCKER_IMAGE_ID_FILE="$disk_image_id_file"
+printf 'sha256:image-before-build\n' > "$disk_image_id_file"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_IMAGE_RM_FAIL=true bash ./build_and_verify.sh
+) >"$rm_failed_output" 2>&1; then
+  cat "$rm_failed_output" >&2
+  fail "a failed image removal must not change the exit status"
+fi
+
+assert_contains "$rm_failed_output" "旧イメージを削除できませんでした (他から使用中の可能性があります): sha256:image-before-build"
+assert_contains "$rm_failed_output" "手動で削除する場合: docker image rm sha256:image-before-build"
+unset FAKE_DOCKER_IMAGE_ID_FILE
+
+# (6) --disk-usage-report と --prune-build-cache-keep
+#     fake docker の system df は FAKE_DOCKER_DF_COUNTER を指定すると、
+#     呼び出しのたびにビルドキャッシュが 400MB ずつ増える。
+#     1 回目 (ビルド前): 2GB + 100MB + 500MB + 400MB  = 2.79 GiB
+#     2 回目 (終了時)  : 2GB + 100MB + 500MB + 800MB  = 3.17 GiB (+381.47 MiB)
+disk_report_output="$TEST_TMP/disk-usage-report.out"
+export FAKE_DOCKER_DF_COUNTER="$TEST_TMP/df.count"
+: > "$FAKE_DOCKER_DF_COUNTER"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --disk-usage-report --prune-build-cache-keep 10GB
+) >"$disk_report_output" 2>&1; then
+  cat "$disk_report_output" >&2
+  fail "--disk-usage-report returned a non-zero status"
+fi
+
+assert_contains "$disk_report_output" "Docker 使用量 (ビルド前): 2.79 GiB (docker system df による概算)"
+assert_contains "$disk_report_output" "Docker 使用量 (終了時): 3.17 GiB (docker system df による概算)"
+assert_contains "$disk_report_output" "実行前からの増減: +381.47 MiB"
+assert_contains "$disk_report_output" "ビルドキャッシュを削除します (docker builder prune --force --keep-storage 10GB)"
+assert_contains "$FAKE_DOCKER_CALLS" "builder prune --force --keep-storage 10GB"
+# 計測はビルドの前に行う (ビルドで増えた分を増減へ含めるため)
+assert_before "$disk_report_output" "Docker 使用量 (ビルド前)" "docker compose build を実行します"
+unset FAKE_DOCKER_DF_COUNTER
+
+# (7) --prune-build-cache は容量指定なしで全削除する
+prune_all_cache_output="$TEST_TMP/prune-build-cache.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-cache --prune-build-cache
+) >"$prune_all_cache_output" 2>&1; then
+  cat "$prune_all_cache_output" >&2
+  fail "--prune-build-cache returned a non-zero status"
+fi
+
+assert_contains "$FAKE_DOCKER_CALLS" "builder prune --force --all"
+# キャッシュを片付ける指定があるときは、--no-cache の案内を重ねて出さない
+assert_not_contains "$prune_all_cache_output" "終了時にキャッシュを片付けるには --prune-build-cache を併用してください"
+
+# (8) --keep-storage を持たない buildx では削除せず警告に留める
+no_keep_storage_output="$TEST_TMP/no-keep-storage.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_NO_KEEP_STORAGE=true bash ./build_and_verify.sh --prune-build-cache-keep 512MB
+) >"$no_keep_storage_output" 2>&1; then
+  cat "$no_keep_storage_output" >&2
+  fail "missing --keep-storage support must not change the exit status"
+fi
+
+assert_contains "$no_keep_storage_output" "この環境の docker builder prune は --keep-storage を持たないため、ビルドキャッシュを削除しません"
+assert_not_contains "$FAKE_DOCKER_CALLS" "builder prune --force --keep-storage"
+
+# (9) --dry-run では削除を行わず、実行予定だけを表示する
+disk_dry_run_output="$TEST_TMP/disk-usage-dry-run.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --no-cache --prune-build-cache --disk-usage-report
+) >"$disk_dry_run_output" 2>&1; then
+  cat "$disk_dry_run_output" >&2
+  fail "disk usage options with --dry-run returned a non-zero status"
+fi
+
+assert_contains "$disk_dry_run_output" "[DRY-RUN] docker builder prune --force --all"
+assert_contains "$disk_dry_run_output" "[DRY-RUN] 世代交代した旧イメージの削除は行いません"
+assert_contains "$disk_dry_run_output" "Docker 使用量 (ビルド前):"
+assert_not_contains "$FAKE_DOCKER_CALLS" "builder prune --force --all"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image rm"
+
+# (10) --prune-build-cache-keep の書式チェック
+invalid_keep_output="$TEST_TMP/invalid-keep-storage.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --prune-build-cache-keep '10ギガ'
+) >"$invalid_keep_output" 2>&1; then
+  cat "$invalid_keep_output" >&2
+  fail "an invalid --prune-build-cache-keep value unexpectedly returned zero"
+fi
+assert_contains "$invalid_keep_output" "--prune-build-cache-keep にはサイズを指定してください (例: 10GB / 512MB): 10ギガ"
+
+# (11) --cleanup-all-docker-data 併用時は、削除前後の容量表示と重複させない
+cleanup_disk_report_output="$TEST_TMP/cleanup-disk-report.out"
+export FAKE_DOCKER_CLEANED="$TEST_TMP/docker-cleaned-disk-report"
+rm -f -- "$FAKE_DOCKER_CLEANED"
+: > "$FAKE_DOCKER_CALLS"
+if ! printf 'DELETE ALL DOCKER DATA\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --disk-usage-report --cleanup-all-docker-data
+) >"$cleanup_disk_report_output" 2>&1; then
+  cat "$cleanup_disk_report_output" >&2
+  fail "--disk-usage-report with --cleanup-all-docker-data returned a non-zero status"
+fi
+
+assert_contains "$cleanup_disk_report_output" "容量削減結果 (Docker 管理対象・概算)"
+assert_not_contains "$cleanup_disk_report_output" "Docker 使用量 (終了時)"
+
+unset FAKE_DOCKER_CLEANED FAKE_DOCKER_IMAGE_ID_FILE FAKE_DOCKER_DF_COUNTER
+
 # ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
 # compose.yml の環境変数 → BuildKit シークレット → Elytron CredentialStore →
 # jboss-cli が生成した standalone.xml → 実行時の値、の各段でパスワードが
@@ -2593,4 +2795,4 @@ assert_contains "$copy_dry_run_output" \
   "[DRY-RUN] 上書き前のファイルを復元: $copy_dry_run_dir/copy-src.npmrc"
 assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, and Docker cleanup scenarios\n'
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, and Docker cleanup scenarios\n'
