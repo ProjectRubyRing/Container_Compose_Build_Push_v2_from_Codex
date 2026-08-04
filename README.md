@@ -7,11 +7,63 @@
 > **スクリプト別の詳細資料** — パラメータ、全体構成、処理フローを網羅した資料を
 > `docs/` に用意しています。
 >
-> - [build_and_push.sh 詳細ガイド](docs/build_and_push_guide.md)
-> - [buildx_build_and_push.sh 詳細ガイド](docs/buildx_build_and_push_guide.md)
-> - [build_and_verify.sh 詳細ガイド](docs/build_and_verify_guide.md)
-> - [scripts_reference.xlsx](docs/scripts_reference.xlsx) — 上記を一覧化した Excel 資料 (全 9 シート。
->   `08_JVM_OTel設定` に JVM パラメータの分類と OpenTelemetry 環境変数の特定条件をまとめています)
+> | スクリプト | Markdown 版 | Excel 版 |
+> | --- | --- | --- |
+> | `build_and_push.sh` | [詳細ガイド](docs/build_and_push_guide.md) | [build_and_push_guide.xlsx](docs/build_and_push_guide.xlsx) |
+> | `buildx_build_and_push.sh` | [詳細ガイド](docs/buildx_build_and_push_guide.md) | [buildx_build_and_push_guide.xlsx](docs/buildx_build_and_push_guide.xlsx) |
+> | `build_and_verify.sh` | [詳細ガイド](docs/build_and_verify_guide.md) | [build_and_verify_guide.xlsx](docs/build_and_verify_guide.xlsx) |
+>
+> - Excel 版は各ガイドと同じ内容を 5 シート構成へ組み直したものです (後述)。
+> - [scripts_reference.xlsx](docs/scripts_reference.xlsx) — 3 スクリプトを横断して一覧化した
+>   Excel 資料 (全 9 シート。`08_JVM_OTel設定` に JVM パラメータの分類と
+>   OpenTelemetry 環境変数の特定条件をまとめています)。こちらも同じ md から生成します
+
+### Excel 版ガイド (`docs/*_guide.xlsx`)
+
+md ガイドと同じ内容を、Excel で読みやすい 5 シート構成へ組み直したものです。
+フォントは全シート **Meiryo UI**、列幅と行高は内容から計算して明示しているため、
+折り返した本文が既定の行高で切れることがありません。
+
+| シート | 記載内容 |
+| --- | --- |
+| `00_目次` | 対象スクリプト・役割・生成日時・シート索引 |
+| `01_スクリプト仕様` | 役割 / できること / 全体構成 / 処理の流れ / 入出力ファイル / 終了コード / 環境変数 |
+| `02_パラメータ一覧` | **指定可能なパラメータ**の全件 (分類・値の形式・既定値・複数指定の可否・説明)。オートフィルタとウィンドウ枠固定つき。既定値が効いている行は色を変えて強調 |
+| `03_既定で有効な動作` | **オプションを指定しなくても有効な動作**。「オプション不要で動く機能」「既定値を持つパラメータ」「その他の既定挙動」の 3 部構成 |
+| `04_設定例` | 用途別の**設定例**。コマンド列はそのままコピーして使えます |
+
+### 3 スクリプト横断リファレンス (`docs/scripts_reference.xlsx`)
+
+3 本のガイドを横断して 1 冊にまとめた資料です。同じ生成スクリプトで作られます。
+
+| シート | 記載内容 |
+| --- | --- |
+| `00_概要` | 3 スクリプトの比較 (役割・パラメータ数・終了コード数・環境変数数)、前提条件の突き合わせ、使い分け |
+| `01_build_and_push` / `02_buildx_build_and_push` / `03_build_and_verify` | スクリプト別のパラメータ一覧 (オートフィルタ付き) |
+| `04_処理フロー` | スクリプト別の処理フェーズ。元ガイドの見出しと列構成をそのまま保持 |
+| `05_終了コード` | スクリプト別の終了コードと発生条件 |
+| `06_環境変数` | 入力として参照する環境変数 / スクリプトが設定する環境変数 |
+| `07_実行例` | スクリプト別の実行例 |
+| `08_JVM_OTel設定` | `build_and_verify.sh` の JVM パラメータ分類と OpenTelemetry 設定の検出条件 |
+
+### 再生成
+
+内容は `docs/*_guide.md` から機械的に抽出しているため、二重管理は発生しません。
+**md を更新したら次のコマンドで Excel 版を再生成してください。**
+
+```bash
+# ガイド 3 本 + scripts_reference.xlsx をまとめて再生成
+python3 docs/generate_guide_xlsx.py
+
+# 特定のガイドだけ変換 (3 本揃わないため scripts_reference.xlsx はスキップされる)
+python3 docs/generate_guide_xlsx.py docs/build_and_verify_guide.md
+
+# 横断リファレンスだけ再生成
+python3 docs/generate_guide_xlsx.py --reference-only
+```
+
+生成には Python 3 だけが必要です (`openpyxl` などの追加パッケージは不要。
+xlsx は標準ライブラリだけで組み立てます)。
 
 | スクリプト | ビルド方法 |
 | --- | --- |
@@ -113,11 +165,13 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
 | `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--exit-on-deploy-error` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。デプロイエラー (AP サーバは起動したがアプリのデプロイに失敗) を検出しても調査用の対話操作へ入らず、従来どおりログを出力して終了する。既定ではコンテナと AP サーバを起動したまま残し、各 Compose サービスへ接続して調査できる状態にする | `false` |
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
 | `--log-dir DIR` | コンソールに出力されるログを `DIR` 配下のログファイルにも保存する。画面表示は従来どおり継続し、ログ末尾には処理実行時間 (経過秒数) も記録される。`DIR` が無ければ自動作成する。ファイル名は compose 版が `build_and_push_<YYYYMMDDHHMMSS>.log`、buildx 版が `buildx_build_and_push_<YYYYMMDDHHMMSS>.log`。compose 版で `--build-only` 委譲時も、委譲先 (`build_and_verify.sh`) の出力を含めて記録する | (なし。指定時のみログファイル出力) |
 | `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述)。ECR 関連オプション (`--account-id` / `--registry` / `--repository` / `--tag-prefix` / `--container-name` / `--output` / `--switchback-shell` / `--auto-switchback` / `--warn-only`) は委譲先が解釈できないため、**警告のうえ無視される** | `false` |
-| `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応 | (なし) |
+| `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応。コピー先に同名ファイルがある場合の動作はスクリプトごとに異なる (後述) | (なし) |
+| `--copy-file-no-overwrite` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` のコピー先に同名ファイルがある場合、強制上書きせずに処理を中止する (`exit 1`) | `false` |
 | `--env-list-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後に表示する環境変数一覧の件数。各対象コンテナごとに先頭 `N` 件を表示し、既定は `all` | `all` |
 | `--env-list-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後の環境変数一覧を `FILE` にも出力する。画面表示も継続 | (なし) |
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする | `all` (最下層まで) |
@@ -181,9 +235,33 @@ docker image push <registry>/<repository>:<tag>
 
 - 書式は `SRC:DEST_DIR`。`SRC` はコピー元ファイル、`DEST_DIR` は**既存の**コピー先ディレクトリ。
 - コピー先ファイル名は `SRC` のベース名になります (例: `.npmrc` → `./app/.npmrc`)。
-- **安全策**: コピー先に同名ファイルが既に存在する場合は、自動削除で既存ファイルを
-  消してしまう事故を防ぐため処理を中止します。
 - `--dry-run` 併用時は、実際のコピー/削除は行わず実行内容のみ表示します。
+
+### コピー先に同名ファイルがある場合
+
+スクリプトによって既定の動作が異なります。
+
+| スクリプト | 既定の動作 |
+| --- | --- |
+| `build_and_verify.sh` (`build_and_push.sh --build-only` の委譲先を含む) | **強制上書き**する |
+| `build_and_push.sh` (`--build-only` なし) / `buildx_build_and_push.sh` | 中止する (`exit 1`) |
+
+`build_and_verify.sh` では、上書き前のファイルを一時退避しておき、処理終了時に
+**削除ではなく復元**します。そのためコピー先は実行前の状態へ戻り、自動削除で
+既存ファイルを失うことはありません。
+
+```bash
+# 既存の ./app/.npmrc を強制上書きしてビルドし、終了時に元の .npmrc へ戻す
+./build_and_verify.sh --copy-file .npmrc:./app
+
+# 既存ファイルには一切触れず、あればその時点で中止する
+./build_and_verify.sh --copy-file-no-overwrite --copy-file .npmrc:./app
+```
+
+- `--copy-file-no-overwrite` は `build_and_verify.sh` のオプションです
+  (`build_and_push.sh --build-only` からもそのまま委譲されます)。
+- **安全策**: コピー先が通常ファイル以外 (ディレクトリ・シンボリックリンク等) の場合は、
+  `--copy-file-no-overwrite` の有無にかかわらず、上書き・自動削除のいずれも行わず中止します。
 
 ## ログファイル出力 (`--log-dir`)
 
@@ -227,7 +305,9 @@ ECR 関連オプションを除いた引数がそのまま渡されます。ECR 
 - ECR を操作しないため、`--account-id` / `--registry` や AWS 認証情報は不要です
   (`aws` コマンドが無くても実行できます)。
 - **`--copy-file` が指定されている場合は、ビルド前に事前ファイルコピーを行った
-  うえでビルドし、処理後に自動削除します** (`build_and_push.sh` と同じ挙動)。
+  うえでビルドし、処理後に自動削除します**。コピー先に同名ファイルがある場合は
+  強制上書きし、処理終了時に上書き前のファイルへ復元します
+  (`--copy-file-no-overwrite` を付けると、上書きせず中止します)。
 - BuildKit の進捗形式は既定で `plain` とし、各ビルドステップを保存可能なログとして
   出力します。必要な場合は `BUILDKIT_PROGRESS` 環境変数で変更できます。
 - ビルド完了後は対象イメージを検査し、イメージ ID・作成日時・サイズを
@@ -340,8 +420,10 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
 
 - JBoss EAP 8.1 の正常起動は既定で `WFLYSRV0025` のみを成功とします。
   `WFLYSRV0026` (エラー付き起動) または `WFLYSRV0056` (boot failure) を検出した場合は、
-  正常起動ログの有無にかかわらず直ちに失敗終了します。別の正常起動メッセージを
+  正常起動ログの有無にかかわらず失敗扱いとします。別の正常起動メッセージを
   使う場合は `--startup-log-pattern` (拡張正規表現) で上書きできます。
+  この 2 つは「AP サーバは起動したがアプリのデプロイでエラーになった」状態のため、
+  既定ではコンテナを落とさず調査モードへ入ります (後述)。
 - `compose up` の直前時刻をログ取得開始時刻として `compose logs --since` に渡し、
   再利用したコンテナに残る過去の起動ログを今回の結果として扱わないようにします。
 - `--startup-service NAME` で **JBoss EAP の起動確認を行う Compose サービス**を
@@ -445,6 +527,40 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   を満たせず、バックエンドが起動しないまま `compose up` が失敗した場合も同様です。
   `--keep-container` / `--keep-container-mode` 指定時はコンテナを残すため実行せず、
   `--no-shutdown-logs` を指定すると無効化できます。
+  デプロイエラーで調査モードへ入った場合もコンテナを残すため実行しません (後述)。
+
+#### デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
+
+AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプロイでエラーになった場合**
+(`WFLYSRV0026` / `WFLYSRV0056` を検出)、既定では**コンテナと AP サーバを起動したまま残し、
+デプロイ成功後と同じ対話操作を開始**します。コンテナを落とさずに中を調査できます。
+
+- 開始する対話操作は、`--keep-container-mode` を指定していればそのモード、
+  未指定なら `logs` です。`logs` では起動中の各 Compose サービスを番号で選び、
+  ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断を繰り返し行えます。
+- 対話操作に入る前に、失敗した起動ログと **WAR デプロイ時 Java 例外解析**の結果を
+  表示するため、原因を見てから調査に入れます。
+- 対話操作を終えてもコンテナは起動状態のまま残ります。不要になったら
+  `docker compose -f compose.yml down` で削除してください。
+- デプロイエラーは失敗のままなので、終了コードは `1` です。
+- **起動確認のタイムアウト・コンテナの途中停止・`compose up` の失敗**は
+  デプロイエラーではないため、従来どおりそのまま終了します。
+- **端末から入力できない場合 (CI など)** は対話操作を開始できないため、コンテナを
+  残さず従来どおりの終了処理へ自動的に切り替わります。CI でもコンテナを残したい
+  場合は `--keep-container` を併用してください。
+- `--exit-on-deploy-error` を指定すると、デプロイエラーでも対話操作へ入らず、
+  従来どおりログを出力して終了します。
+
+```bash
+# 既定: デプロイエラーでもコンテナを残し、そのまま調査へ入る
+./build_and_verify.sh --verify-startup
+
+# デプロイエラー時は bash 接続で調査する
+./build_and_verify.sh --verify-startup --keep-container-mode bash
+
+# 従来どおり、デプロイエラーならそのまま終了する
+./build_and_verify.sh --verify-startup --exit-on-deploy-error
+```
 
 ```bash
 # ビルド + jbosseap 起動確認

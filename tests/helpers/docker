@@ -6,6 +6,14 @@ if [ -n "${FAKE_DOCKER_CALLS:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_DOCKER_CALLS"
 fi
 
+# ビルド実行時点でのファイル内容を控える (--copy-file の上書き検証用)。
+# FAKE_BUILD_SNAPSHOT_SRC / FAKE_BUILD_SNAPSHOT の両方を指定したときだけ動く。
+if [ -n "${FAKE_BUILD_SNAPSHOT:-}" ] && [ -n "${FAKE_BUILD_SNAPSHOT_SRC:-}" ] \
+    && [[ " $* " == *" build "* ]]; then
+  cp "$FAKE_BUILD_SNAPSHOT_SRC" "$FAKE_BUILD_SNAPSHOT" 2>/dev/null \
+    || printf '<missing>\n' > "$FAKE_BUILD_SNAPSHOT"
+fi
+
 fail() {
   printf 'fake docker: unsupported arguments: %s\n' "$*" >&2
   exit 64

@@ -57,6 +57,13 @@
 #                          対処方法 / スタックトレース / デプロイログ の 6 シート
 #                          構成で、フォントは Meiryo UI、行高は内容と列幅から
 #                          計算して明示するため、折り返した本文が切れない。
+#  (13) デプロイエラー時の調査:
+#                          AP サーバ (JBoss EAP 等) は起動したが、アプリのデプロイで
+#                          エラーとなった場合、既定ではコンテナと AP サーバを起動した
+#                          まま残し、デプロイ成功後と同じ対話操作を開始して、各
+#                          Compose サービスへの bash 接続やログ確認を行える状態にする。
+#                          --exit-on-deploy-error 指定時は、従来どおりログを出力して
+#                          そのまま終了する。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -177,8 +184,18 @@ JBOSS_HOME_CANDIDATES=(
 # ビルド前に一時コピーし、ビルド後に自動削除するファイル群
 # COPY_SPECS: "SRC:DEST_DIR" の配列 (--copy-file で繰り返し指定)
 # COPIED_FILES: 実際にコピーしたコピー先ファイルパス (削除対象として記録)
+# COPIED_BACKUPS: 上書き前の既存ファイルの退避先パス (COPIED_FILES と同じ添字)。
+#                 退避していない要素は空文字。処理終了時に削除ではなく復元する。
 COPY_SPECS=()
 COPIED_FILES=()
+COPIED_BACKUPS=()
+# コピー先に同名ファイルが既に存在する場合の動作
+#   true  (既定)                    : 強制上書きする (元ファイルは退避し、処理終了時に復元)
+#   false (--copy-file-no-overwrite): 上書きせず処理を中止する
+COPY_OVERWRITE="true"
+COPY_BACKUP_DIR=""                # 上書き前ファイルの退避先 (初回の上書き時に作成)
+# 退避したことを示す dry-run 用のマーカー (dry-run では実ファイルを退避しないため)
+COPY_BACKUP_DRY_RUN_MARK="(dry-run)"
 
 # ---- 起動確認 (jbosseap) 関連 ----------------------------------------------
 VERIFY_STARTUP="false"            # true: ビルド後にコンテナを起動し起動完了を確認
@@ -199,6 +216,17 @@ STARTUP_WAIT_TIMEOUT="600"        # --wait の最大待機秒数
 ALLOW_SERVICE_EXIT=()
 KEEP_CONTAINER="false"            # true: 確認後もコンテナを停止・削除せずに残す
 KEEP_CONTAINER_MODE=""            # bash/http/logs: 確認後に実行する対話操作 (指定時はコンテナを残す)
+# デプロイエラー (AP サーバ自体は起動したが、アプリのデプロイに失敗した状態) を
+# 検出した場合の動作。
+#   true  (既定)                  : コンテナと AP サーバを起動したまま、調査用の
+#                                   対話操作 (成功時と同じ操作) へ入る
+#   false (--exit-on-deploy-error): 従来どおりログを出力してそのまま終了する
+KEEP_CONTAINER_ON_DEPLOY_ERROR="true"
+# デプロイエラー時に開始する対話操作。--keep-container-mode 指定時はその指定を使う。
+# 既定の logs は「各 Compose サービスを選んで bash 接続・ログ確認」を行うモード。
+DEPLOY_ERROR_INTERACTION_MODE="logs"
+STARTUP_DEPLOY_ERROR="false"      # 起動確認でデプロイエラー (起動失敗ログ) を検出したか
+INTERACTION_MENU_ENTERED="false"  # 対話操作の選択を 1 度でも読み取れたか (調査に入れたか)
 SUPPRESS_REMOVED_LOGS="false"     # true: compose down の Removed ログ等を抑制する
 SUPPRESS_STARTUP_LOGS="false"     # true: 起動確認対象と同時起動サービスのログ表示を抑制する
 STARTUP_LOG_LINES="50"            # all: 全行表示 / 数値: 末尾からの最大表示行数
@@ -587,7 +615,15 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            複数ファイルに対応するため繰り返し指定できる。
                            例: --copy-file .npmrc:./app --copy-file cert.pem:./app/certs
                            - DEST_DIR は既存ディレクトリである必要がある
-                           - コピー先に同名ファイルが既存の場合は事故防止のため中止する
+                           - コピー先に同名ファイルが既存の場合は強制上書きする (既定)。
+                             上書き前のファイルは一時退避し、処理終了時に削除ではなく
+                             復元するため、コピー先は実行前の状態に戻る
+                           - コピー先が通常ファイル以外 (ディレクトリ / シンボリック
+                             リンク等) の場合は、上書き・自動削除とも行わず中止する
+
+  --copy-file-no-overwrite --copy-file のコピー先に同名ファイルが既に存在する場合、
+                           上書きせず処理を中止する (exit 1)。
+                           既存ファイルへ一切触れたくない場合に指定する。
 
 JBoss マスターパスワード (BuildKit シークレット):
   --jboss-password-param NAME
@@ -704,6 +740,19 @@ JBoss マスターパスワードの伝搬検証:
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
                            送達診断の JSON 整形には curl と Python 3 が必要。
+  --exit-on-deploy-error   デプロイエラー (AP サーバは起動したが、アプリのデプロイで
+                           失敗した状態) を検出したときに、調査用の対話操作へ入らず
+                           そのまま終了する (従来の動作)。
+                           既定では、デプロイエラーを検出してもコンテナと AP サーバを
+                           起動したまま残し、デプロイ成功後と同じ対話操作
+                           (--keep-container-mode 未指定なら logs) を開始して、
+                           各 Compose サービスへの bash 接続やログ確認を行える。
+                           対話操作を終えてもコンテナは起動状態のまま残るため、
+                           不要になったら compose down で削除する。
+                           端末から入力できない場合 (CI 等) は対話操作へ入れないため、
+                           自動的に従来どおりの終了処理へ切り替える。
+                           起動確認のタイムアウトやコンテナの途中停止は、
+                           デプロイエラーではないため従来どおり終了する。
   --jboss-context-root ROOT
                            http モードで使う JBoss EAP のコンテキストルート。
                            未指定時は WFLYUT0021 ログから検出し、複数なら選択する。
@@ -907,6 +956,7 @@ while [ $# -gt 0 ]; do
     --dry-run)             DRY_RUN="true"; shift ;;
     --cleanup-all-docker-data) CLEANUP_ALL_DOCKER_DATA="true"; shift ;;
     --copy-file)           need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
+    --copy-file-no-overwrite) COPY_OVERWRITE="false"; shift ;;
     --region)              need_value "$1" $#; REGION="$2"; shift 2 ;;
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
@@ -932,6 +982,7 @@ while [ $# -gt 0 ]; do
     --no-shutdown-logs)    CAPTURE_SHUTDOWN_LOGS="false"; shift ;;
     --keep-container)      KEEP_CONTAINER="true"; shift ;;
     --keep-container-mode) need_value "$1" $#; KEEP_CONTAINER_MODE="$2"; shift 2 ;;
+    --exit-on-deploy-error) KEEP_CONTAINER_ON_DEPLOY_ERROR="false"; shift ;;
     --jboss-context-root)  need_value "$1" $#; JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
     --jboss-http-port)     need_value "$1" $#; JBOSS_HTTP_PORT="$2"; shift 2 ;;
     --suppress-removed-logs) SUPPRESS_REMOVED_LOGS="true"; shift ;;
@@ -2618,10 +2669,33 @@ show_verified_jboss_password_stages() {
 # ---- ビルド前後の一時ファイルコピー / 自動削除 ------------------------------
 # --copy-file で指定した SRC:DEST_DIR を検証し、SRC を DEST_DIR へコピーする。
 # コピーしたコピー先パスは COPIED_FILES に記録し、EXIT トラップで自動削除する。
+#
+# コピー先に同名ファイルが既にある場合の動作:
+#   既定                      強制上書きする。ただし処理終了時の自動削除で元ファイルを
+#                             失わないよう、上書き前のファイルを退避しておき、削除では
+#                             なく復元することでコピー先を実行前の状態へ戻す。
+#   --copy-file-no-overwrite  上書きせず中止する (既存ファイルへ一切触れない)。
+
+# 上書き前ファイルの退避先ディレクトリを (初回のみ) 作成する。
+ensure_copy_backup_dir() {
+  [ -n "$COPY_BACKUP_DIR" ] && return 0
+  if ! COPY_BACKUP_DIR="$(mktemp -d 2>/dev/null)"; then
+    COPY_BACKUP_DIR=""
+    err "上書き前ファイルの退避先ディレクトリを作成できませんでした"
+    return 1
+  fi
+  return 0
+}
+
 prepare_copy_files() {
   [ ${#COPY_SPECS[@]} -eq 0 ] && return 0
   log "ビルド前の一時ファイルコピーを実行します (${#COPY_SPECS[@]} 件) ..."
-  local spec src dest_dir dest
+  if [ "$COPY_OVERWRITE" = "true" ]; then
+    log "コピー先に同名ファイルがある場合は強制上書きします (上書き前のファイルは処理終了時に復元します)。"
+  else
+    log "コピー先に同名ファイルがある場合は中止します (--copy-file-no-overwrite)。"
+  fi
+  local spec src dest_dir dest backup
   for spec in "${COPY_SPECS[@]}"; do
     # 最初の ':' で SRC と DEST_DIR に分割する (':' が無ければ書式エラー)
     if [ "${spec%%:*}" = "$spec" ]; then
@@ -2643,31 +2717,75 @@ prepare_copy_files() {
       exit 1
     fi
     dest="${dest_dir%/}/$(basename "$src")"
-    # 既存ファイルを上書き→後で削除すると元ファイルを消してしまうため中止する
-    if [ -e "$dest" ]; then
-      err "コピー先に同名ファイルが既に存在します: $dest (自動削除による事故防止のため中止します)"
-      exit 1
+    backup=""
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      # 通常ファイル以外 (ディレクトリ / シンボリックリンク / 特殊ファイル) は、
+      # 上書きも自動削除も別の実体を壊しうるため、指定によらず常に中止する。
+      if [ -L "$dest" ] || [ ! -f "$dest" ]; then
+        err "コピー先が通常ファイルではありません: $dest (上書き・自動削除とも行わないため中止します)"
+        exit 1
+      fi
+      if [ "$COPY_OVERWRITE" != "true" ]; then
+        err "コピー先に同名ファイルが既に存在します: $dest (--copy-file-no-overwrite が指定されているため中止します)"
+        exit 1
+      fi
+      if [ "$DRY_RUN" = "true" ]; then
+        # dry-run では実退避を行わないため、復元プレビュー用にマーカーだけ記録する
+        backup="$COPY_BACKUP_DRY_RUN_MARK"
+        log "[DRY-RUN] 既存ファイルを退避して強制上書き: $dest (処理後に退避したファイルを復元)"
+      else
+        ensure_copy_backup_dir || exit 1
+        # 同名のコピー先が複数あっても衝突しないよう、記録順の連番を前置する
+        backup="${COPY_BACKUP_DIR}/${#COPIED_FILES[@]}.$(basename "$dest")"
+        # 復元時にパーミッション / タイムスタンプまで元へ戻すため -p を付ける
+        if ! cp -p "$dest" "$backup"; then
+          err "上書き前ファイルの退避に失敗しました: $dest -> $backup"
+          exit 1
+        fi
+        warn "コピー先の既存ファイルを強制上書きします: $dest (退避先: $backup、処理終了時に復元します)"
+      fi
     fi
     if [ "$DRY_RUN" = "true" ]; then
       log "[DRY-RUN] cp $src -> $dest (処理後に自動削除)"
     else
       if ! cp "$src" "$dest"; then
         err "ファイルのコピーに失敗しました: $src -> $dest"
+        # 退避済みなら、コピー先が壊れている可能性があるため EXIT トラップで復元させる
+        if [ -n "$backup" ]; then
+          COPIED_FILES+=("$dest")
+          COPIED_BACKUPS+=("$backup")
+        fi
         exit 1
       fi
       log "コピーしました: $src -> $dest"
     fi
     # dry-run でも記録し、削除プレビューを表示できるようにする
     COPIED_FILES+=("$dest")
+    COPIED_BACKUPS+=("$backup")
   done
 }
 
-# コピーしたファイルのみ削除する (EXIT トラップから呼び出す)。
+# コピーしたファイルのみ後始末する (EXIT トラップから呼び出す)。
+# 強制上書きした分は削除せず、退避しておいた上書き前のファイルを復元する。
 cleanup_copied_files() {
   [ ${#COPIED_FILES[@]} -eq 0 ] && return 0
-  log "コピーした一時ファイルを削除します (${#COPIED_FILES[@]} 件) ..."
-  local f
-  for f in "${COPIED_FILES[@]}"; do
+  log "コピーした一時ファイルを後始末します (${#COPIED_FILES[@]} 件) ..."
+  local i f backup
+  # 同じコピー先を複数回上書きした場合に元へ戻せるよう、記録と逆順 (後入れ先出し) で
+  # 巻き戻す。正順だと最後の復元で「上書き後の内容」が残ってしまう。
+  for (( i = ${#COPIED_FILES[@]} - 1; i >= 0; i-- )); do
+    f="${COPIED_FILES[$i]}"
+    backup="${COPIED_BACKUPS[$i]:-}"
+    if [ -n "$backup" ]; then
+      if [ "$DRY_RUN" = "true" ]; then
+        log "[DRY-RUN] 上書き前のファイルを復元: $f"
+      elif mv -f "$backup" "$f"; then
+        log "上書き前のファイルを復元しました: $f"
+      else
+        warn "上書き前のファイルを復元できませんでした: $backup -> $f (手動で復元してください)"
+      fi
+      continue
+    fi
     if [ "$DRY_RUN" = "true" ]; then
       log "[DRY-RUN] rm -f $f"
     elif rm -f "$f"; then
@@ -2677,6 +2795,16 @@ cleanup_copied_files() {
     fi
   done
   COPIED_FILES=()
+  COPIED_BACKUPS=()
+  # 退避用ディレクトリは、復元し切れたときだけ (= 空のときだけ) 削除する。
+  # 復元に失敗した分が残っている場合は、手動復旧できるよう消さずに知らせる。
+  if [ -n "$COPY_BACKUP_DIR" ] && [ -d "$COPY_BACKUP_DIR" ]; then
+    if rmdir "$COPY_BACKUP_DIR" 2>/dev/null; then
+      COPY_BACKUP_DIR=""
+    else
+      warn "退避したファイルが残っています: $COPY_BACKUP_DIR (内容を確認し、手動で復元・削除してください)"
+    fi
+  fi
 }
 
 # ---- 起動確認 / URL 確認 用ヘルパ -------------------------------------------
@@ -4254,6 +4382,19 @@ containers_all_running() {
   return 0
 }
 
+# 調査用の対話操作へ入れるコンテナが 1 つでも起動しているか。
+# デプロイエラーでは AP サーバ以外のサイドカーが終了していることもあるため、
+# 「全て起動中」ではなく「1 つでも起動中」を条件にする。
+any_container_running() {
+  local cid running
+  while IFS= read -r cid; do
+    [ -n "$cid" ] || continue
+    running="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)"
+    [ "$running" = "true" ] && return 0
+  done < <(compose_container_ids_all)
+  return 1
+}
+
 # 起動確認中に停止した「起動対象サービス」を検出する。
 # --startup-service で検証対象を絞っていると、それ以外のサービス (DB へ繋がらずに落ちた
 # バックエンド等) の異常終了が見逃され、検証対象のタイムアウトまで待たされてしまうため、
@@ -4459,6 +4600,9 @@ wait_for_startup() {
           err "JBoss EAP 8.1 が正常起動しませんでした: サービス '${svc}'"
           err "  ${failure_line}"
           dump_startup_logs_from_snapshot "$normalized_logs" "対象サービス: ${svc}"
+          # AP サーバ自体は起動しており、デプロイの失敗で異常終了しているケース。
+          # コンテナ内を調査できるよう、呼び出し元で対話操作へ入れるよう記録する。
+          STARTUP_DEPLOY_ERROR="true"
           return 1
         elif grep -qE "$STARTUP_LOG_PATTERN" <<< "$normalized_logs"; then
           log "jbosseap サーバーの起動完了を確認しました: サービス '${svc}'"
@@ -4481,6 +4625,8 @@ wait_for_startup() {
         err "JBoss EAP 8.1 が正常起動しませんでした。"
         err "  ${failure_line}"
         dump_startup_logs_from_snapshot "$normalized_logs" "全対象サービス"
+        # 上と同じくデプロイエラー扱いとし、調査用の対話操作へ入れるようにする。
+        STARTUP_DEPLOY_ERROR="true"
         return 1
       elif grep -qE "$STARTUP_LOG_PATTERN" <<< "$normalized_logs"; then
         log "jbosseap サーバーの起動完了を確認しました。"
@@ -4646,6 +4792,7 @@ select_interaction_target() {
         err "コンテナ選択を読み取れませんでした。対話可能な端末から実行してください。"
         return 1
       fi
+      INTERACTION_MENU_ENTERED="true"
       case "$choice" in
         ''|*[!0-9]*|0*)
           warn "1 から ${#container_ids[@]} の番号を入力してください。"
@@ -8250,6 +8397,7 @@ run_interactive_compose_service_actions() {
       err "Compose サービス操作の選択を読み取れませんでした。対話可能な端末から実行してください。"
       return 1
     fi
+    INTERACTION_MENU_ENTERED="true"
 
     case "$action" in
       1)
@@ -8327,6 +8475,7 @@ run_interactive_compose_service_menu() {
         err "Compose サービスの選択を読み取れませんでした。対話可能な端末から実行してください。"
         return 1
       fi
+      INTERACTION_MENU_ENTERED="true"
       case "$choice" in
         0)
           log "Compose サービスの対話操作を終了しました。"
@@ -8388,6 +8537,75 @@ run_keep_container_interaction() {
       run_interactive_compose_service_menu || return 1
       ;;
   esac
+  return 0
+}
+
+# ---- デプロイエラー時の調査モード -------------------------------------------
+# AP サーバ (JBoss EAP 等) は起動したが、アプリのデプロイでエラーとなった場合、
+# コンテナを落としてしまうとコンテナ内を調査できない。そこで既定では、
+# コンテナと AP サーバを起動したまま、デプロイ成功後と同じ対話操作へ入り、
+# 各 Compose サービスへの bash 接続やログ確認ができる状態にする。
+# --exit-on-deploy-error 指定時は、従来どおりそのまま終了する。
+#
+# 戻り値は常に 0 (デプロイエラー自体の失敗は呼び出し元が exit 1 で扱う)。
+handle_deploy_error_investigation() {
+  # 起動失敗ログによるデプロイエラー以外 (タイムアウト、コンテナの途中停止など) は
+  # 調査対象としない。コンテナが残っていないか、原因がデプロイ以外のためである。
+  [ "$STARTUP_DEPLOY_ERROR" = "true" ] || return 0
+
+  if [ "$KEEP_CONTAINER_ON_DEPLOY_ERROR" != "true" ]; then
+    log "デプロイエラーを検出しましたが、--exit-on-deploy-error が指定されているため、そのまま終了します。"
+    return 0
+  fi
+
+  # --keep-container-mode を明示していればその操作を、無指定なら logs を使う。
+  local mode="${KEEP_CONTAINER_MODE:-$DEPLOY_ERROR_INTERACTION_MODE}"
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] デプロイエラー時はコンテナと AP サーバを起動したまま、対話操作 (${mode}) でコンテナ内を調査できる状態にします。"
+    log "[DRY-RUN] そのまま終了させる場合は --exit-on-deploy-error を指定します。"
+    return 0
+  fi
+
+  # コンテナが残っていなければ調査できないため、従来どおりの終了処理へ任せる。
+  if ! any_container_running; then
+    warn "起動中のコンテナが無いため、デプロイエラーの調査用対話操作へは入りません。"
+    return 0
+  fi
+
+  # デプロイ失敗の原因そのものである Java 例外の解析を、調査へ入る前に見せる。
+  # (後始末からも呼ばれるが、二重実行は関数側で防いでいる)
+  analyze_war_deploy_exceptions 1
+
+  local previous_keep_container="$KEEP_CONTAINER"
+  local previous_mode="$KEEP_CONTAINER_MODE"
+  # 対話操作の最中と終了後にコンテナを止めないよう、後始末より先に維持を指定する。
+  # (teardown_container と capture_shutdown_logs はいずれも KEEP_CONTAINER を見る)
+  KEEP_CONTAINER="true"
+  KEEP_CONTAINER_MODE="$mode"
+
+  diag ""
+  diag "==================================================================="
+  diag "デプロイエラーを検出しました。コンテナと AP サーバは起動したまま残します。"
+  diag "コンテナ内を調査できるよう、対話操作 (${mode}) を開始します。"
+  diag "調査せずそのまま終了させたい場合は --exit-on-deploy-error を指定してください。"
+  diag "==================================================================="
+
+  local interaction_status=0
+  run_keep_container_interaction || interaction_status=$?
+  KEEP_CONTAINER_MODE="$previous_mode"
+
+  if [ "$interaction_status" -eq 0 ] || [ "$INTERACTION_MENU_ENTERED" = "true" ]; then
+    log "デプロイエラーの調査用対話操作を終了しました。コンテナは起動状態のまま残します。"
+    log "  手動で停止・削除する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+    return 0
+  fi
+
+  # 端末から入力できず調査に入れなかった場合 (CI など) は、コンテナを残したままに
+  # せず、従来どおりのエラー終了 (終了ログ取得 → compose down) へ戻す。
+  KEEP_CONTAINER="$previous_keep_container"
+  warn "対話操作を開始できなかったため、通常のエラー終了として後始末します。"
+  warn "  調査のためコンテナを残したい場合は --keep-container を併用してください。"
   return 0
 }
 
@@ -12490,6 +12708,9 @@ fi
 if [ "$VERIFY_STARTUP" = "true" ]; then
   if ! wait_for_startup; then
     err "起動確認に失敗しました。"
+    # デプロイエラー (AP サーバは起動済み) の場合は、既定でコンテナを起動したまま
+    # 調査用の対話操作へ入る。--exit-on-deploy-error 指定時は何もせず終了する。
+    handle_deploy_error_investigation
     exit 1
   fi
 fi

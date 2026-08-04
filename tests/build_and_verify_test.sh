@@ -474,6 +474,7 @@ if (
     --startup-service app \
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/failure-reports" \
+    --exit-on-deploy-error \
     --suppress-removed-logs
 ) >"$failure_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
@@ -521,6 +522,68 @@ assert_before "${failure_report_files[0]}" "[9-3] Compose サービス: adot-col
 assert_before "${failure_report_files[0]}" "TracesExporter resource spans" "[9-4] Compose サービス: cache"
 # レポートは画面表示の行数制限に影響されず、ANSI 色コードも残さない。
 assert_not_contains "${failure_report_files[0]}" $'\033['
+# --exit-on-deploy-error 指定時は調査用の対話操作へ入らず、コンテナも残さない。
+assert_not_contains "$failure_output" "デプロイエラーを検出しました。コンテナと AP サーバは起動したまま残します。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# ---- デプロイエラー時の調査モード (既定) ------------------------------------
+# AP サーバは起動したがデプロイに失敗した場合、既定ではコンテナを残したまま
+# 対話操作へ入り、各 Compose サービスへ接続して調査できる。
+deploy_error_keep_output="$TEST_TMP/deploy-error-keep.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-failure.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector"
+# 1) app を選択 → 1) ログ表示 → (継続) → 0) サービス選択へ戻る → 0) 対話操作を終了
+if printf '1\n1\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --suppress-removed-logs
+) >"$deploy_error_keep_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_error_keep_output" >&2
+  fail "deploy error investigation mode unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$deploy_error_keep_output" "JBoss EAP 8.1 が正常起動しませんでした"
+assert_contains "$deploy_error_keep_output" "デプロイエラーを検出しました。コンテナと AP サーバは起動したまま残します。"
+assert_contains "$deploy_error_keep_output" "コンテナ内を調査できるよう、対話操作 (logs) を開始します。"
+# 成功後の対話操作と同じ Compose サービス選択メニューが出る
+assert_contains "$deploy_error_keep_output" "操作する起動中の Compose サービスを選択してください:"
+assert_contains "$deploy_error_keep_output" "デプロイエラーの調査用対話操作を終了しました。コンテナは起動状態のまま残します。"
+# 調査できるようコンテナは残す (compose down も SIGTERM 停止も行わない)
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml stop"
+assert_contains "$deploy_error_keep_output" "コンテナを残します (--keep-container)。"
+
+# 端末から入力できない場合 (CI 等) は対話操作へ入れないため、従来どおり後始末する。
+deploy_error_noinput_output="$TEST_TMP/deploy-error-noinput.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --suppress-removed-logs < /dev/null
+) >"$deploy_error_noinput_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_error_noinput_output" >&2
+  fail "deploy error investigation without stdin unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$deploy_error_noinput_output" "デプロイエラーを検出しました。コンテナと AP サーバは起動したまま残します。"
+assert_contains "$deploy_error_noinput_output" "対話操作を開始できなかったため、通常のエラー終了として後始末します。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 # adot collector の healthcheck 失敗で depends_on: service_healthy を満たせず、
 # compose up が失敗する状況。ECS のタスク停止と同じく SIGTERM で終了させ、
@@ -1320,6 +1383,7 @@ if printf 'DELETE ALL DOCKER DATA\n' | (
     --compose-service app \
     --startup-service app \
     --env-list-limit 1 \
+    --exit-on-deploy-error \
     --suppress-removed-logs \
     --cleanup-all-docker-data
 ) >"$failed_build_cleanup_output" 2>&1; then
@@ -2050,6 +2114,7 @@ if (
     --startup-service app \
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-reports" \
+    --exit-on-deploy-error \
     --suppress-removed-logs
 ) >"$deploy_exception_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
@@ -2329,6 +2394,7 @@ if (
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-off-reports" \
     --no-deploy-exception-analysis \
+    --exit-on-deploy-error \
     --suppress-removed-logs
 ) >"$deploy_exception_off_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
@@ -2406,4 +2472,125 @@ if (
 fi
 assert_contains "$deploy_exception_limit_output" "--deploy-exception-limit には 1 以上の整数を指定してください: 0"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, and Docker cleanup scenarios\n'
+# ---- --copy-file の事前コピー (強制上書き / 上書き禁止) ----------------------
+# 既定はコピー先の同名ファイルを強制上書きし、上書き前のファイルは処理終了時に
+# 復元する。--copy-file-no-overwrite 指定時は既存ファイルに触れず中止する。
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+copy_src="$TEST_TMP/copy-src.npmrc"
+printf 'from-copy-file\n' > "$copy_src"
+
+# 既定: 既存ファイルを強制上書きし、ビルドは上書き後の内容を見る。終了後は復元される。
+copy_overwrite_dir="$TEST_TMP/copy-overwrite"
+mkdir -p "$copy_overwrite_dir"
+printf 'pre-existing\n' > "$copy_overwrite_dir/copy-src.npmrc"
+copy_overwrite_output="$TEST_TMP/copy-overwrite.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_BUILD_SNAPSHOT="$TEST_TMP/copy-overwrite.snapshot" \
+  FAKE_BUILD_SNAPSHOT_SRC="$copy_overwrite_dir/copy-src.npmrc" \
+  bash ./build_and_verify.sh --copy-file "${copy_src}:${copy_overwrite_dir}"
+) >"$copy_overwrite_output" 2>&1; then
+  cat "$copy_overwrite_output" >&2
+  fail "--copy-file did not overwrite an existing destination file by default"
+fi
+assert_contains "$copy_overwrite_output" "コピー先の既存ファイルを強制上書きします: $copy_overwrite_dir/copy-src.npmrc"
+assert_contains "$copy_overwrite_output" "上書き前のファイルを復元しました: $copy_overwrite_dir/copy-src.npmrc"
+assert_not_contains "$copy_overwrite_output" "削除しました: $copy_overwrite_dir/copy-src.npmrc"
+# ビルド時点ではコピー元の内容に置き換わっている
+assert_contains "$TEST_TMP/copy-overwrite.snapshot" "from-copy-file"
+# 処理終了後は上書き前の内容へ戻っている (自動削除で消えていない)
+[ -f "$copy_overwrite_dir/copy-src.npmrc" ] \
+  || fail "--copy-file removed the pre-existing destination file instead of restoring it"
+assert_contains "$copy_overwrite_dir/copy-src.npmrc" "pre-existing"
+
+# 既存ファイルが無い場合は従来どおりコピー → 自動削除
+copy_new_dir="$TEST_TMP/copy-new"
+mkdir -p "$copy_new_dir"
+copy_new_output="$TEST_TMP/copy-new.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_BUILD_SNAPSHOT="$TEST_TMP/copy-new.snapshot" \
+  FAKE_BUILD_SNAPSHOT_SRC="$copy_new_dir/copy-src.npmrc" \
+  bash ./build_and_verify.sh --copy-file "${copy_src}:${copy_new_dir}"
+) >"$copy_new_output" 2>&1; then
+  cat "$copy_new_output" >&2
+  fail "--copy-file failed for a destination without an existing file"
+fi
+assert_contains "$TEST_TMP/copy-new.snapshot" "from-copy-file"
+assert_contains "$copy_new_output" "削除しました: $copy_new_dir/copy-src.npmrc"
+assert_not_contains "$copy_new_output" "上書き前のファイルを復元しました"
+[ -e "$copy_new_dir/copy-src.npmrc" ] \
+  && fail "--copy-file left the copied file behind"
+
+# --copy-file-no-overwrite: 既存ファイルがあれば中止し、既存ファイルは変更しない
+copy_no_overwrite_dir="$TEST_TMP/copy-no-overwrite"
+mkdir -p "$copy_no_overwrite_dir"
+printf 'must-not-change\n' > "$copy_no_overwrite_dir/copy-src.npmrc"
+copy_no_overwrite_output="$TEST_TMP/copy-no-overwrite.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --copy-file-no-overwrite \
+    --copy-file "${copy_src}:${copy_no_overwrite_dir}"
+) >"$copy_no_overwrite_output" 2>&1; then
+  cat "$copy_no_overwrite_output" >&2
+  fail "--copy-file-no-overwrite overwrote an existing destination file"
+fi
+assert_contains "$copy_no_overwrite_output" \
+  "コピー先に同名ファイルが既に存在します: $copy_no_overwrite_dir/copy-src.npmrc (--copy-file-no-overwrite が指定されているため中止します)"
+assert_contains "$copy_no_overwrite_dir/copy-src.npmrc" "must-not-change"
+
+# コピー先が通常ファイル以外 (ディレクトリ) の場合は既定でも中止する
+copy_dir_conflict_dir="$TEST_TMP/copy-dir-conflict"
+mkdir -p "$copy_dir_conflict_dir/copy-src.npmrc"
+copy_dir_conflict_output="$TEST_TMP/copy-dir-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --copy-file "${copy_src}:${copy_dir_conflict_dir}"
+) >"$copy_dir_conflict_output" 2>&1; then
+  cat "$copy_dir_conflict_output" >&2
+  fail "--copy-file accepted a destination that is a directory"
+fi
+assert_contains "$copy_dir_conflict_output" \
+  "コピー先が通常ファイルではありません: $copy_dir_conflict_dir/copy-src.npmrc"
+[ -d "$copy_dir_conflict_dir/copy-src.npmrc" ] \
+  || fail "--copy-file removed the conflicting destination directory"
+
+# 同じコピー先を 2 回上書きしても、最終的に一番最初の内容へ戻る (逆順で巻き戻す)
+copy_twice_dir="$TEST_TMP/copy-twice"
+mkdir -p "$copy_twice_dir"
+printf 'the-original\n' > "$copy_twice_dir/copy-src.npmrc"
+copy_src2="$TEST_TMP/copy-src2/copy-src.npmrc"
+mkdir -p "$TEST_TMP/copy-src2"
+printf 'second-copy\n' > "$copy_src2"
+copy_twice_output="$TEST_TMP/copy-twice.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --copy-file "${copy_src}:${copy_twice_dir}" \
+    --copy-file "${copy_src2}:${copy_twice_dir}"
+) >"$copy_twice_output" 2>&1; then
+  cat "$copy_twice_output" >&2
+  fail "--copy-file failed when the same destination was written twice"
+fi
+assert_contains "$copy_twice_dir/copy-src.npmrc" "the-original"
+
+# --dry-run では上書き・復元の予定のみ表示し、実ファイルは変更しない
+copy_dry_run_dir="$TEST_TMP/copy-dry-run"
+mkdir -p "$copy_dry_run_dir"
+printf 'dry-run-original\n' > "$copy_dry_run_dir/copy-src.npmrc"
+copy_dry_run_output="$TEST_TMP/copy-dry-run.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --copy-file "${copy_src}:${copy_dry_run_dir}"
+) >"$copy_dry_run_output" 2>&1; then
+  cat "$copy_dry_run_output" >&2
+  fail "--copy-file with --dry-run returned a non-zero status"
+fi
+assert_contains "$copy_dry_run_output" \
+  "[DRY-RUN] 既存ファイルを退避して強制上書き: $copy_dry_run_dir/copy-src.npmrc"
+assert_contains "$copy_dry_run_output" \
+  "[DRY-RUN] 上書き前のファイルを復元: $copy_dry_run_dir/copy-src.npmrc"
+assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, and Docker cleanup scenarios\n'

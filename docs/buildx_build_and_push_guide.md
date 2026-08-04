@@ -6,6 +6,8 @@
 - 対象ファイル: `buildx_build_and_push.sh`
 - 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash 5.x / GNU coreutils / Docker CE)
 - 関連ドキュメント: [compose 版ガイド](build_and_push_guide.md) / [ビルド・動作確認ガイド](build_and_verify_guide.md)
+- Excel 版: [buildx_build_and_push_guide.xlsx](buildx_build_and_push_guide.xlsx) — 仕様 / パラメータ / 既定で有効な動作 / 設定例 の 5 シート構成 (Meiryo UI)。
+  本ファイルを更新したら `python3 docs/generate_guide_xlsx.py` で再生成してください
 
 ---
 

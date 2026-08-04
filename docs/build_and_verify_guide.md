@@ -7,6 +7,8 @@
 - 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash 5.x / GNU coreutils / Docker CE)
 - 呼び出し経路: 直接実行、または `build_and_push.sh --build-only` からの委譲
 - 関連ドキュメント: [compose 版ガイド](build_and_push_guide.md) / [buildx 版ガイド](buildx_build_and_push_guide.md)
+- Excel 版: [build_and_verify_guide.xlsx](build_and_verify_guide.xlsx) — 仕様 / パラメータ / 既定で有効な動作 / 設定例 の 5 シート構成 (Meiryo UI)。
+  本ファイルを更新したら `python3 docs/generate_guide_xlsx.py` で再生成してください
 
 ---
 
@@ -125,6 +127,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 3. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
 4. teardown_container        … compose down (--keep-container 指定時は残す)
 5. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
+                                   (既存ファイルを強制上書きした分は削除せず、
+                                    退避しておいた上書き前のファイルを復元)
 6. 一時ファイル削除          … Java 例外解析結果・URL 応答本文・HTTP ボディ・healthcheck 診断
 ```
 
@@ -164,6 +168,9 @@ flowchart TD
     S --> T{--verify-startup?}
     T -- あり --> U[起動完了ログを待つ<br/>WFLYSRV0025 検出まで]
     T -- なし --> V
+    U -- デプロイエラー<br/>WFLYSRV0026 / 0056 --> U2{--exit-on-deploy-error?}
+    U2 -- なし 既定 --> U3[コンテナを残したまま<br/>調査用の対話操作を開始] --> Z3[exit 1 コンテナは起動状態のまま]
+    U2 -- あり --> Z4[従来どおり終了 exit 1]
     U --> V{--verify-url?}
     V -- あり --> W[curl でリトライしながら応答確認]
     V -- なし --> W2
@@ -307,7 +314,8 @@ compose down (削除)
 | `--compose-service NAME` | サービス名 | (全サービス) | **可** (繰り返し / カンマ区切り) | ビルド・起動対象。複数指定時は `base` を先行ビルド。`base` は起動対象にならない |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
 | `--dry-run` | フラグ | `false` | — | ビルド/起動/URL 呼び出し/ファイル操作を行わずプレビュー |
-| `--copy-file SRC:DEST_DIR` | `コピー元:コピー先ディレクトリ` | (なし) | **可** | ビルド前にコピーし、終了後に自動削除 |
+| `--copy-file SRC:DEST_DIR` | `コピー元:コピー先ディレクトリ` | (なし) | **可** | ビルド前にコピーし、終了後に自動削除。コピー先に同名ファイルがあれば強制上書きし、終了時に上書き前のファイルへ復元 |
+| `--copy-file-no-overwrite` | フラグ | `false` | — | `--copy-file` のコピー先に同名ファイルがあれば上書きせず中止 (`exit 1`) |
 
 ### 4.2 JBoss マスターパスワード (BuildKit シークレット)
 
@@ -396,6 +404,7 @@ compose down (削除)
 | `--keep-container-mode MODE` | `bash` / `http` / `logs` | (なし) | 指定すると `--verify-startup` と `--keep-container` を暗黙に有効化 |
 | `--jboss-context-root ROOT` | コンテキストルートのパス | (ログから検出) | `http` モード専用。URL 全体は指定不可 |
 | `--jboss-http-port PORT` | 1〜65535 | (ログから検出。既定 8080) | `http` モード専用。公開ポートがあれば自動変換 |
+| `--exit-on-deploy-error` | フラグ | `false` | デプロイエラーを検出しても調査用の対話操作へ入らず、従来どおり終了する (→ 5.10) |
 
 ### 4.7 情報表示・レポート
 
@@ -516,6 +525,47 @@ services:
 | CloudWatch Logs 送達診断 | `cwagent` / `cloudwatch-logs-mock` への偽装送達を確認 | `curl` + Python 3 |
 | X-Ray トレース診断 | `otel` / `adot-collector` / `jaeger` への偽装トレースを確認 | `curl` + Python 3 |
 
+### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
+
+AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイでエラーとなった場合
+(`WFLYSRV0026` / `WFLYSRV0056` を検出)、**既定ではコンテナと AP サーバを起動したまま残し、
+デプロイ成功後と同じ対話操作を開始**します。コンテナを落とさずに中を調査できます。
+
+| 項目 | 内容 |
+| --- | --- |
+| 対象 | 起動失敗ログ (`WFLYSRV0026` / `WFLYSRV0056`) を検出したデプロイエラー |
+| 対象外 | 起動確認のタイムアウト、コンテナの途中停止、`compose up` の失敗 (いずれも従来どおり終了) |
+| 開始する操作 | `--keep-container-mode` 指定時はそのモード。未指定時は `logs` (→ 5.4) |
+| 対話の前 | 失敗した起動ログと、WAR デプロイ時 Java 例外解析の結果を先に表示する |
+| 対話の後 | コンテナは起動状態のまま残る。不要になったら `docker compose -f compose.yml down` |
+| 終了コード | デプロイエラーは失敗のままなので `1` |
+
+```
+起動確認 → WFLYSRV0026 検出
+  → 起動ログを表示
+  → WAR デプロイ時 Java 例外解析を表示
+  → 対話操作 (logs) を開始  ← 各 Compose サービスへ bash 接続 / ログ確認
+  → 対話操作を終了してもコンテナは残したまま exit 1
+```
+
+**端末から入力できない場合 (CI など)**、対話操作は開始できません。この場合はコンテナを
+残さず、従来どおりの終了処理 (SIGTERM による終了ログ取得 → `compose down`) へ自動的に
+切り替わります。CI でもコンテナを残したい場合は `--keep-container` を併用してください。
+
+`--exit-on-deploy-error` を指定すると、デプロイエラーでも対話操作へ入らず、
+従来どおりログを出力して終了します。
+
+```bash
+# 既定: デプロイエラーでもコンテナを残して調査できる
+./build_and_verify.sh --verify-startup
+
+# デプロイエラー時は bash 接続で調査する
+./build_and_verify.sh --verify-startup --keep-container-mode bash
+
+# 従来どおり、デプロイエラーならそのまま終了する
+./build_and_verify.sh --verify-startup --exit-on-deploy-error
+```
+
 ### 5.5 `--verify-url` 関連オプションの組み合わせ
 
 | 組み合わせ | 可否 |
@@ -586,7 +636,8 @@ services:
 | 起動確認 | ポーリング内容を説明するのみ (成功扱い) |
 | URL 確認 | curl を実行せず内容を説明 |
 | 対話操作 | 実行内容の説明のみ |
-| `--copy-file` | コピー・削除を行わず予定を表示 |
+| デプロイエラー時の調査モード | 対話操作へは入らず、調査できる状態にする旨だけを表示 |
+| `--copy-file` | コピー・上書き・退避・復元・削除を行わず予定を表示 |
 | `--report-dir` | ファイル出力をスキップ |
 | ローカルイメージ確認 | スキップ |
 | AWS 未認証 (`--jboss-password-param` 時) | 中止せず警告のみ |
@@ -1125,7 +1176,7 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
-| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
+| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
 | `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
@@ -1171,6 +1222,13 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 # 10) 起動中サービスのログ・healthcheck・送達診断を調べる
 ./build_and_verify.sh --compose-service app,db,cwagent --keep-container-mode logs
 
+# 10-2) デプロイエラーになってもコンテナを残して調査する (既定の動作)
+#       AP サーバ起動後にデプロイが失敗すると、そのまま対話操作が始まる
+./build_and_verify.sh --verify-startup --compose-service app,db
+
+# 10-3) 従来どおり、デプロイエラーならそのまま終了する (CI 向け)
+./build_and_verify.sh --verify-startup --exit-on-deploy-error
+
 # 11) 全量レポートとコンテナ内ツリーを保存
 #     (JVM パラメータと OpenTelemetry 設定も同じレポートへ保存される)
 ./build_and_verify.sh --verify-startup \
@@ -1181,7 +1239,11 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
     --deployment-dir-env JBOSS_HOME,APP_DEPLOY_DIR
 
 # 13) 認証情報を一時配置してビルド
+#     (コピー先に .npmrc があっても強制上書きし、終了時に元のファイルへ戻す)
 ./build_and_verify.sh --copy-file .npmrc:./app
+
+# 13-2) コピー先の既存ファイルには一切触れず、あれば中止する
+./build_and_verify.sh --copy-file-no-overwrite --copy-file .npmrc:./app
 
 # 14) パラメータストアのマスターパスワードを使ってビルド
 ./build_and_verify.sh --jboss-password-param /j1/jboss/master-password
@@ -1261,7 +1323,12 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `--jboss-context-root / --jboss-http-port は --keep-container-mode http と併用してください` | 併用条件違反 | `--keep-container-mode http` を付ける |
 | `--url-body-json と --url-body-form は同時に指定できません` | ボディの二重指定 | どちらか一方にする |
 | `ローカルベースイメージが見つかりません` | `compose.yml` の `image:` と `--local-image` が不一致 | 両者を一致させる |
-| `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 | 表示された失敗行と起動ログを確認 |
+| `コピー先に同名ファイルが既に存在します: … (--copy-file-no-overwrite が指定されているため中止します)` | 上書き禁止指定でコピー先に同名ファイルがある | 既存ファイルを退避する、コピー先を変える、または `--copy-file-no-overwrite` を外して強制上書き (終了時に復元) させる |
+| `コピー先が通常ファイルではありません` | コピー先が既存のディレクトリ・シンボリックリンク等 | 上書きも自動削除も行わないため、コピー先を変えるか対象を手動で片付ける |
+| `上書き前のファイルを復元できませんでした: … -> …` | 退避先からの `mv` に失敗 (権限・容量など) | 表示された退避先パスから手動で戻す。退避先ディレクトリは削除されずに残る |
+| `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 (デプロイエラー) | 既定ではコンテナを残したまま調査用の対話操作へ入る (→ 5.4-2)。表示された失敗行と Java 例外解析を確認 |
+| `対話操作を開始できなかったため、通常のエラー終了として後始末します` | デプロイエラーを検出したが、端末から入力できず調査モードへ入れなかった (CI 等) | 対話実行するか、`--keep-container` を併用してコンテナを残す |
+| `起動中のコンテナが無いため、デプロイエラーの調査用対話操作へは入りません` | デプロイエラー検出後にコンテナが残っていない | コンテナが落ちた原因を起動ログで確認する |
 | `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | `dependency failed to start` の対象サービスと、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |
 | `コンテナが起動途中で停止しました` | アプリの異常終了 | 表示されたログで原因を確認 |
 | `SIGTERM による停止に失敗しました (compose stop, exit=…)` | `compose stop` が失敗 (daemon 応答なし等) | 終了処理のログが欠ける場合がある。`docker ps -a` で状態を確認 |

@@ -6,6 +6,8 @@
 - 対象ファイル: `build_and_push.sh`
 - 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash 5.x / GNU coreutils / Docker CE)
 - 関連ドキュメント: [buildx 版ガイド](buildx_build_and_push_guide.md) / [ビルド・動作確認ガイド](build_and_verify_guide.md)
+- Excel 版: [build_and_push_guide.xlsx](build_and_push_guide.xlsx) — 仕様 / パラメータ / 既定で有効な動作 / 設定例 の 5 シート構成 (Meiryo UI)。
+  本ファイルを更新したら `python3 docs/generate_guide_xlsx.py` で再生成してください
 
 ---
 
@@ -342,7 +344,7 @@ flowchart TD
 | 書式 | `SRC:DEST_DIR` (最初の `:` で分割) |
 | 繰り返し | 可。指定順にコピーされる |
 | コピー先 | **既存のディレクトリ**である必要がある |
-| 同名ファイル | コピー先に既存ファイルがあると、事故防止のため中止する (`exit 1`) |
+| 同名ファイル | コピー先に既存ファイルがあると、事故防止のため中止する (`exit 1`)。ただし `--build-only` で `build_and_verify.sh` へ委譲した場合は、委譲先の既定に従い**強制上書き** (終了時に上書き前のファイルへ復元) となる。委譲時に中止させたい場合は `--copy-file-no-overwrite` を併用する |
 | 削除 | 終了時 (成功・失敗・中断のいずれでも) 自動削除。削除するのはコピーしたファイルのみ |
 
 ```bash
