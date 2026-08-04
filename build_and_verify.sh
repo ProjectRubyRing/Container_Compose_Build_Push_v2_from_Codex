@@ -467,6 +467,10 @@ DEPLOY_EXCEPTION_DEPLOY_TOTAL="0"  # うちデプロイ処理中に発生した�
 DEPLOY_EXCEPTION_WORST=""          # 最も高い深刻度
 DEPLOY_EXCEPTION_VERDICT=""        # 解析の総合判定
 DEPLOY_EXCEPTION_SKIP_REASON=""    # 解析しなかった理由 (全量レポートへ記載する)
+# 解析対象ログの取得状況。コンテナの起動に失敗した場合でも解析自体は必ず行うため、
+# 「どこまでのログを解析できたのか」を画面・全量レポート・Excel の三方へ明示する。
+DEPLOY_EXCEPTION_LOG_STATUS=""
+DEPLOY_EXCEPTION_LOG_COLLECTED="false" # 解析対象のログを 1 行でも取得できたか
 # 解析ヘルパーへ渡すログのサービス区切り。ログ本文の行頭には現れない制御文字を使う。
 DEPLOY_EXCEPTION_SERVICE_MARKER=$'\037'
 
@@ -10570,6 +10574,8 @@ def build_text_report(meta, events, stats, scanned_services, line_count, truncat
     add("Compose 定義  : %s" % meta.get("compose_file", ""))
     add("解析対象      : %s (%d サービス)" % (" ".join(scanned_services) or "(なし)", len(scanned_services)))
     add("解析ログ行数  : %d 行" % line_count)
+    if meta.get("log_status"):
+        add("ログ取得状況  : %s" % meta.get("log_status", ""))
     add("検出した例外  : %d 件 (デプロイ処理中: %d 件 / デプロイ外: %d 件)"
         % (stats["total"], stats["deploy"], stats["other"]))
     if stats["by_severity"]:
@@ -10586,8 +10592,14 @@ def build_text_report(meta, events, stats, scanned_services, line_count, truncat
 
     if not events:
         add("")
-        add("Java の例外スタックトレースは検出されませんでした。")
-        add("デプロイ処理でスローされた例外が無いか、対象サービスのログに出力されていません。")
+        if line_count == 0:
+            # ログが無い = 解析していないことを、0 件検出と読み違えられないようにする。
+            add("解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。")
+            add("コンテナの起動 (compose up) に失敗した場合は、デプロイ結果ファイルの")
+            add("[9] Compose サービス別ログと、compose up 自体のエラー出力を確認してください。")
+        else:
+            add("Java の例外スタックトレースは検出されませんでした。")
+            add("デプロイ処理でスローされた例外が無いか、対象サービスのログに出力されていません。")
         # 例外が無くても、Excel の「デプロイログ」シートと内容を揃える。
         if full and lines:
             out.extend(build_log_section(lines, events, max_log_rows))
@@ -11149,6 +11161,7 @@ def build_summary_sheet(meta, events, stats, scanned_services, line_count, trunc
     kv("解析対象サービス", " ".join(scanned_services) or "(なし)")
     kv("解析ログ行数", "%d 行" % line_count)
     kv("ログ取得範囲", meta.get("log_scope", ""))
+    kv("ログ取得状況", meta.get("log_status", ""))
     sheet.add([])
 
     sheet.add([Cell("2. 検出サマリ", S_SECTION)])
@@ -11159,7 +11172,11 @@ def build_summary_sheet(meta, events, stats, scanned_services, line_count, trunc
        " / ".join("%s %d 件" % (name, count) for name, count in stats["by_severity"]) or "(なし)")
     kv("分類の内訳",
        " / ".join("%s %d 件" % (name, count) for name, count in stats["by_category"]) or "(なし)")
-    verdict_style = S_OK if stats["total"] == 0 else SEVERITY_STYLE.get(stats["worst"], S_BODY)
+    if stats["total"] == 0:
+        # 解析対象のログが無い場合は「未評価」のため、OK と同じ色にはしない。
+        verdict_style = S_OK if line_count else S_WARN
+    else:
+        verdict_style = SEVERITY_STYLE.get(stats["worst"], S_BODY)
     sheet.add([Cell("総合判定", S_LABEL), Cell(stats["verdict"], verdict_style)])
     if truncated:
         kv("注意", "詳細分析は上限の %d 件までです。残りは件数のみ集計しています "
@@ -11167,7 +11184,10 @@ def build_summary_sheet(meta, events, stats, scanned_services, line_count, trunc
     sheet.add([])
 
     sheet.add([Cell("3. 優先して対応すべき例外", S_SECTION)])
-    if not events:
+    if not events and line_count == 0:
+        sheet.add([Cell("(未評価)", S_BODY),
+                   Cell("解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。", S_BODY)])
+    elif not events:
         sheet.add([Cell("(なし)", S_BODY), Cell("Java の例外スタックトレースは検出されませんでした。", S_BODY)])
     else:
         sheet.add(header_row(["No", "例外クラス (根本原因)", "対応の要点"]))
@@ -11454,7 +11474,7 @@ def read_meta(path):
     return meta
 
 
-def compute_stats(events):
+def compute_stats(events, log_available=True):
     severity_counts = {}
     category_counts = {}
     deploy = 0
@@ -11470,7 +11490,11 @@ def compute_stats(events):
     by_category = sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
     worst = by_severity[0][0] if by_severity else ""
     total = len(events)
-    if total == 0:
+    if total == 0 and not log_available:
+        # 解析対象のログが 1 行も無い場合、0 件は「例外が無かった」ことを意味しない。
+        # コンテナの起動に失敗した実行を OK と誤読させないため、判定を分ける。
+        verdict = "未評価 (解析対象のログが無いため判定できません)"
+    elif total == 0:
         verdict = "OK (Java 例外は検出されませんでした)"
     elif deploy and worst == "致命的":
         verdict = "NG (デプロイ処理中に致命的な例外が発生しています)"
@@ -11531,7 +11555,7 @@ def main(argv):
     ))
     # 集計は検出した全件から求め、詳細分析だけを上限までに絞る。
     # (件数そのものを取りこぼすと、レポートの総合判定が実態とずれるため)
-    stats = compute_stats(events)
+    stats = compute_stats(events, bool(lines))
     truncated = 0
     if len(events) > args.max_exceptions:
         truncated = args.max_exceptions
@@ -11623,7 +11647,9 @@ write_deploy_exception_meta() {
   else
     overall_status="失敗 (exit=${exit_status})"
   fi
-  if [ -n "$CONTAINER_LOG_SINCE" ]; then
+  if [ "$DEPLOY_EXCEPTION_LOG_COLLECTED" != "true" ]; then
+    log_scope="(解析対象のログを取得できていません)"
+  elif [ -n "$CONTAINER_LOG_SINCE" ]; then
     log_scope="今回の compose up 以降 (--since ${CONTAINER_LOG_SINCE})"
   else
     log_scope="コンテナ作成時からの全期間"
@@ -11647,25 +11673,32 @@ write_deploy_exception_meta() {
     deploy_exception_meta_entry "overall_status" "$overall_status"
     deploy_exception_meta_entry "report_file" "$report_file"
     deploy_exception_meta_entry "log_scope" "$log_scope"
+    deploy_exception_meta_entry "log_status" "$DEPLOY_EXCEPTION_LOG_STATUS"
   } > "$meta_file"
 }
 
 # 解析対象のログを、サービス区切り付きの 1 ファイルへ書き出す。
 # サービスをまたいでデプロイ対象や起動完了ログを取り違えないよう、
 # サービス単位に取得して区切り行を挟む。
+# 戻り値は「ログ本文を 1 行でも取得できたか」。コンテナの起動に失敗した場合でも
+# 途中まで出たログは残っているため、取得できた分だけを解析対象とする。
 collect_deploy_exception_logs() {
-  local output_file="$1" service_name
+  local output_file="$1" service_name service_logs collected="false"
   local -a services=()
 
+  : > "$output_file" || return 1
   mapfile -t services < <(compose_all_service_names)
   [ ${#services[@]} -gt 0 ] || return 1
-  : > "$output_file" || return 1
   for service_name in "${services[@]}"; do
     [ -n "$service_name" ] || continue
+    service_logs="$(compose_logs "$service_name" | strip_ansi_codes)"
+    # ログが 1 行も無いサービスは区切りだけが残っても意味が無いため書き出さない。
+    [ -n "$service_logs" ] || continue
     printf '%s%s\n' "$DEPLOY_EXCEPTION_SERVICE_MARKER" "$service_name" >> "$output_file"
-    compose_logs "$service_name" | strip_ansi_codes >> "$output_file"
+    printf '%s\n' "$service_logs" >> "$output_file"
+    collected="true"
   done
-  [ -s "$output_file" ]
+  [ "$collected" = "true" ]
 }
 
 # 解析結果ファイル (Excel / テキスト) の出力先を決める。明示指定が最優先で、
@@ -11728,6 +11761,12 @@ read_deploy_exception_summary() {
 # 成功経路 (主処理の末尾) と失敗経路 (EXIT トラップ) の双方から呼ばれるため、
 # 二重に実行しないよう DEPLOY_EXCEPTION_ANALYZED で守る。コンテナを削除する前に
 # 呼ぶ必要がある (compose logs が取得できなくなるため)。
+#
+# コンテナの起動 (compose up) に失敗した場合でも解析は必ず実行する。
+# 起動に失敗する原因そのものがデプロイ処理中の Java 例外であることが多く、
+# 「全量レポートしか出ず、例外解析だけ無い」状態では原因調査ができないため。
+# 解析対象のログを 1 行も取得できなかった場合も、その事実を結果として出力する
+# (0 件検出ではなく「未評価」として扱い、理由を三方へ残す)。
 analyze_war_deploy_exceptions() {
   local exit_status="${1:-0}"
   local log_file="" meta_file="" summary_file="" excel_path="" text_path="" line=""
@@ -11745,11 +11784,6 @@ analyze_war_deploy_exceptions() {
     DEPLOY_EXCEPTION_ANALYZED="true"
     DEPLOY_EXCEPTION_SKIP_REASON="DRY-RUN のため解析していません。"
     log "[DRY-RUN] WAR デプロイ時 Java 例外解析をスキップします。"
-    return 0
-  fi
-  if [ "$STARTED_CONTAINER" != "true" ]; then
-    DEPLOY_EXCEPTION_ANALYZED="true"
-    DEPLOY_EXCEPTION_SKIP_REASON="コンテナを起動していないため、デプロイ処理のログがありません。"
     return 0
   fi
   if ! resolve_deploy_exception_python; then
@@ -11771,12 +11805,26 @@ analyze_war_deploy_exceptions() {
     return 1
   fi
 
-  if ! collect_deploy_exception_logs "$log_file"; then
-    rm -f -- "$log_file" "$meta_file" "$summary_file" "$DEPLOY_EXCEPTION_TEXT_FILE"
-    DEPLOY_EXCEPTION_TEXT_FILE=""
-    DEPLOY_EXCEPTION_SKIP_REASON="Compose サービスのログを取得できなかったため解析していません。"
-    warn "WAR デプロイ時 Java 例外解析をスキップしました: Compose サービスのログを取得できません。"
-    return 1
+  # 解析対象ログの収集。取得できなかった場合も解析自体は続け、その理由を結果へ残す。
+  # compose up まで到達していない実行では、前回の実行が残したコンテナのログを
+  # 今回の結果として解析してしまわないよう、収集そのものを行わない。
+  if [ "$COMPOSE_UP_ATTEMPTED" != "true" ]; then
+    : > "$log_file"
+    DEPLOY_EXCEPTION_LOG_COLLECTED="false"
+    DEPLOY_EXCEPTION_LOG_STATUS="コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません (ビルド失敗、または起動確認を伴わない実行)。"
+  elif collect_deploy_exception_logs "$log_file"; then
+    DEPLOY_EXCEPTION_LOG_COLLECTED="true"
+    if [ "$STARTED_CONTAINER" = "true" ]; then
+      DEPLOY_EXCEPTION_LOG_STATUS="コンテナ起動後のデプロイ処理ログを解析しました。"
+    else
+      DEPLOY_EXCEPTION_LOG_STATUS="コンテナの起動 (compose up) に失敗したため、失敗するまでに出力されたログを解析しました。"
+    fi
+  else
+    : > "$log_file"
+    DEPLOY_EXCEPTION_LOG_COLLECTED="false"
+    # 取得できなかったことは show_war_deploy_exception_analysis が結果として示すため、
+    # ここでは警告を重ねない。
+    DEPLOY_EXCEPTION_LOG_STATUS="Compose サービスのログを 1 行も取得できませんでした (コンテナが作成されていない可能性があります)。"
   fi
   write_deploy_exception_meta "$meta_file" "$exit_status"
 
@@ -11835,8 +11883,21 @@ show_war_deploy_exception_analysis() {
     fi
     err "WAR デプロイ時に Java の例外を ${DEPLOY_EXCEPTION_TOTAL} 件検出しました (デプロイ処理中: ${DEPLOY_EXCEPTION_DEPLOY_TOTAL} 件)。"
     err "  判定: ${DEPLOY_EXCEPTION_VERDICT}"
-  else
+  elif [ "$DEPLOY_EXCEPTION_LOG_COLLECTED" = "true" ]; then
     log "WAR デプロイ時の Java 例外は検出されませんでした。"
+  elif [ "$COMPOSE_UP_ATTEMPTED" = "true" ]; then
+    # ログが出ているはずの実行で 1 行も取得できなかった場合の 0 件は、
+    # 「例外が無かった」ことを意味しないため、検出結果ではなく理由を示す。
+    warn "WAR デプロイ時 Java 例外解析: ${DEPLOY_EXCEPTION_LOG_STATUS}"
+    warn "  判定: ${DEPLOY_EXCEPTION_VERDICT}"
+  else
+    # コンテナを起動しない実行 (ビルドのみ / ビルド失敗) は想定内のため通常表示。
+    log "WAR デプロイ時 Java 例外解析: ${DEPLOY_EXCEPTION_LOG_STATUS}"
+    log "  判定: ${DEPLOY_EXCEPTION_VERDICT}"
+  fi
+  # コンテナの起動に失敗した実行では、解析できた範囲を明示する。
+  if [ "$DEPLOY_EXCEPTION_LOG_COLLECTED" = "true" ] && [ "$STARTED_CONTAINER" != "true" ]; then
+    log "  解析範囲: ${DEPLOY_EXCEPTION_LOG_STATUS}"
   fi
   if [ -n "$DEPLOY_EXCEPTION_EXCEL_FILE" ]; then
     log "Java 例外解析の Excel ブックを出力しました: $DEPLOY_EXCEPTION_EXCEL_FILE"
@@ -11856,7 +11917,7 @@ append_deploy_exception_report() {
   local report_file="$1"
 
   if [ -z "$DEPLOY_EXCEPTION_TEXT_FILE" ] || [ ! -s "$DEPLOY_EXCEPTION_TEXT_FILE" ]; then
-    printf '%s\n' "${DEPLOY_EXCEPTION_SKIP_REASON:-デプロイ処理のログを取得できなかったため解析していません。}" \
+    printf '%s\n' "${DEPLOY_EXCEPTION_SKIP_REASON:-解析結果を取得できなかったため記載できません。}" \
         >> "$report_file"
     return 0
   fi
@@ -11871,6 +11932,7 @@ append_deploy_exception_report() {
   else
     printf 'テキスト      : (未出力)\n' >> "$report_file"
   fi
+  printf 'ログ取得状況  : %s\n' "${DEPLOY_EXCEPTION_LOG_STATUS:-(不明)}" >> "$report_file"
   printf '取得範囲      : 終了ログ (SIGTERM 後) を取得する前のデプロイ処理ログ\n' >> "$report_file"
   printf '\n' >> "$report_file"
   cat -- "$DEPLOY_EXCEPTION_TEXT_FILE" >> "$report_file"
@@ -12079,6 +12141,7 @@ write_build_report() {
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
     printf '                デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)\n'
+    printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -12397,7 +12460,7 @@ if [ "$NEED_CONTAINER" != "true" ]; then
     warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
   if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
-    warn "WAR デプロイ時 Java 例外解析はコンテナ起動を伴う動作確認時のみ実行されます。--verify-startup または --verify-url を併用してください。"
+    warn "WAR デプロイ時 Java 例外解析は、コンテナを起動していないため解析対象のログがありません (結果は「未評価」として出力します)。--verify-startup または --verify-url を併用してください。"
   fi
   if [ "$CWAGENT_VERIFY_ACTIVE" = "true" ]; then
     # 送信先を特定できている場合のみ、送達が未確認であることを明示する。

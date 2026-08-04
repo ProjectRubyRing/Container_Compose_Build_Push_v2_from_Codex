@@ -636,6 +636,24 @@ assert_contains "${build_failure_reports[0]}" "[9-2] Compose サービス: app"
 assert_contains "${build_failure_reports[0]}" "[9-3] Compose サービス: adot-collector"
 assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテナなし)" 3
 assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
+# ビルド失敗で compose up まで到達しなかった場合も Java 例外解析は必ず実行し、
+# 「0 件検出」ではなく「未評価」として理由まで残す。
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$build_failure_output"; then
+  assert_contains "$build_failure_output" \
+    "WAR デプロイ時 Java 例外解析: コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
+  assert_contains "${build_failure_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
+  assert_contains "${build_failure_reports[0]}" \
+    "ログ取得状況  : コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
+  assert_contains "${build_failure_reports[0]}" "総合判定      : 未評価 (解析対象のログが無いため判定できません)"
+  assert_not_contains "${build_failure_reports[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
+  build_failure_books=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#build_failure_books[@]} -eq 1 ] && [ -s "${build_failure_books[0]}" ] \
+    || fail "expected a java exception workbook even when the build failed"
+  build_failure_texts=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ${#build_failure_texts[@]} -eq 1 ] && [ -s "${build_failure_texts[0]}" ] \
+    || fail "expected a java exception text file even when the build failed"
+  assert_contains "${build_failure_texts[0]}" "解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。"
+fi
 
 # JVM を実行しないコンテナ (OTel Collector / DB など) でも、Java プロセス無しを
 # 明示したうえで OpenTelemetry の環境変数側は同じ形式で一覧化する。
@@ -2199,6 +2217,101 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   clean_reports=("${REPORT_FILES[@]}")
   assert_contains "${clean_reports[0]}" "検出した例外  : 0 件"
   assert_contains "${clean_reports[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
+fi
+
+# --- コンテナの起動 (compose up) に失敗しても、解析を実行して結果を出力すること ---
+# 起動できない原因そのものがデプロイ処理中の Java 例外であることが多いため、
+# デプロイ結果ファイルだけを残して解析を省略してしまわないことを確認する。
+deploy_exception_upfail_output="$TEST_TMP/deploy-exception-upfail.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_COMPOSE_UP_FAIL="true"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-upfail-reports" \
+    --suppress-removed-logs
+) >"$deploy_exception_upfail_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
+  cat "$deploy_exception_upfail_output" >&2
+  fail "compose up failure unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
+
+assert_contains "$deploy_exception_upfail_output" "コンテナの起動に失敗しました (compose up)"
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_upfail_output"; then
+  # 起動に失敗した時点までのログから、成功時と同じ内容の解析結果を出す。
+  assert_contains "$deploy_exception_upfail_output" \
+    "WAR デプロイ時に Java の例外を 2 件検出しました (デプロイ処理中: 2 件)。"
+  assert_contains "$deploy_exception_upfail_output" \
+    "解析範囲: コンテナの起動 (compose up) に失敗したため、失敗するまでに出力されたログを解析しました。"
+  assert_contains "$deploy_exception_upfail_output" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+
+  collect_report_files "$TEST_TMP/deploy-exception-upfail-reports"
+  upfail_reports=("${REPORT_FILES[@]}")
+  [ ${#upfail_reports[@]} -eq 1 ] && [ -f "${upfail_reports[0]}" ] \
+    || fail "expected one report for the compose up failure scenario"
+  assert_contains "${upfail_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
+  assert_contains "${upfail_reports[0]}" \
+    "ログ取得状況  : コンテナの起動 (compose up) に失敗したため、失敗するまでに出力されたログを解析しました。"
+  assert_contains "${upfail_reports[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  # 旧実装がここへ記録していた「解析していません」に戻っていないこと。
+  assert_not_contains "${upfail_reports[0]}" "コンテナを起動していないため、デプロイ処理のログがありません。"
+
+  upfail_books=("$TEST_TMP/deploy-exception-upfail-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#upfail_books[@]} -eq 1 ] && [ -s "${upfail_books[0]}" ] \
+    || fail "expected a java exception workbook when compose up failed"
+  upfail_texts=("$TEST_TMP/deploy-exception-upfail-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ${#upfail_texts[@]} -eq 1 ] && [ -s "${upfail_texts[0]}" ] \
+    || fail "expected a java exception text file when compose up failed"
+  assert_contains "${upfail_texts[0]}" "総合判定      : NG (デプロイ処理中に致命的な例外が発生しています)"
+  assert_contains "${upfail_texts[0]}" "at com.example.orders.OrderService.<init>(OrderService.java:31)"
+fi
+
+# --- 起動に失敗し、ログも 1 行も取得できない場合は「未評価」として出力すること ---
+deploy_exception_nolog_output="$TEST_TMP/deploy-exception-nolog.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_COMPOSE_UP_FAIL="true"
+export FAKE_COMPOSE_NO_CONTAINERS="true"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-nolog-reports" \
+    --suppress-removed-logs
+) >"$deploy_exception_nolog_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL \
+        FAKE_COMPOSE_NO_CONTAINERS
+  cat "$deploy_exception_nolog_output" >&2
+  fail "compose up failure without containers unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL \
+      FAKE_COMPOSE_NO_CONTAINERS
+
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_nolog_output"; then
+  assert_contains "$deploy_exception_nolog_output" \
+    "WAR デプロイ時 Java 例外解析: Compose サービスのログを 1 行も取得できませんでした"
+  # ログが無いのに「例外なし」と読める表示をしないこと。
+  assert_not_contains "$deploy_exception_nolog_output" "WAR デプロイ時の Java 例外は検出されませんでした。"
+  collect_report_files "$TEST_TMP/deploy-exception-nolog-reports"
+  nolog_reports=("${REPORT_FILES[@]}")
+  [ ${#nolog_reports[@]} -eq 1 ] && [ -f "${nolog_reports[0]}" ] \
+    || fail "expected one report when no container log was available"
+  assert_contains "${nolog_reports[0]}" "総合判定      : 未評価 (解析対象のログが無いため判定できません)"
+  nolog_books=("$TEST_TMP/deploy-exception-nolog-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#nolog_books[@]} -eq 1 ] && [ -s "${nolog_books[0]}" ] \
+    || fail "expected a java exception workbook when no container log was available"
 fi
 
 # --- --no-deploy-exception-analysis で解析と Excel 出力を止められること ---
