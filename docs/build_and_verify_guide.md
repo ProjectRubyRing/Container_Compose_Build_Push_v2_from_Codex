@@ -94,6 +94,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 中盤 | JVM パラメータ・OpenTelemetry 設定 | `/proc/<pid>/cmdline` の走査、JVM オプションの分類、OpenTelemetry 設定の突き合わせ |
 | 中盤 | 対話操作 | bash / HTTP / logs モードと、healthcheck・MySQL・可観測性の各ヘルパ |
 | 後半 | Docker 完全クリーンアップ | 対象の集計、確認フレーズ、削除、検証 |
+| 後半 | ビルドの停滞検知・進捗表示 | ビルド出力の読み手、監視プロセス、停滞診断、上限時間での中断 |
 | 後半 | WAR デプロイ時 Java 例外解析 | 解析ヘルパー (Python 3) の埋め込みと、ログ収集・実行・表示・レポート追記 |
 | 後半 | 全量レポート | `write_build_report` |
 | 後半 | 後始末 (`cleanup_all`) | EXIT トラップ本体 |
@@ -104,7 +105,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | グループ | 代表的な関数 | 役割 |
 | --- | --- | --- |
 | ログ・時刻 | `log` / `warn` / `err` / `diag` / `to_jst_display_time` | 出力整形と UTC→JST 変換 |
-| 引数処理 | `append_services` / `need_value` / `validate_positive_integer` | カンマ区切り分割、値欠落検出、数値検証 |
+| 引数処理 | `append_services` / `need_value` / `validate_positive_integer` / `validate_non_negative_integer` | カンマ区切り分割、値欠落検出、数値検証 (ビルド監視の各値は 0 を許す) |
 | Compose 操作 | `compose_container_ids` / `compose_logs` / `compose_started_services` | 対象サービスの ID・ログ・サービス名取得 |
 | 起動確認 | `start_container` / `wait_for_startup` / `containers_all_running` / `target_services_all_running` | 起動、ログポーリング、途中停止の検知 |
 | ログ表示 | `show_startup_logs` / `print_startup_logs_with_highlights` / `show_companion_service_logs` | 行数制御と重要ログの色分け |
@@ -115,6 +116,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | healthcheck | `run_interactive_compose_healthcheck` / `run_healthcheck_http_probe` | healthcheck の設定・履歴・通信確認 |
 | 可観測性 | `render_cloudwatch_delivery_report` / `run_otel_jaeger_trace_helper` | cwagent / OTel のローカル送達診断 |
 | クリーンアップ | `cleanup_all_docker_data` / `teardown_container` / `cleanup_copied_files` | Docker 全体削除と通常後始末 |
+| ビルド監視 | `run_build_with_watchdog` / `build_watchdog_reader` / `build_watchdog_monitor` / `diagnose_build_stall` / `build_phase_from_line` / `check_build_disk_space` | `exporting layers` などで出力が途切れたときの進捗表示・停滞診断・上限時間での中断 |
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
 | Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_deploy_exception_excel_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
@@ -229,8 +231,12 @@ Java 例外解析は成功経路では主処理の末尾で、失敗経路では
 | タイミング | 処理 |
 | --- | --- |
 | ビルド前 | `--disk-usage-report` 指定時に使用量を測定 (増減の基準にする) |
+| ビルド前 | data root の空き容量を確認し、5 GiB 未満なら警告する (5.2-2 参照) |
 | ビルド前 | 世代交代の判定に使う現在のローカルイメージ ID を控える |
 | ローカルイメージ確認の直後 | ID が変わっていれば、タグを失った旧世代イメージを削除する |
+
+ビルド自体は監視プロセス付きで実行し、`exporting to image` / `exporting layers` で
+出力が途切れても状況が分かるようにします (5.2-2 参照)。
 
 ### 3.3 起動確認フェーズの詳細
 
@@ -334,6 +340,10 @@ compose down (削除)
 | `--compose-file FILE` | ファイルパス | `compose.yml` | 不可 | compose 定義ファイル |
 | `--compose-service NAME` | サービス名 | (全サービス) | **可** (繰り返し / カンマ区切り) | ビルド・起動対象。複数指定時は `base` を先行ビルド。`base` は起動対象にならない |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
+| `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | 不可 | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔。`0` で表示しない |
+| `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | 不可 | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は中断しない |
+| `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | 不可 | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM で中断し (20 秒後に SIGKILL)、`exit 1` |
+| `--no-build-watchdog` | フラグ | `false` | — | 上記の監視をすべて行わない。監視が有効な間は `BUILDKIT_PROGRESS=tty` を `plain` へ切り替えるため、tty 形式を使いたい場合に指定する |
 | `--dry-run` | フラグ | `false` | — | ビルド/起動/URL 呼び出し/ファイル操作を行わずプレビュー |
 | `--copy-file SRC:DEST_DIR` | `コピー元:コピー先ディレクトリ` | (なし) | **可** | ビルド前にコピーし、終了後に自動削除。コピー先に同名ファイルがあれば強制上書きし、終了時に上書き前のファイルへ復元 |
 | `--copy-file-no-overwrite` | フラグ | `false` | — | `--copy-file` のコピー先に同名ファイルがあれば上書きせず中止 (`exit 1`) |
@@ -492,6 +502,105 @@ compose down (削除)
 
 `base` はベースイメージを提供する**ビルド専用サービス**であり、起動しても即終了するため、
 明示指定されていても起動・ログ収集・生存監視の対象からは除外されます。
+
+### 5.2-0 ビルドの停滞検知・進捗表示 (`--build-progress-interval` / `--build-stall-timeout` / `--build-timeout`)
+
+> 節番号は既存の並びを崩さないため `5.2-0` としています (`5.2` の直前に読む内容です)。
+
+#### 何が起きているのか
+
+`exporting to image` は、ビルドしたレイヤを Docker のイメージストアへ書き出す段です。
+1 レイヤずつ順に「tar 化 → DiffID (sha256) の再計算 → data root への展開・登録」を行い、
+並列化されないため、ベースイメージのようにレイヤが大きいと**この段だけで数分〜数十分**
+かかります。
+
+一方 `--progress=plain` は `#12 exporting layers` の 1 行を出したあと、完了して
+`#12 exporting layers 45.2s done` を出すまで**何も表示しません**。このため、
+次のどれであっても画面上は「`exporting layers` から動かない」という同じ見え方になります。
+
+| # | 原因 | 見分け方 |
+| --- | --- | --- |
+| 1 | **遅いだけで進んでいる** (最も多い) | data root の空き容量が減り続けている |
+| 2 | data root の空き容量・inode の不足 | 空き容量が数 GiB を切っている / `df -i` の使用率が 100% 近い |
+| 3 | ディスク I/O の枯渇 (EBS のバーストクレジット切れ等) | `iostat -x 1` の `%util` が張り付き `await` が大きい |
+| 4 | 同じ daemon の別操作との競合 (`image rm` / `system prune` / 別ビルド) | 他の docker コマンドも返らない |
+| 5 | Docker daemon 自体の停止 | `docker version` / `docker system df` が応答しない |
+| 6 | 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている | Ctrl+Q で再開する |
+| 7 | ウイルス対策 / EDR による data root のリアルタイムスキャン | スキャン除外で改善する |
+
+#### 監視の構成
+
+ビルドコマンドは `run_build_with_watchdog` 経由で実行します。
+
+| プロセス | 役割 |
+| --- | --- |
+| ビルド本体 | パイプ左辺。`$BASHPID` を控えてから `exec` するため、PID = `docker` プロセスとなり中断できる |
+| 読み手 (`build_watchdog_reader`) | パイプ右辺。行をそのまま流しつつ「最後に出力があった時刻」と「BuildKit のフェーズ」を一時ディレクトリへ記録する |
+| 監視 (`build_watchdog_monitor`) | 別プロセス。一時ディレクトリを見て進捗表示・停滞検知・上限時間での中断を行う |
+
+#### (1) 進捗表示 (`--build-progress-interval`、既定 30 秒)
+
+```text
+[2026-08-05 09:41:50 JST] ビルド継続中 (全サービス): 経過 4分30秒 / 直近の出力から 4分12秒 / フェーズ: exporting layers (レイヤをイメージストアへ書き出し中) 継続 4分12秒
+[2026-08-05 09:41:50 JST]   data root の空き容量: 10.35 GiB (前回から 820.00 MiB 減少 → 書き出しは進んでいます) /var/lib/docker
+```
+
+BuildKit の出力から検出するフェーズは次のとおりです。
+
+| 出力に含まれる文字列 | 表示するフェーズ |
+| --- | --- |
+| `exporting layers` | `exporting layers (レイヤをイメージストアへ書き出し中)` |
+| `exporting manifest` / `exporting config` / `exporting attestation` | `exporting manifest/config (メタデータの書き出し)` |
+| `writing image` | `writing image (イメージ ID の確定)` |
+| `naming to` | `naming to (ローカルイメージ名の付与)` |
+| `importing to docker` / `sending tarball` / `unpacking to docker` | `importing to docker (docker イメージストアへの取り込み)` |
+| `exporting to image` / `exporting to docker image format` | `exporting to image (イメージ書き出しの開始)` |
+| `pushing layers` / `pushing manifest` | `pushing (レジストリへの送信)` |
+| `transferring context` / `transferring dockerfile` | `transferring context (ビルドコンテキストの転送)` |
+
+data root の空き容量は `df` から取得します (daemon には問い合わせないため、daemon が
+busy でも取得できます)。**減り続けていれば上表の 1、変化がなければ 2〜7 を疑います。**
+
+#### (2) 停滞検知 (`--build-stall-timeout`、既定 300 秒)
+
+出力が指定秒数途切れたら、次を timeout 付きで調べて診断を表示します。
+**処理は中断しません** (遅いだけの場合にビルドを捨てないため)。
+
+| 確認項目 | 判断材料 |
+| --- | --- |
+| `docker version --format '{{.Server.Version}}'` (10 秒) | 応答しなければ daemon 全体が停止している (上表 5) |
+| data root の空き容量 (`df -Pk`) | 数 GiB を切っていれば上表 2 |
+| data root の inode (`df -Pi`) | 使用率が 100% 近ければ上表 2 |
+| `docker system df` (15 秒) | 応答しなければ daemon がイメージストアのロックを掴んで動けない疑い (上表 4・5) |
+
+続けて上表の 7 原因と対処方法、別端末で実行する確認コマンドを一覧表示します。
+出力が再開すれば検知状態は解除され、次に途切れたときに再び診断します。
+
+#### (3) 上限時間での中断 (`--build-timeout`、既定 0 = 無制限)
+
+| 段階 | 動作 |
+| --- | --- |
+| 上限超過 | `err` で通知し、(2) と同じ診断を「上限時間超過」として表示 |
+| SIGTERM | ビルド本体の PID へ送信。`docker` CLI が落ちると BuildKit のセッションも切れ、daemon 側のビルドもキャンセルされる |
+| 20 秒待っても残っていれば SIGKILL | `BUILD_TIMEOUT_KILL_GRACE` |
+| 中断指示 (`abort`) | 読み手へ通知。ビルドの子プロセスが出力パイプを掴んだままでも読むのをやめ、パイプラインが完了する |
+
+終了コードは `1`。全量レポートの `[1] ビルド結果` には
+`詳細: compose build が上限時間 (N 秒) を超えたため中断しました。` と記録します。
+
+#### (4) ビルド前の空き容量チェック
+
+上表 2 を事前に潰すため、ビルド開始前に data root の空き容量を表示し、
+5 GiB (`BUILD_MIN_FREE_GIB`) を下回っていれば警告します。
+
+#### 制約
+
+- 監視は BuildKit の出力を**行単位**で読むため、行末が改行にならない tty 形式とは
+  併用できません。`BUILDKIT_PROGRESS=tty` を指定した場合は警告のうえ `plain` へ
+  切り替えます。tty 形式のまま実行するには `--no-build-watchdog` を指定します。
+- data root は Docker がローカル接続 (`unix://` / `npipe://`) のときだけ特定します。
+  リモート daemon ではホスト側の `df` を見ても意味がないため、空き容量の表示は行いません。
+- `--dry-run` では監視を行いません (ビルドを実行しないため)。
 
 ### 5.2 起動完了の判定パターン
 
@@ -1294,8 +1403,8 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
-| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
+| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 
@@ -1433,6 +1542,13 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 
 # 17-3) Java 例外解析を行わない (ログ量を抑えたい場合)
 ./build_and_verify.sh --verify-startup --no-deploy-exception-analysis
+
+# 18) ビルドが exporting layers から進まないときの調査
+#     進捗を 10 秒ごとに表示し、60 秒出力が途切れたら診断を出す
+./build_and_verify.sh --build-progress-interval 10 --build-stall-timeout 60
+
+# 19) 30 分を超えたらビルドを中断して確実にプロンプトを戻す
+./build_and_verify.sh --build-timeout 1800
 ```
 
 ---
@@ -1453,6 +1569,10 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `--jboss-context-root / --jboss-http-port は --keep-container-mode http と併用してください` | 併用条件違反 | `--keep-container-mode http` を付ける |
 | `--url-body-json と --url-body-form は同時に指定できません` | ボディの二重指定 | どちらか一方にする |
 | `ローカルベースイメージが見つかりません` | `compose.yml` の `image:` と `--local-image` が不一致 | 両者を一致させる |
+| `ビルド出力が … 途切れています … 停滞の可能性があるため診断します。` | `exporting layers` などで BuildKit の出力が `--build-stall-timeout` 秒途切れた | 続けて表示される「ビルド停滞の診断」を確認する。data root の空き容量が減り続けていれば遅いだけで進行中 (→ 5.2-0) |
+| `ビルドが上限時間 … 秒を超えました … 中断します。` | `--build-timeout` の指定値を超えた | 診断結果で原因を切り分ける。遅いだけなら上限値を延ばすか `--build-timeout 0` で無制限にする (→ 5.2-0) |
+| `data root の空き容量が 5 GiB を下回っています` | 書き出し先の空き容量が不足 | `docker builder prune --all --force` / `docker image prune --all --force` で空けてから再実行する (`--prune-build-cache` も利用可) |
+| `BUILDKIT_PROGRESS=tty はビルド監視と併用できないため plain へ切り替えます。` | 行単位で読めない tty 形式が指定された | tty 形式のまま実行するには `--no-build-watchdog` を指定する |
 | `コピー先に同名ファイルが既に存在します: … (--copy-file-no-overwrite が指定されているため中止します)` | 上書き禁止指定でコピー先に同名ファイルがある | 既存ファイルを退避する、コピー先を変える、または `--copy-file-no-overwrite` を外して強制上書き (終了時に復元) させる |
 | `コピー先が通常ファイルではありません` | コピー先が既存のディレクトリ・シンボリックリンク等 | 上書きも自動削除も行わないため、コピー先を変えるか対象を手動で片付ける |
 | `上書き前のファイルを復元できませんでした: … -> …` | 退避先からの `mv` に失敗 (権限・容量など) | 表示された退避先パスから手動で戻す。退避先ディレクトリは削除されずに残る |

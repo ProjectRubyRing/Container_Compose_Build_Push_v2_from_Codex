@@ -80,6 +80,31 @@ BUILD_CONTEXTS=()                 # --build-context NAME=VALUE (追加のビル�
 SECRETS=()                        # --secret id=...,src=... 等 (ビルドシークレット, 繰り返し指定可)
 PROGRESS=""                       # buildx の進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定
 NO_CACHE="false"                  # true: キャッシュを破棄してビルド (--no-cache)
+
+# ---- ビルドの停滞検知・進捗表示 ---------------------------------------------
+# BuildKit の "exporting to image" / "exporting layers" は、ビルドしたレイヤを
+# Docker のイメージストアへ書き出す段 (buildx --load ではさらに importing to
+# docker が続く)。--progress=plain では開始の 1 行を出したあと、完了するまで
+# 追加の出力が一切出ない。ベースイメージのように 1 レイヤが大きいとこの段だけで
+# 数分〜数十分かかることがあり、画面が止まったままプロンプトが戻らないように
+# 見える (実際には書き出しが進んでいることが多い)。
+# 「遅いだけなのか、本当に停止しているのか」を画面から判断できるよう、
+#   (1) 一定間隔で経過時間・BuildKit のフェーズ・data root の空き容量の増減を出す
+#   (2) 出力が一定時間途切れたら停滞と判断し、原因を切り分ける診断を出す
+#   (3) 上限時間を超えたらビルドを中断してプロンプトを返す
+# の 3 段構えで監視する。(1)(2) は既定で有効、(3) は明示指定時のみ。
+BUILD_WATCHDOG="true"             # false (--no-build-watchdog): 監視を一切行わない
+BUILD_PROGRESS_INTERVAL="30"      # 進捗を表示する間隔 (秒)。0 で進捗表示を行わない
+BUILD_STALL_TIMEOUT="300"         # 出力が途切れてから停滞と判断するまでの秒数。0 で無効
+BUILD_TIMEOUT="0"                 # ビルド全体の上限秒数。0 (既定) は無制限
+BUILD_TIMEOUT_KILL_GRACE="20"     # 上限超過時、SIGTERM から SIGKILL までの猶予秒数
+BUILD_WATCHDOG_TICK="5"           # 監視ループの点検間隔 (秒)。判定の時間分解能になる
+BUILD_WATCHDOG_READ_TIMEOUT="2"   # ビルド出力の読み取り待ち上限 (秒)。中断指示への反応間隔
+BUILD_MIN_FREE_GIB="5"            # 開始前に警告する data root 空き容量のしきい値 (GiB)
+BUILD_WATCHDOG_DIR=""             # 監視用の一時ディレクトリ
+BUILD_WATCHDOG_DATA_ROOT=""       # docker data root (ローカル接続時のみ特定できる)
+BUILD_WATCHDOG_DATA_ROOT_RESOLVED="false"
+BUILD_TIMED_OUT="false"           # 上限時間で中断したか
 OUTPUT_FILE="imagedefinition.json"
 ECR_USERNAME="AWS"                # ECR ログイン時の固定ユーザー名
 DRY_RUN="false"                   # true: 実際の変更は行わず、実行内容のプレビューのみ表示
@@ -215,8 +240,30 @@ Options:
                            例: --secret id=npmrc,src=./.npmrc \
                                --secret id=token,env=GITHUB_TOKEN
   --progress MODE          進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定。
-                           CI ログには plain が読みやすい
+                           CI ログには plain が読みやすい。
+                           ※ ビルド監視が有効な間は tty を plain へ切り替える
+                             (監視は行単位でビルド出力を読むため)。
   --no-cache               キャッシュを破棄して buildx build する
+  --build-progress-interval SEC
+                           ビルド中に進捗を表示する間隔 (既定: 30)。0 で行わない。
+                           BuildKit の "exporting to image" / "exporting layers"
+                           は、開始の 1 行を出したあと完了するまで追加の出力が
+                           出ない。ベースイメージのようにレイヤが大きいとこの段
+                           だけで数分〜数十分かかり、停止したのか進んでいるのか
+                           画面から判断できなくなる。そこで一定間隔で「経過時間 /
+                           直近の出力からの経過 / BuildKit のフェーズ / Docker
+                           data root の空き容量の増減」を表示する。空き容量が
+                           減り続けていれば遅いだけで進行中、変化がなければ停滞と
+                           判断できる。
+  --build-stall-timeout SEC
+                           ビルド出力がこの秒数途切れたら停滞と判断し、Docker
+                           daemon の応答・空き容量・inode を調べて想定原因と
+                           対処方法を表示する (既定: 300)。0 で行わない。
+                           検知しても処理は継続する (中断はしない)。
+  --build-timeout SEC      ビルド全体の上限秒数 (既定: 0 = 無制限)。超えた場合は
+                           診断を表示したうえで SIGTERM でビルドを中断し
+                           (20 秒後に SIGKILL)、終了コード 1 で終了する。
+  --no-build-watchdog      上記の監視をすべて行わず、ビルド出力をそのまま流す。
 
   --output FILE            imagedefinition の出力先 (既定: imagedefinition.json)
   --log-dir DIR            コンソールに出力されるログを、DIR 配下のログファイルにも
@@ -343,6 +390,10 @@ while [ $# -gt 0 ]; do
     --secret)           need_value "$1" $#; SECRETS+=("$2"); shift 2 ;;
     --progress)         need_value "$1" $#; PROGRESS="$2"; shift 2 ;;
     --no-cache)         NO_CACHE="true"; shift ;;
+    --build-progress-interval) need_value "$1" $#; BUILD_PROGRESS_INTERVAL="$2"; shift 2 ;;
+    --build-stall-timeout)     need_value "$1" $#; BUILD_STALL_TIMEOUT="$2"; shift 2 ;;
+    --build-timeout)           need_value "$1" $#; BUILD_TIMEOUT="$2"; shift 2 ;;
+    --no-build-watchdog)       BUILD_WATCHDOG="false"; shift ;;
     --output)           need_value "$1" $#; OUTPUT_FILE="$2"; shift 2 ;;
     --log-dir)          need_value "$1" $#; LOG_DIR="$2"; shift 2 ;;  # 冒頭でログ複製を設定済み (値の再取得のみ)
     --dry-run)          DRY_RUN="true"; shift ;;
@@ -443,6 +494,21 @@ if [ -n "$PROGRESS" ]; then
       exit 2 ;;
   esac
 fi
+
+# ビルド監視の各値は「0 = その監視を行わない」を意味するため 0 を許す。
+validate_non_negative_integer() {
+  local value="$1" opt_name="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      err "${opt_name} には 0 以上の整数を指定してください: ${value}"
+      return 1
+    ;;
+  esac
+  return 0
+}
+validate_non_negative_integer "$BUILD_PROGRESS_INTERVAL" "--build-progress-interval" || exit 2
+validate_non_negative_integer "$BUILD_STALL_TIMEOUT" "--build-stall-timeout" || exit 2
+validate_non_negative_integer "$BUILD_TIMEOUT" "--build-timeout" || exit 2
 
 # ---- レジストリ URL の組み立て ---------------------------------------------
 if [ -z "$REGISTRY" ]; then
@@ -886,6 +952,570 @@ fi
 # パラメータストアへのアクセスに AWS 権限が必要なため、スイッチバック確定後に行う。
 prepare_jboss_password
 
+# =============================================================================
+# ビルドの停滞検知・進捗表示
+# -----------------------------------------------------------------------------
+# BuildKit の "exporting to image" / "exporting layers" は、ビルドしたレイヤを
+# Docker のイメージストアへ書き出す段。ここでは 1 レイヤずつ順に
+#   tar 化 → DiffID (sha256) の再計算 → data root への展開・登録
+# を行うため、ベースイメージのようにレイヤが大きいと数分〜数十分かかる。
+# ところが --progress=plain は "#N exporting layers" の 1 行を出したあと、
+# 完了して "#N exporting layers 45.2s done" を出すまで何も表示しない。
+# その結果、
+#   - 遅いだけで正常に進んでいる (最も多い)
+#   - data root の空き容量・inode が尽きて書き込みが進まない
+#   - ディスク I/O が枯渇している (EBS のバーストクレジット切れ等)
+#   - 同じ daemon の別操作 (image rm / prune / 別ビルド) と競合している
+#   - Docker daemon 自体が固まっている
+#   - 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている
+# のどれであっても、画面上は「exporting layers から動かない」という同じ見え方に
+# なり、待つべきか打ち切るべきかを判断できない。
+#
+# そこで、ビルドを監視プロセス付きで実行し、
+#   (1) 一定間隔で経過時間・BuildKit のフェーズ・data root の空き容量の増減を出す
+#       (空き容量が減り続けていれば「遅いだけで進行中」と判断できる)
+#   (2) 出力が一定時間途切れたら停滞と判断し、上記の原因を切り分ける診断を出す
+#   (3) 上限時間を超えたらビルドを中断してプロンプトを返す
+# の 3 段構えで「処理状況が分からないまま戻らない」状態を解消する。
+# =============================================================================
+
+# バイト数を人間可読な単位へ整形する。
+format_bytes() {
+  local bytes="$1"
+  LC_ALL=C awk -v bytes="$bytes" '
+    BEGIN {
+      split("B KiB MiB GiB TiB PiB", units, " ")
+      value = bytes + 0
+      unit = 1
+      while (value >= 1024 && unit < 6) {
+        value /= 1024
+        unit++
+      }
+      if (unit == 1) {
+        printf "%.0f %s", value, units[unit]
+      } else {
+        printf "%.2f %s", value, units[unit]
+      }
+    }'
+}
+
+# 現在の Docker 接続先。リモート daemon ではホスト側の df を見ても意味がないため、
+# data root を見るかどうかの判断に使う。
+current_docker_endpoint() {
+  if [ -n "${DOCKER_CONTEXT:-}" ]; then
+    docker context inspect "$DOCKER_CONTEXT" \
+      --format '{{.Endpoints.docker.Host}}' 2>/dev/null
+  elif [ -n "${DOCKER_HOST:-}" ]; then
+    printf '%s\n' "$DOCKER_HOST"
+  else
+    docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null
+  fi
+}
+
+# 現在のエポック秒の取得。ビルド出力は 1 行ごとに時刻を記録するため、
+# command substitution による fork を避けられる printf '%(...)T' を優先する。
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] \
+    || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 2 ]; }; then
+  BUILD_EPOCH_PRINTF="true"
+else
+  BUILD_EPOCH_PRINTF="false"
+fi
+
+# 第 1 引数で指定した変数へ現在のエポック秒を格納する。
+set_epoch_now() {
+  if [ "$BUILD_EPOCH_PRINTF" = "true" ]; then
+    printf -v "$1" '%(%s)T' -1
+  else
+    printf -v "$1" '%s' "$(date '+%s')"
+  fi
+}
+
+epoch_now() {
+  local value=""
+  set_epoch_now value
+  printf '%s\n' "$value"
+}
+
+# 秒数を「1時間2分3秒」形式へ整形する (経過時間の読み違えを防ぐ)。
+format_duration() {
+  local total="${1:-0}" hours minutes seconds
+  case "$total" in
+    ''|*[!0-9]*) total=0 ;;
+  esac
+  hours=$(( total / 3600 ))
+  minutes=$(( (total % 3600) / 60 ))
+  seconds=$(( total % 60 ))
+  if [ "$hours" -gt 0 ]; then
+    printf '%d時間%d分%d秒' "$hours" "$minutes" "$seconds"
+  elif [ "$minutes" -gt 0 ]; then
+    printf '%d分%d秒' "$minutes" "$seconds"
+  else
+    printf '%d秒' "$seconds"
+  fi
+}
+
+# 診断コマンドが停滞の巻き添えで固まらないよう、timeout があれば必ず被せる。
+# timeout が無い環境ではそのまま実行する (RHEL では coreutils に含まれる)。
+build_diag_run() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${seconds}s" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Docker data root。exporting layers の書き出し先であり、空き容量の増減が
+# 「進んでいるか」の最も確実な判断材料になる。リモート daemon (tcp:// / ssh://)
+# ではホスト側の df を見ても意味がないため、ローカル接続のときだけ特定する。
+build_watchdog_data_root() {
+  local endpoint
+  if [ "$BUILD_WATCHDOG_DATA_ROOT_RESOLVED" != "true" ]; then
+    BUILD_WATCHDOG_DATA_ROOT_RESOLVED="true"
+    endpoint="$(current_docker_endpoint 2>/dev/null || true)"
+    case "$endpoint" in
+      unix://*|npipe://*|'')
+        BUILD_WATCHDOG_DATA_ROOT="$(build_diag_run 10 docker info \
+          --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+        ;;
+      *)
+        BUILD_WATCHDOG_DATA_ROOT=""
+        ;;
+    esac
+  fi
+  [ -n "$BUILD_WATCHDOG_DATA_ROOT" ] || return 1
+  printf '%s' "$BUILD_WATCHDOG_DATA_ROOT"
+}
+
+# df 自体が固まっても監視ループが止まらないよう、timeout 付きで空き容量を取得する。
+build_watchdog_free_bytes() {
+  local path="$1" free_kib
+  free_kib="$(build_diag_run 10 df -Pk -- "$path" 2>/dev/null \
+    | awk 'NR == 2 { print $4; exit }')"
+  case "$free_kib" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$(( free_kib * 1024 ))"
+}
+
+# 監視用ファイルから数値を読む。書き込みと重なって空・不正だった場合は
+# 既定値を返し、監視ループが誤検知しないようにする。
+build_watchdog_read_number() {
+  local file="$1" fallback="$2" value=""
+  if [ -f "$file" ]; then
+    IFS= read -r value < "$file" 2>/dev/null || value=""
+  fi
+  case "${value:-}" in
+    ''|*[!0-9]*) printf '%s' "$fallback" ;;
+    *) printf '%s' "$value" ;;
+  esac
+}
+
+# BuildKit (--progress=plain) の出力 1 行から、いま実行中のフェーズを判定して
+# BUILD_PHASE_LABEL へ格納する。判定できなければ 1 を返す (フェーズ変化なし)。
+#   例) "#12 exporting to image" / "#12 exporting layers"
+#       "#12 writing image sha256:..." / "#12 naming to docker.io/library/j1/base.local"
+BUILD_PHASE_LABEL=""
+BUILD_PHASE_SINCE=""
+build_phase_from_line() {
+  BUILD_PHASE_LABEL=""
+  case "$1" in
+    *"exporting layers"*)
+      BUILD_PHASE_LABEL='exporting layers (レイヤをイメージストアへ書き出し中)' ;;
+    *"exporting manifest"*|*"exporting config"*|*"exporting attestation"*)
+      BUILD_PHASE_LABEL='exporting manifest/config (メタデータの書き出し)' ;;
+    *"writing image"*)
+      BUILD_PHASE_LABEL='writing image (イメージ ID の確定)' ;;
+    *"naming to"*)
+      BUILD_PHASE_LABEL='naming to (ローカルイメージ名の付与)' ;;
+    *"importing to docker"*|*"sending tarball"*|*"unpacking to docker"*)
+      BUILD_PHASE_LABEL='importing to docker (docker イメージストアへの取り込み)' ;;
+    *"exporting to image"*|*"exporting to docker image format"*|*"exporting to oci image format"*)
+      BUILD_PHASE_LABEL='exporting to image (イメージ書き出しの開始)' ;;
+    *"pushing layers"*|*"pushing manifest"*)
+      BUILD_PHASE_LABEL='pushing (レジストリへの送信)' ;;
+    *"transferring context"*|*"transferring dockerfile"*)
+      BUILD_PHASE_LABEL='transferring context (ビルドコンテキストの転送)' ;;
+    *)
+      return 1 ;;
+  esac
+  return 0
+}
+
+# フェーズ記録ファイル (1 行目: フェーズ名 / 2 行目: 開始エポック秒) を読む。
+build_watchdog_load_phase() {
+  local state="$1" label="" since=""
+  if [ -f "${state}/phase" ]; then
+    { IFS= read -r label; IFS= read -r since; } < "${state}/phase" 2>/dev/null || true
+  fi
+  BUILD_PHASE_LABEL="${label:-}"
+  case "${since:-}" in
+    ''|*[!0-9]*) BUILD_PHASE_SINCE="" ;;
+    *) BUILD_PHASE_SINCE="$since" ;;
+  esac
+}
+
+# ビルド出力の読み手。受け取った行はそのまま流しつつ、「最後に出力があった時刻」と
+# 「現在の BuildKit フェーズ」を監視プロセスへ渡すためファイルへ記録する。
+# 大量出力でも負荷を増やさないよう、行ごとの処理は fork しない書き方に揃える。
+#
+# read には必ず時間制限を付ける。ビルド本体を停止させても、その子プロセスが
+# 出力パイプの書き込み側を掴んだままだと read は EOF を受け取れず、
+# 「中断したのにプロンプトが戻らない」という当初の症状に逆戻りしてしまう。
+# 時間制限で定期的に目を覚まし、中断指示 (abort) が出ていれば読むのをやめる。
+build_watchdog_reader() {
+  local state="$1" chunk="" pending="" now="" last_stamp="" current_phase="" status
+  while :; do
+    if IFS= read -r -t "$BUILD_WATCHDOG_READ_TIMEOUT" chunk; then
+      : # 1 行読めた (下で処理する)
+    else
+      status=$?
+      if [ "$status" -gt 128 ]; then
+        # 時間切れ。read は途中まで読んだ内容を chunk へ残すため、次に読める分と
+        # つなげられるよう溜めておく (行の取りこぼしを防ぐ)。
+        pending="${pending}${chunk}"
+        [ -e "${state}/abort" ] && break
+        continue
+      fi
+      # EOF。読み残しがあれば最後に 1 行として出す。
+      if [ -n "${pending}${chunk}" ]; then
+        printf '%s\n' "${pending}${chunk}"
+      fi
+      break
+    fi
+
+    chunk="${pending}${chunk}"
+    pending=""
+    printf '%s\n' "$chunk"
+    set_epoch_now now
+    if [ "$now" != "$last_stamp" ]; then
+      printf '%s\n' "$now" > "${state}/last_output"
+      last_stamp="$now"
+    fi
+    if build_phase_from_line "$chunk" && [ "$BUILD_PHASE_LABEL" != "$current_phase" ]; then
+      current_phase="$BUILD_PHASE_LABEL"
+      # 監視プロセスが書きかけの状態を読まないよう、別名で書いてから差し替える。
+      if printf '%s\n%s\n' "$current_phase" "$now" > "${state}/phase.tmp" 2>/dev/null; then
+        mv -f "${state}/phase.tmp" "${state}/phase" 2>/dev/null || true
+      fi
+    fi
+    chunk=""
+  done
+}
+
+# 上限時間を超えたビルドを終了させる。docker CLI を落とすと BuildKit 側の
+# セッションも切れるため、daemon 側で走っているビルドもキャンセルされる。
+build_watchdog_terminate() {
+  local state="$1" pid waited=0
+  pid="$(build_watchdog_read_number "${state}/build.pid" "")"
+  if [ -z "$pid" ]; then
+    warn "ビルドプロセスの PID を特定できないため中断できませんでした。手動で停止してください。"
+    return 1
+  fi
+  log "ビルドプロセスへ SIGTERM を送ります (pid=${pid})。"
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$waited" -lt "$BUILD_TIMEOUT_KILL_GRACE" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  warn "SIGTERM で終了しなかったため SIGKILL を送ります (pid=${pid})。"
+  kill -KILL "$pid" 2>/dev/null || true
+  return 0
+}
+
+# 「exporting layers から進まない」ときに、遅いだけなのか本当に停止しているのかを
+# 切り分けるための情報をまとめて出す。停滞中でも必ず戻るよう、外部コマンドには
+# すべて timeout を被せる。
+diagnose_build_stall() {
+  local reason="$1" phase="$2" silence="$3" elapsed="$4" data_root="$5"
+  local server_version free inode_usage df_output df_line
+
+  diag ""
+  diag "────────────────────────────────────────────────────────────────────"
+  diag " ビルド停滞の診断 (${reason})"
+  diag "────────────────────────────────────────────────────────────────────"
+  diag "  経過時間             : $(format_duration "$elapsed")"
+  diag "  直近の出力からの経過 : $(format_duration "$silence")"
+  diag "  BuildKit のフェーズ  : ${phase:-(未検出)}"
+
+  # (1) Docker daemon がそもそも応答するか。ここで返らない場合は exporting だけの
+  #     問題ではなく、daemon 全体が固まっている。
+  if server_version="$(build_diag_run 10 docker version \
+      --format '{{.Server.Version}}' 2>/dev/null)" && [ -n "$server_version" ]; then
+    diag "  Docker daemon        : 応答あり (Server ${server_version})"
+  else
+    diag "  Docker daemon        : 10 秒以内に応答しません (daemon 側で停止している可能性)"
+  fi
+
+  # (2) 書き出し先の残量。exporting layers は展開後のレイヤ全体分を書き込むため、
+  #     ここが尽きると進まなくなる。inode 枯渇でも同じ症状になる。
+  if [ -n "$data_root" ]; then
+    diag "  Docker data root     : ${data_root}"
+    if free="$(build_watchdog_free_bytes "$data_root")"; then
+      diag "    空き容量           : $(format_bytes "$free")"
+    else
+      diag "    空き容量           : 取得できませんでした"
+    fi
+    inode_usage="$(build_diag_run 10 df -Pi -- "$data_root" 2>/dev/null \
+      | awk 'NR == 2 { printf "使用 %s / 空き %s", $5, $4; exit }')"
+    [ -n "$inode_usage" ] && diag "    inode              : ${inode_usage}"
+  else
+    diag "  Docker data root     : 特定できません (リモート daemon か docker info 失敗)"
+  fi
+
+  # (3) daemon 側の応答性。docker system df が返らない場合、daemon がイメージ
+  #     ストアのロックを掴んだまま動けなくなっている疑いが強い。
+  if df_output="$(build_diag_run 15 docker system df 2>/dev/null)" && [ -n "$df_output" ]; then
+    diag "  docker system df     :"
+    while IFS= read -r df_line; do
+      [ -n "$df_line" ] && diag "    ${df_line}"
+    done <<< "$df_output"
+  else
+    diag "  docker system df     : 15 秒以内に応答しません (daemon が busy の可能性)"
+  fi
+
+  diag ""
+  diag "  exporting layers から進まないときの主な原因と確認方法:"
+  diag "   1. 遅いだけで進んでいる (最も多い)"
+  diag "      レイヤの tar 化と DiffID の再計算は 1 レイヤずつ直列に行われ、"
+  diag "      --progress=plain では完了するまで追加の出力が出ない。"
+  diag "      → 上の進捗表示で data root の空き容量が減り続けていれば進行中。"
+  diag "        そのまま待つ (打ち切るなら --build-timeout SEC を指定して再実行)。"
+  diag "   2. data root の空き容量・inode の不足"
+  diag "      → 上の空き容量が数 GiB を切っていないか確認する。"
+  diag "        docker builder prune --all --force / docker image prune --all --force"
+  diag "        で空けてから再実行する。"
+  diag "   3. ディスク I/O の枯渇 (EBS のバーストクレジット切れ、ネットワークストレージ)"
+  diag "      → iostat -x 1 の %util と await、CloudWatch の BurstBalance を確認する。"
+  diag "   4. 同じ Docker daemon の別操作との競合"
+  diag "      → docker image rm / docker system prune / 別のビルドが同時に走って"
+  diag "        いないか確認する。イメージストアのロックを取り合うと双方止まる。"
+  diag "   5. Docker daemon 自体の停止"
+  diag "      → 上の daemon 応答が「応答なし」なら journalctl -u docker -n 200 を確認する。"
+  diag "        kill -USR1 <dockerd の pid> でゴルーチンのスタックダンプを採取できる。"
+  diag "   6. 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている"
+  diag "      → Ctrl+Q を押すと再開する。プロセスは動き続けている。"
+  diag "   7. ウイルス対策 / EDR による data root のリアルタイムスキャン"
+  diag "      → data root をスキャン対象から除外する。"
+  diag ""
+  diag "  別端末から確認する場合:"
+  diag "    docker system df -v"
+  [ -n "$data_root" ] && diag "    df -h ${data_root} ; df -i ${data_root}"
+  diag "    ps -eo pid,stat,etime,args | grep -E 'dockerd|buildkitd|compose'"
+  diag "────────────────────────────────────────────────────────────────────"
+  diag ""
+}
+
+# 監視プロセス本体。ビルドとは別プロセスで動き、進捗表示・停滞検知・上限時間での
+# 中断を行う。親シェルとは ${state} 配下のファイルだけでやり取りする。
+build_watchdog_monitor() {
+  local state="$1" desc="$2"
+  local started now elapsed silence last_beat last_output slept tick _candidate
+  local phase="" phase_since="" phase_elapsed detail
+  local free_now free_prev="" data_root=""
+  local stall_reported="false" max_silence=0 max_silence_phase=""
+
+  # 点検間隔は判定の時間分解能そのものになるため、指定値がこれより短い場合は
+  # そちらに合わせる (--build-progress-interval 2 なら 2 秒ごとに点検する)。
+  tick="$BUILD_WATCHDOG_TICK"
+  for _candidate in "$BUILD_PROGRESS_INTERVAL" "$BUILD_STALL_TIMEOUT" "$BUILD_TIMEOUT"; do
+    [ "$_candidate" -gt 0 ] && [ "$_candidate" -lt "$tick" ] && tick="$_candidate"
+  done
+  [ "$tick" -lt 1 ] && tick=1
+
+  set_epoch_now started
+  last_beat="$started"
+  data_root="$(build_watchdog_data_root 2>/dev/null || true)"
+
+  while [ -e "${state}/running" ]; do
+    # ビルド完了後すぐ抜けられるよう、点検間隔は 1 秒ずつ刻んで待つ。
+    slept=0
+    while [ "$slept" -lt "$tick" ] && [ -e "${state}/running" ]; do
+      sleep 1
+      slept=$(( slept + 1 ))
+    done
+    [ -e "${state}/running" ] || break
+
+    set_epoch_now now
+    elapsed=$(( now - started ))
+    [ "$elapsed" -lt 0 ] && elapsed=0
+    last_output="$(build_watchdog_read_number "${state}/last_output" "$started")"
+    silence=$(( now - last_output ))
+    [ "$silence" -lt 0 ] && silence=0
+    build_watchdog_load_phase "$state"
+    phase="$BUILD_PHASE_LABEL"
+    phase_since="$BUILD_PHASE_SINCE"
+
+    if [ "$silence" -gt "$max_silence" ]; then
+      max_silence="$silence"
+      max_silence_phase="$phase"
+    fi
+
+    # (1) 定期の進捗表示。ビルドが「生きているか」を空き容量の増減で示す。
+    if [ "$BUILD_PROGRESS_INTERVAL" -gt 0 ] \
+        && [ $(( now - last_beat )) -ge "$BUILD_PROGRESS_INTERVAL" ]; then
+      last_beat="$now"
+      detail="経過 $(format_duration "$elapsed") / 直近の出力から $(format_duration "$silence")"
+      if [ -n "$phase" ]; then
+        if [ -n "$phase_since" ]; then
+          phase_elapsed=$(( now - phase_since ))
+          [ "$phase_elapsed" -lt 0 ] && phase_elapsed=0
+          detail="${detail} / フェーズ: ${phase} 継続 $(format_duration "$phase_elapsed")"
+        else
+          detail="${detail} / フェーズ: ${phase}"
+        fi
+      fi
+      log "ビルド継続中 (${desc}): ${detail}"
+      if [ -n "$data_root" ] && free_now="$(build_watchdog_free_bytes "$data_root")"; then
+        if [ -z "$free_prev" ]; then
+          log "  data root の空き容量: $(format_bytes "$free_now") (${data_root})"
+        elif [ "$free_now" -lt "$free_prev" ]; then
+          log "  data root の空き容量: $(format_bytes "$free_now") (前回から $(format_bytes "$(( free_prev - free_now ))") 減少 → 書き出しは進んでいます) ${data_root}"
+        elif [ "$free_now" -gt "$free_prev" ]; then
+          log "  data root の空き容量: $(format_bytes "$free_now") (前回から $(format_bytes "$(( free_now - free_prev ))") 増加) ${data_root}"
+        else
+          log "  data root の空き容量: $(format_bytes "$free_now") (前回から変化なし) ${data_root}"
+        fi
+        free_prev="$free_now"
+      fi
+    fi
+
+    # (2) 停滞検知。出力が途切れている間に 1 度だけ診断を出し、出力が再開したら
+    #     次の途切れで再び検知できるよう戻す。処理自体は中断しない。
+    if [ "$BUILD_STALL_TIMEOUT" -gt 0 ]; then
+      if [ "$silence" -ge "$BUILD_STALL_TIMEOUT" ]; then
+        if [ "$stall_reported" != "true" ]; then
+          stall_reported="true"
+          warn "ビルド出力が $(format_duration "$silence") 途切れています (${desc})。停滞の可能性があるため診断します。"
+          diagnose_build_stall "停滞検知" "$phase" "$silence" "$elapsed" "$data_root"
+        fi
+      else
+        stall_reported="false"
+      fi
+    fi
+
+    # (3) 上限時間での中断。プロンプトが戻らない状態を確実に打ち切る。
+    if [ "$BUILD_TIMEOUT" -gt 0 ] && [ "$elapsed" -ge "$BUILD_TIMEOUT" ]; then
+      err "ビルドが上限時間 ${BUILD_TIMEOUT} 秒を超えました (${desc}, 経過 $(format_duration "$elapsed"))。中断します。"
+      diagnose_build_stall "上限時間超過" "$phase" "$silence" "$elapsed" "$data_root"
+      printf 'timeout\n' > "${state}/outcome"
+      build_watchdog_terminate "$state"
+      # 中断処理が終わったことを読み手へ伝える。ビルドの子プロセスが出力パイプを
+      # 掴んだままでも、読み手はここで読むのをやめてパイプラインが完了する。
+      : > "${state}/abort"
+      break
+    fi
+  done
+
+  printf '%s\n%s\n' "$max_silence" "$max_silence_phase" > "${state}/max_silence" 2>/dev/null || true
+}
+
+# 監視を行うかどうか。0 を指定した項目は個別に無効化される。
+build_watchdog_enabled() {
+  [ "$BUILD_WATCHDOG" = "true" ] || return 1
+  [ "$DRY_RUN" = "true" ] && return 1
+  [ "$BUILD_PROGRESS_INTERVAL" -gt 0 ] && return 0
+  [ "$BUILD_STALL_TIMEOUT" -gt 0 ] && return 0
+  [ "$BUILD_TIMEOUT" -gt 0 ] && return 0
+  return 1
+}
+
+# 監視設定を 1 行で表す。
+build_watchdog_setting_label() {
+  local timeout_label="なし (無制限)"
+  [ "$BUILD_TIMEOUT" -gt 0 ] && timeout_label="${BUILD_TIMEOUT} 秒"
+  printf '進捗表示 %s / 停滞判定 %s / 上限 %s' \
+    "$([ "$BUILD_PROGRESS_INTERVAL" -gt 0 ] && printf '%s 秒間隔' "$BUILD_PROGRESS_INTERVAL" || printf 'なし')" \
+    "$([ "$BUILD_STALL_TIMEOUT" -gt 0 ] && printf '%s 秒' "$BUILD_STALL_TIMEOUT" || printf 'なし')" \
+    "$timeout_label"
+}
+
+# ビルド開始前に書き出し先の空き容量を確認する。exporting layers は展開後の
+# レイヤ全体分を data root へ書き込むため、ここが少ないまま始めると
+# 書き出しの途中で停滞・失敗する。最も多い原因を事前に潰すための確認。
+check_build_disk_space() {
+  [ "$DRY_RUN" = "true" ] && return 0
+  local data_root free threshold
+  data_root="$(build_watchdog_data_root 2>/dev/null || true)"
+  [ -n "$data_root" ] || return 0
+  free="$(build_watchdog_free_bytes "$data_root")" || return 0
+  threshold=$(( BUILD_MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+  log "ビルド開始前の data root 空き容量: $(format_bytes "$free") (${data_root})"
+  if [ "$free" -lt "$threshold" ]; then
+    warn "data root の空き容量が ${BUILD_MIN_FREE_GIB} GiB を下回っています: $(format_bytes "$free")"
+    warn "  BuildKit の exporting layers は展開後のレイヤ全体分をここへ書き込むため、"
+    warn "  書き出しの途中で停滞または失敗する可能性があります。"
+    warn "  空ける場合: docker builder prune --all --force / docker image prune --all --force"
+  fi
+  return 0
+}
+
+# 監視付きでビルドコマンドを実行する。
+# DRY-RUN 時と監視無効時は run と同じ動作 (コマンドをそのまま実行する)。
+run_build_with_watchdog() {
+  local desc="$1"
+  shift
+  local state status=0 monitor_pid outcome="" max_silence="" max_silence_phase=""
+
+  if [ "$DRY_RUN" = "true" ]; then
+    printf '[%s] [DRY-RUN] %s\n' "$(now_display_time)" "$*"
+    return 0
+  fi
+  if ! build_watchdog_enabled; then
+    "$@"
+    return $?
+  fi
+  if ! state="$(mktemp -d "${TMPDIR:-/tmp}/build-watchdog.XXXXXX" 2>/dev/null)" \
+      || [ -z "$state" ]; then
+    warn "ビルド監視用の一時ディレクトリを作成できないため、監視なしでビルドします。"
+    "$@"
+    return $?
+  fi
+  BUILD_WATCHDOG_DIR="$state"
+  : > "${state}/running"
+  epoch_now > "${state}/last_output"
+
+  log "ビルドを監視します ($(build_watchdog_setting_label))。"
+  build_watchdog_monitor "$state" "$desc" &
+  monitor_pid=$!
+
+  # $BASHPID を控えてから exec することで、パイプ左辺のプロセス = ビルド本体の
+  # PID となる。上限時間を超えたとき、監視プロセスはこの PID を止める。
+  {
+    printf '%s\n' "$BASHPID" > "${state}/build.pid"
+    exec "$@"
+  } 2>&1 | build_watchdog_reader "$state"
+  status="${PIPESTATUS[0]}"
+
+  rm -f "${state}/running"
+  wait "$monitor_pid" 2>/dev/null || true
+
+  if [ -f "${state}/outcome" ]; then
+    IFS= read -r outcome < "${state}/outcome" 2>/dev/null || outcome=""
+  fi
+  if [ -f "${state}/max_silence" ]; then
+    { IFS= read -r max_silence; IFS= read -r max_silence_phase; } \
+      < "${state}/max_silence" 2>/dev/null || true
+  fi
+
+  if [ "${outcome:-}" = "timeout" ]; then
+    BUILD_TIMED_OUT="true"
+    err "ビルドを上限時間 (${BUILD_TIMEOUT} 秒) で中断しました: ${desc}"
+    err "  BuildKit のフェーズと診断結果は上の「ビルド停滞の診断」を確認してください。"
+    [ "$status" -eq 0 ] && status=1
+  elif [ -n "${max_silence:-}" ]; then
+    log "ビルド監視の結果: $(build_watchdog_setting_label) / 最長の無出力 $(format_duration "$max_silence")"
+  fi
+
+  case "$state" in
+    */build-watchdog.*) rm -rf -- "$state" ;;
+  esac
+  BUILD_WATCHDOG_DIR=""
+  return "$status"
+}
+
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_copied_files) により
 # ビルド終了後 / 途中終了時のいずれでも自動削除される。
@@ -910,8 +1540,22 @@ fi
 if [ -n "$PLATFORM" ]; then
   BUILDX_OPTS+=(--platform "$PLATFORM")
 fi
+# 監視は BuildKit の出力を行単位で読むため、行末が改行にならない tty 形式とは
+# 併用できない (画面が空のまま溜まってしまう)。監視を優先して plain へ切り替える。
+if build_watchdog_enabled && [ "$PROGRESS" = "tty" ]; then
+  warn "--progress tty はビルド監視と併用できないため plain へ切り替えます。"
+  warn "  tty 形式のまま実行する場合は --no-build-watchdog を指定してください。"
+  PROGRESS="plain"
+fi
 if [ -n "$PROGRESS" ]; then
   BUILDX_OPTS+=(--progress "$PROGRESS")
+fi
+if build_watchdog_enabled; then
+  log "ビルドの停滞検知: $(build_watchdog_setting_label)"
+elif [ "$DRY_RUN" = "true" ]; then
+  log "ビルドの停滞検知: DRY-RUN のため行いません。"
+else
+  log "ビルドの停滞検知: 無効 (--no-build-watchdog または各値に 0 を指定)"
 fi
 if [ "$NO_CACHE" = "true" ]; then
   BUILDX_OPTS+=(--no-cache)
@@ -933,9 +1577,17 @@ if [ "$JBOSS_SECRET_ENABLED" = "true" ]; then
   BUILDX_OPTS+=(--secret "id=${JBOSS_SECRET_ID},env=${JBOSS_PASSWORD_ENV}")
 fi
 
+# exporting layers / importing to docker の書き出し先が足りているかを、
+# ビルドを始める前に確認する。
+check_build_disk_space
+
 log "docker buildx build を実行します (dockerfile=${DOCKERFILE}, context=${BUILD_CONTEXT}) ..."
-if ! run docker buildx build "${BUILDX_OPTS[@]}" "$BUILD_CONTEXT"; then
-  err "docker buildx build に失敗しました"
+if ! run_build_with_watchdog "buildx ${LOCAL_IMAGE}" docker buildx build "${BUILDX_OPTS[@]}" "$BUILD_CONTEXT"; then
+  if [ "$BUILD_TIMED_OUT" = "true" ]; then
+    err "docker buildx build を上限時間 (${BUILD_TIMEOUT} 秒) で中断しました"
+  else
+    err "docker buildx build に失敗しました"
+  fi
   exit 1
 fi
 

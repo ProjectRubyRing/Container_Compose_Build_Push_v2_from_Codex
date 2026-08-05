@@ -59,6 +59,18 @@ if [ "${1:-}" = "compose" ]; then
         printf 'fake compose build failed\n' >&2
         exit 42
       fi
+      # exporting to image / exporting layers で出力が途切れる様子の再現。
+      # BuildKit (--progress=plain) は "exporting layers" の 1 行を出したあと、
+      # 完了するまで何も出力しない。FAKE_DOCKER_BUILD_EXPORT_STALL に秒数を
+      # 指定すると、その無出力時間を作り出す (ビルド監視のテスト用)。
+      if [ -n "${FAKE_DOCKER_BUILD_EXPORT_STALL:-}" ]; then
+        printf '#12 exporting to image\n'
+        printf '#12 exporting layers\n'
+        sleep "$FAKE_DOCKER_BUILD_EXPORT_STALL"
+        printf '#12 exporting layers %ss done\n' "$FAKE_DOCKER_BUILD_EXPORT_STALL"
+        printf '#12 writing image sha256:fake-exported-image done\n'
+        printf '#12 DONE %ss\n' "$FAKE_DOCKER_BUILD_EXPORT_STALL"
+      fi
       # ビルドでローカルイメージが世代交代する様子の再現。
       # FAKE_DOCKER_IMAGE_ID_FILE を指定したときだけ、image inspect が返す ID を
       # ビルド後の値へ差し替える (未指定なら ID は変わらない = 従来どおり)。
@@ -209,8 +221,24 @@ if [ "${1:-}" = "system" ] && [ "${2:-}" = "prune" ]; then
 fi
 
 if [ "${1:-}" = "info" ]; then
-  # ホスト側 df の値は環境依存になるため、Docker 管理対象容量だけをテストする。
+  # data root は既定では返さない (ホスト側 df の値が環境依存になるため)。
+  # FAKE_DOCKER_DATA_ROOT を指定したときだけ、その値を返す。
+  if [ -n "${FAKE_DOCKER_DATA_ROOT:-}" ] && [[ " $* " == *" {{.DockerRootDir}} "* ]]; then
+    printf '%s\n' "$FAKE_DOCKER_DATA_ROOT"
+    exit 0
+  fi
   exit 65
+fi
+
+# ビルド停滞の診断が最初に確認する「Docker daemon が応答するか」の再現。
+# FAKE_DOCKER_DAEMON_HANG=true なら応答しない daemon として扱う (終了コード 1)。
+if [ "${1:-}" = "version" ]; then
+  if [ "${FAKE_DOCKER_DAEMON_HANG:-false}" = "true" ]; then
+    printf 'Cannot connect to the Docker daemon\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-27.1.1}"
+  exit 0
 fi
 
 if [ "${1:-}" = "container" ]; then

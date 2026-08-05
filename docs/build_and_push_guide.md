@@ -177,7 +177,7 @@ flowchart TD
 | 13 | ECR 権限チェック | `aws ecr get-login-password` の成否で判定。成功時のトークンは後段の `docker login` に再利用 | 下記 3.3 参照 |
 | 14 | シークレット準備 | パラメータストア / 直接指定 / 既存環境変数のいずれかからマスターパスワードを取得し export | `exit 1` |
 | 15 | 事前コピー | `--copy-file SRC:DEST_DIR` を検証してコピー。終了時に自動削除 | `exit 1` / `exit 2` |
-| 16 | ビルド | `docker compose -f <file> build [--no-cache] [service]` | `exit 1` |
+| 16 | ビルド | `docker compose -f <file> build [--no-cache] [service]` を監視プロセス付きで実行 (進捗表示・停滞検知・上限時間での中断。5.7 参照)。開始前に data root の空き容量を確認 | `exit 1` |
 | 17 | イメージ確認 | `docker image inspect <local-image>` (`--dry-run` 時はスキップ) | `exit 1` |
 | 18 | タグ生成 | `<TAG_PREFIX>-<YYYYMMDDHHMMSS>` (JST) | — |
 | 19 | ECR ログイン | `docker login --username AWS --password-stdin` (パスワードは標準入力経由) | `exit 1` |
@@ -241,6 +241,10 @@ flowchart TD
 | `--compose-file FILE` | ファイルパス | `compose.yml` | 不可 | compose 定義ファイル |
 | `--compose-service NAME` | サービス名 | (全サービス) | 不可 | 指定時はそのサービスのみビルド |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
+| `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | 不可 | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔。`0` で表示しない (5.7 参照) |
+| `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | 不可 | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は中断しない |
+| `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | 不可 | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM で中断し (20 秒後に SIGKILL)、`exit 1` |
+| `--no-build-watchdog` | フラグ | `false` | — | 上記の監視をすべて行わない。監視が有効な間は `BUILDKIT_PROGRESS=tty` を `plain` へ切り替えるため、tty 形式を使いたい場合に指定する |
 | `--container-name NAME` | 任意の文字列 | `--repository` の値 | 不可 | `imagedefinition.json` の `name` |
 | `--output FILE` | ファイルパス | `imagedefinition.json` | 不可 | imagedefinition の出力先 |
 
@@ -402,6 +406,39 @@ RUN --mount=type=secret,id=jboss_master_password \
 | 委譲時 | `--build-only` の委譲先の出力も同じログに記録される |
 | 末尾 | 処理実行時間を必ず記録してから終了する |
 
+### 5.7 ビルドの停滞検知・進捗表示
+
+`exporting to image` は、ビルドしたレイヤを Docker のイメージストアへ書き出す段です。
+1 レイヤずつ順に「tar 化 → DiffID (sha256) の再計算 → data root への展開・登録」を行い、
+並列化されないため、ベースイメージのようにレイヤが大きいと**この段だけで数分〜数十分**
+かかります。一方 `--progress=plain` は `#12 exporting layers` の 1 行を出したあと、
+完了するまで**何も表示しません**。このため、次のどれであっても画面上は
+「`exporting layers` から動かない」という同じ見え方になります。
+
+| # | 原因 | 見分け方 |
+| --- | --- | --- |
+| 1 | **遅いだけで進んでいる** (最も多い) | data root の空き容量が減り続けている |
+| 2 | data root の空き容量・inode の不足 | 空き容量が数 GiB を切っている / `df -i` の使用率が 100% 近い |
+| 3 | ディスク I/O の枯渇 (EBS のバーストクレジット切れ等) | `iostat -x 1` の `%util` が張り付き `await` が大きい |
+| 4 | 同じ daemon の別操作との競合 (`image rm` / `system prune` / 別ビルド) | 他の docker コマンドも返らない |
+| 5 | Docker daemon 自体の停止 | `docker version` / `docker system df` が応答しない |
+| 6 | 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている | Ctrl+Q で再開する |
+| 7 | ウイルス対策 / EDR による data root のリアルタイムスキャン | スキャン除外で改善する |
+
+そこで `compose build` は監視プロセス付きで実行します。
+
+| 機能 | オプション | 既定 | 動作 |
+| --- | --- | --- | --- |
+| 進捗表示 | `--build-progress-interval SEC` | 30 秒 | 経過時間 / 直近の出力からの経過 / BuildKit のフェーズ / data root の空き容量の増減を表示する。空き容量が減り続けていれば上表 1、変化がなければ 2〜7 を疑う |
+| 停滞検知 | `--build-stall-timeout SEC` | 300 秒 | `docker version` (10 秒) / `docker system df` (15 秒) の応答、空き容量、inode を timeout 付きで調べ、上表の原因と対処を一覧表示する。**処理は中断しない** |
+| 上限時間 | `--build-timeout SEC` | 0 (無制限) | 診断を表示のうえ SIGTERM でビルドを中断し (20 秒後に SIGKILL)、`exit 1` |
+| 事前チェック | (常時) | — | ビルド開始前に data root の空き容量を表示し、5 GiB 未満なら警告する |
+
+`docker` CLI を落とすと BuildKit のセッションも切れるため、daemon 側のビルドも
+キャンセルされます。監視は BuildKit の出力を**行単位**で読むため、`BUILDKIT_PROGRESS=tty`
+は `plain` へ切り替えます (tty 形式のまま実行するには `--no-build-watchdog`)。
+`--dry-run` では監視を行いません。
+
 ---
 
 ## 6. 環境変数
@@ -415,6 +452,7 @@ RUN --mount=type=secret,id=jboss_master_password \
 | `ECR_REGISTRY` | `--registry` | レジストリ URL の直接指定 |
 | `SWITCHBACK_SHELL` | `--switchback-shell` | スイッチバック用シェルのパス |
 | `JBOSS_MASTER_PASSWORD` (既定名) | `--jboss-password-env` | 事前 export した値をそのまま使用 |
+| `BUILDKIT_PROGRESS` | (なし) | ビルドログの表示形式。未指定時は `plain` を使用。ビルド監視が有効な間は `tty` を `plain` へ切り替える |
 
 オプションで指定した値が環境変数より優先されます。
 
@@ -423,6 +461,7 @@ RUN --mount=type=secret,id=jboss_master_password \
 | 環境変数 | 用途 |
 | --- | --- |
 | `TZ` | `Asia/Tokyo` または `JST-9` に設定し、表示時刻を JST に統一 |
+| `BUILDKIT_PROGRESS` | 既定 `plain`。tty の上書き表示でビルドログが欠落するのを防ぎ、ビルド監視が行単位で読めるようにする |
 | `<--jboss-password-env の値>` | BuildKit シークレットとして compose へ渡す |
 | `JBOSS_MASTER_PASSWORD` | 同梱 `compose.yml` 用に必ず定義 (未使用時は空文字) |
 
@@ -433,8 +472,8 @@ RUN --mount=type=secret,id=jboss_master_password \
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | プッシュと imagedefinition 出力が完了 / `--help` / `--dry-run` 完走 |
-| `1` | 実行時エラー | AWS 未認証、Docker デーモン未接続、ECR 権限なし、スイッチバック失敗、SSM 取得失敗、コピー失敗、ビルド失敗、ローカルイメージ未検出、ログイン失敗、タグ付け失敗、push 失敗、出力書き込み失敗、ログディレクトリ作成失敗、必須コマンド不足 |
-| `2` | 引数エラー | 不明なオプション、値の欠落、`--account-id`/`--registry` 未指定、リポジトリ名・タグ接頭辞の形式違反、JBoss オプションの排他違反、`--copy-file` の書式不正 |
+| `1` | 実行時エラー | AWS 未認証、Docker デーモン未接続、ECR 権限なし、スイッチバック失敗、SSM 取得失敗、コピー失敗、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、ログイン失敗、タグ付け失敗、push 失敗、出力書き込み失敗、ログディレクトリ作成失敗、必須コマンド不足 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、ビルド監視の各値が 0 未満か非数値、`--account-id`/`--registry` 未指定、リポジトリ名・タグ接頭辞の形式違反、JBoss オプションの排他違反、`--copy-file` の書式不正 |
 
 `--build-only` 委譲時は、委譲先 `build_and_verify.sh` の終了コードがそのまま返ります。
 
@@ -504,6 +543,13 @@ RUN --mount=type=secret,id=jboss_master_password \
 
 # 9) レジストリを直接指定 (アカウント ID 不要)
 ./build_and_push.sh --registry 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com
+
+# ビルドが exporting layers から進まないときの調査 (進捗 10 秒 / 停滞判定 60 秒)
+./build_and_push.sh --account-id 123456789012 \
+    --build-progress-interval 10 --build-stall-timeout 60
+
+# 30 分を超えたらビルドを中断して確実にプロンプトを戻す
+./build_and_push.sh --account-id 123456789012 --build-timeout 1800
 ```
 
 ---
@@ -522,5 +568,9 @@ RUN --mount=type=secret,id=jboss_master_password \
 | `パラメータストアからの取得に失敗しました` | パラメータ名・リージョン誤り、`ssm:GetParameter` 権限不足 | 表示されたエラー本文と対象リージョンを確認 |
 | `コピー先に同名ファイルが既に存在します` | `--copy-file` のコピー先に同名ファイルがある | 既存ファイルを退避するか、コピー先を変更 |
 | `ローカルベースイメージが見つかりません` | `compose.yml` の `image:` と `--local-image` が不一致 | 両者を一致させる |
+| `ビルド出力が … 途切れています … 停滞の可能性があるため診断します。` | `exporting layers` などで BuildKit の出力が `--build-stall-timeout` 秒途切れた | 続けて表示される「ビルド停滞の診断」を確認する。data root の空き容量が減り続けていれば遅いだけで進行中 |
+| `ビルドが上限時間 … 秒を超えました … 中断します。` | `--build-timeout` の指定値を超えた | 診断結果で原因を切り分ける。遅いだけなら上限値を延ばすか `--build-timeout 0` で無制限にする |
+| `data root の空き容量が 5 GiB を下回っています` | 書き出し先の空き容量が不足 | `docker builder prune --all --force` / `docker image prune --all --force` で空けてから再実行する |
+| `BUILDKIT_PROGRESS=tty はビルド監視と併用できないため plain へ切り替えます。` | 行単位で読めない tty 形式が指定された | tty 形式のまま実行するには `--no-build-watchdog` を指定する |
 | `docker push に失敗しました` | 権限・ネットワーク・リポジトリ不存在など | 表示される原因診断ガイド (A〜E) の調査手順に従う |
 | `imagedefinition の書き込みに失敗しました` | 出力先の権限不足・容量不足 | `--output` のパスと権限を確認 |

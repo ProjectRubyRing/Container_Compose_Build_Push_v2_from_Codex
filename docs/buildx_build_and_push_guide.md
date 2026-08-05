@@ -197,7 +197,7 @@ flowchart TD
 | 15 | シークレット準備 | パラメータストア / 直接指定 / 既存環境変数から取得し export | `exit 1` |
 | 16 | 事前コピー | `--copy-file SRC:DEST_DIR` をコピー。終了時に自動削除 | `exit 1` / `exit 2` |
 | 17 | 入力確認 | `--dockerfile` のファイルと `--context` のディレクトリの存在確認 | `exit 1` |
-| 18 | ビルド | `docker buildx build --load -t <local-image> -f <dockerfile> [オプション] <context>` | `exit 1` |
+| 18 | ビルド | `docker buildx build --load -t <local-image> -f <dockerfile> [オプション] <context>` を監視プロセス付きで実行 (進捗表示・停滞検知・上限時間での中断。6.8 参照)。開始前に data root の空き容量を確認 | `exit 1` |
 | 19 | イメージ確認 | `docker image inspect` (`--dry-run` 時はスキップ) | `exit 1` |
 | 20 | タグ生成 | `<TAG_PREFIX>-<YYYYMMDDHHMMSS>` (JST) | — |
 | 21 | ECR ログイン | `docker login --username AWS --password-stdin` | `exit 1` |
@@ -282,8 +282,12 @@ docker buildx build \
 | `--build-arg KEY=VALUE` | `KEY=VALUE` | (なし) | **可** | ビルド引数 |
 | `--build-context NAME=VALUE` | `NAME=VALUE` | (なし) | **可** | 追加のビルドコンテキスト。`FROM` / `COPY --from=` で名前参照できる |
 | `--secret SPEC` | buildx の `--secret` と同一書式 | (なし) | **可** | 例: `id=npmrc,src=./.npmrc` / `id=token,env=GITHUB_TOKEN` |
-| `--progress MODE` | `auto`/`plain`/`tty`/`rawjson`/`quiet` | (buildx 既定) | 不可 | CI ログには `plain` が読みやすい |
+| `--progress MODE` | `auto`/`plain`/`tty`/`rawjson`/`quiet` | (buildx 既定) | 不可 | CI ログには `plain` が読みやすい。ビルド監視が有効な間は `tty` を `plain` へ切り替える |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
+| `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | 不可 | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔。`0` で表示しない |
+| `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | 不可 | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は中断しない |
+| `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | 不可 | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM で中断し (20 秒後に SIGKILL)、`exit 1` |
+| `--no-build-watchdog` | フラグ | `false` | — | 上記の監視をすべて行わない |
 
 ### 5.3 出力・実行制御
 
@@ -422,6 +426,40 @@ RUN --mount=type=secret,id=jboss_master_password \
 | 記録開始 | **引数パースより前**。不明オプションや値欠落のエラーもログに残る |
 | 末尾 | 処理実行時間を必ず記録してから終了する |
 
+### 6.8 ビルドの停滞検知・進捗表示
+
+`exporting to image` は、ビルドしたレイヤを Docker のイメージストアへ書き出す段です
+(buildx は `--load` のため、さらに `importing to docker` が続きます)。
+1 レイヤずつ順に「tar 化 → DiffID (sha256) の再計算 → data root への展開・登録」を行い、
+並列化されないため、ベースイメージのようにレイヤが大きいと**この段だけで数分〜数十分**
+かかります。一方 `--progress plain` は `#12 exporting layers` の 1 行を出したあと、
+完了するまで**何も表示しません**。このため、次のどれであっても画面上は
+「`exporting layers` から動かない」という同じ見え方になります。
+
+| # | 原因 | 見分け方 |
+| --- | --- | --- |
+| 1 | **遅いだけで進んでいる** (最も多い) | data root の空き容量が減り続けている |
+| 2 | data root の空き容量・inode の不足 | 空き容量が数 GiB を切っている / `df -i` の使用率が 100% 近い |
+| 3 | ディスク I/O の枯渇 (EBS のバーストクレジット切れ等) | `iostat -x 1` の `%util` が張り付き `await` が大きい |
+| 4 | 同じ daemon の別操作との競合 (`image rm` / `system prune` / 別ビルド) | 他の docker コマンドも返らない |
+| 5 | Docker daemon 自体の停止 | `docker version` / `docker system df` が応答しない |
+| 6 | 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている | Ctrl+Q で再開する |
+| 7 | ウイルス対策 / EDR による data root のリアルタイムスキャン | スキャン除外で改善する |
+
+そこで `docker buildx build` は監視プロセス付きで実行します。
+
+| 機能 | オプション | 既定 | 動作 |
+| --- | --- | --- | --- |
+| 進捗表示 | `--build-progress-interval SEC` | 30 秒 | 経過時間 / 直近の出力からの経過 / BuildKit のフェーズ / data root の空き容量の増減を表示する。空き容量が減り続けていれば上表 1、変化がなければ 2〜7 を疑う |
+| 停滞検知 | `--build-stall-timeout SEC` | 300 秒 | `docker version` (10 秒) / `docker system df` (15 秒) の応答、空き容量、inode を timeout 付きで調べ、上表の原因と対処を一覧表示する。**処理は中断しない** |
+| 上限時間 | `--build-timeout SEC` | 0 (無制限) | 診断を表示のうえ SIGTERM でビルドを中断し (20 秒後に SIGKILL)、`exit 1` |
+| 事前チェック | (常時) | — | ビルド開始前に data root の空き容量を表示し、5 GiB 未満なら警告する |
+
+`docker buildx` CLI を落とすと BuildKit のセッションも切れるため、ビルダー側のビルドも
+キャンセルされます。監視は BuildKit の出力を**行単位**で読むため、`--progress tty` は
+`plain` へ切り替えます (tty 形式のまま実行するには `--no-build-watchdog`)。
+`--dry-run` では監視を行いません。
+
 ---
 
 ## 7. 環境変数
@@ -451,8 +489,8 @@ RUN --mount=type=secret,id=jboss_master_password \
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | プッシュと imagedefinition 出力が完了 / `--help` / `--dry-run` 完走 |
-| `1` | 実行時エラー | AWS 未認証、buildx 不在、Docker デーモン未接続、ECR 権限なし、スイッチバック失敗、SSM 取得失敗、コピー失敗、Dockerfile / コンテキスト不在、ビルド失敗、ローカルイメージ未検出、ログイン失敗、タグ付け失敗、push 失敗、出力書き込み失敗、ログディレクトリ作成失敗 |
-| `2` | 引数エラー | 不明なオプション、値の欠落、`--account-id`/`--registry` 未指定、複数 platform 指定、`--progress` の不正値、リポジトリ名・タグ接頭辞の形式違反、JBoss オプションの排他違反、`--jboss-secret-id` が空、`--copy-file` の書式不正 |
+| `1` | 実行時エラー | AWS 未認証、buildx 不在、Docker デーモン未接続、ECR 権限なし、スイッチバック失敗、SSM 取得失敗、コピー失敗、Dockerfile / コンテキスト不在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、ログイン失敗、タグ付け失敗、push 失敗、出力書き込み失敗、ログディレクトリ作成失敗 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、ビルド監視の各値が 0 未満か非数値、`--account-id`/`--registry` 未指定、複数 platform 指定、`--progress` の不正値、リポジトリ名・タグ接頭辞の形式違反、JBoss オプションの排他違反、`--jboss-secret-id` が空、`--copy-file` の書式不正 |
 
 ---
 
@@ -506,6 +544,13 @@ export GITHUB_TOKEN=ghp_xxx
 ./buildx_build_and_push.sh --account-id 123456789012 \
     --auto-switchback --switchback-shell /opt/team/switchback.sh \
     --log-dir ./logs
+
+# ビルドが exporting layers から進まないときの調査 (進捗 10 秒 / 停滞判定 60 秒)
+./buildx_build_and_push.sh --account-id 123456789012 \
+    --build-progress-interval 10 --build-stall-timeout 60
+
+# 30 分を超えたらビルドを中断して確実にプロンプトを戻す
+./buildx_build_and_push.sh --account-id 123456789012 --build-timeout 1800
 ```
 
 ---
@@ -525,5 +570,9 @@ export GITHUB_TOKEN=ghp_xxx
 | `ビルドコンテキストが存在しません` | `--context` のパス誤り | パスを確認 |
 | `ECR への操作権限がありません` | ロールに ECR 権限が無い | スイッチバック、または表示された AWS エラー本文で切り分け |
 | `ローカルベースイメージが見つかりません` | `--load` の取り込み失敗 | ビルダーの driver 設定を確認 |
+| `ビルド出力が … 途切れています … 停滞の可能性があるため診断します。` | `exporting layers` などで BuildKit の出力が `--build-stall-timeout` 秒途切れた | 続けて表示される「ビルド停滞の診断」を確認する。data root の空き容量が減り続けていれば遅いだけで進行中 |
+| `ビルドが上限時間 … 秒を超えました … 中断します。` | `--build-timeout` の指定値を超えた | 診断結果で原因を切り分ける。遅いだけなら上限値を延ばすか `--build-timeout 0` で無制限にする |
+| `data root の空き容量が 5 GiB を下回っています` | 書き出し先の空き容量が不足 | `docker builder prune --all --force` / `docker image prune --all --force` で空けてから再実行する |
+| `--progress tty はビルド監視と併用できないため plain へ切り替えます。` | 行単位で読めない tty 形式が指定された | tty 形式のまま実行するには `--no-build-watchdog` を指定する |
 | `docker image push に失敗しました` | 権限・ネットワーク・リポジトリ不存在など | 表示される原因診断ガイド (A〜E) に従う |
 | `imagedefinition の書き込みに失敗しました` | 出力先の権限・容量不足 | `--output` のパスと権限を確認 |

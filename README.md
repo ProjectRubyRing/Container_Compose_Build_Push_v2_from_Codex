@@ -155,6 +155,10 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--compose-file FILE` | compose ファイル (**compose 版のみ**) | `compose.yml` |
 | `--compose-service NAME` | ビルド対象サービス名 (未指定なら全サービス) (**compose 版のみ**)。`build_and_verify.sh` / `--build-only` では繰り返し指定またはカンマ区切りで複数指定できる。複数指定時は `base` を先行ビルドする。`base` はビルド専用のため、指定に含めても**起動対象にはならない** | (全サービス) |
 | `--no-cache` | キャッシュを破棄してビルドする | `false` |
+| `--build-progress-interval SEC` | ビルド中に「経過時間 / 直近の出力からの経過 / BuildKit のフェーズ / Docker data root の空き容量の増減」を表示する間隔。`0` で表示しない (後述) | `30` |
+| `--build-stall-timeout SEC` | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は継続する | `300` |
+| `--build-timeout SEC` | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM でビルドを中断し (20 秒後に SIGKILL)、終了コード `1` で終了する。`0` は無制限 | `0` |
+| `--no-build-watchdog` | 上記の監視をすべて行わず、ビルド出力をそのまま流す。監視が有効な間は `BUILDKIT_PROGRESS=tty` (buildx 版は `--progress tty`) を `plain` へ切り替えるため、tty 形式を使いたい場合に指定する | `false` |
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
 | `--cleanup-all-docker-data` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。処理終了時に確認ダイアログを表示し、承認後、現在の Docker context の全コンテナ・全イメージ・全ローカルボリューム・未使用ネットワーク・現在の daemon で削除可能な全ビルドキャッシュを削除する | `false` |
@@ -224,6 +228,111 @@ aws ecr get-login-password --region <region> \
 docker image tag j1/base.local <registry>/<repository>:<tag>
 docker image push <registry>/<repository>:<tag>
 ```
+
+## ビルドが `exporting to image` / `exporting layers` で止まって見えるとき
+
+ベースイメージのビルドで、次の表示から先へ進まなくなることがあります。
+
+```text
+#12 exporting to image
+#12 exporting layers
+```
+
+### なぜ「止まって見える」のか
+
+`exporting to image` は、ビルドしたレイヤを Docker のイメージストアへ書き出す段です。
+ここでは 1 レイヤずつ順に
+
+1. レイヤの tar 化
+2. DiffID (sha256) の再計算
+3. Docker data root (`/var/lib/docker` など) への展開・登録
+
+を行います。並列化されないため、ベースイメージのようにレイヤが大きいと
+**この段だけで数分〜数十分**かかります。
+
+問題は、`--progress=plain` が `#12 exporting layers` の 1 行を出したあと、
+完了して `#12 exporting layers 45.2s done` を出すまで**何も表示しない**ことです
+(tty 形式では経過秒数が更新されますが、ログへリダイレクトすると plain になります)。
+その結果、次のどれであっても画面上は同じ見え方になり、待つべきか打ち切るべきかを
+判断できません。
+
+| # | 原因 | 見分け方 |
+| --- | --- | --- |
+| 1 | **遅いだけで進んでいる** (最も多い) | data root の空き容量が減り続けている |
+| 2 | data root の空き容量・inode の不足 | 空き容量が数 GiB を切っている / `df -i` の使用率が 100% 近い |
+| 3 | ディスク I/O の枯渇 (EBS のバーストクレジット切れ、ネットワークストレージ) | `iostat -x 1` の `%util` が張り付き `await` が大きい |
+| 4 | 同じ daemon の別操作との競合 (`docker image rm` / `system prune` / 別ビルド) | 他の docker コマンドも返らない |
+| 5 | Docker daemon 自体の停止 | `docker version` / `docker system df` が応答しない |
+| 6 | 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている | Ctrl+Q で再開する |
+| 7 | ウイルス対策 / EDR による data root のリアルタイムスキャン | スキャン除外で改善する |
+
+### 対処 (既定で有効)
+
+3 スクリプトとも、ビルドを**監視プロセス付き**で実行します。
+
+**(1) 進捗表示 — 30 秒ごと (`--build-progress-interval`)**
+
+```text
+[2026-08-05 09:41:50 JST] ビルド継続中 (全サービス): 経過 4分30秒 / 直近の出力から 4分12秒 / フェーズ: exporting layers (レイヤをイメージストアへ書き出し中) 継続 4分12秒
+[2026-08-05 09:41:50 JST]   data root の空き容量: 10.35 GiB (前回から 820.00 MiB 減少 → 書き出しは進んでいます) /var/lib/docker
+```
+
+BuildKit の出力からフェーズを検出し、経過時間と併せて表示します。
+**data root の空き容量が減り続けていれば「遅いだけで進行中」**、
+変化がなければ停滞と判断できます (上表の 1 と 2〜7 を切り分ける材料)。
+
+**(2) 停滞検知 — 出力が 300 秒途切れたら (`--build-stall-timeout`)**
+
+Docker daemon の応答 (`docker version` / `docker system df` を timeout 付きで実行)、
+data root の空き容量と inode を自動で調べ、上表の原因と対処方法を一覧表示します。
+**検知しても処理は中断しません** (遅いだけの場合にビルドを捨てないため)。
+
+```text
+────────────────────────────────────────────────────────────────────
+ ビルド停滞の診断 (停滞検知)
+────────────────────────────────────────────────────────────────────
+  経過時間             : 8分12秒
+  直近の出力からの経過 : 5分3秒
+  BuildKit のフェーズ  : exporting layers (レイヤをイメージストアへ書き出し中)
+  Docker daemon        : 応答あり (Server 27.1.1)
+  Docker data root     : /var/lib/docker
+    空き容量           : 2.10 GiB
+    inode              : 使用 41% / 空き 3145728
+  ...
+```
+
+**(3) 上限時間での中断 — `--build-timeout SEC` (既定は無制限)**
+
+指定した秒数を超えたら、診断を表示したうえで SIGTERM でビルドを中断します
+(20 秒で終了しなければ SIGKILL)。`docker` CLI を落とすと BuildKit のセッションも
+切れるため、daemon 側のビルドもキャンセルされます。終了コードは `1` です。
+**プロンプトが戻らない状態を確実に打ち切りたい場合**に指定してください。
+
+```bash
+# 30 分を超えたら中断する
+./build_and_verify.sh --build-timeout 1800
+```
+
+**(4) ビルド前の空き容量チェック**
+
+上表 2 を事前に潰すため、ビルド開始前に data root の空き容量を表示し、
+5 GiB を下回っていれば警告します。
+
+```text
+[2026-08-05 09:41:46 JST] ビルド開始前の data root 空き容量: 10.35 GiB (/var/lib/docker)
+```
+
+### 注意
+
+- 監視は BuildKit の出力を**行単位**で読むため、行末が改行にならない tty 形式とは
+  併用できません。`BUILDKIT_PROGRESS=tty` (buildx 版は `--progress tty`) を
+  指定した場合は、警告のうえ `plain` へ切り替えます。tty 形式のまま実行したい場合は
+  `--no-build-watchdog` を指定してください。
+- data root は Docker がローカル接続 (`unix://` / `npipe://`) のときだけ特定します。
+  リモート daemon (`tcp://` / `ssh://`) ではホスト側の `df` を見ても意味がないため、
+  空き容量の表示は行いません (経過時間とフェーズの表示は行います)。
+- `build_and_verify.sh` では、監視結果 (設定値・最長の無出力時間・中断の有無) を
+  `--report-dir` の全量ビルドレポート `[1] ビルド結果` の「ビルド監視」欄にも記録します。
 
 ## ビルド前後の一時ファイルコピー (`--copy-file`)
 

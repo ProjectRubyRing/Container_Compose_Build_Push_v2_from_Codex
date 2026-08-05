@@ -2795,4 +2795,149 @@ assert_contains "$copy_dry_run_output" \
   "[DRY-RUN] 上書き前のファイルを復元: $copy_dry_run_dir/copy-src.npmrc"
 assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, and Docker cleanup scenarios\n'
+# =============================================================================
+# ビルドの停滞検知・進捗表示
+# -----------------------------------------------------------------------------
+# BuildKit の exporting layers は --progress=plain では完了まで何も出力しないため、
+# 「止まっているのか進んでいるのか」を画面から判断できない。fake docker に
+# 無出力時間を作らせ、進捗表示・停滞診断・上限時間での中断を確認する。
+# =============================================================================
+
+# 進捗表示と停滞検知。exporting layers で 8 秒間出力が途切れる状況を作る。
+export FAKE_DOCKER_BUILD_EXPORT_STALL=8
+export FAKE_DOCKER_DATA_ROOT="$TEST_TMP/fake-data-root"
+mkdir -p "$FAKE_DOCKER_DATA_ROOT"
+build_stall_output="$TEST_TMP/build-stall.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --build-progress-interval 2 \
+    --build-stall-timeout 4 \
+    --report-dir "$TEST_TMP/build-stall-reports"
+) >"$build_stall_output" 2>&1; then
+  cat "$build_stall_output" >&2
+  fail "build watchdog scenario returned a non-zero status"
+fi
+# 監視設定の表示と、ビルド開始前の空き容量チェック
+assert_contains "$build_stall_output" "ビルドの停滞検知: 進捗表示 2 秒間隔 / 停滞判定 4 秒 / 上限 なし (無制限)"
+assert_contains "$build_stall_output" "ビルド開始前の data root 空き容量:"
+# BuildKit のフェーズを出力から検出し、経過時間つきで表示する
+assert_matches "$build_stall_output" \
+  'ビルド継続中 \(全サービス\): 経過 .+ / 直近の出力から .+ / フェーズ: exporting layers'
+assert_contains "$build_stall_output" "  data root の空き容量:"
+# 出力が途切れたら停滞と判断し、原因の切り分け診断を出す
+assert_contains "$build_stall_output" "停滞の可能性があるため診断します。"
+assert_contains "$build_stall_output" "ビルド停滞の診断 (停滞検知)"
+assert_contains "$build_stall_output" "BuildKit のフェーズ  : exporting layers (レイヤをイメージストアへ書き出し中)"
+assert_contains "$build_stall_output" "Docker daemon        : 応答あり (Server 27.1.1)"
+assert_contains "$build_stall_output" "exporting layers から進まないときの主な原因と確認方法:"
+assert_contains "$build_stall_output" "1. 遅いだけで進んでいる (最も多い)"
+assert_contains "$build_stall_output" "6. 端末のフロー制御 (Ctrl+S) で画面表示だけが止まっている"
+# 停滞を検知しても処理は中断せず、ビルド出力はそのまま流れる
+assert_contains "$build_stall_output" "#12 exporting layers 8s done"
+assert_contains "$build_stall_output" "compose build に成功しました (全サービス)。"
+# 全量レポートにも監視結果を残す
+collect_report_files "$TEST_TMP/build-stall-reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected exactly 1 report file for the build watchdog scenario"
+assert_matches "${REPORT_FILES[0]}" 'ビルド監視    : 進捗表示 2 秒間隔 / 停滞判定 4 秒 / 上限 なし \(無制限\) / 最長の無出力 '
+
+# Docker daemon が応答しない場合は診断でそう表示する
+export FAKE_DOCKER_DAEMON_HANG=true
+build_hang_output="$TEST_TMP/build-daemon-hang.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --build-progress-interval 0 --build-stall-timeout 3
+) >"$build_hang_output" 2>&1; then
+  cat "$build_hang_output" >&2
+  fail "build watchdog daemon-hang scenario returned a non-zero status"
+fi
+assert_contains "$build_hang_output" \
+  "Docker daemon        : 10 秒以内に応答しません (daemon 側で停止している可能性)"
+unset FAKE_DOCKER_DAEMON_HANG
+
+# 上限時間を超えたらビルドを中断し、プロンプトを返す (終了コード 1)。
+# 60 秒の無出力を作っても、中断処理により短時間で戻ることを確認する。
+export FAKE_DOCKER_BUILD_EXPORT_STALL=60
+build_timeout_output="$TEST_TMP/build-timeout.out"
+build_timeout_started="$(date +%s)"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --build-timeout 4 \
+    --build-progress-interval 0 \
+    --build-stall-timeout 0 \
+    --report-dir "$TEST_TMP/build-timeout-reports"
+) >"$build_timeout_output" 2>&1; then
+  cat "$build_timeout_output" >&2
+  fail "--build-timeout did not fail the run when the build exceeded the limit"
+fi
+build_timeout_elapsed=$(( $(date +%s) - build_timeout_started ))
+# 中断できずに sleep 60 の完走を待ってしまっていないこと (当初の症状への回帰防止)
+[ "$build_timeout_elapsed" -lt 45 ] \
+  || fail "--build-timeout took ${build_timeout_elapsed}s to return; the abort did not take effect"
+assert_contains "$build_timeout_output" "ビルドが上限時間 4 秒を超えました"
+assert_contains "$build_timeout_output" "ビルド停滞の診断 (上限時間超過)"
+assert_contains "$build_timeout_output" "ビルドプロセスへ SIGTERM を送ります"
+assert_contains "$build_timeout_output" "ビルドを上限時間 (4 秒) で中断しました: 全サービス"
+collect_report_files "$TEST_TMP/build-timeout-reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected exactly 1 report file for the build timeout scenario"
+assert_contains "${REPORT_FILES[0]}" \
+  "詳細          : compose build が上限時間 (4 秒) を超えたため中断しました。"
+assert_contains "${REPORT_FILES[0]}" "上限時間超過により中断"
+unset FAKE_DOCKER_BUILD_EXPORT_STALL
+
+# --no-build-watchdog では監視を行わず、従来どおりビルド出力をそのまま流す
+build_no_watchdog_output="$TEST_TMP/build-no-watchdog.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-build-watchdog
+) >"$build_no_watchdog_output" 2>&1; then
+  cat "$build_no_watchdog_output" >&2
+  fail "--no-build-watchdog returned a non-zero status"
+fi
+assert_contains "$build_no_watchdog_output" \
+  "ビルドの停滞検知: 無効 (--no-build-watchdog または各値に 0 を指定)"
+assert_not_contains "$build_no_watchdog_output" "ビルドを監視します"
+assert_contains "$build_no_watchdog_output" "compose build に成功しました (全サービス)。"
+
+# BUILDKIT_PROGRESS=tty は行単位で読めないため、監視有効時は plain へ切り替える
+build_tty_output="$TEST_TMP/build-progress-tty.out"
+if ! (
+  cd "$REPO_ROOT"
+  BUILDKIT_PROGRESS=tty bash ./build_and_verify.sh
+) >"$build_tty_output" 2>&1; then
+  cat "$build_tty_output" >&2
+  fail "BUILDKIT_PROGRESS=tty run returned a non-zero status"
+fi
+assert_contains "$build_tty_output" \
+  "BUILDKIT_PROGRESS=tty はビルド監視と併用できないため plain へ切り替えます。"
+assert_contains "$build_tty_output" "BuildKit のビルドログ表示形式: plain"
+assert_contains "$build_tty_output" "[fake-build] BUILDKIT_PROGRESS=plain"
+
+# --no-build-watchdog なら tty 指定をそのまま尊重する
+build_tty_keep_output="$TEST_TMP/build-progress-tty-keep.out"
+if ! (
+  cd "$REPO_ROOT"
+  BUILDKIT_PROGRESS=tty bash ./build_and_verify.sh --no-build-watchdog
+) >"$build_tty_keep_output" 2>&1; then
+  cat "$build_tty_keep_output" >&2
+  fail "BUILDKIT_PROGRESS=tty with --no-build-watchdog returned a non-zero status"
+fi
+assert_contains "$build_tty_keep_output" "[fake-build] BUILDKIT_PROGRESS=tty"
+
+# 監視の各値は 0 以上の整数のみ受け付ける
+build_bad_value_output="$TEST_TMP/build-bad-value.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --build-timeout abc
+) >"$build_bad_value_output" 2>&1; then
+  cat "$build_bad_value_output" >&2
+  fail "--build-timeout accepted a non-numeric value"
+fi
+assert_contains "$build_bad_value_output" \
+  "--build-timeout には 0 以上の整数を指定してください: abc"
+unset FAKE_DOCKER_DATA_ROOT
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, and Docker cleanup scenarios\n'
