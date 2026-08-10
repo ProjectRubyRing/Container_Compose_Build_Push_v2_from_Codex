@@ -137,6 +137,7 @@ if [ "${1:-}" = "compose" ]; then
           mysql80) printf 'cid-mysql80\n' ;;
           aurora84) printf 'cid-mysql84\n' ;;
           nohealth) printf 'cid-nohealth\n' ;;
+          tlsapp) printf 'cid-tlsapp\n' ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -444,6 +445,7 @@ if [ "${1:-}" = "inspect" ]; then
         *"cid-mysql80"*) printf '/mysql-8.0.42\n' ;;
         *"cid-mysql84"*) printf '/aurora-mysql-8.4\n' ;;
         *"cid-nohealth"*) printf '/no-healthcheck\n' ;;
+        *"cid-tlsapp"*) printf '/app-front\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
       ;;
@@ -658,6 +660,49 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "-it" ] \
     cid-mysql84) printf 'Welcome to the MySQL monitor.  Server version: 8.4.6\n' ;;
   esac
   exit 0
+fi
+
+# 証明書チェックの対象判定。トラストストアと HTTPS 接続先を設定したコンテナだけ成功させる。
+# ここで拾わないと、後段の /proc 走査ハンドラや汎用 exec ハンドラが成功を返してしまう。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"cert-check-probe"* ]]; then
+  [ "${2:-}" = "cid-tlsapp" ] && exit 0
+  exit 1
+fi
+
+# 証明書チェック本体。コンテナ内スクリプトの出力と終了コードを模擬する。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"cert-check-report"* ]]; then
+  case "${FAKE_CERT_CHECK_RESULT:-ok}" in
+    undetectable)
+      printf '\n=== 0. コンテナ内から検出した設定 ===\n'
+      printf '\nトラストストアを検出できませんでした。\n'
+      exit 2
+      ;;
+    ng)
+      printf '\n=== 1-1. トラストストア /opt/app/security/truststore.p12 ===\n'
+      printf '[FAIL] cacert.crt はこのストアに登録されていない\n'
+      printf '\n=== 結果 ===\n'
+      printf '  PASS=1  FAIL=1  WARN=0  SKIP=0\n'
+      printf '判定: NG — 上記 [FAIL] の内容を確認してください。\n'
+      exit 1
+      ;;
+    *)
+      printf '\n=== 0. コンテナ内から検出した設定 ===\n'
+      printf '     keytool         : /opt/java/openjdk/bin/keytool\n'
+      printf '     トラストストア  : 1 件\n'
+      printf '       - /opt/app/security/truststore.p12  (起動中 JVM の -Djavax.net.ssl.trustStore)\n'
+      printf '     接続先          : 1 件\n'
+      printf '       - SECURE_API_URL = https://secure-api:8443/api/v1/ping\n'
+      printf '\n=== 2-1. HTTPS 接続 SECURE_API_URL ===\n'
+      printf '[PASS] /opt/app/security/truststore.p12 由来の PEM で接続成功 (HTTP 200)\n'
+      printf '[PASS] 対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)\n'
+      printf '\n=== 結果 ===\n'
+      printf '  PASS=4  FAIL=0  WARN=0  SKIP=0\n'
+      printf '判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。\n'
+      exit 0
+      ;;
+  esac
 fi
 
 # cwagent のコンテナ内設定ディレクトリの一覧 (設定ファイルを取得できない場合の診断)。

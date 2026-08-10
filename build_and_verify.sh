@@ -32,8 +32,11 @@
 #   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
 #                          bash 接続するか、対話式の HTTP リクエスト、または
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
-#                          healthcheck 設定・実行履歴・HTTP 通信、および
-#                          cwagent / OTel のローカル送達診断を実行する。
+#                          healthcheck 設定・実行履歴・HTTP 通信、
+#                          cwagent / OTel のローカル送達診断、および
+#                          JVM トラストストアを持つコンテナ (front / back 等) の
+#                          証明書チェック (自己証明書による HTTPS 接続確認) を
+#                          実行する。
 #  (10) CloudWatch Logs 送信検証:
 #                          compose.yml に cwagent (CloudWatch Agent サイドカー) が
 #                          定義されている場合、ビルド前に設定ファイルを静的に
@@ -846,7 +849,12 @@ JBoss マスターパスワードの伝搬検証:
                                     MySQL サーバーでは SQL の対話実行も選択できる。
                                     cwagent / cloudwatch-logs-mock では CloudWatch
                                     Logs 偽装送達、otel / adot-collector / jaeger
-                                    では X-Ray 偽装トレースも確認できる
+                                    では X-Ray 偽装トレースも確認できる。
+                                    JVM トラストストアと https:// の接続先を
+                                    設定済みのコンテナ (front / back 等) では
+                                    証明書チェックも選択でき、コンテナ内の
+                                    設定だけで自己証明書による HTTPS 接続を
+                                    確認する (パラメータ入力なし)
                                     (bash 接続先には /bin/bash が必要)
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
@@ -6276,6 +6284,538 @@ MYSQL_CLIENT_SCRIPT
   log "MySQL セッションを終了しました。サービス操作の選択へ戻ります。"
 }
 
+# 選択された Compose サービスが「JVM トラストストアと HTTPS 接続先を持つ AP コンテナ」かを、
+# サービス名やイメージタグではなくコンテナ内の設定だけで判定する。front / back のように
+# 自己証明書 (cacert.crt) を取り込んだコンテナでのみ証明書チェックを表示することで、
+# 選択後に接続先やトラストストアを入力させずに済ませる。
+compose_service_supports_cert_check() {
+  local service_name="$1" container_id
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  container_id="${container_ids[0]}"
+  docker exec "$container_id" /bin/sh -c '
+    # cert-check-probe: 証明書チェックに必要な道具と設定がそろっているか
+    command -v curl >/dev/null 2>&1 || exit 1
+    if ! command -v keytool >/dev/null 2>&1; then
+      { [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/keytool" ]; } || exit 1
+    fi
+    cert_probe_env="$(env 2>/dev/null)" || exit 1
+    printf "%s\n" "$cert_probe_env" \
+      | grep -q "^[A-Za-z_][A-Za-z0-9_]*=https://" || exit 1
+    # JAVA_TOOL_OPTIONS で渡した -D は argv に現れないため、cmdline だけでなく
+    # 起動中プロセスの environ も見る (JBoss の standalone.sh がこの渡し方をする)。
+    for cert_probe_proc in /proc/[0-9]*; do
+      if [ -r "$cert_probe_proc/cmdline" ] \
+          && tr "\0" "\n" < "$cert_probe_proc/cmdline" 2>/dev/null \
+            | grep -q -- "-Djavax.net.ssl.trustStore="; then
+        exit 0
+      fi
+      if [ -r "$cert_probe_proc/environ" ] \
+          && tr "\0" "\n" < "$cert_probe_proc/environ" 2>/dev/null \
+            | sed -n -e "s/^JAVA_TOOL_OPTIONS=//p" -e "s/^JAVA_OPTS=//p" \
+                     -e "s/^JDK_JAVA_OPTIONS=//p" \
+            | grep -q -- "-Djavax.net.ssl.trustStore="; then
+        exit 0
+      fi
+    done
+    printf "%s\n" "$cert_probe_env" \
+      | grep -qE "^[A-Za-z_][A-Za-z0-9_]*(TRUSTSTORE|TRUST_STORE)[A-Za-z0-9_]*=/" || exit 1
+    exit 0
+  ' >/dev/null 2>&1
+}
+
+# front / back のように自己証明書を取り込んだコンテナで、そのコンテナ自身の curl から
+# HTTPS の REST API (別 Compose サービスの secure-api / ALB 等) へ接続できるかを確認する。
+# トラストストア・パスワード・接続先・CA 証明書はすべてコンテナ内の JVM 引数と環境変数から
+# 検出するため、選択後の入力は不要。パスワードはコンテナ内でだけ解決し、
+# docker exec のコマンドライン (ホストのプロセス引数) には一切載せない。
+run_interactive_compose_cert_check() {
+  local service_name="$1" container_id container_name cert_check_script
+  local capture_file="" exec_status=0
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  cert_check_script="$(cat <<'CERT_CHECK_SCRIPT'
+set -u
+# cert-check-report: トラストストアと HTTPS 接続先をコンテナ内の設定だけから検出し、
+# そのコンテナ自身の curl で HTTPS 接続できるかを検証する。
+# 追加のパラメータ入力を不要にするため、次の順で自動検出する。
+#   トラストストア : 起動中 JVM の -Djavax.net.ssl.trustStore → *TRUSTSTORE* 環境変数
+#   パスワード     : 同 -Djavax.net.ssl.trustStorePassword → *TRUSTSTORE*PASSWORD 環境変数
+#                    → changeit → パスワード無し (整合性チェック省略)
+#   接続先         : https:// で始まる値を持つ環境変数 (SECURE_API_URL 等)
+#   CA 証明書      : ${PKI_TRUST_DIR}/*.crt → *CACERT* / *CA_BUNDLE* 環境変数
+# 終了コード: 0 = 判定 OK / 1 = 判定 NG / 2 = 検出できず実行不能
+
+CC_PASS=0
+CC_FAIL=0
+CC_WARN=0
+CC_SKIP=0
+CC_CONNECT_TIMEOUT=5
+CC_MAX_TIME=15
+CC_MAX_STORES=3
+CC_MAX_TARGETS=4
+CC_TAB="$(printf '\t')"
+
+cc_section() { printf '\n=== %s ===\n' "$1"; }
+cc_info()    { printf '     %s\n' "$1"; }
+cc_pass()    { CC_PASS=$((CC_PASS + 1)); printf '[PASS] %s\n' "$1"; }
+cc_fail()    { CC_FAIL=$((CC_FAIL + 1)); printf '[FAIL] %s\n' "$1"; }
+cc_warn()    { CC_WARN=$((CC_WARN + 1)); printf '[WARN] %s\n' "$1"; }
+cc_skip()    { CC_SKIP=$((CC_SKIP + 1)); printf '[SKIP] %s\n' "$1"; }
+
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'curl がコンテナ内に見つからないため証明書チェックを実行できません。\n'
+  exit 2
+fi
+
+CC_KEYTOOL=""
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/keytool" ]; then
+  # AP サーバを動かしている JVM の keytool を優先する。PATH 上の keytool が
+  # 古い Java だと PKCS12 のトラストストアを読めないことがあるため。
+  CC_KEYTOOL="${JAVA_HOME}/bin/keytool"
+elif command -v keytool >/dev/null 2>&1; then
+  CC_KEYTOOL="$(command -v keytool)"
+fi
+if [ -z "$CC_KEYTOOL" ]; then
+  printf 'keytool がコンテナ内に見つからないため証明書チェックを実行できません。\n'
+  exit 2
+fi
+
+umask 077
+if ! CC_DIR="$(mktemp -d 2>/dev/null)"; then
+  printf '証明書チェック用の一時ディレクトリを作成できません。\n'
+  exit 2
+fi
+cc_cleanup() { rm -rf -- "$CC_DIR"; }
+trap cc_cleanup EXIT HUP INT TERM
+
+# 環境変数はパスワードを含み得るため、ファイルへは書き出さずシェル変数だけで扱う。
+CC_ENV="$(env 2>/dev/null || true)"
+
+# 起動中 JVM のトラストストア指定を 1 プロセス分だけ拾う。
+# JAVA_TOOL_OPTIONS / JAVA_OPTS で渡した -D は argv に現れない (JVM が起動時に
+# 環境変数から読む) ため、cmdline に無ければ environ 側も見る。JBoss の
+# standalone.sh 経由の起動はこちらに該当する。
+# 値は 1 行 1 トークンへ正規化し、以降の -D 解析を cmdline と共通にする。
+# 標準入力のトークン列から -D<名前>= の値を 1 つ取り出す。
+# `sh -c "java -D..."` のように 1 トークンへ複数の -D が詰まっている場合があるため、
+# 行頭固定にはせずマーカー以降を取り、最初の空白で切る。
+cc_scan_dvalue() {
+  sed -n "s/.*-D$1=//p" | sed 's/[[:space:]].*//' | head -n 1
+}
+
+CC_JVM_ARGS=""
+CC_JVM_SOURCE=""
+for cc_proc in /proc/[0-9]*; do
+  if [ -r "$cc_proc/cmdline" ]; then
+    cc_args="$(tr '\0' '\n' < "$cc_proc/cmdline" 2>/dev/null || true)"
+    cc_try="$(printf '%s\n' "$cc_args" | cc_scan_dvalue 'javax\.net\.ssl\.trustStore')"
+    if [ -n "$cc_try" ]; then
+      CC_JVM_ARGS="$cc_args"
+      CC_JVM_SOURCE='コマンドライン引数'
+      break
+    fi
+  fi
+  if [ -r "$cc_proc/environ" ]; then
+    cc_args="$(tr '\0' '\n' < "$cc_proc/environ" 2>/dev/null \
+      | sed -n -e 's/^JAVA_TOOL_OPTIONS=//p' -e 's/^JAVA_OPTS=//p' \
+               -e 's/^JDK_JAVA_OPTIONS=//p' \
+      | tr ' ' '\n' || true)"
+    cc_try="$(printf '%s\n' "$cc_args" | cc_scan_dvalue 'javax\.net\.ssl\.trustStore')"
+    if [ -n "$cc_try" ]; then
+      CC_JVM_ARGS="$cc_args"
+      CC_JVM_SOURCE='JAVA_TOOL_OPTIONS 等の環境変数'
+      break
+    fi
+  fi
+done
+
+# パスワードは画面へ出さず、使用する瞬間だけ名前から値を解決する。
+cc_password_of() {
+  case "$1" in
+    jvm)
+      printf '%s\n' "$CC_JVM_ARGS" \
+        | cc_scan_dvalue 'javax\.net\.ssl\.trustStorePassword'
+      ;;
+    default) printf 'changeit' ;;
+    none) : ;;
+    env:*)
+      cc_pw_name="${1#env:}"
+      if command -v printenv >/dev/null 2>&1; then
+        printenv "$cc_pw_name" 2>/dev/null || :
+      else
+        eval "printf '%s' \"\${${cc_pw_name}:-}\""
+      fi
+      ;;
+  esac
+}
+
+CC_STORES_FILE="$CC_DIR/stores.tsv"
+: > "$CC_STORES_FILE"
+cc_add_store() {
+  [ -n "${1:-}" ] || return 0
+  if cut -d"$CC_TAB" -f1 "$CC_STORES_FILE" | grep -qxF -- "$1"; then
+    return 0
+  fi
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CC_STORES_FILE"
+}
+
+if [ -n "$CC_JVM_ARGS" ]; then
+  cc_jvm_store="$(printf '%s\n' "$CC_JVM_ARGS" \
+    | cc_scan_dvalue 'javax\.net\.ssl\.trustStore')"
+  cc_add_store "$cc_jvm_store" "起動中 JVM の -Djavax.net.ssl.trustStore (${CC_JVM_SOURCE})" 'jvm'
+fi
+
+# *TRUSTSTORE* / *TRUST_STORE* を名前に含み、絶対パスを値に持つ環境変数。
+# パスワード・種別・別名の変数はストア本体ではないため除外する。
+printf '%s\n' "$CC_ENV" \
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*(TRUSTSTORE|TRUST_STORE)[A-Za-z0-9_]*=/' \
+  | grep -Ev '^[^=]*(PASSWORD|PASSWD|PASS|TYPE|ALIAS)[^=]*=' \
+  > "$CC_DIR/store-env.txt" 2>/dev/null || :
+while IFS= read -r cc_line; do
+  [ -n "$cc_line" ] || continue
+  cc_name="${cc_line%%=*}"
+  cc_value="${cc_line#*=}"
+  case "$cc_name" in
+    *_FILE) cc_pw_env="${cc_name%_FILE}_PASSWORD" ;;
+    *_PATH) cc_pw_env="${cc_name%_PATH}_PASSWORD" ;;
+    *)      cc_pw_env="${cc_name}_PASSWORD" ;;
+  esac
+  cc_add_store "$cc_value" "環境変数 ${cc_name}" "env:${cc_pw_env}"
+done < "$CC_DIR/store-env.txt"
+
+# https:// を値に持つ環境変数を接続先として使う (SECURE_API_URL 等)。
+CC_TARGETS_FILE="$CC_DIR/targets.txt"
+printf '%s\n' "$CC_ENV" \
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*=https://[^[:space:]]+$' \
+  | sort -u > "$CC_TARGETS_FILE" 2>/dev/null || : > "$CC_TARGETS_FILE"
+
+CC_CACERTS_FILE="$CC_DIR/cacerts.txt"
+: > "$CC_CACERTS_FILE"
+cc_add_cacert() {
+  { [ -n "${1:-}" ] && [ -r "$1" ]; } || return 0
+  grep -qxF -- "$1" "$CC_CACERTS_FILE" && return 0
+  printf '%s\n' "$1" >> "$CC_CACERTS_FILE"
+}
+if [ -n "${PKI_TRUST_DIR:-}" ] && [ -d "${PKI_TRUST_DIR}" ]; then
+  for cc_crt in "${PKI_TRUST_DIR}"/*.crt; do
+    cc_add_cacert "$cc_crt"
+  done
+fi
+printf '%s\n' "$CC_ENV" \
+  | grep -E '^[^=]*(CACERT|CA_CERT|CA_BUNDLE)[^=]*=/' \
+  > "$CC_DIR/cacert-env.txt" 2>/dev/null || :
+while IFS= read -r cc_line; do
+  [ -n "$cc_line" ] || continue
+  cc_add_cacert "${cc_line#*=}"
+done < "$CC_DIR/cacert-env.txt"
+
+cc_count_lines() {
+  cc_lines="$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')"
+  case "${cc_lines:-}" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$cc_lines" ;;
+  esac
+}
+
+CC_STORE_TOTAL="$(cc_count_lines "$CC_STORES_FILE")"
+CC_TARGET_TOTAL="$(cc_count_lines "$CC_TARGETS_FILE")"
+CC_CACERT_TOTAL="$(cc_count_lines "$CC_CACERTS_FILE")"
+
+# 上限で打ち切ると未確認の対象が残るため、判定と同じ場所にその旨を出す。
+# 結果欄だけを見て「全件 OK」と読み違えないようにする。
+cc_truncation_note() {
+  if [ "$CC_STORE_TOTAL" -gt "$CC_MAX_STORES" ]; then
+    printf '  注意: 検出したトラストストア %s 件のうち先頭 %s 件のみ確認しました。\n' \
+      "$CC_STORE_TOTAL" "$CC_MAX_STORES"
+  fi
+  if [ "$CC_TARGET_TOTAL" -gt "$CC_MAX_TARGETS" ]; then
+    printf '  注意: 検出した接続先 %s 件のうち先頭 %s 件のみ確認しました。\n' \
+      "$CC_TARGET_TOTAL" "$CC_MAX_TARGETS"
+  fi
+}
+
+cc_section '0. コンテナ内から検出した設定'
+cc_info "keytool         : $CC_KEYTOOL"
+if [ -n "$CC_JVM_ARGS" ]; then
+  cc_info "JVM             : -Djavax.net.ssl.trustStore を検出した (${CC_JVM_SOURCE})"
+else
+  cc_info 'JVM             : トラストストアを指定した起動中プロセスは見つからなかった'
+fi
+
+if [ "$CC_STORE_TOTAL" -eq 0 ]; then
+  printf '\nトラストストアを検出できませんでした。\n'
+  printf '  -Djavax.net.ssl.trustStore を付けて JVM を起動しているか、\n'
+  printf '  トラストストアのパスを持つ *TRUSTSTORE* 環境変数があるか確認してください。\n'
+  exit 2
+fi
+if [ "$CC_TARGET_TOTAL" -eq 0 ]; then
+  printf '\nHTTPS の接続先を検出できませんでした。\n'
+  printf '  https:// で始まる値を持つ環境変数 (SECURE_API_URL 等) を設定してください。\n'
+  exit 2
+fi
+
+cc_info "トラストストア  : ${CC_STORE_TOTAL} 件"
+while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
+  [ -n "$cc_store" ] || continue
+  cc_info "  - ${cc_store}  (${cc_source})"
+done < "$CC_STORES_FILE"
+cc_info "接続先          : ${CC_TARGET_TOTAL} 件"
+while IFS= read -r cc_line; do
+  [ -n "$cc_line" ] || continue
+  cc_info "  - ${cc_line%%=*} = ${cc_line#*=}"
+done < "$CC_TARGETS_FILE"
+if [ "$CC_CACERT_TOTAL" -gt 0 ]; then
+  cc_info "CA 証明書       : ${CC_CACERT_TOTAL} 件 (フィンガープリント照合に使用)"
+  while IFS= read -r cc_line; do
+    [ -n "$cc_line" ] || continue
+    cc_info "  - ${cc_line}"
+  done < "$CC_CACERTS_FILE"
+else
+  cc_info 'CA 証明書       : 検出なし (フィンガープリント照合は行わない)'
+fi
+if [ "$CC_STORE_TOTAL" -gt "$CC_MAX_STORES" ] || [ "$CC_TARGET_TOTAL" -gt "$CC_MAX_TARGETS" ]; then
+  cc_info "確認件数の上限  : トラストストア ${CC_MAX_STORES} 件 / 接続先 ${CC_MAX_TARGETS} 件まで"
+fi
+
+# =====================================================================
+# 1. トラストストアから PEM バンドルを書き出す
+#    curl は JKS / PKCS12 を直接読めないため keytool -rfc で PEM へ変換する。
+# =====================================================================
+CC_READY_FILE="$CC_DIR/ready.tsv"
+: > "$CC_READY_FILE"
+cc_store_index=0
+while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
+  [ -n "$cc_store" ] || continue
+  cc_store_index=$((cc_store_index + 1))
+  [ "$cc_store_index" -le "$CC_MAX_STORES" ] || break
+
+  cc_section "1-${cc_store_index}. トラストストア ${cc_store}"
+  cc_info "検出元: ${cc_source}"
+  if [ ! -r "$cc_store" ]; then
+    cc_fail "トラストストアを読み取れない: ${cc_store}"
+    continue
+  fi
+  cc_pass 'トラストストアを読み取れる'
+
+  cc_bundle="$CC_DIR/bundle-${cc_store_index}.pem"
+  cc_listing="$CC_DIR/keytool-${cc_store_index}.out"
+  cc_keytool_err="$CC_DIR/keytool-${cc_store_index}.err"
+  cc_listed='no'
+  cc_used_token=''
+  for cc_token in "$cc_pwtoken" jvm default none; do
+    [ -n "$cc_token" ] || continue
+    cc_pw="$(cc_password_of "$cc_token")"
+    if [ "$cc_token" = 'none' ] || [ -z "$cc_pw" ]; then
+      "$CC_KEYTOOL" -list -rfc -keystore "$cc_store" \
+        > "$cc_listing" 2> "$cc_keytool_err" < /dev/null \
+        && { cc_listed='yes'; cc_used_token='none'; }
+    else
+      "$CC_KEYTOOL" -list -rfc -keystore "$cc_store" -storepass "$cc_pw" \
+        > "$cc_listing" 2> "$cc_keytool_err" < /dev/null \
+        && { cc_listed='yes'; cc_used_token="$cc_token"; }
+    fi
+    cc_pw=''
+    [ "$cc_listed" = 'yes' ] && break
+  done
+
+  if [ "$cc_listed" != 'yes' ]; then
+    cc_fail 'keytool でトラストストアを読み取れない (パスワード / ストア種別を確認する)'
+    sed 's/^/       /' "$cc_keytool_err" 2>/dev/null | head -n 5
+    continue
+  fi
+  # パスワードの値は出さず、どこから解決したかだけを示す。
+  case "$cc_used_token" in
+    jvm)     cc_info 'パスワード: JVM の -Djavax.net.ssl.trustStorePassword で整合性チェックまで成功' ;;
+    env:*)   cc_info "パスワード: 環境変数 ${cc_used_token#env:} で整合性チェックまで成功" ;;
+    default) cc_info 'パスワード: 既定値 changeit で整合性チェックまで成功' ;;
+    *)       cc_warn 'トラストストアのパスワードを解決できないため、整合性チェック無しで内容だけを読み取った' ;;
+  esac
+
+  awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' "$cc_listing" > "$cc_bundle"
+  # grep -c は不一致でも "0" を出力して終了コード 1 を返すため、
+  # || で値を足さず、失敗時は代入し直して数値を 1 つに保つ。
+  cc_certs="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$cc_bundle" 2>/dev/null)" || cc_certs=0
+  case "${cc_certs:-}" in
+    ''|*[!0-9]*) cc_certs=0 ;;
+  esac
+  if [ "$cc_certs" -gt 0 ]; then
+    cc_pass "PEM バンドルを書き出した (証明書 ${cc_certs} 枚)"
+    printf '%s\t%s\t%s\n' "$cc_store" "$cc_source" "$cc_bundle" >> "$CC_READY_FILE"
+  else
+    cc_fail 'トラストストアから証明書を取り出せなかった'
+    continue
+  fi
+
+  # 検出した CA 証明書がこのストアに登録されているかを SHA-256 で照合する。
+  if [ "$CC_CACERT_TOTAL" -eq 0 ]; then
+    cc_skip 'CA 証明書を検出できないためフィンガープリント照合は行わない'
+  elif ! command -v openssl >/dev/null 2>&1; then
+    cc_skip 'openssl が無いためフィンガープリント照合は行わない'
+  else
+    cc_split_dir="$CC_DIR/split-${cc_store_index}"
+    mkdir -p "$cc_split_dir"
+    awk -v dir="$cc_split_dir" '
+      /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%03d.pem", dir, n) }
+      n > 0 { print > out }
+    ' "$cc_bundle"
+    while IFS= read -r cc_cacert; do
+      [ -n "$cc_cacert" ] || continue
+      cc_want="$(openssl x509 -in "$cc_cacert" -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/^.*=//' | tr -d '\r')"
+      if [ -z "$cc_want" ]; then
+        cc_warn "CA 証明書のフィンガープリントを取得できない (PEM / DER 形式を確認する): ${cc_cacert}"
+        continue
+      fi
+      cc_found='no'
+      for cc_pem in "$cc_split_dir"/cert-*.pem; do
+        [ -r "$cc_pem" ] || continue
+        cc_have="$(openssl x509 -in "$cc_pem" -noout -fingerprint -sha256 2>/dev/null \
+          | sed 's/^.*=//' | tr -d '\r')"
+        if [ "$cc_have" = "$cc_want" ]; then
+          cc_found='yes'
+          break
+        fi
+      done
+      if [ "$cc_found" = 'yes' ]; then
+        cc_pass "$(basename -- "$cc_cacert") と同一の証明書がこのストアに登録されている"
+      else
+        cc_fail "$(basename -- "$cc_cacert") はこのストアに登録されていない"
+        cc_info "対処: ${CC_KEYTOOL} -importcert -trustcacerts -noprompt -alias cacert \\"
+        cc_info "        -file ${cc_cacert} -keystore ${cc_store} -storepass <password>"
+      fi
+    done < "$CC_CACERTS_FILE"
+  fi
+done < "$CC_STORES_FILE"
+
+CC_READY_TOTAL="$(cc_count_lines "$CC_READY_FILE")"
+if [ "$CC_READY_TOTAL" -eq 0 ]; then
+  cc_section '結果'
+  printf '  PASS=%d  FAIL=%d  WARN=%d  SKIP=%d\n' "$CC_PASS" "$CC_FAIL" "$CC_WARN" "$CC_SKIP"
+  cc_truncation_note
+  printf '判定: NG — PEM バンドルを用意できたトラストストアがありません。\n'
+  exit 1
+fi
+
+# =====================================================================
+# 2. 検出した接続先へ、各トラストストア由来の PEM で HTTPS 接続する
+# =====================================================================
+cc_target_index=0
+while IFS= read -r cc_target_line <&3; do
+  [ -n "$cc_target_line" ] || continue
+  cc_target_index=$((cc_target_index + 1))
+  [ "$cc_target_index" -le "$CC_MAX_TARGETS" ] || break
+  cc_target_name="${cc_target_line%%=*}"
+  cc_target_url="${cc_target_line#*=}"
+
+  cc_section "2-${cc_target_index}. HTTPS 接続 ${cc_target_name}"
+  cc_info "接続先: ${cc_target_url}"
+
+  while IFS="$CC_TAB" read -r cc_store cc_source cc_bundle; do
+    [ -n "$cc_bundle" ] || continue
+    cc_curl_err="$CC_DIR/curl.err"
+    # このループは標準入力から $CC_READY_FILE を読んでいるため、curl には
+    # /dev/null を渡して読み取り位置を進めさせない。
+    cc_code="$(curl --silent --show-error \
+      --connect-timeout "$CC_CONNECT_TIMEOUT" --max-time "$CC_MAX_TIME" \
+      --output /dev/null --write-out '%{http_code}' \
+      --cacert "$cc_bundle" "$cc_target_url" < /dev/null 2> "$cc_curl_err")"
+    cc_rc=$?
+    if [ "$cc_rc" -eq 0 ]; then
+      cc_pass "${cc_store} 由来の PEM で接続成功 (HTTP ${cc_code})"
+    else
+      cc_fail "${cc_store} 由来の PEM で接続失敗 (curl exit=${cc_rc})"
+      sed 's/^/       /' "$cc_curl_err" 2>/dev/null | head -n 3
+      case "$cc_rc" in
+        60) cc_info 'exit 60 = 証明書を検証できない。CA 証明書がこのストアに入っているか確認する。' ;;
+        35) cc_info 'exit 35 = TLS ハンドシェイク失敗。プロトコル / 暗号スイートの不一致を確認する。' ;;
+        7)  cc_info 'exit 7 = 接続不可。宛先ホスト・ポート・Compose ネットワークを確認する。' ;;
+        6)  cc_info 'exit 6 = 名前解決に失敗。Compose のサービス名を確認する。' ;;
+        28) cc_info "exit 28 = タイムアウト (最大 ${CC_MAX_TIME} 秒)。宛先の起動状態を確認する。" ;;
+      esac
+    fi
+  done < "$CC_READY_FILE"
+
+  # 対照テスト: CA を渡さないと失敗することで、上の成功がトラストストアの効果だと確認できる。
+  curl --silent --show-error \
+    --connect-timeout "$CC_CONNECT_TIMEOUT" --max-time "$CC_MAX_TIME" \
+    --output /dev/null "$cc_target_url" \
+    < /dev/null > /dev/null 2> "$CC_DIR/curl-control.err"
+  cc_control_rc=$?
+  if [ "$cc_control_rc" -eq 60 ]; then
+    cc_pass '対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)'
+  elif [ "$cc_control_rc" -eq 0 ]; then
+    cc_warn '対照テスト: --cacert 無しでも接続できた。サーバ証明書が OS 標準の CA バンドルでも検証できるため、上の成功はトラストストアの効果を示していない。'
+  else
+    cc_warn "対照テスト: --cacert 無しの接続が exit=${cc_control_rc} で失敗した (証明書検証以外の理由の可能性)"
+  fi
+done 3< "$CC_TARGETS_FILE"
+
+cc_section '結果'
+printf '  PASS=%d  FAIL=%d  WARN=%d  SKIP=%d\n' "$CC_PASS" "$CC_FAIL" "$CC_WARN" "$CC_SKIP"
+cc_truncation_note
+if [ "$CC_FAIL" -gt 0 ]; then
+  printf '判定: NG — 上記 [FAIL] の内容を確認してください。\n'
+  exit 1
+fi
+printf '判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。\n'
+exit 0
+CERT_CHECK_SCRIPT
+)"
+
+  diag ""
+  diag "════════════════ 証明書チェック ════════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "コンテナ内の JVM 引数と環境変数からトラストストアと HTTPS 接続先を検出し、"
+  diag "そのコンテナ自身の curl で接続できるかを確認します (追加の入力は不要)。"
+  diag "接続待ちが入るため、完了まで数十秒かかることがあります。"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "証明書チェックの保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  docker exec "$container_id" /bin/sh -c "$cert_check_script" \
+    > "$capture_file" 2>&1 || exec_status=$?
+  print_healthcheck_capture "$capture_file" "(証明書チェックの出力がありません)"
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "証明書チェック結果 : OK"
+      ;;
+    1)
+      diag "証明書チェック結果 : NG (上記 [FAIL] を確認してください)"
+      ;;
+    2)
+      warn "証明書チェックに必要な設定をコンテナ内から検出できませんでした。"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' で証明書チェックを実行できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
+  diag "接続先やトラストストアの内容には機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
 # 可観測性ヘルパーの JSON は認証ヘッダー等を含み得るため、生データを表示せず
 # Python 3 で必要な項目だけを抽出する。logs モード全体の必須依存にはせず、
 # 専用ヘルパーが選択された時点で利用可否を確認する。
@@ -8511,7 +9051,7 @@ pause_compose_service_actions() {
 
 run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
-  local mysql_action=0 observability_action=0
+  local mysql_action=0 observability_action=0 cert_check_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -8521,6 +9061,11 @@ run_interactive_compose_service_actions() {
   if [ -n "$helper_kind" ]; then
     max_action=$(( max_action + 1 ))
     observability_action="$max_action"
+  fi
+  # 証明書チェックは最後に採番し、既存操作の番号を変えない。
+  if compose_service_supports_cert_check "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    cert_check_action="$max_action"
   fi
   while :; do
     diag ""
@@ -8539,6 +9084,9 @@ run_interactive_compose_service_actions() {
         diag "  ${observability_action}) X-Ray 偽装 Jaeger のトレースを確認 (サービス / トレース / スパン)"
         ;;
     esac
+    if [ "$cert_check_action" -gt 0 ]; then
+      diag "  ${cert_check_action}) 証明書チェック (トラストストアと HTTPS 接続先を自動検出して確認)"
+    fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
     if ! IFS= read -r action; then
@@ -8587,6 +9135,11 @@ run_interactive_compose_service_actions() {
               fi
               ;;
           esac
+          pause_compose_service_actions || return 1
+        elif [ "$cert_check_action" -gt 0 ] && [ "$action" = "$cert_check_action" ]; then
+          if ! run_interactive_compose_cert_check "$service_name"; then
+            warn "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
+          fi
           pause_compose_service_actions || return 1
         else
           warn "0 から ${max_action} の番号を入力してください。"
@@ -8659,7 +9212,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェックを繰り返し実行します。"
         ;;
     esac
     return 0

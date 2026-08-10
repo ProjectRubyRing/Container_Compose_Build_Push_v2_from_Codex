@@ -172,7 +172,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェックも選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--exit-on-deploy-error` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。デプロイエラー (AP サーバは起動したがアプリのデプロイに失敗) を検出しても調査用の対話操作へ入らず、従来どおりログを出力して終了する。既定ではコンテナと AP サーバを起動したまま残し、各 Compose サービスへ接続して調査できる状態にする | `false` |
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
@@ -1181,6 +1181,7 @@ CloudWatch Logs には届きません。
 - `logs`: 現在起動している Compose サービスを番号付きで表示します。サービス選択後、
   `1` で今回の起動以降のログ表示、`2` で対象コンテナの対話式 `/bin/bash` 接続を
   選べます。`3` では Docker healthcheck の設定・実行履歴・通信内容を確認できます。
+  さらに、コンテナの設定に応じて MySQL 接続・送達診断・証明書チェックが追加されます。
   bash セッション内では `cd` で移動しながら任意のコマンドを実行でき、
   bash 終了後は同じサービスの操作選択へ戻ります。同一サービスに複数コンテナがある場合は
   警告を表示して先頭の実行中コンテナへ接続します。ログ表示後も Enter キーで操作選択へ
@@ -1235,6 +1236,48 @@ MySQL 8.4 / Aurora 8.4 互換系で共通です。
 パスワードを解決できない構成では安全な対話入力を求めます。解決したパスワードは Docker の
 コマンドラインへ含めず、コンテナ内に権限を制限して作成した一時オプションファイルから
 `mysql` へ渡し、セッション終了時に削除します。
+
+`logs` モードで選択した実行中コンテナが、JVM トラストストア（起動中プロセスの
+`-Djavax.net.ssl.trustStore`、または絶対パスを値に持つ `*TRUSTSTORE*` 環境変数）と
+`https://` で始まる値を持つ環境変数の両方を備えている場合、`証明書チェック` が
+**最後の操作番号**として追加されます。サービス名やイメージタグではなくコンテナ内の設定だけで
+判定するため、front / back のように自己証明書 `cacert.crt` を取り込んだ AP コンテナでのみ
+表示されます。既存操作の番号は変わりません。
+
+JBoss EAP の `standalone.sh` のように **`JAVA_TOOL_OPTIONS` で `-D` を渡す**起動方法では、
+その指定は JVM の `argv`（`/proc/<pid>/cmdline`）に現れません。このため検出では
+`/proc/<pid>/environ` の `JAVA_TOOL_OPTIONS` / `JAVA_OPTS` / `JDK_JAVA_OPTIONS` も併せて読みます。
+`docker exec` の環境には entrypoint が実行時に `export` した値が入らないため、この経路が無いと
+JDK 側トラストストアを取りこぼします。
+
+選択すると、そのコンテナ自身の `curl` から HTTPS の REST API（別 Compose サービスの
+`secure-api` や ALB など）へ接続できるかを確認します。**接続先やトラストストアの入力は不要**で、
+すべてコンテナ内の設定から検出します。
+
+| 項目 | 検出元（上から順に試行） |
+|------|--------------------------|
+| トラストストア | 起動中 JVM の `-Djavax.net.ssl.trustStore`（コマンドライン引数と、`JAVA_TOOL_OPTIONS` / `JAVA_OPTS` / `JDK_JAVA_OPTIONS` 経由の指定の両方）→ 絶対パスを値に持つ `*TRUSTSTORE*` / `*TRUST_STORE*` 環境変数（`*_FILE` / `*_PATH` 含む。パスワード・種別・別名の変数は除外） |
+| パスワード | 同 `-Djavax.net.ssl.trustStorePassword` → 対応する `*_PASSWORD` 環境変数 → `changeit` → パスワード無し（整合性チェックを省略して内容だけ読み取り） |
+| 接続先 | `https://` で始まる値を持つ環境変数（`SECURE_API_URL`、`SECURE_API_VIA_ALB_URL` 等） |
+| CA 証明書 | `${PKI_TRUST_DIR}/*.crt` → `*CACERT*` / `*CA_CERT*` / `*CA_BUNDLE*` 環境変数 |
+
+`curl` は JKS / PKCS12 のトラストストアを直接読めないため、`keytool -list -rfc` で PEM バンドルへ
+書き出してから `--cacert` に渡します。`keytool` は `$JAVA_HOME/bin/keytool` を優先します
+（PATH 上の `keytool` が古い Java だと PKCS12 を読めないことがあるため）。検出した CA 証明書は
+SHA-256 フィンガープリントでストア内の証明書と突き合わせ、登録されていない場合は
+`keytool -importcert` の実行例を表示します（照合には `openssl` が必要で、無い場合は SKIP）。
+
+接続確認は「検出したトラストストア × 検出した接続先」の組み合わせで実行し、接続先ごとに
+`--cacert` を渡さない**対照テスト**も行います。対照テストが `curl exit 60` で失敗することで、
+接続成功が OS 標準の CA バンドルではなくトラストストアの効果であると確認できます。実行時間を
+抑えるため、トラストストアは 3 件、接続先は 4 件、`curl` は接続 5 秒 / 全体 15 秒を上限とします。
+上限で打ち切った場合は、結果欄にも `注意: 検出した接続先 N 件のうち先頭 M 件のみ確認しました。` と
+表示するため、`判定: OK` を全件確認済みと読み違えることはありません。
+
+判定は `判定: OK` / `判定: NG` として表示します。`NG` は診断結果であり、操作選択へそのまま戻ります。
+トラストストアや接続先を検出できない構成では、その旨を表示して操作選択へ戻ります。
+トラストストアのパスワードはコンテナ内でだけ解決するため、`docker exec` のコマンドライン
+（ホストのプロセス引数）や画面出力には現れません。
 
 さらに、対象のComposeサービス名に応じて次の可観測性専用操作が追加されます。MySQL 操作と
 同時に利用可能な場合も番号は重複せず、専用操作を使わない通常サービスでは

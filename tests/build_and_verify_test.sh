@@ -1015,6 +1015,93 @@ assert_occurrences "$mysql_failure_output" "Compose サービス 'mysql80' で�
 assert_contains "$mysql_failure_output" "Compose サービスの対話操作を終了しました。"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
+cert_check_output="$TEST_TMP/keep-mode-cert-check.out"
+: > "$FAKE_DOCKER_CALLS"
+# トラストストアと HTTPS 接続先を設定したコンテナ (front / back 相当) でだけ
+# 証明書チェックが追加され、既存操作の番号は変わらないこと。
+export FAKE_COMPOSE_PS_SERVICES="app tlsapp"
+if ! printf '2\n4\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,tlsapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$cert_check_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$cert_check_output" >&2
+  fail "certificate check helper returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$cert_check_output" "  4) 証明書チェック (トラストストアと HTTPS 接続先を自動検出して確認)"
+assert_contains "$cert_check_output" "Compose サービス : tlsapp"
+assert_contains "$cert_check_output" "コンテナ         : app-front"
+assert_contains "$cert_check_output" "そのコンテナ自身の curl で接続できるかを確認します (追加の入力は不要)。"
+assert_contains "$cert_check_output" "判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。"
+assert_contains "$cert_check_output" "証明書チェック結果 : OK"
+# 証明書チェックを持たないサービスでは従来どおり 0 から 3 のまま。
+assert_contains "$cert_check_output" "Compose サービス 'app' で実行する操作を選択してください:"
+assert_not_contains "$cert_check_output" "0 から 4 の番号を入力してください。"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-tlsapp /bin/sh -c"
+# パスワードはコンテナ内で解決するため、docker のコマンドラインへは載らない。
+assert_not_contains "$FAKE_DOCKER_CALLS" "-storepass changeit"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+cert_check_ng_output="$TEST_TMP/keep-mode-cert-check-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+export FAKE_CERT_CHECK_RESULT="ng"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$cert_check_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_CERT_CHECK_RESULT
+  cat "$cert_check_ng_output" >&2
+  fail "NG certificate check did not return to the service action menu"
+fi
+unset FAKE_CERT_CHECK_RESULT
+
+assert_contains "$cert_check_ng_output" "[FAIL] cacert.crt はこのストアに登録されていない"
+assert_contains "$cert_check_ng_output" "証明書チェック結果 : NG (上記 [FAIL] を確認してください)"
+# NG は診断結果であり、ヘルパー自体の失敗としては扱わない。
+assert_not_contains "$cert_check_ng_output" "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$cert_check_ng_output" "Compose サービス 'tlsapp' で実行する操作を選択してください:" 2
+
+cert_check_undetectable_output="$TEST_TMP/keep-mode-cert-check-undetectable.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_CERT_CHECK_RESULT="undetectable"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$cert_check_undetectable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_CERT_CHECK_RESULT
+  cat "$cert_check_undetectable_output" >&2
+  fail "undetectable certificate check did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_CERT_CHECK_RESULT
+
+assert_contains "$cert_check_undetectable_output" "証明書チェックに必要な設定をコンテナ内から検出できませんでした。"
+assert_contains "$cert_check_undetectable_output" "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$cert_check_undetectable_output" "Compose サービスの対話操作を終了しました。"
+
 cwagent_helper_output="$TEST_TMP/keep-mode-cwagent-helper.out"
 : > "$FAKE_DOCKER_CALLS"
 : > "$FAKE_CURL_CALLS"

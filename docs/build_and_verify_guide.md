@@ -654,7 +654,7 @@ services:
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェックを繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -669,6 +669,26 @@ services:
 | MySQL 実行 | MySQL サーバーで SQL を対話実行 | MySQL クライアント |
 | CloudWatch Logs 送達診断 | `cwagent` / `cloudwatch-logs-mock` への偽装送達を確認 | `curl` + Python 3 |
 | X-Ray トレース診断 | `otel` / `adot-collector` / `jaeger` への偽装トレースを確認 | `curl` + Python 3 |
+| 証明書チェック | 自己証明書を取り込んだコンテナ (front / back 等) から、HTTPS の REST API (`secure-api` / ALB 等) へ接続できるかを確認 | コンテナ内の `curl` + `keytool` |
+
+証明書チェックは常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
+表示条件と検出内容は次のとおりで、選択後の入力は一切ありません。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | コンテナ内に `curl` と `keytool` があり、JVM トラストストア (起動中プロセスの `-Djavax.net.ssl.trustStore` または絶対パスを値に持つ `*TRUSTSTORE*` 環境変数) と `https://` を値に持つ環境変数の両方がある |
+| トラストストア | 起動中 JVM の `-Djavax.net.ssl.trustStore` → `*TRUSTSTORE*` / `*TRUST_STORE*` 環境変数 (最大 3 件) |
+| JVM の検出経路 | `/proc/<pid>/cmdline` に無ければ `/proc/<pid>/environ` の `JAVA_TOOL_OPTIONS` / `JAVA_OPTS` / `JDK_JAVA_OPTIONS` を見る。`standalone.sh` のように `JAVA_TOOL_OPTIONS` で渡した `-D` は argv に現れず、`docker exec` の環境にも入らないため |
+| パスワード | `-Djavax.net.ssl.trustStorePassword` → 対応する `*_PASSWORD` 環境変数 → `changeit` → 無し (整合性チェックを省略) |
+| 接続先 | `https://` で始まる値を持つ環境変数 (`SECURE_API_URL` 等、最大 4 件) |
+| CA 証明書 | `${PKI_TRUST_DIR}/*.crt` → `*CACERT*` / `*CA_CERT*` / `*CA_BUNDLE*` 環境変数 |
+| 実行内容 | `keytool -list -rfc` で PEM バンドルへ書き出し → `curl --cacert` で接続 → `--cacert` 無しの対照テスト → CA 証明書の SHA-256 照合 (`openssl` があるとき) |
+| タイムアウト | `curl` は接続 5 秒 / 全体 15 秒 |
+| 上限超過時 | 結果欄へ `注意: 検出した接続先 N 件のうち先頭 M 件のみ確認しました。` を出し、未確認分が残ることを判定と同じ場所に示す |
+| 終了扱い | `判定: NG` は診断結果としてそのまま操作選択へ戻る。設定を検出できない場合のみヘルパー失敗として扱う |
+
+パスワードはコンテナ内でだけ解決するため、`docker exec` のコマンドライン (ホストのプロセス引数)
+にも画面出力にも現れません。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 
