@@ -2768,6 +2768,8 @@ assert_contains "$deploy_exception_limit_output" "--deploy-exception-limit に�
 # =============================================================================
 # compose.yml の read_only 指定と、実際に動いたコンテナの書き込み状況から、
 #   - read_only: true で書き込み先が足りないディレクトリを「要対応」とすること
+#   - ビルド時にだけ書き込むディレクトリは「ビルド時のみ」として対象から外すこと
+#   - entrypoint.sh など実行時に書き込むディレクトリは「要対応」とすること
 #   - 足りている構成では「問題なし」と判定すること
 #   - read_only 未設定でも、書き込みが起きるディレクトリを「推奨」で出すこと
 #   - テキストと Excel を出力し、全量レポートの [11] へ同じ内容を残すこと
@@ -2783,6 +2785,11 @@ export FAKE_COMPOSE_CONFIG_SERVICES="app"
 export FAKE_COMPOSE_PS_SERVICES="app"
 export FAKE_READONLY_ROOTFS="true"
 export FAKE_CONTAINER_TMPFS='/tmp|rw,size=64m'
+# 起動スクリプト。entrypoint.sh はビルドコンテキストから、standalone.sh は
+# (コンテキストに実体が無いため) 実行中のコンテナから読ませる。
+export FAKE_CONTAINER_ENTRYPOINT="/usr/local/bin/entrypoint.sh"
+export FAKE_CONTAINER_CMD="/opt/jboss-eap/bin/standalone.sh"
+export FAKE_CONTAINER_SCRIPTS="/opt/jboss-eap/bin/standalone.sh|$readonly_fixture_dir/image-standalone.sh"
 if ! (
   cd "$REPO_ROOT"
   bash ./build_and_verify.sh \
@@ -2824,9 +2831,29 @@ else
     "app-opt-jboss-eap-standalone-configuration:/opt/jboss-eap/standalone/configuration"
   assert_contains "$readonly_missing_output" \
     "読み取り専用ファイルシステム分析: 書き込み先が用意されていないディレクトリを"
+
+  # --- ビルド段階と実行段階の切り分け ---
+  # Dockerfile がビルド時に書くだけのディレクトリは、イメージへ焼き込み済みの
+  # ため read_only: true でも失敗しない。要対応にせず「ビルド時のみ」とすること
+  assert_contains "$readonly_missing_output" \
+    "ビルド時にだけ書き込むディレクトリ (read_only のままで問題なし):"
+  assert_contains "$readonly_missing_output" "/opt/appconfig"
+  assert_not_contains "$readonly_missing_output" "[要対応] /opt/appconfig"
+  assert_not_contains "$readonly_missing_output" "[要確認] /opt/appconfig"
+  # entrypoint.sh が起動のたびに書くディレクトリは、実行時の書き込みとして要対応にすること
+  assert_contains "$readonly_missing_output" "[要対応] /var/lib/appstate"
+  assert_contains "$readonly_missing_output" "書き込み時期: 実行時"
+  assert_contains "$readonly_missing_output" \
+    "根拠        : 実行時の書き込み: 起動スクリプトが 1 箇所で書き込みます。例: mkdir /var/lib/appstate"
+  # コンテナ内にしか無い起動スクリプト (ベースイメージ同梱) も読んで判定すること
+  assert_contains "$readonly_missing_output" "[要対応] /opt/jboss-eap/standalone/boot-work"
+  assert_contains "$readonly_missing_output" \
+    "起動スクリプト   : /opt/jboss-eap/bin/standalone.sh (コンテナ内)"
+  assert_contains "$readonly_missing_output" "ビルド時のみ 4"
   # 実行状況の収集に使ったコマンド
   assert_contains "$FAKE_DOCKER_CALLS" "diff cid-app"
   assert_contains "$FAKE_DOCKER_CALLS" "__BUILD_AND_VERIFY_RO_PROBE__"
+  assert_contains "$FAKE_DOCKER_CALLS" "__BUILD_AND_VERIFY_RO_SCRIPT__"
 
   # --- 出力ファイル (テキスト / Excel) ---
   readonly_missing_texts=("$TEST_TMP/readonly-missing-reports"/build_and_verify_*_readonly_filesystem.txt)
@@ -2842,6 +2869,12 @@ else
   assert_contains "$readonly_missing_text_file" "検出の根拠  : ソフトウェア別の既知の書き込み先"
   assert_contains "$readonly_missing_text_file" "参考: 書き込みが発生しやすいディレクトリの一覧"
   assert_contains "$readonly_missing_text_file" "{jboss_home}/standalone/tmp"
+  # 全量テキストには、ビルド時のみと判定した根拠まで残すこと
+  assert_contains "$readonly_missing_text_file" "[ビルド時のみ] /opt/appconfig"
+  assert_contains "$readonly_missing_text_file" "検出の根拠  : Dockerfile (ビルド時)"
+  assert_contains "$readonly_missing_text_file" \
+    "ビルド時の書き込みだけを検出しました。"
+  assert_contains "$readonly_missing_text_file" "readonly/Dockerfile"
 
   # --- 全量レポート ---
   collect_report_files "$TEST_TMP/readonly-missing-reports"
@@ -2859,13 +2892,17 @@ fi
 # --- read_only: true で tmpfs / ボリュームを揃えた構成 (問題なし) ---
 readonly_ok_output="$TEST_TMP/readonly-ok.out"
 : > "$FAKE_DOCKER_CALLS"
+# ベースイメージ同梱の起動スクリプトは、ここでは対象から外す
+# (ビルドコンテキストの entrypoint.sh だけで、実行時の書き込みを判定させる)。
+unset FAKE_CONTAINER_CMD FAKE_CONTAINER_SCRIPTS
 export FAKE_CONTAINER_TMPFS='/tmp|rw,size=256m,mode=1777
 /var/tmp|rw,size=64m
 /run|rw,size=16m,mode=755
 /var/cache|rw,size=64m
 /opt/jboss-eap/standalone/tmp|rw,size=512m
 /opt/jboss-eap/standalone/data|rw,size=256m
-/opt/jboss-eap/standalone/content|rw,size=64m'
+/opt/jboss-eap/standalone/content|rw,size=64m
+/var/lib/appstate|rw,size=64m'
 export FAKE_CONTAINER_MOUNTS='volume|/var/lib/docker/volumes/app-server-log/_data|/opt/jboss-eap/standalone/log|true
 volume|/var/lib/docker/volumes/app-configuration/_data|/opt/jboss-eap/standalone/configuration|true
 volume|/var/lib/docker/volumes/app-deployments/_data|/opt/jboss-eap/standalone/deployments|true
@@ -2889,6 +2926,11 @@ if ! grep -Fq "書き込み先分析をスキップしました: Python 3 が見
   assert_contains "$readonly_ok_output" "判定             : 問題なし (読み取り専用のまま動作可能)"
   assert_contains "$readonly_ok_output" "対応が必要なディレクトリはありません。"
   assert_not_contains "$readonly_ok_output" "[要対応] /opt/jboss-eap/standalone/tmp"
+  # 起動スクリプトが書く場所へ tmpfs を割り当てていれば、要対応にしないこと
+  assert_not_contains "$readonly_ok_output" "[要対応] /var/lib/appstate"
+  # ビルド時にだけ書き込むディレクトリは、対応不要として数える
+  assert_contains "$readonly_ok_output" \
+    "(ビルド時にだけ書き込む 2 件は、イメージへ焼き込み済みのため read_only でも問題になりません"
   # ファイル出力先の指定が無い実行では、その旨を案内すること
   assert_contains "$readonly_ok_output" \
     "読み取り専用ファイルシステム分析のファイル出力は、--report-dir または"
@@ -2930,6 +2972,8 @@ if ! grep -Fq "書き込み先分析をスキップしました: Python 3 が見
   assert_contains "$readonly_writable_output" "[推奨] /opt/appdata"
   # 親ディレクトリ (/opt) は、より深い検出があるため候補にしないこと
   assert_not_contains "$readonly_writable_output" "[推奨] /opt : "
+  # ビルド時にだけ書き込むディレクトリは、read_only を有効にするときも用意が要らない
+  assert_not_contains "$readonly_writable_output" "[推奨] /opt/appconfig"
   assert_contains "$readonly_writable_output" "read_only 未使用"
   # compose.yml の指定と実際のコンテナが食い違う場合は、その旨を残すこと
   assert_contains "$readonly_writable_output" \
@@ -2939,7 +2983,7 @@ if ! grep -Fq "書き込み先分析をスキップしました: Python 3 が見
   [ -f "$TEST_TMP/readonly-writable.xlsx" ] || fail "--readonly-analysis-excel did not write the workbook"
   assert_contains "$TEST_TMP/readonly-writable.txt" "書き込み実績: コンテナ内で"
 fi
-unset FAKE_DOCKER_DIFF FAKE_READONLY_ROOTFS
+unset FAKE_DOCKER_DIFF FAKE_READONLY_ROOTFS FAKE_CONTAINER_ENTRYPOINT
 
 # --- --no-readonly-analysis では一切行わないこと ---
 readonly_disabled_output="$TEST_TMP/readonly-disabled.out"

@@ -458,6 +458,19 @@ if [ "${1:-}" = "inspect" ]; then
     *".Config.Env"*)
       printf 'PATH=/usr/bin\n'
       ;;
+    # 読み取り専用ファイルシステム分析: 起動スクリプトを特定するための
+    # ENTRYPOINT / CMD と、相対パスの基点になる作業ディレクトリ。
+    *".Config.Entrypoint"*)
+      if [ -n "${FAKE_CONTAINER_ENTRYPOINT:-}" ]; then
+        printf '%s\n' "$FAKE_CONTAINER_ENTRYPOINT"
+      fi
+      if [ -n "${FAKE_CONTAINER_CMD:-}" ]; then
+        printf '%s\n' "$FAKE_CONTAINER_CMD"
+      fi
+      ;;
+    *".Config.WorkingDir"*)
+      printf '%s\n' "${FAKE_CONTAINER_WORKDIR:-/opt/jboss-eap}"
+      ;;
     # 読み取り専用ファイルシステム分析: ルートファイルシステムを読み取り専用に
     # したかどうか (compose.yml の read_only が反映された結果)。
     *".HostConfig.ReadonlyRootfs"*)
@@ -488,6 +501,35 @@ if [ "${1:-}" = "diff" ]; then
   if [ -n "${FAKE_DOCKER_DIFF:-}" ]; then
     printf '%s\n' "$FAKE_DOCKER_DIFF"
   fi
+  exit 0
+fi
+
+# 読み取り専用ファイルシステム分析: コンテナ内の起動スクリプトの読み出し。
+# FAKE_CONTAINER_SCRIPTS へ "コンテナ内のパス|ホスト側のファイル" を 1 行ずつ
+# 指定すると、そのファイルの中身をスクリプトの中身として返す。指定の無いパスは
+# 「コンテナ内に無い」状態を再現する。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"__BUILD_AND_VERIFY_RO_SCRIPT__"* ]]; then
+  shift 6
+  for fake_script_target in "$@"; do
+    printf '__BUILD_AND_VERIFY_RO_SCRIPT__FILE %s\n' "$fake_script_target"
+    fake_script_source=""
+    if [ -n "${FAKE_CONTAINER_SCRIPTS:-}" ]; then
+      while IFS='|' read -r fake_script_path fake_script_file; do
+        [ -n "$fake_script_path" ] || continue
+        if [ "$fake_script_path" = "$fake_script_target" ]; then
+          fake_script_source="$fake_script_file"
+          break
+        fi
+      done <<< "$FAKE_CONTAINER_SCRIPTS"
+    fi
+    if [ -n "$fake_script_source" ] && [ -f "$fake_script_source" ]; then
+      head -n 2000 "$fake_script_source"
+    else
+      printf '__BUILD_AND_VERIFY_RO_SCRIPT__MISSING\n'
+    fi
+  done
+  printf '__BUILD_AND_VERIFY_RO_SCRIPT__END\n'
   exit 0
 fi
 

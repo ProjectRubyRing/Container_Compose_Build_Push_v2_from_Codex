@@ -23,6 +23,8 @@ services:
       - /opt/jboss-eap/standalone/tmp:rw,size=512m
       - /opt/jboss-eap/standalone/data:rw,size=256m
       - /opt/jboss-eap/standalone/content:rw,size=64m
+      # entrypoint.sh が起動のたびに作るディレクトリ (ビルド時ではなく実行時の書き込み)
+      - /var/lib/appstate:rw,size=64m
     volumes:
       - app-server-log:/opt/jboss-eap/standalone/log
       - app-configuration:/opt/jboss-eap/standalone/configuration

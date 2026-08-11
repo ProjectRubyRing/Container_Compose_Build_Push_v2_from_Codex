@@ -73,7 +73,13 @@
 #                          割り当てるべきディレクトリを判定する。read_only: true の
 #                          サービスは「今の Compose 設定のままで書き込みに失敗しないか」
 #                          を、read_only が未設定・false のサービスは「有効化するなら
-#                          どこに書き込み先が要るか」を出力する。結果は画面・全量
+#                          どこに書き込み先が要るか」を出力する。
+#                          判定はビルド段階と実行段階を分けて行う。Dockerfile の
+#                          RUN / COPY でビルド時に書いたディレクトリはイメージへ
+#                          焼き込み済みのため read_only でも問題にならず、
+#                          「ビルド時のみ」として対象から外す。entrypoint.sh など
+#                          起動のたびに走るスクリプトの書き込み先は、実際に失敗する
+#                          場所として「要対応」に挙げる。結果は画面・全量
 #                          レポートに加え、Excel ブック
 #                          (build_and_verify_<日時>_readonly_filesystem.xlsx) と
 #                          テキスト (同 _readonly_filesystem.txt) へも出力する。
@@ -590,11 +596,13 @@ READONLY_ANALYSIS_TEXT_OUTPUT=""    # 実際に出力したテキストのパス
 READONLY_ANALYSIS_DIGEST_FILE=""
 READONLY_ANALYSIS_SKIP_REASON=""    # 分析しなかった理由 (全量レポートへ記載する)
 READONLY_ANALYSIS_COLLECT_STATUS="" # 情報の取得状況 (compose.yml のみ / コンテナからも)
+READONLY_ANALYSIS_BUILD_STATUS=""   # Dockerfile (ビルド時の書き込み先) の取得状況
 READONLY_TOTAL="0"                  # 検出した書き込み先ディレクトリの総数
 READONLY_ACTION="0"                 # うち要対応 (read_only のままでは書き込みに失敗する)
 READONLY_CHECK="0"                  # うち要確認
 READONLY_RECOMMEND="0"              # うち推奨 (read_only 未使用のサービス)
 READONLY_OK="0"                     # うち OK (書き込み先が確保されている)
+READONLY_BUILD_ONLY="0"             # うちビルド時のみ (read_only でも問題にならない)
 READONLY_SERVICES="0"               # 分析したサービス数
 READONLY_ENABLED_SERVICES="0"       # read_only が有効なサービス数
 READONLY_VERDICT=""                 # 総合判定
@@ -606,6 +614,13 @@ READONLY_PROBE_MARK="__BUILD_AND_VERIFY_RO_PROBE__"
 READONLY_PROBE_MAX_DIRS="80"        # 1 コンテナあたりのプローブ対象ディレクトリ数の上限
 READONLY_DIFF_LIMIT="400"           # docker diff から取り込む変更の最大件数
 READONLY_LOG_ERROR_LIMIT="30"       # ログから取り込む書き込みエラーの最大件数
+# 起動スクリプト (entrypoint.sh 等) の中身をコンテナから読むときの目印。
+# プローブと同じく、コンテナへ渡すスクリプト側にも同じ文字列を直接記述している。
+READONLY_SCRIPT_MARK="__BUILD_AND_VERIFY_RO_SCRIPT__"
+READONLY_BUILD_WRITE_LIMIT="300"    # Dockerfile から取り込むビルド時書き込み先の上限
+READONLY_SCRIPT_MAX_FILES="12"      # 走査する起動スクリプトの最大数 (source 先を含む)
+READONLY_SCRIPT_MAX_LINES="2000"    # 1 スクリプトあたりに読む最大行数
+READONLY_SCRIPT_WRITE_LIMIT="200"   # 起動スクリプトから取り込む書き込み先の上限
 # 読み取り専用のディレクトリへ書こうとしたときに出る代表的なメッセージ。
 READONLY_LOG_ERROR_PATTERN='Read-only file system|EROFS|Permission denied|AccessDeniedException|FileSystemException|ReadOnlyFileSystemException'
 # コンテナ内で必ず確認する一般的な書き込み先。JBoss EAP のディレクトリは
@@ -1052,7 +1067,20 @@ WAR デプロイ時の Java 例外解析:
                            書き込みが発生するディレクトリを洗い出し、read_only を
                            有効化するなら tmpfs とバインドマウントのどちらを
                            割り当てるべきかを「推奨」として出力する
-                         判定には、コンテナのマウント定義、書き込み層の変更
+                         判定は、書き込みが起きる段階を分けて行う。
+                         - ビルド時 (Dockerfile の RUN / COPY / ADD / WORKDIR)
+                           イメージのレイヤへ焼き込み済みで、実行時は読むだけの
+                           ため read_only: true でも失敗しない。「ビルド時のみ」
+                           として対象から外し、対応不要であることを明示する
+                           (マルチステージの場合は、イメージに残る最終ステージと
+                           そこへ引き継がれる前段だけを対象にする)
+                         - 実行時 (entrypoint.sh 等の起動スクリプト、実測)
+                           コンテナを起動するたびに書き込むため、書き込み先が
+                           なければ必ず失敗する。「要対応」として挙げる
+                         起動スクリプトはビルドコンテキストと実行中のコンテナの
+                         両方から中身を読み、mkdir・リダイレクト・cp・sed -i など
+                         書き込みを伴うコマンドの対象ディレクトリを取り出す。
+                         あわせて、コンテナのマウント定義、書き込み層の変更
                          (docker diff)、コンテナ内から見た書き込み可否と
                          起動後に更新されたファイル数、JVM パラメータ
                          (-Djava.io.tmpdir / -XX:HeapDumpPath 等)、ディレクトリを
@@ -14283,15 +14311,28 @@ V_ACTION = "要対応"      # read_only 有効で書き込みできず、失敗�
 V_CHECK = "要確認"       # 設定はあるが副作用がある、または書き込みの有無を確認したい
 V_RECOMMEND = "推奨"     # read_only 未設定。有効化するなら tmpfs / バインドマウントが要る
 V_OK = "OK"              # 書き込み先が確保されている
+V_BUILD_ONLY = "ビルド時のみ"  # ビルド段階だけで書き込む。read_only のままで問題ない
 V_INFO = "情報"          # 参考情報 (書き込みの実績も必要性も確認できていない)
 
-VERDICT_ORDER = {V_ACTION: 0, V_CHECK: 1, V_RECOMMEND: 2, V_OK: 3, V_INFO: 4}
+VERDICT_ORDER = {V_ACTION: 0, V_CHECK: 1, V_RECOMMEND: 2, V_OK: 3,
+                 V_BUILD_ONLY: 4, V_INFO: 5}
+
+# 書き込みが起きる段階。read_only: true が壊すのは実行時の書き込みだけであり、
+# ビルド時の書き込みはイメージのレイヤへ焼き込まれた後なので影響を受けない。
+W_BUILD = "ビルド時"          # Dockerfile の RUN / COPY 等でのみ書き込む
+W_RUNTIME = "実行時"          # コンテナの起動中に書き込む (read_only の対象)
+W_BOTH = "ビルド時+実行時"     # ビルドで用意し、実行中にも書き込む
+W_UNKNOWN = "未確認"          # どちらの段階で書くのか確認できていない
 
 # 必須度。判定の重み付けと表示に使う。
 N_REQUIRED = "必須"
 N_LIKELY = "高"
 N_OPTIONAL = "中"
 NEED_ORDER = {N_REQUIRED: 0, N_LIKELY: 1, N_OPTIONAL: 2}
+
+# ビルド時だけ書き込むディレクトリを一覧へ出す上限。判定には影響しないため、
+# 件数が多いイメージで出力が埋まらないところで打ち切る。
+BUILD_FINDING_LIMIT = 40
 
 
 # =============================================================================
@@ -14326,6 +14367,70 @@ class Service(object):
         self.notes = []
         self.findings = []
         self.kinds = set()
+        # -- ビルド段階と実行段階の書き込み先 --------------------------------
+        self.build = None                    # このサービスのイメージの ImageBuild
+        self.script_writes = {}              # path -> [(script, 根拠)] (実行時)
+        self.scripts = []                    # [(script, 取得元, 補足)] (実行時)
+
+    # -- ビルド時 / 実行時の書き込み ----------------------------------------
+    def build_writes(self):
+        """Dockerfile のビルド段階で書き込むディレクトリ。path -> [(命令, 根拠)]"""
+        return self.build.writes if self.build is not None else {}
+
+    def image_volumes(self):
+        """イメージの VOLUME 宣言。read_only でも匿名ボリュームが rw で付く。"""
+        return self.build.volumes if self.build is not None else []
+
+    def all_script_writes(self):
+        """起動スクリプトが実行時に書き込むディレクトリ (イメージ側 + コンテナ側)。
+
+        同じスクリプトをビルドコンテキストとコンテナの両方から読めた場合は、
+        件数が二重にならないよう同じ根拠をまとめる。
+        """
+        merged = {}
+        sources = [self.build.script_writes] if self.build is not None else []
+        sources.append(self.script_writes)
+        for source in sources:
+            for path, items in source.items():
+                bucket = merged.setdefault(path, [])
+                for item in items:
+                    if item not in bucket:
+                        bucket.append(item)
+        return merged
+
+    def all_scripts(self):
+        """走査した起動スクリプトの一覧 (同じスクリプトは 1 件にまとめる)。"""
+        scripts = []
+        seen = {}
+        entries = list(self.build.scripts) if self.build is not None else []
+        entries.extend(self.scripts)
+        for script, source, detail in entries:
+            if script in seen:
+                # 中身を読めた方を残す (片方が「未取得」でも、読めた事実を優先する)。
+                if seen[script][1] == "未取得" and source != "未取得":
+                    scripts[scripts.index(seen[script])] = (script, source, detail)
+                    seen[script] = (script, source, detail)
+                continue
+            seen[script] = (script, source, detail)
+            scripts.append((script, source, detail))
+        return scripts
+
+    def build_write_entries(self, path):
+        """path 自身、またはその配下へのビルド時書き込みを返す。"""
+        entries = []
+        for target, items in self.build_writes().items():
+            if is_under(target, path):
+                entries.extend((target, instruction, detail)
+                               for instruction, detail in items)
+        return entries
+
+    def script_write_entries(self, path):
+        """path 自身、またはその配下への実行時 (起動スクリプト) 書き込みを返す。"""
+        entries = []
+        for target, items in self.all_script_writes().items():
+            if is_under(target, path):
+                entries.extend((target, script, detail) for script, detail in items)
+        return entries
 
     # -- 判定の材料 ----------------------------------------------------------
     def effective_read_only(self):
@@ -14347,11 +14452,33 @@ class Service(object):
         return bool(self.container) or bool(self.mountinfo) or bool(self.probe)
 
 
+class ImageBuild(object):
+    """1 つのイメージについて、Dockerfile から読み取った事実。
+
+    compose.yml では「base サービスがビルドしたイメージを app サービスが使う」
+    形が普通にあるため、ビルド時の事実はサービスではなくイメージ名で持ち、
+    同じイメージを使うサービスすべてから参照できるようにする。
+    """
+
+    def __init__(self, image):
+        self.image = image
+        self.dockerfile = ""
+        self.dockerfile_service = ""
+        self.target_stage = ""
+        self.writes = {}                     # path -> [(命令, 根拠)]
+        self.volumes = []                    # VOLUME 宣言 (実行時は rw で付く)
+        self.entrypoints = []                # [(entrypoint|cmd, 記述内容)]
+        self.scripts = []                    # [(スクリプト, 取得元, 補足)]
+        self.script_writes = {}              # path -> [(スクリプト, 根拠)]
+        self.notes = []
+
+
 def parse_facts(path):
-    """収集した事実ファイルを Service の辞書へ読み込む (定義順を保つ)。"""
+    """収集した事実ファイルを Service / ImageBuild へ読み込む (定義順を保つ)。"""
     services = {}
     order = []
     named_volumes = []
+    images = {}
 
     def service_of(name):
         if name not in services:
@@ -14359,8 +14486,13 @@ def parse_facts(path):
             order.append(name)
         return services[name]
 
+    def image_of(name):
+        if name not in images:
+            images[name] = ImageBuild(name)
+        return images[name]
+
     if not path or not os.path.exists(path):
-        return [], []
+        return [], [], {}
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             raw = raw.rstrip("\r\n")
@@ -14375,6 +14507,37 @@ def parse_facts(path):
                 continue
             if not rest:
                 continue
+
+            # img_* はイメージ名で記録した、Dockerfile 由来の事実。
+            if kind.startswith("img_"):
+                image = image_of(rest[0])
+                fields = rest[1:]
+
+                def field(index, default=""):
+                    return fields[index] if len(fields) > index else default
+
+                if kind == "img_dockerfile":
+                    image.dockerfile = field(0)
+                    image.dockerfile_service = field(1)
+                    image.target_stage = field(2)
+                elif kind == "img_build_write":
+                    image.writes.setdefault(normalize_path(field(0)), []).append(
+                        (field(1), field(2)))
+                elif kind == "img_volume":
+                    target = normalize_path(field(0))
+                    if target and target not in image.volumes:
+                        image.volumes.append(target)
+                elif kind == "img_entrypoint":
+                    image.entrypoints.append((field(0), field(1)))
+                elif kind == "img_script":
+                    image.scripts.append((field(0), field(1), field(2)))
+                elif kind == "img_script_write":
+                    image.script_writes.setdefault(normalize_path(field(0)), []).append(
+                        (field(1), field(2)))
+                elif kind == "img_note":
+                    image.notes.append(field(0))
+                continue
+
             service = service_of(rest[0])
             values = rest[1:]
 
@@ -14437,9 +14600,34 @@ def parse_facts(path):
                 service.processes.append(value(0))
             elif kind == "rt_jboss_home":
                 service.jboss_home = normalize_path(value(0))
+            elif kind == "rt_script":
+                service.scripts.append((value(0), value(1), value(2)))
+            elif kind == "rt_script_write":
+                service.script_writes.setdefault(normalize_path(value(0)), []).append(
+                    (value(1), value(2)))
             elif kind == "note":
                 service.notes.append(value(0))
-    return [services[name] for name in order], named_volumes
+    return [services[name] for name in order], named_volumes, images
+
+
+def attach_images(services, images):
+    """サービスへ、そのイメージのビルド事実を結び付ける。
+
+    image の指定が無いサービスは、compose がイメージ名を決めるため
+    "service:<名前>" を鍵にした事実を探す。
+    """
+    for service in services:
+        build = None
+        if service.image and service.image in images:
+            build = images[service.image]
+        elif ("service:%s" % service.name) in images:
+            build = images["service:%s" % service.name]
+        service.build = build
+        if build is not None:
+            for note in build.notes:
+                if note not in service.notes:
+                    service.notes.append(note)
+    return services
 
 
 def to_int(text):
@@ -14765,7 +14953,8 @@ def detect_kinds(service):
 class Finding(object):
     __slots__ = ("path", "purpose", "writes", "need", "recommend", "options",
                  "persist", "tmpfs_ok", "reason", "action", "current", "verdict",
-                 "evidence", "origin")
+                 "evidence", "origin", "stage", "runtime_write", "build_write",
+                 "runtime_expected")
 
     def __init__(self, path, purpose, writes, need, recommend, options, persist,
                  tmpfs_ok, reason, action, origin):
@@ -14783,6 +14972,13 @@ class Finding(object):
         self.current = ""
         self.verdict = V_INFO
         self.evidence = []
+        self.stage = W_UNKNOWN        # 書き込みが起きる段階 (ビルド時 / 実行時)
+        self.runtime_write = False    # 実行中の書き込みを確認できたか
+        self.build_write = False      # ビルド時の書き込みを確認できたか
+        # 実行時に書き込むと考えられる根拠があるか (知識・JVM パラメータ・
+        # 起動スクリプト・実測)。確認できた書き込みが無くても、実行時に書く
+        # ディレクトリであることが分かっていれば真になる。
+        self.runtime_expected = False
 
     def sort_key(self):
         return (VERDICT_ORDER.get(self.verdict, 9), NEED_ORDER.get(self.need, 9), self.path)
@@ -14838,6 +15034,15 @@ def mount_points(service):
             else:
                 label = "マウント (%s)" % kind
             points.append(Coverage(kind, volume["target"], rw, label, "compose.yml"))
+
+    # イメージの VOLUME 宣言は、明示的なマウントが無くても匿名ボリュームが
+    # 読み書き可でマウントされるため、read_only でも書き込みできる場所になる。
+    covered = set(point.target for point in points)
+    for target in service.image_volumes():
+        if target in covered:
+            continue
+        points.append(Coverage("volume", target, True,
+                               "匿名ボリューム (イメージの VOLUME 宣言)", "Dockerfile"))
     return points
 
 
@@ -14874,10 +15079,36 @@ def mountinfo_is_read_only(service, path):
 
 
 def collect_evidence(service, path, finding):
-    """アプリの実行状況から、そのディレクトリへの書き込み実績を集める。"""
+    """そのディレクトリへの書き込みを、段階 (ビルド時 / 実行時) ごとに集める。
+
+    同時に finding へ、実行時の書き込みを確認できたか (runtime_write) と、
+    ビルド時の書き込みを確認できたか (build_write) を記録する。read_only の
+    判定は前者だけを見る (ビルド時の書き込みはイメージへ焼き込み済みのため)。
+    """
     evidence = []
+
+    # ---- ビルド段階 (Dockerfile) --------------------------------------------
+    build_entries = service.build_write_entries(path)
+    if build_entries:
+        finding.build_write = True
+        sample = "; ".join("%s: %s" % (entry[1], entry[2]) for entry in build_entries[:3])
+        evidence.append("ビルド時の書き込み: Dockerfile の %d 件の記述で作成・更新されます。例: %s"
+                        % (len(build_entries), sample))
+
+    # ---- 実行段階 (起動スクリプト) ------------------------------------------
+    script_entries = service.script_write_entries(path)
+    if script_entries:
+        finding.runtime_write = True
+        finding.runtime_expected = True
+        sample = "; ".join("%s (%s)" % (entry[2], entry[1]) for entry in script_entries[:3])
+        evidence.append("実行時の書き込み: 起動スクリプトが %d 箇所で書き込みます。例: %s"
+                        % (len(script_entries), sample))
+
+    # ---- 実行段階 (実際に動いたコンテナ) ------------------------------------
     diff_paths = [entry for entry in service.diff if is_under(entry[1], path)]
     if diff_paths:
+        finding.runtime_write = True
+        finding.runtime_expected = True
         sample = ", ".join(entry[1] for entry in diff_paths[:3])
         evidence.append("書き込み実績: コンテナ内で %d 件の変更を検出 (docker diff)。例: %s"
                         % (len(diff_paths), sample))
@@ -14887,10 +15118,17 @@ def collect_evidence(service, path, finding):
             evidence.append("このディレクトリはコンテナ内に存在しません。")
         else:
             if probe["recent"] > 0:
+                finding.runtime_write = True
+                finding.runtime_expected = True
                 evidence.append("起動後に更新されたファイル %d 件 (コンテナ内で検出)。"
                                 % probe["recent"])
             if probe["files"] > 0:
-                evidence.append("ファイル %d 件を保持。" % probe["files"])
+                # 起動後に更新が無いファイルは、ビルド時に置かれたものとみなせる。
+                if probe["recent"] == 0 and finding.build_write:
+                    evidence.append("ファイル %d 件を保持 (起動後の更新は検出されておらず、"
+                                    "ビルド時に配置された内容と考えられます)。" % probe["files"])
+                else:
+                    evidence.append("ファイル %d 件を保持。" % probe["files"])
             evidence.append("コンテナ内からの書き込み可否: %s"
                             % ("書き込み可" if probe["writable"] else "書き込み不可"))
     read_only_mount = mountinfo_is_read_only(service, path)
@@ -14898,16 +15136,21 @@ def collect_evidence(service, path, finding):
         evidence.append("コンテナ内の /proc/mounts でも読み取り専用 (ro) でマウントされています。")
     for line in service.log_errors:
         if path != "/" and path in line:
+            finding.runtime_write = True
+            finding.runtime_expected = True
             evidence.append("ログ: %s" % line.strip())
     return evidence
 
 
-def has_write_evidence(evidence):
-    for item in evidence:
-        if item.startswith("書き込み実績") or item.startswith("起動後に更新された") \
-                or item.startswith("ログ:"):
-            return True
-    return False
+def resolve_stage(finding):
+    """書き込みが起きる段階を決める。判定と表示の両方で使う。"""
+    if finding.runtime_expected and finding.build_write:
+        return W_BOTH
+    if finding.runtime_expected:
+        return W_RUNTIME
+    if finding.build_write:
+        return W_BUILD
+    return W_UNKNOWN
 
 
 def probe_says_missing(service, path):
@@ -14927,7 +15170,20 @@ def judge(service, finding, coverage):
         writable = probe["writable"]
 
     finding.current = coverage.label
-    evidence_has_write = has_write_evidence(finding.evidence)
+    finding.stage = resolve_stage(finding)
+    evidence_has_write = finding.runtime_write
+
+    # ビルド段階でしか書き込まないディレクトリは、read_only の対象外。
+    # イメージのレイヤへ書き込み済みで、実行中は読むだけのため、ルート
+    # ファイルシステムが読み取り専用でも失敗しない。
+    if finding.stage == W_BUILD:
+        finding.verdict = V_BUILD_ONLY
+        finding.action = ("対応不要。ビルド時に書き込み済みで、コンテナの実行中に"
+                          "書き込む動きは検出していないため、read_only: true でも失敗しません。")
+        finding.evidence.append(
+            "ビルド時の書き込みだけを検出しました。イメージのレイヤへ焼き込まれた後は"
+            "読み取りしか行わないため、読み取り専用ルートファイルシステムでも失敗しません。")
+        return
 
     if coverage.kind == "rootfs":
         if not read_only:
@@ -15049,7 +15305,7 @@ def analyze_service(service):
     findings = {}
 
     def add(path, purpose, writes, need, recommend, options, persist, tmpfs_ok,
-            reason, action, origin):
+            reason, action, origin, runtime_expected=False):
         path = normalize_path(path)
         if not path or path == "/":
             return None
@@ -15061,9 +15317,12 @@ def analyze_service(service):
                 existing.recommend = recommend
                 existing.options = options
             existing.origin = "%s / %s" % (existing.origin, origin)
+            # 実行時に書くという根拠は、1 つでもあれば残す。
+            existing.runtime_expected = existing.runtime_expected or runtime_expected
             return existing
         finding = Finding(path, purpose, writes, need, recommend, options, persist,
                           tmpfs_ok, reason, action, origin)
+        finding.runtime_expected = runtime_expected
         findings[path] = finding
         return finding
 
@@ -15076,7 +15335,7 @@ def analyze_service(service):
             continue
         add(path, entry.purpose, entry.writes, entry.need, entry.recommend,
             entry.options, entry.persist, entry.tmpfs_ok, entry.reason, entry.action,
-            "ソフトウェア別の既知の書き込み先")
+            "ソフトウェア別の既知の書き込み先", runtime_expected=True)
 
     for path, option_name, _prop in derive_jvm_candidates(service):
         if probe_says_missing(service, path):
@@ -15086,7 +15345,7 @@ def analyze_service(service):
             N_LIKELY, "tmpfs", "rw,size=128m", False, True,
             "%s で書き込み先として指定されているため、実行時に書き込みが発生します。" % option_name,
             "tmpfs かボリュームを割り当てるか、書き込みの要らない値へ変更する。",
-            "JVM パラメータ")
+            "JVM パラメータ", runtime_expected=True)
 
     for path, env_name in derive_env_candidates(service):
         if probe_says_missing(service, path):
@@ -15108,7 +15367,32 @@ def analyze_service(service):
             "コンテナの書き込み層に %d 件の変更が残っており、実行時に書き込みが起きています。"
             "read_only を有効にすると、この書き込みは失敗します。" % count,
             "tmpfs かボリュームを割り当てる。",
-            "実測 (docker diff)")
+            "実測 (docker diff)", runtime_expected=True)
+
+    # 起動スクリプト (entrypoint.sh 等) が書き込むディレクトリ。ビルド時の
+    # 書き込みと違い、コンテナを起動するたびに発生するため、書き込み先が
+    # 用意されていなければ毎回失敗する。
+    for path, items in sorted(service.all_script_writes().items()):
+        scripts = ", ".join(sorted(set(script for script, _detail in items)))
+        add(path, "起動スクリプトが実行時に書き込むディレクトリ",
+            "起動処理が作成・更新するディレクトリとファイル",
+            N_REQUIRED, "tmpfs", "rw,size=64m", False, True,
+            "%s がコンテナの起動ごとに書き込みます。read_only を有効にすると、"
+            "この書き込みは読み取り専用ファイルシステムのため失敗します。" % scripts,
+            "tmpfs かボリュームを割り当てる (書き込み自体が不要なら起動スクリプトを見直す)。",
+            "起動スクリプト %s (実行時)" % scripts, runtime_expected=True)
+
+    # Dockerfile がビルド時に書き込むディレクトリ。実行時にも書くのでなければ
+    # read_only: true のままで問題にならないことを、根拠付きで示すために挙げる。
+    build_writes = service.build_writes()
+    for path in sorted(build_writes)[:BUILD_FINDING_LIMIT]:
+        instructions = ", ".join(sorted(set(item[0] for item in build_writes[path])))
+        add(path, "ビルド時に作成・更新されるディレクトリ",
+            "Dockerfile がイメージへ焼き込む内容 (%s)" % instructions,
+            N_OPTIONAL, "設定不要", "", False, True,
+            "Dockerfile の %s によって、ビルド段階で書き込まれています。" % instructions,
+            "対応不要 (実行時にも書き込む場合だけ、書き込み先の用意が要る)。",
+            "Dockerfile (ビルド時)")
 
     for finding in findings.values():
         finding.evidence = collect_evidence(service, finding.path, finding)
@@ -15149,7 +15433,8 @@ def service_verdict(service):
 
 
 def verdict_counts(service):
-    counts = {V_ACTION: 0, V_CHECK: 0, V_RECOMMEND: 0, V_OK: 0, V_INFO: 0}
+    counts = {V_ACTION: 0, V_CHECK: 0, V_RECOMMEND: 0, V_OK: 0,
+              V_BUILD_ONLY: 0, V_INFO: 0}
     for finding in service.findings:
         counts[finding.verdict] = counts.get(finding.verdict, 0) + 1
     return counts
@@ -15193,18 +15478,22 @@ def compute_stats(services):
         "services": len(services),
         "read_only_services": 0,
         "total": 0,
+        "build_analyzed_services": 0,
         V_ACTION: 0,
         V_CHECK: 0,
         V_RECOMMEND: 0,
         V_OK: 0,
+        V_BUILD_ONLY: 0,
         V_INFO: 0,
     }
     for service in services:
         if service.effective_read_only():
             stats["read_only_services"] += 1
+        if service.build is not None and service.build.dockerfile:
+            stats["build_analyzed_services"] += 1
         counts = verdict_counts(service)
         stats["total"] += len(service.findings)
-        for key in (V_ACTION, V_CHECK, V_RECOMMEND, V_OK, V_INFO):
+        for key in (V_ACTION, V_CHECK, V_RECOMMEND, V_OK, V_BUILD_ONLY, V_INFO):
             stats[key] += counts[key]
     return stats
 
@@ -15257,9 +15546,14 @@ def build_text_report(meta, services, stats, digest):
     out.append("解析対象       : %s" % meta.get("analyzed_services", ""))
     out.append("取得状況       : %s" % meta.get("collect_status", ""))
     out.append("総合判定       : %s" % meta.get("verdict", ""))
-    out.append("検出ディレクトリ: %d 件 (要対応 %d / 要確認 %d / 推奨 %d / OK %d / 情報 %d)"
+    out.append("検出ディレクトリ: %d 件 (要対応 %d / 要確認 %d / 推奨 %d / OK %d / "
+               "ビルド時のみ %d / 情報 %d)"
                % (stats["total"], stats[V_ACTION], stats[V_CHECK], stats[V_RECOMMEND],
-                  stats[V_OK], stats[V_INFO]))
+                  stats[V_OK], stats[V_BUILD_ONLY], stats[V_INFO]))
+    out.append("判定の前提     : read_only: true が妨げるのは実行時の書き込みだけです。"
+               "Dockerfile のビルド時に書いたディレクトリは、イメージへ焼き込み済みのため")
+    out.append("                 「ビルド時のみ」として対象から外し、entrypoint.sh などが"
+               "起動のたびに書く場所を「要対応」として挙げています。")
     out.append("")
 
     if not services:
@@ -15274,6 +15568,14 @@ def build_text_report(meta, services, stats, digest):
         out.append("  read_only        : compose.yml=%s / 実状態=%s" % (compose_label, runtime_label))
         out.append("  イメージ         : %s" % (service.image or "(未指定)"))
         out.append("  コンテナ         : %s" % (service.container or "(未起動)"))
+        if service.build is not None and service.build.dockerfile:
+            out.append("  Dockerfile       : %s%s"
+                       % (service.build.dockerfile,
+                          " (ステージ: %s)" % service.build.target_stage
+                          if service.build.target_stage else ""))
+        for script, source, detail in service.all_scripts():
+            out.append("  起動スクリプト   : %s (%s%s)"
+                       % (script, source, ": %s" % detail if source == "未取得" else ""))
         if service.jboss_home:
             out.append("  JBOSS_HOME       : %s" % service.jboss_home)
         if service.kinds:
@@ -15285,6 +15587,7 @@ def build_text_report(meta, services, stats, digest):
 
         # 要約では、対応が要るものだけを詳細に出し、read_only 未使用のサービスの
         # 「推奨」は 1 行ずつの一覧に畳む (毎回の実行で画面が埋まらないようにする)。
+        build_only = [item for item in service.findings if item.verdict == V_BUILD_ONLY]
         shown = service.findings
         listed = []
         if digest:
@@ -15293,6 +15596,11 @@ def build_text_report(meta, services, stats, digest):
             listed = [item for item in service.findings if item.verdict == V_RECOMMEND]
             if not shown and not listed:
                 out.append("  対応が必要なディレクトリはありません。")
+                if build_only:
+                    out.append("  (ビルド時にだけ書き込む %d 件は、イメージへ焼き込み済みのため "
+                               "read_only でも問題になりません: %s)"
+                               % (len(build_only),
+                                  ", ".join(item.path for item in build_only[:5])))
                 out.append("")
                 continue
         if not shown and not listed:
@@ -15304,6 +15612,7 @@ def build_text_report(meta, services, stats, digest):
             out.append("  [%s] %s" % (finding.verdict, finding.path))
             out.append("      用途        : %s" % finding.purpose)
             out.append("      書き込み内容: %s" % finding.writes)
+            out.append("      書き込み時期: %s" % finding.stage)
             out.append("      必須度      : %s / 推奨する設定: %s%s"
                        % (finding.need, finding.recommend,
                           " (%s)" % finding.options if finding.options else ""))
@@ -15331,6 +15640,12 @@ def build_text_report(meta, services, stats, digest):
                                % (finding.verdict, finding.path, finding.purpose,
                                   finding.recommend,
                                   " (%s)" % finding.options if finding.options else ""))
+                out.append("")
+            if build_only:
+                out.append("  ビルド時にだけ書き込むディレクトリ (read_only のままで問題なし):")
+                out.append("    %s" % ", ".join(finding.path for finding in build_only[:15]))
+                if len(build_only) > 15:
+                    out.append("    (ほか %d 件)" % (len(build_only) - 15))
                 out.append("")
 
         snippet = compose_snippet(service)
@@ -15430,7 +15745,7 @@ S_SECTION = 10
 S_OK = 11
 
 VERDICT_STYLE = {V_ACTION: S_FATAL, V_CHECK: S_MAJOR, V_RECOMMEND: S_WARN,
-                 V_OK: S_OK, V_INFO: S_CENTER}
+                 V_OK: S_OK, V_BUILD_ONLY: S_OK, V_INFO: S_CENTER}
 
 STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -15701,6 +16016,10 @@ def build_summary_sheet(meta, services, stats):
     kv("要確認", "%d 件 (設定はあるが副作用・確認が必要)" % stats[V_CHECK])
     kv("推奨", "%d 件 (read_only を有効にするなら設定が必要)" % stats[V_RECOMMEND])
     kv("OK", "%d 件 (書き込み先が確保されている)" % stats[V_OK])
+    kv("ビルド時のみ", "%d 件 (ビルド時に書き込み済みで、read_only でも問題にならない)"
+       % stats[V_BUILD_ONLY])
+    kv("Dockerfile を解析したサービス", "%d / %d サービス"
+       % (stats["build_analyzed_services"], stats["services"]))
     sheet.add([])
 
     sheet.add([Cell("3. この分析について", S_SECTION)])
@@ -15711,16 +16030,25 @@ def build_summary_sheet(meta, services, stats):
         "read_only が未設定・false のサービスでも、書き込みが発生するディレクトリを "
         "「推奨」として一覧し、read_only を有効化するときに必要な tmpfs / "
         "バインドマウントの設定例を出力します。")
+    sheet.add([])
+    sheet.add_notice(
+        "read_only: true が妨げるのは「コンテナの実行中の書き込み」だけです。"
+        "Dockerfile の RUN / COPY でビルド時に作ったディレクトリは、イメージのレイヤへ"
+        "焼き込まれた後であり、実行時に読むだけなら読み取り専用のままで問題ありません。"
+        "そこでこの分析では、Dockerfile の最終ステージを解析して得たビルド時の書き込み先と、"
+        "entrypoint.sh などの起動スクリプト・実際の書き込み層・コンテナ内の状態から得た"
+        "実行時の書き込み先を分けて集め、実行時の書き込みが無いディレクトリは"
+        "「ビルド時のみ」として対象から外しています。")
     return sheet
 
 
 def build_service_sheet(services):
     sheet = Sheet("サービス別判定",
-                  widths=[18, 20, 16, 16, 34, 10, 10, 10, 8, 30],
-                  freeze_rows=1, autofilter_row=1, autofilter_cols=10)
+                  widths=[18, 20, 16, 16, 34, 10, 10, 10, 8, 14, 30, 34],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=12)
     sheet.add(header_row(["サービス", "イメージ", "read_only (compose)",
                           "read_only (実状態)", "判定", "要対応", "要確認", "推奨",
-                          "OK", "コンテナ"]))
+                          "OK", "ビルド時のみ", "コンテナ", "Dockerfile"]))
     if not services:
         sheet.add_notice("compose.yml からサービスを読み取れませんでした。")
         return sheet
@@ -15743,17 +16071,21 @@ def build_service_sheet(services):
             Cell(counts[V_CHECK], S_CENTER, numeric=True),
             Cell(counts[V_RECOMMEND], S_CENTER, numeric=True),
             Cell(counts[V_OK], S_CENTER, numeric=True),
+            Cell(counts[V_BUILD_ONLY], S_CENTER, numeric=True),
             Cell(service.container or "(未起動)", S_BODY),
+            Cell(service.build.dockerfile if service.build is not None
+                 and service.build.dockerfile else "(未解析)", S_BODY),
         ])
     return sheet
 
 
 def build_directory_sheet(services):
     sheet = Sheet("ディレクトリ判定",
-                  widths=[14, 40, 10, 8, 30, 34, 34, 40, 26],
-                  freeze_rows=1, autofilter_row=1, autofilter_cols=9)
-    sheet.add(header_row(["サービス", "ディレクトリ", "判定", "必須度", "用途",
-                          "書き込み内容", "現在の設定", "推奨する設定と対処", "検出の根拠"]))
+                  widths=[14, 40, 10, 14, 8, 30, 34, 34, 40, 26],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=10)
+    sheet.add(header_row(["サービス", "ディレクトリ", "判定", "書き込み時期", "必須度",
+                          "用途", "書き込み内容", "現在の設定", "推奨する設定と対処",
+                          "検出の根拠"]))
     rows = 0
     for service in services:
         for finding in service.findings:
@@ -15764,6 +16096,7 @@ def build_directory_sheet(services):
                 Cell(service.name, S_LABEL),
                 Cell(finding.path, S_MONO),
                 Cell(finding.verdict, VERDICT_STYLE.get(finding.verdict, S_CENTER)),
+                Cell(finding.stage, S_CENTER),
                 Cell(finding.need, S_CENTER),
                 Cell(finding.purpose, S_BODY),
                 Cell(finding.writes, S_BODY),
@@ -15774,6 +16107,43 @@ def build_directory_sheet(services):
             rows += 1
     if rows == 0:
         sheet.add_notice("書き込み先の候補を検出できませんでした。")
+    return sheet
+
+
+def build_stage_sheet(services):
+    """ビルド時と実行時の書き込みを、根拠の 1 行ずつまで並べたシート。"""
+    sheet = Sheet("ビルド時/実行時の書き込み", widths=[14, 12, 40, 22, 60],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=5)
+    sheet.add(header_row(["サービス", "段階", "ディレクトリ", "出どころ", "根拠"]))
+    rows = 0
+    for service in services:
+        if service.build is not None and service.build.dockerfile:
+            sheet.add([Cell(service.name, S_LABEL), Cell("(参考)", S_CENTER),
+                       Cell(service.build.dockerfile, S_MONO), Cell("Dockerfile", S_BODY),
+                       Cell("このイメージのビルド内容を解析した Dockerfile%s。"
+                            % (" (ステージ: %s)" % service.build.target_stage
+                               if service.build.target_stage else ""), S_BODY)])
+            rows += 1
+        for path, items in sorted(service.build_writes().items()):
+            for instruction, detail in items[:5]:
+                sheet.add([Cell(service.name, S_LABEL), Cell(W_BUILD, S_CENTER),
+                           Cell(path, S_MONO), Cell(instruction, S_BODY),
+                           Cell(detail, S_BODY)])
+                rows += 1
+        for script, source, detail in service.all_scripts():
+            sheet.add([Cell(service.name, S_LABEL), Cell(W_RUNTIME, S_CENTER),
+                       Cell(script, S_MONO), Cell("起動スクリプト (%s)" % source, S_BODY),
+                       Cell(detail or "このスクリプトの中身から実行時の書き込みを調べました。",
+                            S_BODY)])
+            rows += 1
+        for path, items in sorted(service.all_script_writes().items()):
+            for script, detail in items[:5]:
+                sheet.add([Cell(service.name, S_LABEL), Cell(W_RUNTIME, S_CENTER),
+                           Cell(path, S_MONO), Cell(script, S_BODY), Cell(detail, S_BODY)])
+                rows += 1
+    if rows == 0:
+        sheet.add_notice("Dockerfile と起動スクリプトからは、書き込み先を取得できませんでした "
+                         "(compose.yml に build 定義が無い、または Dockerfile を読めません)。")
     return sheet
 
 
@@ -15913,7 +16283,8 @@ def main(argv):
     args = parser.parse_args(argv)
 
     meta = read_meta(args.meta_file)
-    services, _named_volumes = parse_facts(args.facts_file)
+    services, _named_volumes, images = parse_facts(args.facts_file)
+    attach_images(services, images)
     for service in services:
         analyze_service(service)
 
@@ -15931,6 +16302,7 @@ def main(argv):
             build_summary_sheet(meta, services, stats),
             build_service_sheet(services),
             build_directory_sheet(services),
+            build_stage_sheet(services),
             build_evidence_sheet(services),
             build_write_activity_sheet(services),
             build_recommendation_sheet(services),
@@ -15944,6 +16316,7 @@ def main(argv):
     print("READONLY_CHECK=%d" % stats[V_CHECK], file=sys.stderr)
     print("READONLY_RECOMMEND=%d" % stats[V_RECOMMEND], file=sys.stderr)
     print("READONLY_OK=%d" % stats[V_OK], file=sys.stderr)
+    print("READONLY_BUILD_ONLY=%d" % stats[V_BUILD_ONLY], file=sys.stderr)
     print("READONLY_SERVICES=%d" % stats["services"], file=sys.stderr)
     print("READONLY_ENABLED_SERVICES=%d" % stats["read_only_services"], file=sys.stderr)
     print("READONLY_VERDICT=%s" % verdict, file=sys.stderr)
@@ -16143,6 +16516,1066 @@ readonly_collect_compose_facts() {
   return 0
 }
 
+# =============================================================================
+# ビルド段階 (Dockerfile) と実行段階 (起動スクリプト) の書き込み先を分けて集める
+# -----------------------------------------------------------------------------
+# read_only: true が壊すのは「コンテナの実行中に起きる書き込み」だけである。
+# Dockerfile の RUN や COPY で作ったディレクトリは、ビルド時にイメージのレイヤへ
+# 焼き込まれた後であり、実行時に読むだけなら読み取り専用のままで何も問題ない。
+# 一方で entrypoint.sh が起動のたびに行う mkdir・設定ファイルの書き換え・ログの
+# 作成は、書き込み先を用意していなければ毎回 EROFS で失敗する。
+# 同じディレクトリでも、どちらの段階で書いているかで結論が正反対になるため、
+#   (1) Dockerfile の最終ステージ  → ビルド時の書き込み先
+#   (2) 起動スクリプトの中身        → 実行時の書き込み先
+# を別々の事実として集め、判定側で切り分けられるようにする。
+#
+# (1)(2) とも、シェルのコマンド列から書き込み先を読み取る処理は同じであるため、
+# readonly_shell_write_targets へ集約している。
+# =============================================================================
+
+# 走査中の作業ディレクトリ。Dockerfile の WORKDIR (実行時はコンテナの WorkingDir)
+# を入れる。空のときは相対パスを解決できないものとして捨てる。
+READONLY_SCAN_WORKDIR=""
+# 走査中に展開できる変数 (Dockerfile の ENV / ARG、スクリプト内の代入)。
+declare -A READONLY_SCAN_VARS=()
+# 展開に使う変数名を、長い順に並べたもの。$JBOSS より先に $JBOSS_HOME を
+# 置き換えないと、前方一致で誤った値になるため順序を固定する。
+READONLY_SCAN_VAR_NAMES=()
+READONLY_SCAN_VARS_DIRTY="false"
+# 走査の結果を返すための変数。この一連の処理はスクリプト 1 行ごとに走るため、
+# $( ) やプロセス置換で受け渡すと、数百行のスクリプトでプロセスの起動だけに
+# 何分もかかってしまう (特に fork の重い Windows の Git Bash)。値の受け渡しは
+# すべてグローバル変数で行い、外部コマンドも使わない。
+READONLY_SCAN_RESULT=""            # readonly_expand_scan_vars の結果
+READONLY_SCAN_PATH=""              # readonly_scan_normalize_path の結果
+READONLY_SPLIT_PARTS=()            # readonly_split の結果
+READONLY_WRITE_PATHS=()            # 見つかった書き込み先ディレクトリ
+READONLY_WRITE_DETAILS=()          # 同じ添字の書き込み先の根拠
+
+# 走査の状態を初期化する。第 1 引数は作業ディレクトリ (不明なら空)。
+readonly_scan_reset() {
+  READONLY_SCAN_WORKDIR="${1:-}"
+  READONLY_SCAN_VARS=()
+  READONLY_SCAN_VAR_NAMES=()
+  READONLY_SCAN_VARS_DIRTY="false"
+}
+
+# 文字列を区切り文字で分割し、READONLY_SPLIT_PARTS へ入れる。
+# read -a のヒアストリングは一時ファイルを作るため、glob 展開だけを止めて
+# 配列へ代入する (単語分割は IFS が行う)。
+readonly_split() {
+  local separator="$1" text="$2" restore_glob="false"
+  case "$-" in
+    *f*) ;;
+    *) restore_glob="true"; set -f ;;
+  esac
+  local IFS="$separator"
+  READONLY_SPLIT_PARTS=($text)
+  [ "$restore_glob" = "true" ] && set +f
+  return 0
+}
+
+# 展開に使う変数名を長い順に並べ直す。名前の長さで数え上げるだけにして、
+# sort などの外部コマンドを起動しない。
+readonly_scan_rebuild_var_order() {
+  local name length=0
+  READONLY_SCAN_VAR_NAMES=()
+  for name in "${!READONLY_SCAN_VARS[@]}"; do
+    [ ${#name} -gt "$length" ] && length=${#name}
+  done
+  while [ "$length" -gt 0 ]; do
+    for name in "${!READONLY_SCAN_VARS[@]}"; do
+      [ ${#name} -eq "$length" ] && READONLY_SCAN_VAR_NAMES+=("$name")
+    done
+    length=$((length - 1))
+  done
+  READONLY_SCAN_VARS_DIRTY="false"
+  return 0
+}
+
+# パスに含まれる ${VAR} / $VAR を、判明している値で展開して
+# READONLY_SCAN_RESULT へ入れる。${VAR:-既定値} のような形は展開せず、
+# 後段のパス検証で捨てる。
+readonly_expand_scan_vars() {
+  local text="$1" name value round=0
+  [ "$READONLY_SCAN_VARS_DIRTY" = "true" ] && readonly_scan_rebuild_var_order
+  while [ "$round" -lt 3 ]; do
+    case "$text" in
+      *'$'*) ;;
+      *) break ;;
+    esac
+    if [ ${#READONLY_SCAN_VAR_NAMES[@]} -gt 0 ]; then
+      for name in "${READONLY_SCAN_VAR_NAMES[@]}"; do
+        value="${READONLY_SCAN_VARS[$name]}"
+        text="${text//\$\{$name\}/$value}"
+        text="${text//\$$name/$value}"
+      done
+    fi
+    round=$((round + 1))
+  done
+  READONLY_SCAN_RESULT="$text"
+  return 0
+}
+
+# 展開に使う変数を 1 件覚える。値自体が未解決の変数を含むものは使わない。
+readonly_scan_set_var() {
+  local name="$1" value="$2"
+  case "$name" in
+    ""|*[!A-Za-z0-9_]*) return 0 ;;
+  esac
+  # 前後の引用符を外す
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  case "$value" in
+    *'$'*)
+      readonly_expand_scan_vars "$value"
+      value="$READONLY_SCAN_RESULT"
+      ;;
+  esac
+  case "$value" in
+    *'$'*|*'`'*) return 0 ;;
+  esac
+  READONLY_SCAN_VARS["$name"]="$value"
+  READONLY_SCAN_VARS_DIRTY="true"
+  return 0
+}
+
+# 判定の対象にしないパス。疑似ファイルシステムと BuildKit のシークレットは、
+# 書き込み先の検討をしても意味がない。
+readonly_scan_ignored_path() {
+  case "$1" in
+    /|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run/secrets|/run/secrets/*) return 0 ;;
+  esac
+  return 1
+}
+
+# パス文字列を絶対パスへ整え、READONLY_SCAN_PATH へ入れる。相対パスは走査中の
+# 作業ディレクトリから解決する。解決できないもの (未解決の変数・glob・作業
+# ディレクトリ不明の相対パス) は 1 を返して捨てる。
+readonly_scan_normalize_path() {
+  local path="$1" part resolved=""
+  local -a parts=() stack=()
+
+  READONLY_SCAN_PATH=""
+  path="${path%\"}"; path="${path#\"}"
+  path="${path%\'}"; path="${path#\'}"
+  case "$path" in
+    *'$'*)
+      readonly_expand_scan_vars "$path"
+      path="$READONLY_SCAN_RESULT"
+      path="${path%\"}"; path="${path#\"}"
+      path="${path%\'}"; path="${path#\'}"
+      ;;
+  esac
+  [ -n "$path" ] || return 1
+  # 変数・コマンド置換・glob が残るものは、実際のパスが決まらないため対象外。
+  case "$path" in
+    -*|*'$'*|*'`'*|*'*'*|*'?'*|*'['*|*'{'*|*'"'*|*"'"*|*'<'*|*'>'*|*'|'*|*';'*) return 1 ;;
+    '~'*) return 1 ;;
+  esac
+  case "$path" in
+    /*) ;;
+    *)
+      [ -n "$READONLY_SCAN_WORKDIR" ] || return 1
+      path="${READONLY_SCAN_WORKDIR%/}/${path}"
+      ;;
+  esac
+
+  readonly_split "/" "$path"
+  parts=(${READONLY_SPLIT_PARTS[@]+"${READONLY_SPLIT_PARTS[@]}"})
+  if [ ${#parts[@]} -gt 0 ]; then
+    for part in "${parts[@]}"; do
+      case "$part" in
+        ""|.) continue ;;
+        ..)
+          if [ ${#stack[@]} -gt 0 ]; then
+            unset "stack[$((${#stack[@]} - 1))]"
+            stack=(${stack[@]+"${stack[@]}"})
+          fi
+          ;;
+        *) stack+=("$part") ;;
+      esac
+    done
+  fi
+  if [ ${#stack[@]} -eq 0 ]; then
+    READONLY_SCAN_PATH="/"
+    return 0
+  fi
+  for part in "${stack[@]}"; do
+    resolved="${resolved}/${part}"
+  done
+  READONLY_SCAN_PATH="$resolved"
+  return 0
+}
+
+# 見つけた書き込み先の一覧を空にする。
+readonly_scan_targets_reset() {
+  READONLY_WRITE_PATHS=()
+  READONLY_WRITE_DETAILS=()
+}
+
+# 書き込み先を 1 件記録する (READONLY_WRITE_PATHS / READONLY_WRITE_DETAILS へ追加)。
+# mode は dir (パスそのものがディレクトリ) / file (親ディレクトリが対象) /
+# auto (拡張子があればファイルとみなす) のいずれか。
+readonly_scan_emit() {
+  local mode="$1" raw="$2" detail="$3" path
+  readonly_scan_normalize_path "$raw" || return 0
+  path="$READONLY_SCAN_PATH"
+  [ -n "$path" ] || return 0
+  case "$mode" in
+    file) mode="parent" ;;
+    auto)
+      case "${path##*/}" in
+        *.*) mode="parent" ;;
+        *) mode="dir" ;;
+      esac
+      ;;
+  esac
+  if [ "$mode" = "parent" ]; then
+    case "$path" in
+      */*) path="${path%/*}" ;;
+      *)   path="/" ;;
+    esac
+    [ -n "$path" ] || path="/"
+  fi
+  readonly_scan_ignored_path "$path" && return 0
+  READONLY_WRITE_PATHS+=("$path")
+  READONLY_WRITE_DETAILS+=("$detail")
+  return 0
+}
+
+# シェルのコマンド列から、書き込みが発生するディレクトリを取り出す。
+# Dockerfile の RUN と、entrypoint.sh などの起動スクリプトで共用する。
+# 結果は READONLY_WRITE_PATHS / READONLY_WRITE_DETAILS へ入れる。
+#
+# 完全なシェルの解釈は行わない。目的は「どこへ書くか」の候補を挙げることであり、
+# 値が確定しないパス (未解決の変数・glob) は誤った指摘を避けるため捨てている。
+readonly_shell_write_targets() {
+  local text="$1"
+  local line cmd token index count target
+  local install_dir sed_in_place tar_extract tar_dir
+  local -a commands=() tokens=() args=()
+
+  readonly_scan_targets_reset
+
+  # コマンドの区切りをすべて改行へ寄せ、1 行 1 コマンドにする。
+  text="${text//$'\r'/ }"
+  text="${text//$'\t'/ }"
+  text="${text//&&/$'\n'}"
+  text="${text//||/$'\n'}"
+  text="${text//|/$'\n'}"
+  text="${text//;/$'\n'}"
+
+  readonly_split $'\n' "$text"
+  commands=(${READONLY_SPLIT_PARTS[@]+"${READONLY_SPLIT_PARTS[@]}"})
+  [ ${#commands[@]} -gt 0 ] || return 0
+
+  for line in "${commands[@]}"; do
+    [ -n "$line" ] || continue
+    readonly_split $' \t' "$line"
+    tokens=(${READONLY_SPLIT_PARTS[@]+"${READONLY_SPLIT_PARTS[@]}"})
+    [ ${#tokens[@]} -gt 0 ] || continue
+
+    # リダイレクト (> file / >> file / 2> file) は、コマンドを問わず書き込みになる。
+    for ((index = 0; index < ${#tokens[@]}; index++)); do
+      token="${tokens[$index]}"
+      case "$token" in
+        *'>'*) ;;
+        *) continue ;;
+      esac
+      target="${token##*>}"                       # 最後の > より後ろが書き込み先
+      if [ -z "$target" ] && [ $((index + 1)) -lt ${#tokens[@]} ]; then
+        target="${tokens[$((index + 1))]}"        # "> file" のように離れている場合
+      fi
+      case "$target" in
+        ''|'&'*) continue ;;                      # 2>&1 のような複製は書き込み先ではない
+      esac
+      readonly_scan_emit file "$target" "リダイレクト (> ${target})"
+    done
+
+    # 制御構文のキーワード・前置きの環境変数・sudo などを読み飛ばし、
+    # 実際に実行されるコマンド名までたどる。
+    index=0
+    while [ "$index" -lt ${#tokens[@]} ]; do
+      case "${tokens[$index]}" in
+        if|then|else|elif|fi|do|done|while|until|for|case|esac|in|'{'|'}'|'('|')'|'!'|\
+        time|sudo|command|exec|nohup|eval|env|set|-)
+          index=$((index + 1)) ;;
+        *=*) index=$((index + 1)) ;;              # FOO=bar cmd の前置き
+        *) break ;;
+      esac
+    done
+    [ "$index" -lt ${#tokens[@]} ] || continue
+    cmd="${tokens[$index]}"
+    cmd="${cmd##*/}"                              # /bin/mkdir のような指定にも対応
+    args=()
+    if [ $((index + 1)) -lt ${#tokens[@]} ]; then
+      args=("${tokens[@]:$((index + 1))}")
+    fi
+
+    case "$cmd" in
+      mkdir)
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          readonly_scan_emit dir "$token" "mkdir ${token}"
+        done
+        ;;
+      install)
+        install_dir="false"
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in
+            -*d*) install_dir="true" ;;
+          esac
+        done
+        target=""
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          if [ "$install_dir" = "true" ]; then
+            readonly_scan_emit dir "$token" "install -d ${token}"
+          else
+            target="$token"
+          fi
+        done
+        [ -n "$target" ] && readonly_scan_emit auto "$target" "install ... ${target}"
+        ;;
+      touch)
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          readonly_scan_emit file "$token" "touch ${token}"
+        done
+        ;;
+      cp|mv|rsync)
+        target=""
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          target="$token"
+          count=$((count + 1))
+        done
+        if [ -n "$target" ]; then
+          case "$target" in
+            */) readonly_scan_emit dir "$target" "${cmd} ... ${target}" ;;
+            *)
+              if [ "$count" -gt 2 ]; then
+                readonly_scan_emit dir "$target" "${cmd} ... ${target}"
+              else
+                readonly_scan_emit auto "$target" "${cmd} ... ${target}"
+              fi
+              ;;
+          esac
+        fi
+        ;;
+      ln)
+        target=""
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          target="$token"
+        done
+        [ -n "$target" ] && readonly_scan_emit file "$target" "ln ... ${target}"
+        ;;
+      tee)
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          readonly_scan_emit file "$token" "tee ${token}"
+        done
+        ;;
+      sed)
+        sed_in_place="false"
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in
+            -i|-i*|--in-place|--in-place=*) sed_in_place="true" ;;
+          esac
+        done
+        if [ "$sed_in_place" = "true" ]; then
+          # 最後の引数だけを対象にする (それ以外は sed のスクリプトであることが多い)。
+          target=""
+          for token in ${args[@]+"${args[@]}"}; do
+            case "$token" in -*) continue ;; esac
+            target="$token"
+          done
+          [ -n "$target" ] && readonly_scan_emit file "$target" "sed -i ... ${target}"
+        fi
+        ;;
+      dd)
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in
+            of=*) readonly_scan_emit file "${token#of=}" "dd ${token}" ;;
+          esac
+        done
+        ;;
+      rm|rmdir|unlink)
+        # 削除も親ディレクトリへの書き込みになるため、読み取り専用では失敗する。
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          readonly_scan_emit file "$token" "${cmd} ${token}"
+        done
+        ;;
+      chown|chmod|chgrp|setfacl|truncate)
+        # 1 つ目の引数はモード・所有者・サイズなので飛ばす。
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in -*) continue ;; esac
+          count=$((count + 1))
+          [ "$count" -eq 1 ] && continue
+          readonly_scan_emit auto "$token" "${cmd} ... ${token}"
+        done
+        ;;
+      tar)
+        tar_extract="false"
+        tar_dir=""
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$token" in
+            --directory=*) tar_dir="${token#--directory=}" ;;
+            --extract|-x*) tar_extract="true" ;;
+            -C) count=1; continue ;;
+          esac
+          if [ "$count" -eq 1 ]; then
+            tar_dir="$token"
+            count=0
+          fi
+        done
+        if [ -n "$tar_dir" ]; then
+          readonly_scan_emit dir "$tar_dir" "tar ... -C ${tar_dir}"
+        elif [ "$tar_extract" = "true" ] && [ -n "$READONLY_SCAN_WORKDIR" ]; then
+          readonly_scan_emit dir "$READONLY_SCAN_WORKDIR" "tar での展開 (作業ディレクトリ)"
+        fi
+        ;;
+      unzip)
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          if [ "$count" -eq 1 ]; then
+            readonly_scan_emit dir "$token" "unzip -d ${token}"
+            count=0
+            continue
+          fi
+          case "$token" in -d) count=1 ;; esac
+        done
+        ;;
+      mktemp)
+        count=0
+        target=""
+        for token in ${args[@]+"${args[@]}"}; do
+          if [ "$count" -eq 1 ]; then
+            readonly_scan_emit dir "$token" "mktemp -p ${token}"
+            count=0
+            continue
+          fi
+          case "$token" in
+            -p|--tmpdir) count=1 ;;
+            --tmpdir=*) readonly_scan_emit dir "${token#--tmpdir=}" "mktemp ${token}" ;;
+            -*) ;;
+            /*) target="$token" ;;
+          esac
+        done
+        [ -n "$target" ] && readonly_scan_emit file "$target" "mktemp ${target}"
+        ;;
+      curl)
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          if [ "$count" -eq 1 ]; then
+            readonly_scan_emit file "$token" "curl -o ${token}"
+            count=0
+            continue
+          fi
+          case "$token" in -o|--output) count=1 ;; esac
+        done
+        ;;
+      wget)
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          case "$count" in
+            1) readonly_scan_emit file "$token" "wget -O ${token}"; count=0; continue ;;
+            2) readonly_scan_emit dir "$token" "wget -P ${token}"; count=0; continue ;;
+          esac
+          case "$token" in
+            -O|--output-document) count=1 ;;
+            -P|--directory-prefix) count=2 ;;
+          esac
+        done
+        ;;
+      keytool|openssl)
+        count=0
+        for token in ${args[@]+"${args[@]}"}; do
+          if [ "$count" -eq 1 ]; then
+            readonly_scan_emit file "$token" "${cmd} ... ${token}"
+            count=0
+            continue
+          fi
+          case "$token" in
+            -keystore|-out|-keyout) count=1 ;;
+          esac
+        done
+        ;;
+    esac
+  done
+  return 0
+}
+
+# コンテナへ渡すスクリプトの候補かどうか。拡張子と、起動スクリプトでよく使う
+# 名前で判断する。実際に中身を読む前の一次選別のため、広めに拾う。
+readonly_looks_like_script() {
+  local token="$1"
+  case "$token" in
+    -*|"") return 1 ;;
+    *'$'*|*'`'*|*'*'*) return 1 ;;
+  esac
+  case "${token##*/}" in
+    *.sh|*.bash|*.ksh) return 0 ;;
+  esac
+  case "${token##*/}" in
+    entrypoint*|docker-entrypoint*|start*|run|run-*|launch*|init) return 0 ;;
+  esac
+  return 1
+}
+
+# Dockerfile を論理行 (行継続を連結し、コメントと空行を除いたもの) として列挙する。
+readonly_dockerfile_logical_lines() {
+  local dockerfile="$1"
+  local physical logical="" trimmed
+  [ -f "$dockerfile" ] || return 1
+  while IFS= read -r physical || [ -n "$physical" ]; do
+    physical="${physical%$'\r'}"
+    trimmed="${physical#"${physical%%[![:space:]]*}"}"
+    # 継続行の途中に現れるコメント行も、Docker と同じく無視する。
+    case "$trimmed" in
+      \#*) continue ;;
+    esac
+    if [ -n "$logical" ]; then
+      logical="${logical}${physical}"
+    else
+      logical="$physical"
+    fi
+    if [[ "$logical" == *\\ ]]; then
+      logical="${logical%\\} "
+      continue
+    fi
+    trimmed="${logical#"${logical%%[![:space:]]*}"}"
+    logical=""
+    [ -n "$trimmed" ] || continue
+    printf '%s\n' "$trimmed"
+  done < "$dockerfile"
+  if [ -n "$logical" ]; then
+    trimmed="${logical#"${logical%%[![:space:]]*}"}"
+    [ -n "$trimmed" ] && printf '%s\n' "$trimmed"
+  fi
+  return 0
+}
+
+# ENTRYPOINT / CMD / COPY の JSON 記法 (["a", "b"]) を、空白区切りへ均す。
+readonly_flatten_json_form() {
+  local text="$1"
+  case "$text" in
+    \[*)
+      text="${text//\[/ }"
+      text="${text//\]/ }"
+      text="${text//\"/ }"
+      text="${text//,/ }"
+      # 連続した空白を 1 つへ畳み、前後の空白を落とす
+      while [[ "$text" == *"  "* ]]; do
+        text="${text//  / }"
+      done
+      text="${text#"${text%%[![:space:]]*}"}"
+      text="${text%"${text##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "$text"
+}
+
+# 解析中の Dockerfile から拾った COPY / ADD の対応 ("コンテキスト側<TAB>イメージ側")。
+# 起動スクリプトの実体をビルドコンテキストから探すために使う。
+READONLY_COPY_MAP=()
+# 解析中の Dockerfile の ENTRYPOINT / CMD から拾ったスクリプトの候補。
+READONLY_ENTRYPOINT_SCRIPTS=()
+# Dockerfile の最終ステージの WORKDIR (起動スクリプトの相対パス解決に使う)。
+READONLY_DOCKERFILE_WORKDIR=""
+# 重複と件数の上限を守るための状態。
+declare -A READONLY_BUILD_WRITE_SEEN=()
+declare -A READONLY_SCRIPT_WRITE_SEEN=()
+declare -A READONLY_SCRIPT_SCANNED=()
+READONLY_BUILD_WRITE_COUNT=0
+READONLY_SCRIPT_WRITE_COUNT=0
+READONLY_SCRIPT_FILE_COUNT=0
+
+# ビルド時の書き込み先を 1 件記録する (同じイメージ・同じディレクトリは 1 回だけ)。
+readonly_emit_build_write() {
+  local out_file="$1" image_key="$2" path="$3" instruction="$4" detail="$5"
+  [ -n "$path" ] || return 0
+  [ -z "${READONLY_BUILD_WRITE_SEEN["${image_key}|${path}"]:-}" ] || return 0
+  [ "$READONLY_BUILD_WRITE_COUNT" -lt "$READONLY_BUILD_WRITE_LIMIT" ] || return 0
+  READONLY_BUILD_WRITE_SEEN["${image_key}|${path}"]="true"
+  READONLY_BUILD_WRITE_COUNT=$((READONLY_BUILD_WRITE_COUNT + 1))
+  readonly_fact img_build_write "$image_key" "$path" "$instruction" "$detail" >> "$out_file"
+}
+
+# 実行時 (起動スクリプト) の書き込み先を 1 件記録する。
+readonly_emit_script_write() {
+  local out_file="$1" kind="$2" key="$3" path="$4" script="$5" detail="$6"
+  [ -n "$path" ] || return 0
+  [ -z "${READONLY_SCRIPT_WRITE_SEEN["${key}|${path}"]:-}" ] || return 0
+  [ "$READONLY_SCRIPT_WRITE_COUNT" -lt "$READONLY_SCRIPT_WRITE_LIMIT" ] || return 0
+  READONLY_SCRIPT_WRITE_SEEN["${key}|${path}"]="true"
+  READONLY_SCRIPT_WRITE_COUNT=$((READONLY_SCRIPT_WRITE_COUNT + 1))
+  readonly_fact "$kind" "$key" "$path" "$script" "$detail" >> "$out_file"
+}
+
+# Dockerfile の ENV 行から変数と値を取り込む。
+#   ENV KEY=VALUE KEY2=VALUE2 / ENV KEY VALUE の双方に対応する。
+readonly_dockerfile_set_env() {
+  local body="$1" token
+  local -a tokens=()
+  read -r -a tokens <<< "$body"
+  [ ${#tokens[@]} -gt 0 ] || return 0
+  if [ ${#tokens[@]} -ge 2 ] && [[ "${tokens[0]}" != *=* ]]; then
+    readonly_scan_set_var "${tokens[0]}" "${tokens[1]}"
+    return 0
+  fi
+  for token in "${tokens[@]}"; do
+    case "$token" in
+      *=*) readonly_scan_set_var "${token%%=*}" "${token#*=}" ;;
+    esac
+  done
+  return 0
+}
+
+# Dockerfile 1 つを解析し、ビルド時の書き込み先・VOLUME・ENTRYPOINT / CMD を記録する。
+# マルチステージの場合、イメージに残るのは最終ステージ (compose の build.target を
+# 指定していればそのステージ) と、そこが FROM で引き継いでいる前段だけであるため、
+# それ以外のステージの書き込みは対象にしない。
+readonly_parse_dockerfile() {
+  local out_file="$1" image_key="$2" dockerfile="$3" context_dir="$4" target_stage="$5"
+  local -a lines=() stage_names=() stage_bases=() stage_starts=() chain=()
+  local -a tokens=() copy_args=()
+  local index cursor guard found selected start finish stage emit_index
+  local line instruction upper rest token name base dest mode
+  local workdir="/"
+
+  [ -f "$dockerfile" ] || return 1
+  mapfile -t lines < <(readonly_dockerfile_logical_lines "$dockerfile")
+  [ ${#lines[@]} -gt 0 ] || return 1
+
+  # ---- ステージの切れ目 (FROM) を拾う ----------------------------------------
+  for ((index = 0; index < ${#lines[@]}; index++)); do
+    line="${lines[$index]}"
+    instruction="${line%%[[:space:]]*}"
+    [ "${instruction^^}" = "FROM" ] || continue
+    rest="${line#"$instruction"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    tokens=()
+    read -r -a tokens <<< "$rest"
+    name=""
+    base=""
+    for token in ${tokens[@]+"${tokens[@]}"}; do
+      case "$token" in
+        --*) continue ;;
+      esac
+      if [ -z "$base" ]; then
+        base="$token"
+        continue
+      fi
+      if [ "${token^^}" = "AS" ]; then
+        name="__NEXT__"
+        continue
+      fi
+      [ "$name" = "__NEXT__" ] && name="$token"
+    done
+    [ "$name" = "__NEXT__" ] && name=""
+    stage_names+=("$name")
+    stage_bases+=("$base")
+    stage_starts+=("$index")
+  done
+  [ ${#stage_starts[@]} -gt 0 ] || return 1
+
+  # ---- 対象ステージと、そこへ引き継がれる前段を決める ------------------------
+  selected=-1
+  if [ -n "$target_stage" ]; then
+    for ((index = 0; index < ${#stage_names[@]}; index++)); do
+      [ "${stage_names[$index]}" = "$target_stage" ] && selected=$index
+    done
+  fi
+  [ "$selected" -ge 0 ] || selected=$((${#stage_names[@]} - 1))
+  cursor="$selected"
+  guard=0
+  while [ "$cursor" -ge 0 ] && [ "$guard" -lt 20 ]; do
+    if [ ${#chain[@]} -gt 0 ]; then
+      chain=("$cursor" "${chain[@]}")     # 前段が先に来るよう先頭へ足す
+    else
+      chain=("$cursor")
+    fi
+    base="${stage_bases[$cursor]}"
+    found=-1
+    for ((index = 0; index < cursor; index++)); do
+      [ -n "${stage_names[$index]}" ] && [ "${stage_names[$index]}" = "$base" ] && found=$index
+    done
+    cursor="$found"
+    guard=$((guard + 1))
+  done
+
+  # ---- 命令をたどって、ビルド時の書き込み先を集める --------------------------
+  readonly_scan_reset "/"
+  READONLY_COPY_MAP=()
+  READONLY_ENTRYPOINT_SCRIPTS=()
+  # 最初の FROM より前に置かれたグローバル ARG も、パスの展開に使う。
+  for ((index = 0; index < stage_starts[0]; index++)); do
+    line="${lines[$index]}"
+    instruction="${line%%[[:space:]]*}"
+    [ "${instruction^^}" = "ARG" ] || continue
+    rest="${line#"$instruction"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    name="${rest%%[[:space:]]*}"
+    case "$name" in
+      *=*) readonly_scan_set_var "${name%%=*}" "${name#*=}" ;;
+    esac
+  done
+
+  for stage in "${chain[@]}"; do
+    start=$((stage_starts[stage] + 1))
+    if [ $((stage + 1)) -lt ${#stage_starts[@]} ]; then
+      finish=$((stage_starts[stage + 1] - 1))
+    else
+      finish=$((${#lines[@]} - 1))
+    fi
+    # ステージが変わると WORKDIR は基点へ戻る (FROM で引き継いだ場合を除く)。
+    workdir="/"
+    READONLY_SCAN_WORKDIR="/"
+    for ((index = start; index <= finish; index++)); do
+      line="${lines[$index]}"
+      instruction="${line%%[[:space:]]*}"
+      upper="${instruction^^}"
+      rest="${line#"$instruction"}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      [ -n "$rest" ] || continue
+      case "$upper" in
+        ARG)
+          name="${rest%%[[:space:]]*}"
+          case "$name" in
+            *=*) readonly_scan_set_var "${name%%=*}" "${name#*=}" ;;
+          esac
+          ;;
+        ENV)
+          readonly_dockerfile_set_env "$rest"
+          ;;
+        WORKDIR)
+          if readonly_scan_normalize_path "$rest"; then
+            workdir="$READONLY_SCAN_PATH"
+            READONLY_SCAN_WORKDIR="$workdir"
+            readonly_emit_build_write "$out_file" "$image_key" "$workdir" "WORKDIR" \
+                "WORKDIR ${rest} (ビルド時に作成される)"
+          fi
+          ;;
+        COPY|ADD)
+          rest="$(readonly_flatten_json_form "$rest")"
+          tokens=()
+          read -r -a tokens <<< "$rest"
+          copy_args=()
+          for token in ${tokens[@]+"${tokens[@]}"}; do
+            case "$token" in
+              --*) continue ;;
+            esac
+            copy_args+=("$token")
+          done
+          [ ${#copy_args[@]} -ge 2 ] || continue
+          dest="${copy_args[$((${#copy_args[@]} - 1))]}"
+          case "$dest" in
+            */) mode="dir" ;;
+            *)  if [ ${#copy_args[@]} -gt 2 ]; then mode="dir"; else mode="auto"; fi ;;
+          esac
+          readonly_scan_targets_reset
+          readonly_scan_emit "$mode" "$dest" "${upper} ... ${dest} (ビルド時に配置される)"
+          for ((emit_index = 0; emit_index < ${#READONLY_WRITE_PATHS[@]}; emit_index++)); do
+            readonly_emit_build_write "$out_file" "$image_key" \
+                "${READONLY_WRITE_PATHS[$emit_index]}" "$upper" \
+                "${READONLY_WRITE_DETAILS[$emit_index]}"
+          done
+          # 起動スクリプトの実体をコンテキストから探すため、対応を覚えておく。
+          case "$rest" in
+            *--from=*) ;;                       # 前段からのコピーはコンテキストに無い
+            *)
+              for ((cursor = 0; cursor < ${#copy_args[@]} - 1; cursor++)); do
+                READONLY_COPY_MAP+=("${copy_args[$cursor]}"$'\t'"$dest")
+              done
+              ;;
+          esac
+          ;;
+        RUN)
+          # --mount=... などのフラグを落としてからコマンド列として読む。
+          while [ "${rest:0:2}" = "--" ]; do
+            case "$rest" in
+              *[[:space:]]*) rest="${rest#*[[:space:]]}" ;;
+              *) rest="" ;;
+            esac
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+          done
+          rest="$(readonly_flatten_json_form "$rest")"
+          readonly_shell_write_targets "$rest"
+          for ((emit_index = 0; emit_index < ${#READONLY_WRITE_PATHS[@]}; emit_index++)); do
+            readonly_emit_build_write "$out_file" "$image_key" \
+                "${READONLY_WRITE_PATHS[$emit_index]}" "RUN" \
+                "${READONLY_WRITE_DETAILS[$emit_index]}"
+          done
+          ;;
+        VOLUME)
+          # イメージの VOLUME 宣言は、実行時に匿名ボリュームが読み書き可で
+          # マウントされるため、read_only でも書き込みできる場所になる。
+          rest="$(readonly_flatten_json_form "$rest")"
+          tokens=()
+          read -r -a tokens <<< "$rest"
+          for token in ${tokens[@]+"${tokens[@]}"}; do
+            if readonly_scan_normalize_path "$token"; then
+              readonly_fact img_volume "$image_key" "$READONLY_SCAN_PATH" >> "$out_file"
+            fi
+          done
+          ;;
+        ENTRYPOINT|CMD)
+          rest="$(readonly_flatten_json_form "$rest")"
+          readonly_fact img_entrypoint "$image_key" "${upper,,}" "$rest" >> "$out_file"
+          tokens=()
+          read -r -a tokens <<< "$rest"
+          for token in ${tokens[@]+"${tokens[@]}"}; do
+            if readonly_looks_like_script "$token"; then
+              READONLY_ENTRYPOINT_SCRIPTS+=("$token")
+            fi
+          done
+          ;;
+      esac
+    done
+  done
+  READONLY_DOCKERFILE_WORKDIR="$workdir"
+  return 0
+}
+
+# イメージ内のパス (例: /usr/local/bin/entrypoint.sh) に対応するファイルを、
+# ビルドコンテキストから探す。COPY / ADD の対応を優先し、見つからなければ
+# 同じ名前のファイルを浅い階層から探す。
+readonly_find_context_file() {
+  local context_dir="$1" script="$2"
+  local entry src dest candidate base="${script##*/}"
+
+  [ -d "$context_dir" ] || return 1
+  for entry in ${READONLY_COPY_MAP[@]+"${READONLY_COPY_MAP[@]}"}; do
+    src="${entry%%$'\t'*}"
+    dest="${entry#*$'\t'}"
+    case "$src" in
+      /*|*'$'*|*'*'*|*'?'*) continue ;;
+    esac
+    dest="${dest%/}"
+    candidate=""
+    if [ "$dest" = "$script" ]; then
+      candidate="${context_dir%/}/${src}"
+    elif [ "$dest" = "${script%/*}" ]; then
+      # ディレクトリ宛の COPY。同じファイル名のものを採る。
+      if [ "${src##*/}" = "$base" ]; then
+        candidate="${context_dir%/}/${src}"
+      else
+        candidate="${context_dir%/}/${src%/}/${base}"
+      fi
+    elif [ "${script#"${dest}/"}" != "$script" ]; then
+      candidate="${context_dir%/}/${src%/}/${script#"${dest}/"}"
+    fi
+    [ -n "$candidate" ] || continue
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  candidate="${context_dir%/}/${base}"
+  if [ -f "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  candidate="$(find "$context_dir" -maxdepth 3 -type f -name "$base" 2>/dev/null | head -n 1)"
+  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# 直前に走査したスクリプトが読み込んでいた別スクリプト (source / .) の一覧。
+READONLY_SCRIPT_SOURCES=()
+
+# 起動スクリプトの中身 (標準入力) から、実行時に書き込むディレクトリを取り出す。
+# スクリプト内の代入も覚えて、${LOG_DIR} のようなパスを展開できるようにする。
+readonly_scan_script_text() {
+  local out_file="$1" fact_kind="$2" key="$3" script="$4"
+  local line trimmed assign name value emit_index count=0
+
+  READONLY_SCRIPT_SOURCES=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    count=$((count + 1))
+    [ "$count" -le "$READONLY_SCRIPT_MAX_LINES" ] || break
+    line="${line%$'\r'}"
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [ -n "$trimmed" ] || continue
+    case "$trimmed" in
+      \#*) continue ;;
+    esac
+
+    # 変数の代入を覚える。値が ${OTHER:-/既定値} の形なら既定値を採る。
+    assign="$trimmed"
+    assign="${assign#export }"
+    assign="${assign#local }"
+    if [[ "$assign" =~ ^([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]\;\&\|]*) ]]; then
+      name="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      # LOG_DIR="${LOG_DIR:-/var/log/app}" のような既定値付きの指定は、既定値を採る。
+      if [[ "$value" =~ ^\"?\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=]([^\}\"]*)\}\"?$ ]]; then
+        value="${BASH_REMATCH[1]}"
+      fi
+      readonly_scan_set_var "$name" "$value"
+    elif [[ "$trimmed" =~ ^:[[:space:]]+\"?\$\{([A-Za-z_][A-Za-z0-9_]*):?=([^\}\"]*)\}\"?  ]]; then
+      readonly_scan_set_var "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    fi
+
+    # 読み込んでいる別のスクリプトは、後で同じように走査する。
+    case "$trimmed" in
+      .[[:space:]]*|source[[:space:]]*)
+        value="${trimmed#* }"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%%[[:space:]]*}"
+        [ -n "$value" ] && READONLY_SCRIPT_SOURCES+=("$value")
+        ;;
+    esac
+
+    readonly_shell_write_targets "$trimmed"
+    for ((emit_index = 0; emit_index < ${#READONLY_WRITE_PATHS[@]}; emit_index++)); do
+      readonly_emit_script_write "$out_file" "$fact_kind" "$key" \
+          "${READONLY_WRITE_PATHS[$emit_index]}" "$script" \
+          "${READONLY_WRITE_DETAILS[$emit_index]}"
+    done
+  done
+  return 0
+}
+
+# 中身がテキストのスクリプトかどうか (バイナリの ENTRYPOINT を読まないための確認)。
+readonly_script_is_text() {
+  local file="$1"
+  case "$file" in
+    *.sh|*.bash|*.ksh) return 0 ;;
+  esac
+  [ "$(head -c 2 "$file" 2>/dev/null)" = '#!' ]
+}
+
+# ビルドコンテキスト側の起動スクリプトを走査する。source 先も 1 段だけ追う。
+readonly_scan_context_script() {
+  local out_file="$1" image_key="$2" context_dir="$3" script="$4" depth="$5"
+  local host_file entry resolved
+  local -a sources=()
+
+  [ "$depth" -le 2 ] || return 0
+  [ "$READONLY_SCRIPT_FILE_COUNT" -lt "$READONLY_SCRIPT_MAX_FILES" ] || return 0
+  [ -z "${READONLY_SCRIPT_SCANNED["${image_key}|${script}"]:-}" ] || return 0
+  READONLY_SCRIPT_SCANNED["${image_key}|${script}"]="true"
+
+  if ! host_file="$(readonly_find_context_file "$context_dir" "$script")"; then
+    readonly_fact img_script "$image_key" "$script" "未取得" \
+        "ビルドコンテキストに実体が見つからないため、このスクリプトが実行時に書き込む場所は確認できていません。" \
+        >> "$out_file"
+    return 0
+  fi
+  readonly_script_is_text "$host_file" || return 0
+  READONLY_SCRIPT_FILE_COUNT=$((READONLY_SCRIPT_FILE_COUNT + 1))
+  readonly_fact img_script "$image_key" "$script" "ビルドコンテキスト" "$host_file" >> "$out_file"
+  readonly_scan_script_text "$out_file" img_script_write "$image_key" "$script" < "$host_file"
+
+  sources=(${READONLY_SCRIPT_SOURCES[@]+"${READONLY_SCRIPT_SOURCES[@]}"})
+  for entry in ${sources[@]+"${sources[@]}"}; do
+    if readonly_scan_normalize_path "$entry"; then
+      readonly_scan_context_script "$out_file" "$image_key" "$context_dir" \
+          "$READONLY_SCAN_PATH" $((depth + 1))
+    fi
+  done
+  return 0
+}
+
+# compose.yml の build 定義 (context / dockerfile / target) と image を取り出す。
+# 出力は "サービス<SEP>イメージ<SEP>context<SEP>dockerfile<SEP>target" の 1 行 1 件。
+readonly_collect_build_definitions() {
+  local kind entry_path value rest service
+  local -a order=()
+  local -A svc_image=() svc_context=() svc_dockerfile=() svc_target=() svc_build=() seen=()
+
+  [ -f "$COMPOSE_FILE" ] || return 1
+  while IFS="$COMPOSE_YAML_SEPARATOR" read -r kind entry_path value; do
+    [ -n "$kind" ] || continue
+    case "$entry_path" in
+      services.*) ;;
+      *) continue ;;
+    esac
+    rest="${entry_path#services.}"
+    service="${rest%%.*}"
+    [ -n "$service" ] || continue
+    rest="${rest#"$service"}"
+    rest="${rest#.}"
+    if [ -z "${seen[$service]:-}" ]; then
+      seen["$service"]="true"
+      order+=("$service")
+    fi
+    case "$kind:$rest" in
+      kv:image)            svc_image["$service"]="$value" ;;
+      kv:build)            svc_build["$service"]="true"; svc_context["$service"]="$value" ;;
+      kv:build.context)    svc_build["$service"]="true"; svc_context["$service"]="$value" ;;
+      kv:build.dockerfile) svc_build["$service"]="true"; svc_dockerfile["$service"]="$value" ;;
+      kv:build.target)     svc_target["$service"]="$value" ;;
+    esac
+  done < <(compose_yaml_entries "$COMPOSE_FILE" "$COMPOSE_YAML_SEPARATOR")
+
+  for service in ${order[@]+"${order[@]}"}; do
+    [ "${svc_build[$service]:-}" = "true" ] || continue
+    readonly_fact "$service" "${svc_image[$service]:-}" "${svc_context[$service]:-}" \
+        "${svc_dockerfile[$service]:-}" "${svc_target[$service]:-}"
+  done
+  return 0
+}
+
+# compose.yml がビルドするイメージについて、Dockerfile からビルド時の書き込み先を、
+# ENTRYPOINT / CMD のスクリプトから実行時の書き込み先を集める。
+# 事実はイメージ名で記録するため、同じイメージを使う別サービス
+# (例: base がビルドしたイメージを app が使う) の判定でも参照できる。
+readonly_collect_dockerfile_facts() {
+  local out_file="$1"
+  local service image context dockerfile target compose_dir image_key script
+  local collected="false"
+
+  compose_dir="$(compose_file_dir)" || return 1
+  while IFS="$READONLY_FACT_SEPARATOR" read -r service image context dockerfile target; do
+    [ -n "$service" ] || continue
+    [ -n "$context" ] || context="."
+    case "$context" in
+      /*) ;;
+      *) context="${compose_dir%/}/${context}" ;;
+    esac
+    [ -n "$dockerfile" ] || dockerfile="Dockerfile"
+    case "$dockerfile" in
+      /*) ;;
+      *) dockerfile="${context%/}/${dockerfile}" ;;
+    esac
+    # "context: ." のような指定で入る /./ を畳んで、表示するパスを読みやすくする。
+    context="${context//\/.\//\/}"
+    context="${context%/.}"
+    dockerfile="${dockerfile//\/.\//\/}"
+    image_key="${image:-service:${service}}"
+    if [ ! -f "$dockerfile" ]; then
+      readonly_fact img_note "$image_key" \
+          "Dockerfile が見つからないため (${dockerfile})、ビルド時に書き込むディレクトリは判別できていません。" \
+          >> "$out_file"
+      continue
+    fi
+    readonly_fact img_dockerfile "$image_key" "$dockerfile" "$service" "$target" >> "$out_file"
+    readonly_parse_dockerfile "$out_file" "$image_key" "$dockerfile" "$context" "$target" \
+        || continue
+    collected="true"
+    # ENTRYPOINT / CMD が指すスクリプトは、ビルド時ではなく実行時に走る。
+    # ここで拾った書き込み先が、read_only にしたときに本当に困る場所になる。
+    READONLY_SCAN_WORKDIR="$READONLY_DOCKERFILE_WORKDIR"
+    for script in ${READONLY_ENTRYPOINT_SCRIPTS[@]+"${READONLY_ENTRYPOINT_SCRIPTS[@]}"}; do
+      readonly_scan_context_script "$out_file" "$image_key" "$context" "$script" 1
+    done
+  done < <(readonly_collect_build_definitions)
+
+  [ "$collected" = "true" ]
+}
+
 # コンテナの中から、書き込みに関わる状態を 1 回の exec でまとめて取得する。
 #   - /proc/self/mounts       : どのパスが読み取り専用 (ro) でマウントされているか
 #   - JBOSS_HOME の解決結果   : JBoss EAP のディレクトリを対象へ加えるため
@@ -16222,6 +17655,135 @@ readonly_add_probe_dir() {
   [ ${#probe_dirs[@]} -lt "$READONLY_PROBE_MAX_DIRS" ] || return 0
   probe_seen["$dir"]="true"
   probe_dirs+=("$dir")
+  return 0
+}
+
+# コンテナ内の起動スクリプトの中身を、1 回の exec でまとめて取り出す。
+# 目印はプローブと同じ理由でスクリプト側へ直接書いており、READONLY_SCRIPT_MARK と
+# 読み取り行数の上限 (READONLY_SCRIPT_MAX_LINES) を変えるときは両方を合わせる。
+readonly_container_script_dump() {
+  local cid="$1"
+  shift
+  docker exec "$cid" /bin/sh -c '
+for target in "$@"; do
+  printf "__BUILD_AND_VERIFY_RO_SCRIPT__FILE %s\n" "$target"
+  if [ -f "$target" ] && [ -r "$target" ]; then
+    head -n 2000 "$target" 2>/dev/null || true
+  else
+    printf "%s\n" "__BUILD_AND_VERIFY_RO_SCRIPT__MISSING"
+  fi
+done
+printf "%s\n" "__BUILD_AND_VERIFY_RO_SCRIPT__END"
+' script "$@" 2>/dev/null
+}
+
+# 走査待ちの起動スクリプト (source されていたもの)。
+READONLY_SCRIPT_QUEUE=()
+
+# 取り出した 1 スクリプトぶんの中身を走査し、実行時の書き込み先を記録する。
+readonly_flush_container_script() {
+  local out_file="$1" service="$2" script="$3" status="$4" body_file="$5" entry
+
+  [ -n "$script" ] || return 0
+  [ -z "${READONLY_SCRIPT_SCANNED["${service}|${script}"]:-}" ] || return 0
+  READONLY_SCRIPT_SCANNED["${service}|${script}"]="true"
+  if [ "$status" != "ok" ] || [ ! -s "$body_file" ]; then
+    readonly_fact rt_script "$service" "$script" "未取得" \
+        "コンテナ内でこのスクリプトを読めなかったため、実行時の書き込みは確認できていません。" \
+        >> "$out_file"
+    return 0
+  fi
+  # バイナリの ENTRYPOINT を読み込まないよう、テキストのスクリプトだけを対象にする。
+  case "$script" in
+    *.sh|*.bash|*.ksh) ;;
+    *)
+      [ "$(head -c 2 "$body_file" 2>/dev/null)" = '#!' ] || return 0
+      ;;
+  esac
+  [ "$READONLY_SCRIPT_FILE_COUNT" -lt "$READONLY_SCRIPT_MAX_FILES" ] || return 0
+  READONLY_SCRIPT_FILE_COUNT=$((READONLY_SCRIPT_FILE_COUNT + 1))
+  readonly_fact rt_script "$service" "$script" "コンテナ内" "$script" >> "$out_file"
+  readonly_scan_script_text "$out_file" rt_script_write "$service" "$script" < "$body_file"
+  for entry in ${READONLY_SCRIPT_SOURCES[@]+"${READONLY_SCRIPT_SOURCES[@]}"}; do
+    READONLY_SCRIPT_QUEUE+=("$entry")
+  done
+  return 0
+}
+
+# 実行中のコンテナから、ENTRYPOINT / CMD が指す起動スクリプトの書き込み先を集める。
+# ここで見つかる書き込みは、ビルド時ではなく「コンテナを起動するたびに起きる」ため、
+# read_only を有効にしたときに実際へ失敗する場所になる。
+readonly_collect_container_scripts() {
+  local out_file="$1" service="$2" cid="$3"
+  local token line current="" status="" dump_file body_file resolved round=0
+  local -a pending=()
+  local -A queued=()
+
+  while IFS= read -r token; do
+    [ -n "$token" ] || continue
+    case "$token" in
+      /*) ;;
+      *) continue ;;                       # 相対指定は実体のパスを決められない
+    esac
+    readonly_looks_like_script "$token" || continue
+    [ -z "${queued[$token]:-}" ] || continue
+    queued["$token"]="true"
+    pending+=("$token")
+  done < <(docker inspect \
+      -f '{{range .Config.Entrypoint}}{{.}}{{"\n"}}{{end}}{{range .Config.Cmd}}{{.}}{{"\n"}}{{end}}' \
+      "$cid" 2>/dev/null || true)
+  [ ${#pending[@]} -gt 0 ] || return 0
+
+  dump_file="$(mktemp 2>/dev/null)" || return 0
+  if ! body_file="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$dump_file"
+    return 0
+  fi
+
+  # source されていたスクリプトを追うため、2 周まで読む。
+  while [ ${#pending[@]} -gt 0 ] && [ "$round" -lt 2 ]; do
+    round=$((round + 1))
+    READONLY_SCRIPT_QUEUE=()
+    readonly_container_script_dump "$cid" "${pending[@]}" > "$dump_file"
+    pending=()
+    current=""
+    status=""
+    : > "$body_file"
+    while IFS= read -r line; do
+      case "$line" in
+        "${READONLY_SCRIPT_MARK}FILE "*)
+          readonly_flush_container_script "$out_file" "$service" "$current" "$status" "$body_file"
+          current="${line#"${READONLY_SCRIPT_MARK}FILE "}"
+          status="ok"
+          : > "$body_file"
+          continue
+          ;;
+        "${READONLY_SCRIPT_MARK}MISSING")
+          status="missing"
+          continue
+          ;;
+        "${READONLY_SCRIPT_MARK}END")
+          readonly_flush_container_script "$out_file" "$service" "$current" "$status" "$body_file"
+          current=""
+          status=""
+          : > "$body_file"
+          continue
+          ;;
+      esac
+      printf '%s\n' "$line" >> "$body_file"
+    done < "$dump_file"
+
+    for token in ${READONLY_SCRIPT_QUEUE[@]+"${READONLY_SCRIPT_QUEUE[@]}"}; do
+      readonly_scan_normalize_path "$token" || continue
+      resolved="$READONLY_SCAN_PATH"
+      [ -n "$resolved" ] || continue
+      [ -z "${queued[$resolved]:-}" ] || continue
+      queued["$resolved"]="true"
+      pending+=("$resolved")
+    done
+  done
+
+  rm -f -- "$dump_file" "$body_file"
   return 0
 }
 
@@ -16316,6 +17878,11 @@ readonly_collect_runtime_facts() {
         done
       done < <(collect_container_process_cmdlines "$cid")
 
+      # 起動スクリプトの走査に備え、コンテナの作業ディレクトリを基点にする。
+      # 続く環境変数の取り込みで、${JBOSS_HOME} のようなパスも展開できるようになる。
+      readonly_scan_reset \
+          "$(docker inspect -f '{{.Config.WorkingDir}}' "$cid" 2>/dev/null || true)"
+
       # ディレクトリを指す環境変数。値がパスでないもの、認証情報を持ちやすい名前は除く。
       while IFS= read -r line; do
         case "$line" in
@@ -16334,6 +17901,7 @@ readonly_collect_runtime_facts() {
           *:*) continue ;;
         esac
         readonly_fact rt_env "$service" "$env_name" "$env_value" >> "$out_file"
+        readonly_scan_set_var "$env_name" "$env_value"
         # ディレクトリを指す名前のものだけ、実在と書き込み可否まで確認する。
         # (*_HOME はインストール先を指すため対象にしない)
         case "${env_name^^}" in
@@ -16372,6 +17940,10 @@ readonly_collect_runtime_facts() {
             ;;
         esac
       done < <(readonly_container_probe "$cid" "${probe_dirs[@]}")
+
+      # 起動スクリプト (entrypoint.sh 等) が、起動のたびに書き込む場所。
+      # Dockerfile 側の走査と違い、イメージへ同梱されたスクリプトも確認できる。
+      readonly_collect_container_scripts "$out_file" "$service" "$cid"
     else
       readonly_fact note "$service" \
           "コンテナが停止しているため (状態: ${state})、コンテナ内の書き込み可否は確認できていません。compose.yml の定義とマウント・書き込み層の情報だけで判定しています。" \
@@ -16443,6 +18015,7 @@ read_readonly_analysis_summary() {
       READONLY_CHECK=*)             READONLY_CHECK="${line#*=}" ;;
       READONLY_RECOMMEND=*)         READONLY_RECOMMEND="${line#*=}" ;;
       READONLY_OK=*)                READONLY_OK="${line#*=}" ;;
+      READONLY_BUILD_ONLY=*)        READONLY_BUILD_ONLY="${line#*=}" ;;
       READONLY_SERVICES=*)          READONLY_SERVICES="${line#*=}" ;;
       READONLY_ENABLED_SERVICES=*)  READONLY_ENABLED_SERVICES="${line#*=}" ;;
       READONLY_VERDICT=*)           READONLY_VERDICT="${line#*=}" ;;
@@ -16503,15 +18076,25 @@ analyze_readonly_filesystem() {
     return 1
   fi
 
+  # Dockerfile からビルド時の書き込み先を、ENTRYPOINT / CMD のスクリプトから
+  # 実行時の書き込み先を集める。ビルド時に書いただけのディレクトリは read_only の
+  # ままでも問題にならないため、両者を分けて判定するのに要る。
+  if readonly_collect_dockerfile_facts "$facts_file"; then
+    READONLY_ANALYSIS_BUILD_STATUS="Dockerfile を解析し、ビルド時の書き込み先と実行時 (起動スクリプト) の書き込み先を分けて判定しました。"
+  else
+    READONLY_ANALYSIS_BUILD_STATUS="compose.yml に build 定義が無いか Dockerfile を読めなかったため、ビルド時の書き込み先は判別していません (実行時の書き込みだけで判定しています)。"
+  fi
+
   # 実行状況からの判定は、今回の実行でコンテナへ触れている場合だけ行う。
   # 前回の実行が残したコンテナを今回の結果として扱わないための条件。
   if [ "$COMPOSE_UP_ATTEMPTED" = "true" ] && readonly_collect_runtime_facts "$facts_file"; then
-    READONLY_ANALYSIS_COLLECT_STATUS="compose.yml の定義と、実際に動いたコンテナの状態 (マウント・書き込み層・コンテナ内から見た書き込み可否・JVM パラメータ・ログ) から判定しました。"
+    READONLY_ANALYSIS_COLLECT_STATUS="compose.yml の定義と、実際に動いたコンテナの状態 (マウント・書き込み層・コンテナ内から見た書き込み可否・起動スクリプト・JVM パラメータ・ログ) から判定しました。"
   elif [ "$COMPOSE_UP_ATTEMPTED" = "true" ]; then
-    READONLY_ANALYSIS_COLLECT_STATUS="コンテナが 1 つも見つからなかったため、compose.yml の定義だけで判定しました。"
+    READONLY_ANALYSIS_COLLECT_STATUS="コンテナが 1 つも見つからなかったため、compose.yml と Dockerfile の定義だけで判定しました。"
   else
-    READONLY_ANALYSIS_COLLECT_STATUS="コンテナを起動していないため、compose.yml の定義だけで判定しました (--verify-startup または --verify-url を併用すると、実際の書き込み状況まで確認します)。"
+    READONLY_ANALYSIS_COLLECT_STATUS="コンテナを起動していないため、compose.yml と Dockerfile の定義だけで判定しました (--verify-startup または --verify-url を併用すると、実際の書き込み状況まで確認します)。"
   fi
+  READONLY_ANALYSIS_COLLECT_STATUS="${READONLY_ANALYSIS_COLLECT_STATUS} ${READONLY_ANALYSIS_BUILD_STATUS}"
   write_readonly_analysis_meta "$meta_file" "$exit_status"
 
   excel_path="$(prepare_analysis_output \
@@ -16574,7 +18157,7 @@ show_readonly_filesystem_analysis() {
   else
     log "読み取り専用ファイルシステム分析: ${READONLY_VERDICT}"
   fi
-  log "  対象 ${READONLY_SERVICES} サービス (うち read_only 有効 ${READONLY_ENABLED_SERVICES})、検出ディレクトリ ${READONLY_TOTAL} 件 (要対応 ${READONLY_ACTION} / 要確認 ${READONLY_CHECK} / 推奨 ${READONLY_RECOMMEND} / OK ${READONLY_OK})"
+  log "  対象 ${READONLY_SERVICES} サービス (うち read_only 有効 ${READONLY_ENABLED_SERVICES})、検出ディレクトリ ${READONLY_TOTAL} 件 (要対応 ${READONLY_ACTION} / 要確認 ${READONLY_CHECK} / 推奨 ${READONLY_RECOMMEND} / OK ${READONLY_OK} / ビルド時のみ ${READONLY_BUILD_ONLY})"
   if [ -n "$READONLY_ANALYSIS_EXCEL_FILE" ]; then
     log "読み取り専用ファイルシステム分析の Excel ブックを出力しました: $READONLY_ANALYSIS_EXCEL_FILE"
   fi

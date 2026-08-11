@@ -56,7 +56,7 @@
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
 | 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
-| 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
+| 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -98,7 +98,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 後半 | Docker 完全クリーンアップ | 対象の集計、確認フレーズ、削除、検証 |
 | 後半 | ビルドの停滞検知・進捗表示 | ビルド出力の読み手、監視プロセス、停滞診断、上限時間での中断 |
 | 後半 | WAR デプロイ時 Java 例外解析 | 解析ヘルパー (Python 3) の埋め込みと、ログ収集・実行・表示・レポート追記 |
-| 後半 | 読み取り専用ファイルシステム分析 | 分析ヘルパー (Python 3) の埋め込みと、`compose.yml` / 実行状況の収集・実行・表示・レポート追記 |
+| 後半 | 読み取り専用ファイルシステム分析 | 分析ヘルパー (Python 3) の埋め込みと、`compose.yml` / `Dockerfile` (ビルド時) / 起動スクリプト・実行状況 (実行時) の収集・実行・表示・レポート追記 |
 | 後半 | 全量レポート | `write_build_report` |
 | 後半 | 後始末 (`cleanup_all`) | EXIT トラップ本体 |
 | 末尾 | メイン処理 | ビルド → 起動 → 起動確認 → URL 確認 → 対話 → 情報表示 |
@@ -123,7 +123,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
 | Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
-| 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `show_readonly_filesystem_analysis` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、コンテナの書き込み状況の収集、判定結果の表示と Excel / テキスト出力 |
+| 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_dockerfile_facts` / `readonly_parse_dockerfile` / `readonly_shell_write_targets` / `readonly_scan_context_script` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `readonly_collect_container_scripts` / `show_readonly_filesystem_analysis` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、`Dockerfile` からのビルド時の書き込み先の収集、起動スクリプトからの実行時の書き込み先の収集、コンテナの書き込み状況の収集、判定結果の表示と Excel / テキスト出力 |
 | レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` / `append_readonly_analysis_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
@@ -201,7 +201,7 @@ flowchart TD
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
     AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → Excel 出力]
-    AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + 実行状況 → tmpfs / マウントの要否判定 → Excel 出力]
+    AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + Dockerfile ビルド時 + 起動スクリプト/実行状況 実行時<br/>→ tmpfs / マウントの要否判定 → Excel 出力]
     AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
 ```
@@ -214,9 +214,9 @@ Java 例外解析は成功経路では主処理の末尾で、失敗経路では
 必ず実行します** (6.7 参照)。
 
 読み取り専用ファイルシステムの書き込み先分析も同じタイミングで実行します。
-こちらは `compose.yml` の定義だけでも判定できるため、**コンテナを起動しない実行
-(ビルドのみ / ビルド失敗) でも必ず実行**し、実行状況からの根拠が無いことを
-結果へ明記します (6.8 参照)。
+こちらは `compose.yml` と `Dockerfile` の定義だけでも判定できるため、
+**コンテナを起動しない実行 (ビルドのみ / ビルド失敗) でも必ず実行**し、
+実行状況からの根拠が無いことを結果へ明記します (6.8 参照)。
 
 ### 3.2 ビルドフェーズの詳細
 
@@ -987,7 +987,7 @@ bash build_and_verify.sh --no-cache --verify-startup \
 | `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送信状況チェックの段ごとの判定 (送達の段は `--cwagent-delivery-report` 未指定なら「情報」) | 設定ファイルチェックのみ記録し、送達は「未確認」 |
 | `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 | `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (画面と同じ全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
-| `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` の定義だけで判定し、その旨を記録 |
+| `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -1436,18 +1436,51 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 `java.io.FileNotFoundException: ... (Read-only file system)` が 1 行出るだけで、
 原因が `read_only` にあるとは気付きにくいのが実情です。
 
-この分析は、`compose.yml` の設定・実際に動いたコンテナの状態・ソフトウェア別の
-知識を突き合わせ、ディレクトリごとに「書き込むのに書き込み先が無い」状態を
-判定します。`read_only` を使っていない構成でも、**書き込みが発生するディレクトリを
-洗い出し、有効化するなら `tmpfs` とバインドマウントのどちらを割り当てるべきか**を
-出力します。
+この分析は、`compose.yml` の設定・`Dockerfile` の内容・実際に動いたコンテナの
+状態・ソフトウェア別の知識を突き合わせ、ディレクトリごとに「書き込むのに
+書き込み先が無い」状態を判定します。`read_only` を使っていない構成でも、
+**書き込みが発生するディレクトリを洗い出し、有効化するなら `tmpfs` と
+バインドマウントのどちらを割り当てるべきか**を出力します。
+
+#### ビルド段階と実行段階を分ける
+
+`read_only: true` が妨げるのは**実行中の書き込みだけ**です。`Dockerfile` の
+`RUN mkdir` や `COPY` でビルド時に作ったディレクトリは、イメージのレイヤへ
+焼き込まれた後であり、実行時に読むだけなら読み取り専用のままで問題ありません。
+一方 `entrypoint.sh` が起動のたびに行う `mkdir` や設定ファイルの書き換えは、
+書き込み先が無ければ毎回失敗します。同じディレクトリでも段階によって結論が
+正反対になるため、次のように別々の事実として集めてから判定します。
+
+| 段階 | 収集対象 | 収集方法 | 判定 |
+| --- | --- | --- | --- |
+| ビルド時 | `Dockerfile` の `RUN` / `COPY` / `ADD` / `WORKDIR` / `VOLUME` / `ENTRYPOINT` / `CMD` | `compose.yml` の `build.context` / `build.dockerfile` / `build.target` から `Dockerfile` を解決し、**イメージに残る最終ステージ**と、そこへ `FROM` で引き継がれる前段だけを解析する | 実行時の書き込みが無ければ `ビルド時のみ` (対応不要) |
+| 実行時 | `ENTRYPOINT` / `CMD` が指す起動スクリプトの中身 | ビルドコンテキスト側の実体 (`COPY` の対応から特定) と、実行中のコンテナ内 (`docker exec` で読み出し) の両方。`source` / `.` で読み込む先も 1 段たどる | 書き込み先が無ければ `要対応` |
+
+シェルのコマンド列からの書き込み先の取り出しは、`RUN` と起動スクリプトで同じ
+処理を使います。対象は `mkdir` / `install` / `touch` / `cp` / `mv` / `ln` /
+`tee` / `sed -i` / `dd` / `rm` / `rmdir` / `chown` / `chmod` / `chgrp` /
+`truncate` / `tar -C` / `unzip -d` / `mktemp` / `curl -o` / `wget -O` /
+`keytool` / `openssl` と、リダイレクト (`>` / `>>`) です。
+
+`Dockerfile` の `ENV` / `ARG` と、スクリプト内の代入
+(`LOG_DIR="${LOG_DIR:-/var/log/app}"` のような既定値付きを含む) は展開に使います。
+**値が決まらないパス (未解決の変数・glob・作業ディレクトリが不明な相対パス) は、
+誤った指摘を避けるため候補にしません。** `/dev`・`/proc`・`/sys`・`/run/secrets`
+配下も対象外です。
+
+`Dockerfile` から得た事実は**イメージ名で記録**するため、`base` サービスが
+ビルドしたイメージを `app` サービスが使う構成でも、両方のサービスの判定で
+参照できます。イメージの `VOLUME` 宣言は、`read_only: true` でも匿名ボリュームが
+読み書き可でマウントされるため、書き込みできる場所として扱います。
 
 #### 判定に使う情報
 
 | 分類 | 収集方法 | 内容 |
 | --- | --- | --- |
-| `compose.yml` の定義 | ファイルの解析 | サービスごとの `read_only` / `tmpfs` / `volumes` (短記法・長記法とも) / `image` / `user` / `environment` |
-| コンテナの実状態 | `docker inspect` | `HostConfig.ReadonlyRootfs`、`Mounts` (種別・ソース・マウント先・読み書き)、`HostConfig.Tmpfs` |
+| `compose.yml` の定義 | ファイルの解析 | サービスごとの `read_only` / `tmpfs` / `volumes` (短記法・長記法とも) / `image` / `user` / `environment` / `build` |
+| `Dockerfile` (ビルド時) | ファイルの解析 | 最終ステージの `RUN` / `COPY` / `ADD` / `WORKDIR` が書き込むディレクトリ、`VOLUME` 宣言、`ENTRYPOINT` / `CMD` |
+| 起動スクリプト (実行時) | ビルドコンテキストの読み取り / `docker exec` (1 回) | `entrypoint.sh` などの中身から取り出した書き込み先 |
+| コンテナの実状態 | `docker inspect` | `HostConfig.ReadonlyRootfs`、`Mounts` (種別・ソース・マウント先・読み書き)、`HostConfig.Tmpfs`、`Config.Entrypoint` / `Config.Cmd` / `Config.WorkingDir` |
 | 書き込みの実績 | `docker diff` | 書き込み層に残った追加・変更・削除。**アプリが実行中に実際へ書いた場所** |
 | コンテナ内の状態 | `docker exec` (1 回) | `/proc/self/mounts` の `ro` フラグ、ディレクトリごとの存在・書き込み可否 (`test -w`)・ファイル数・起動後 (PID 1 より新しい) に更新されたファイル数、`JBOSS_HOME` の解決結果 |
 | 起動パラメータ | `/proc/<pid>/cmdline` | `-Djava.io.tmpdir` / `-XX:HeapDumpPath` / `-Xloggc` など書き込み先を明示している JVM パラメータ |
@@ -1484,18 +1517,29 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 
 | 判定 | 条件 | 意味 |
 | --- | --- | --- |
-| `要対応` | `read_only` 有効 + 書き込み先が無い + (必須のディレクトリ、または書き込み実績がある) | そのままでは起動・デプロイが失敗する |
+| `要対応` | `read_only` 有効 + 書き込み先が無い + (必須のディレクトリ、または実行時の書き込みを確認できた) | そのままでは起動・デプロイが失敗する |
 | `要確認` | 書き込み先はあるが副作用がある / 書き込みの有無を確認したい | 永続が必要なディレクトリへ `tmpfs`、イメージ内のファイルを隠す `tmpfs`、読み取り専用マウント など |
-| `推奨` | `read_only` が未設定・`false` で、書き込みが発生する | 有効化するなら書き込み先の用意が必要 |
+| `推奨` | `read_only` が未設定・`false` で、実行時に書き込みが発生する | 有効化するなら書き込み先の用意が必要 |
 | `OK` | 書き込み先が確保されている | 対応不要 |
+| `ビルド時のみ` | ビルド段階の書き込みだけを検出し、実行時の書き込みが無い | イメージへ焼き込み済みのため `read_only: true` のままで動く (対応不要) |
 | `情報` | 必須でなく、書き込みの実績も確認できていない | 参考情報 |
+
+`ビルド時のみ` と判定したディレクトリは、`compose.yml` の設定例にも含めません
+(用意しても意味が無いため)。ディレクトリごとの「書き込み時期」
+(`ビルド時` / `実行時` / `ビルド時+実行時` / `未確認`) も併せて出力するため、
+なぜ対応が要る / 要らないのかを根拠から追えます。
+
+なお、`Dockerfile` を読めない場合 (`compose.yml` に `build` 定義が無い、
+イメージを pull しているだけ、など) はビルド時の書き込み先を判別できないため、
+`ビルド時のみ` の判定は付きません。その旨を `情報の取得状況` へ明記したうえで、
+実行時の書き込みだけで判定します。
 
 判定は**実際のコンテナの状態を優先**します。`compose.yml` が `read_only: true` でも
 コンテナを作り直していなければ実状態は `false` のことがあるため、両者が食い違う
 場合はその旨を結果へ残します。
 
-ディレクトリ 1 件ごとに、用途 / 書き込む内容 / 必須度 / 現在の設定 /
-推奨する設定 / 理由 / 対処 / 判定の根拠 (実測値・ログ) を出力し、
+ディレクトリ 1 件ごとに、用途 / 書き込む内容 / 書き込み時期 / 必須度 /
+現在の設定 / 推奨する設定 / 理由 / 対処 / 判定の根拠 (実測値・ログ) を出力し、
 不足分だけを埋めた **`compose.yml` の設定例**をサービス単位で生成します。
 
 `tmpfs` とボリュームの使い分けも判定に含みます。消えてよい一時領域は `tmpfs`、
@@ -1510,7 +1554,7 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | --- | --- |
 | 画面 | 要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧、`compose.yml` の設定例) |
 | 全量レポート `[11]` | 画面と同じ要約と、出力ファイルのパス・情報の取得状況 |
-| Excel (`..._readonly_filesystem.xlsx`) | 概要 / サービス別判定 / ディレクトリ判定 / 判定の根拠 / 書き込み実績 / 推奨 compose 設定 / 参考: 書き込み先の知識 の 7 シート |
+| Excel (`..._readonly_filesystem.xlsx`) | 概要 / サービス別判定 / ディレクトリ判定 / ビルド時/実行時の書き込み / 判定の根拠 / 書き込み実績 / 推奨 compose 設定 / 参考: 書き込み先の知識 の 8 シート |
 | テキスト (`..._readonly_filesystem.txt`) | Excel と同じ内容。全ディレクトリの判定・根拠・参考知識を含む |
 
 Excel はフォント Meiryo UI、行高を内容と列幅から計算して明示し、見出し行の固定と
@@ -1526,7 +1570,7 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | Python 3 が無い場合 | 分析をスキップし `[WARN]` を出す。ビルドの成否は変えない |
 | 終了コードへの影響 | **なし**。`要対応` を検出しても終了コードは変わらない |
 | `--dry-run` | 分析しない (全量レポート `[11]` へ理由を記録) |
-| コンテナ未起動 (ビルドのみ / ビルド失敗) | **分析する**。`compose.yml` の定義だけで判定し、実行状況からの根拠が無いことを `情報の取得状況` へ明記する |
+| コンテナ未起動 (ビルドのみ / ビルド失敗) | **分析する**。`compose.yml` と `Dockerfile` の定義だけで判定し、実行状況からの根拠が無いことを `情報の取得状況` へ明記する。起動スクリプトはビルドコンテキスト側の実体だけを読む |
 | `compose up` 失敗・起動確認失敗 | **分析する**。停止済みコンテナでもマウント定義と書き込み層の情報は取得できるため、分かる範囲を残す |
 
 ---
@@ -1716,6 +1760,8 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 # 17-4) 読み取り専用ファイルシステム (read_only) の書き込み先分析
 #       既定で毎回実行される。--report-dir があれば
 #       reports/build_and_verify_<日時>_readonly_filesystem.xlsx / .txt も出力される
+#       Dockerfile のビルド時に書くだけのディレクトリは「ビルド時のみ」として
+#       対象から外し、entrypoint.sh などが起動のたびに書く場所を「要対応」に挙げる
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
