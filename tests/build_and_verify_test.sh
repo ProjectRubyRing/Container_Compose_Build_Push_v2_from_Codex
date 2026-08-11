@@ -3027,4 +3027,226 @@ assert_contains "$build_bad_value_output" \
   "--build-timeout には 0 以上の整数を指定してください: abc"
 unset FAKE_DOCKER_DATA_ROOT
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, and Docker cleanup scenarios\n'
+# ---------------------------------------------------------------------------
+# 証明書チェック本体 (コンテナ内で docker exec される埋め込みスクリプト) の詳細診断。
+# docker のモックは本体の出力そのものを模擬しているため、埋め込みスクリプトの中身は
+# そこでは検証できない。ここでは build_and_verify.sh から本体を取り出し、実物の
+# openssl と偽の keytool / curl / getent で直接動かして診断内容を確認する。
+#
+# 再現するのは「自己証明書 (cacert.crt) だけを受領し、秘密鍵が無い」構成:
+#   トラストストア = JDK 標準 CA 2 枚 + 受領 cacert.crt
+#   サーバ提示     = リーフ + local-test-ca (自己署名) ← トラストストアに無い
+# 取り込みは成功しているのに接続できない、という状態を診断できることを確かめる。
+# ---------------------------------------------------------------------------
+if ! command -v openssl >/dev/null 2>&1; then
+  printf 'SKIP: openssl が無いため証明書チェックの詳細診断テストを省略します\n'
+else
+  # Git Bash (MSYS2) は "/C=JP/..." を Windows パスへ変換するため除外する。
+  # Linux では無害。
+  export MSYS2_ARG_CONV_EXCL='/C='
+
+  CC_T="$TEST_TMP/cert-check"
+  mkdir -p "$CC_T/pki" "$CC_T/bin" "$CC_T/java/bin" "$CC_T/java/lib/security" \
+           "$CC_T/trust" "$CC_T/store"
+
+  cc_begin_line="$(grep -n "cat <<'CERT_CHECK_SCRIPT'" "$REPO_ROOT/build_and_verify.sh" \
+    | head -n 1 | cut -d: -f1)"
+  cc_end_line="$(grep -n '^CERT_CHECK_SCRIPT$' "$REPO_ROOT/build_and_verify.sh" \
+    | head -n 1 | cut -d: -f1)"
+  [ -n "$cc_begin_line" ] && [ -n "$cc_end_line" ] \
+    || fail "could not locate the CERT_CHECK_SCRIPT heredoc in build_and_verify.sh"
+  sed -n "$((cc_begin_line + 1)),$((cc_end_line - 1))p" "$REPO_ROOT/build_and_verify.sh" \
+    > "$CC_T/cert-check.sh"
+  sh -n "$CC_T/cert-check.sh" \
+    || fail "the embedded cert-check script is not valid POSIX sh"
+
+  cc_make_ca() {  # $1=ファイル名の基底 $2=CN
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout "$CC_T/pki/$1.key" -out "$CC_T/pki/$1.crt" \
+      -subj "/C=JP/O=Local Test Org/CN=$2" \
+      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1 \
+      || fail "openssl could not generate the test CA: $1"
+  }
+  cc_make_ca jdk-ca-1 "Fake Public Root CA 1"
+  cc_make_ca jdk-ca-2 "Fake Public Root CA 2"
+  cc_make_ca cacert "Received Self-Signed CA"
+  cc_make_ca local-test-ca "Local Test Server-Issuing CA (no received key)"
+
+  cat > "$CC_T/pki/leaf.ext" <<'CERT_CHECK_LEAF_EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:secure-api,DNS:localhost,IP:127.0.0.1
+CERT_CHECK_LEAF_EXT
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$CC_T/pki/leaf.key" -out "$CC_T/pki/leaf.csr" \
+    -subj "/C=JP/O=Local Test Org/CN=secure-api" >/dev/null 2>&1 \
+    || fail "openssl could not generate the test leaf CSR"
+  openssl x509 -req -in "$CC_T/pki/leaf.csr" \
+    -CA "$CC_T/pki/local-test-ca.crt" -CAkey "$CC_T/pki/local-test-ca.key" \
+    -CAcreateserial -days 825 -sha256 -extfile "$CC_T/pki/leaf.ext" \
+    -out "$CC_T/pki/leaf.crt" >/dev/null 2>&1 \
+    || fail "openssl could not issue the test leaf certificate"
+
+  # サーバが提示するチェーン (リーフ + 発行元の自己署名 CA)
+  cat "$CC_T/pki/leaf.crt" "$CC_T/pki/local-test-ca.crt" > "$CC_T/pki/presented.pem"
+  # 受領物の投入口 (PKI_TRUST_DIR として渡す)
+  cp "$CC_T/pki/cacert.crt" "$CC_T/trust/cacert.crt"
+
+  # keytool -list -rfc が返す「トラストストアの中身」を組み立てる。
+  # $1 に追加で入れる CA の基底名を並べる (空なら JDK 標準の 2 枚だけ)。
+  cc_write_store() {
+    {
+      printf 'Keystore type: PKCS12\nKeystore provider: SUN\n\n'
+      printf 'Your keystore contains %s entries\n\n' "$(($# + 2))"
+      for cc_entry in "jdk-ca-1:fakepublicca1 [jdk]" "jdk-ca-2:fakepublicca2 [jdk]" "$@"; do
+        printf 'Alias name: %s\nCreation date: Aug 5, 2026\nEntry type: trustedCertEntry\n\n' \
+          "${cc_entry#*:}"
+        cat "$CC_T/pki/${cc_entry%%:*}.crt"
+        printf '\n\n'
+      done
+    } > "$CC_T/store-rfc.out"
+  }
+
+  # keytool -list (非 rfc) が返す JDK 標準 cacerts の指紋一覧
+  {
+    printf 'Keystore type: JKS\nKeystore provider: SUN\n\nYour keystore contains 2 entries\n\n'
+    for cc_n in 1 2; do
+      printf 'fakepublicca%s [jdk], Aug 5, 2026, trustedCertEntry,\n' "$cc_n"
+      printf 'Certificate fingerprint (SHA-256): %s\n' \
+        "$(openssl x509 -in "$CC_T/pki/jdk-ca-$cc_n.crt" -noout -fingerprint -sha256 \
+           | sed 's/^.*=//')"
+    done
+  } > "$CC_T/jdk-list.out"
+
+  cat > "$CC_T/java/bin/keytool" <<CERT_CHECK_FAKE_KEYTOOL
+#!/bin/sh
+case " \$* " in
+  *" -rfc "*)  cat "$CC_T/store-rfc.out"; exit 0 ;;
+  *" -list "*) cat "$CC_T/jdk-list.out";  exit 0 ;;
+esac
+exit 1
+CERT_CHECK_FAKE_KEYTOOL
+  chmod +x "$CC_T/java/bin/keytool"
+  : > "$CC_T/java/lib/security/cacerts"
+
+  # 偽 curl: サーバ提示チェーンの CA を含む束を渡されたときだけ成功する。
+  cat > "$CC_T/bin/curl" <<CERT_CHECK_FAKE_CURL
+#!/bin/sh
+cc_cacert=""
+cc_prev=""
+for cc_arg in "\$@"; do
+  [ "\$cc_prev" = "--cacert" ] && cc_cacert="\$cc_arg"
+  cc_prev="\$cc_arg"
+done
+cc_mark="\$(sed -n '3p' "$CC_T/pki/local-test-ca.crt")"
+if [ -n "\$cc_cacert" ] && grep -qF "\$cc_mark" "\$cc_cacert" 2>/dev/null; then
+  printf '200'
+  exit 0
+fi
+printf 'curl: (60) SSL certificate problem: self-signed certificate in certificate chain\n' >&2
+exit 60
+CERT_CHECK_FAKE_CURL
+  chmod +x "$CC_T/bin/curl"
+
+  # openssl は s_client だけ差し替え、他は本物へ委譲する。
+  cat > "$CC_T/bin/openssl" <<CERT_CHECK_FAKE_OPENSSL
+#!/bin/sh
+if [ "\$1" = "s_client" ]; then
+  printf 'CONNECTED(00000003)\nCertificate chain\n'
+  cat "$CC_T/pki/presented.pem"
+  printf -- '---\nVerify return code: 19 (self-signed certificate in certificate chain)\n'
+  exit 0
+fi
+exec "$(command -v openssl)" "\$@"
+CERT_CHECK_FAKE_OPENSSL
+  chmod +x "$CC_T/bin/openssl"
+
+  cat > "$CC_T/bin/getent" <<'CERT_CHECK_FAKE_GETENT'
+#!/bin/sh
+[ "${1:-}" = "hosts" ] && [ "${2:-}" = "secure-api" ] || exit 2
+printf '172.20.0.5 secure-api\n'
+CERT_CHECK_FAKE_GETENT
+  chmod +x "$CC_T/bin/getent"
+
+  : > "$CC_T/store/extraslb-truststore.p12"
+
+  cc_run_check() {  # $1=出力ファイル
+    (
+      PATH="$CC_T/bin:$PATH"
+      export PATH
+      export JAVA_HOME="$CC_T/java"
+      export EXTRASLB_TRUSTSTORE_PATH="$CC_T/store/extraslb-truststore.p12"
+      export EXTRASLB_TRUSTSTORE_PASSWORD='changeit'
+      export PKI_TRUST_DIR="$CC_T/trust"
+      export SECURE_API_URL='https://secure-api:8443/api/v1/ping'
+      sh "$CC_T/cert-check.sh"
+    ) > "$1" 2>&1
+  }
+
+  # --- (1) 受領 CA は入っているが、サーバ証明書の発行元が別 CA ---------------
+  cc_missing_output="$TEST_TMP/cert-check-missing-anchor.out"
+  cc_write_store "cacert:extraslb-ca-1"
+  cc_rc=0
+  cc_run_check "$cc_missing_output" || cc_rc=$?
+  [ "$cc_rc" -eq 1 ] \
+    || { cat "$cc_missing_output" >&2; fail "cert check should exit 1 for a missing trust anchor (got $cc_rc)"; }
+
+  # 取り込み自体は成功していることを示す (0 件なら取り込み漏れと区別できない)
+  assert_contains "$cc_missing_output" "独自に追加された CA: 1 件 (JDK 標準 cacerts に無い証明書)"
+  assert_contains "$cc_missing_output" "alias=extraslb-ca-1"
+  assert_contains "$cc_missing_output" "[PASS] cacert.crt と同一の証明書がこのストアに登録されている"
+  # サーバが提示しているチェーンを解析できている
+  assert_contains "$cc_missing_output" "サーバが提示した証明書: 2 枚 (openssl s_client -showcerts)"
+  assert_contains "$cc_missing_output" \
+    "自己署名: YES (チェーンの最上位。クライアントが直接信頼している必要がある)"
+  assert_contains "$cc_missing_output" \
+    "[PASS] 接続先ホスト名 secure-api はサーバ証明書の SAN に含まれている"
+  # 失敗の原因を発行者 CA の不在まで特定できている
+  assert_contains "$cc_missing_output" "[FAIL] $CC_T/store/extraslb-truststore.p12 由来の PEM で接続失敗 (curl exit=60)"
+  assert_contains "$cc_missing_output" "★発行者 CA がこのトラストストアに無い: "
+  assert_contains "$cc_missing_output" "CN=Local Test Server-Issuing CA (no received key)"
+  assert_contains "$cc_missing_output" "自己署名: YES → これを信頼していないことが exit 60 の直接原因。"
+  assert_contains "$cc_missing_output" \
+    "★取り込み自体は成功している: cacert.crt はこのストアに入っている。"
+  assert_contains "$cc_missing_output" \
+    "検証: サーバが提示したチェーンを CA として渡すと接続できた。"
+  # 本命も失敗しているときの対照テストは PASS と数えない
+  assert_contains "$cc_missing_output" "対照テスト: --cacert 無しでも検証に失敗した (curl exit 60)。"
+  assert_not_contains "$cc_missing_output" "[PASS] 対照テスト"
+  # 次の一手が出ている
+  assert_contains "$cc_missing_output" "● 受領した自己証明書はストアに入っているのに接続できない"
+  assert_contains "$cc_missing_output" "● サーバ証明書の発行元 CA がトラストストアに入っていない"
+  assert_contains "$cc_missing_output" "判定: NG — 上記 [FAIL] の内容を確認してください。"
+
+  # --- (2) 発行元のローカル CA も信頼させた正常系 -----------------------------
+  cc_ok_output="$TEST_TMP/cert-check-trust-local.out"
+  cc_write_store "cacert:extraslb-ca-1" "local-test-ca:local-test-ca"
+  cc_run_check "$cc_ok_output" \
+    || { cat "$cc_ok_output" >&2; fail "cert check should exit 0 once the issuing CA is trusted"; }
+  assert_contains "$cc_ok_output" "独自に追加された CA: 2 件 (JDK 標準 cacerts に無い証明書)"
+  assert_contains "$cc_ok_output" "由来の PEM で接続成功 (HTTP 200)"
+  # 本命が成功しているときだけ対照テストは PASS になる
+  assert_contains "$cc_ok_output" "[PASS] 対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)"
+  assert_contains "$cc_ok_output" "判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。"
+  assert_not_contains "$cc_ok_output" "=== 3. 次の一手 ==="
+
+  # --- (3) 取り込み自体が漏れている (JDK 標準そのまま) ------------------------
+  cc_not_imported_output="$TEST_TMP/cert-check-not-imported.out"
+  cc_write_store
+  cc_rc=0
+  cc_run_check "$cc_not_imported_output" || cc_rc=$?
+  [ "$cc_rc" -eq 1 ] \
+    || { cat "$cc_not_imported_output" >&2; fail "cert check should exit 1 when nothing was imported (got $cc_rc)"; }
+  assert_contains "$cc_not_imported_output" "[WARN] 独自に追加された CA: 0 件"
+  assert_contains "$cc_not_imported_output" "[FAIL] cacert.crt はこのストアに登録されていない"
+  assert_contains "$cc_not_imported_output" "● 検出した CA 証明書がトラストストアに入っていない"
+  assert_contains "$cc_not_imported_output" "● トラストストアが JDK 標準 cacerts と同じ内容"
+  # 取り込み済みではないので、発行元違いの案内は出さない
+  assert_not_contains "$cc_not_imported_output" "★取り込み自体は成功している"
+
+  unset MSYS2_ARG_CONV_EXCL
+fi
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check chain diagnosis, and Docker cleanup scenarios\n'

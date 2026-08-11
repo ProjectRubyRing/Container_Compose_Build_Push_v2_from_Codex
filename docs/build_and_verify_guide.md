@@ -27,6 +27,7 @@
 8. [終了コード](#8-終了コード)
 9. [実行例](#9-実行例)
 10. [エラーと対処](#10-エラーと対処)
+11. [自己証明書だけがあり、秘密鍵が無い場合の対処](#11-自己証明書だけがあり秘密鍵が無い場合の対処)
 
 ---
 
@@ -682,13 +683,36 @@ services:
 | パスワード | `-Djavax.net.ssl.trustStorePassword` → 対応する `*_PASSWORD` 環境変数 → `changeit` → 無し (整合性チェックを省略) |
 | 接続先 | `https://` で始まる値を持つ環境変数 (`SECURE_API_URL` 等、最大 4 件) |
 | CA 証明書 | `${PKI_TRUST_DIR}/*.crt` → `*CACERT*` / `*CA_CERT*` / `*CA_BUNDLE*` 環境変数 |
-| 実行内容 | `keytool -list -rfc` で PEM バンドルへ書き出し → `curl --cacert` で接続 → `--cacert` 無しの対照テスト → CA 証明書の SHA-256 照合 (`openssl` があるとき) |
+| 実行内容 | `keytool -list -rfc` で PEM バンドルへ書き出し → `curl --cacert` で接続 → `--cacert` 無しの対照テスト → CA 証明書の SHA-256 照合 → **失敗時はチェーン解析による原因特定** (下表) |
 | タイムアウト | `curl` は接続 5 秒 / 全体 15 秒 |
 | 上限超過時 | 結果欄へ `注意: 検出した接続先 N 件のうち先頭 M 件のみ確認しました。` を出し、未確認分が残ることを判定と同じ場所に示す |
 | 終了扱い | `判定: NG` は診断結果としてそのまま操作選択へ戻る。設定を検出できない場合のみヘルパー失敗として扱う |
 
 パスワードはコンテナ内でだけ解決するため、`docker exec` のコマンドライン (ホストのプロセス引数)
 にも画面出力にも現れません。
+
+#### 証明書チェックが出す詳細診断
+
+`curl exit=60` のような終了コードだけでは「何が足りないのか」が分かりません。
+コンテナ内に `openssl` があるとき、証明書チェックは次の情報まで出します
+(`openssl` が無い場合は合否判定までを行い、その旨を `[SKIP]` で示します)。
+
+| セクション | 出力内容 |
+| --- | --- |
+| `0.` | `keytool` / `openssl` の所在。`openssl` が無ければ原因特定まで至らないことを明示 |
+| `1-N.` | **独自に追加された CA** — トラストストアの中身を JDK 標準 `cacerts` と SHA-256 で差分比較し、「このストアが標準に対して何を足したものか」だけを別名・subject・SHA-256・有効期限つきで表示。0 件なら取り込み漏れとして `[WARN]` |
+| `2-N.` | 接続先 URL のホスト・ポート・名前解決結果 |
+| `2-N.` | **サーバが提示した証明書チェーン** (`openssl s_client -showcerts`) を 1 枚ずつ subject / issuer / SHA-256 / 有効期間で表示。チェーン最上位が自己署名かどうかも判定 |
+| `2-N.` | サーバ証明書の **SAN と接続先ホスト名の一致**判定 (ワイルドカードは 1 ラベルまで) |
+| `2-N.` | 失敗時: `openssl verify` の原文 (`error 19` / `error 20` / `error 10` の意味を併記) |
+| `2-N.` | 失敗時: **サーバ証明書の発行者 CA がこのストアにあるか**を DN の正規化ハッシュで判定。無ければ「不足している CA」の subject と SHA-256 を提示 |
+| `2-N.` | 失敗時: **受領した CA 証明書は入っているのに発行者が別**という状態を専用に判定 (→ 11 章) |
+| `2-N.` | 失敗時: サーバ提示チェーンを `--cacert` に渡して再試行し、「不足は CA 1 点だけ」なのかを確定 |
+| `3.` | 検出した原因ごとの **次の一手** (実行できる形の `keytool -importcert` 等) |
+
+対照テスト (`--cacert` 無しの接続) は、**トラストストア経由の接続が成功しているときだけ**
+`[PASS]` になります。両方失敗している状態では対照テストは何も証明しないため、
+`[PASS]` とは数えず情報行として表示します。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 
@@ -1641,3 +1665,295 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `[NG] ロググループが存在しません` | 設定ファイルの `log_group_name` が CloudWatch Logs に無い | 先に作成しておくか、`--cwagent-create-log-group` を指定して再実行 |
 | `[未確認] Python 3 が見つからないため、設定ファイルの内容を解析できません` | 設定 JSON の解析に必要な Python 3 が無い | `python3` を利用可能にする (静的チェックの他の段は Python 無しでも動作する) |
 | `[未確認] aws コマンドが見つからない / AWS 認証が確認できない` | `--cwagent-delivery-target aws` で実 CloudWatch Logs を確認しようとした | `aws` を導入し `aws login --remote` で認証する。ローカル検証なら `logs.endpoint_override` で偽装サービスへ向ける |
+| `[FAIL] … 由来の PEM で接続失敗 (curl exit=60)` | サーバ証明書をトラストストアの CA 一式で検証できない | 続けて出る「詳細診断」を読む。`★発行者 CA がこのトラストストアに無い` なら不足している CA を取り込む (→ 11 章) |
+| `★発行者 CA がこのトラストストアに無い: …` | サーバ証明書を発行した CA がストアに入っていない | 表示された subject / SHA-256 の CA を配布元から入手し `keytool -importcert` で取り込む。JVM の再起動が必要 |
+| `★取り込み自体は成功している: cacert.crt はこのストアに入っている。` | 受領 CA は入っているが、サーバ証明書の発行元が別の CA | **秘密鍵の無い自己証明書を受領した構成の典型**。→ 11 章の A / B / C から選ぶ |
+| `[WARN] 独自に追加された CA: 0 件 (このストアは JDK 標準 … と同じ内容)` | 自己証明書がストアへ 1 枚も追加されていない | 取り込み先のストアの取り違え (JDK 同梱 `cacerts` と AP 用ストアの混同)、ビルド時の証明書の配置漏れを確認 |
+| `[FAIL] 接続先ホスト名 … がサーバ証明書の SAN に含まれていない` | CA は信頼できているが名前検証で落ちる | 接続先 URL を SAN 記載の名前へ合わせるか、その名前を SAN に含む証明書を発行し直す |
+| `対照テスト: --cacert 無しでも検証に失敗した (curl exit 60)。` | トラストストア経由も失敗しているため対照テストが成立していない | この行自体は原因ではない。上の `[FAIL]` と詳細診断を読む |
+| `[SKIP] openssl が無いため、サーバが提示する証明書チェーンは確認しない` | コンテナに `openssl` が無い | 合否判定のみ行われる。原因まで特定したい場合は調査用イメージへ `openssl` を入れる |
+| `[FAIL] 追加された CA '…' は有効期限が切れている` | トラストストア内の CA が期限切れ | 更新された CA 証明書へ入れ替える。コンテナの時刻ずれでも同じ症状になるため `date` も確認 |
+
+---
+
+## 11. 自己証明書だけがあり、秘密鍵が無い場合の対処
+
+「社内 CA から `cacert.crt` **だけ**を受領した」「サーバから証明書をエクスポートしたが
+`.key` が付いてこない」という状況は非常によくあります。この章はその状態で
+**何ができて何ができないのか**、**なぜ HTTPS が通らないのか**、**どう直すのか**を
+順を追って説明します。
+
+### 11.1 結論 (先に読む 3 行)
+
+1. **秘密鍵の無い証明書は「信じる側」でしか使えません。**「名乗る側」では使えません。
+2. したがって、`cacert.crt` を持っているだけでは、**その CA が発行したサーバ証明書を
+   サーバに用意することはできません**。サーバは別の CA が発行した証明書を出すしかありません。
+3. その結果クライアントは `curl exit 60`
+   (`self-signed certificate in certificate chain`) で必ず失敗します。
+   **トラストストアへの取り込みが失敗しているのではありません。**
+
+### 11.2 なぜそうなるのか — 証明書と秘密鍵の役割分担
+
+TLS で使う鍵ペアには、はっきり分かれた 2 つの役割があります。
+
+| 持ち物 | 中身 | できること | できないこと |
+| --- | --- | --- | --- |
+| **証明書** (`cacert.crt`) | 公開鍵 + 名前 + 署名 | 相手の署名を**検証**する。トラストアンカーとして配布する | 署名を**作る**。サーバとして名乗る |
+| **秘密鍵** (`cacert.key`) | 秘密鍵 | 署名を**作る** (= 証明書を発行する)。サーバとして名乗る | (公開してはいけない) |
+
+HTTPS の検証は「サーバ証明書 → その発行者 → …」とたどって、
+**クライアントが信頼している CA にたどり着けるか**で決まります。
+
+```
+サーバが提示するもの        クライアントが持っているもの
+─────────────────────      ─────────────────────────────
+[1] サーバ証明書            トラストストア
+    subject: secure-api       ├ (JDK 標準の公開 CA 群)
+    issuer : ★A              └ cacert.crt  (= 受領した自己署名 CA)
+      ↑ この ★A と同じ証明書がストアにあれば OK
+[2] ★A の証明書
+```
+
+`cacert.crt` の**秘密鍵が無い**と、`★A = cacert.crt` にすることが
+**暗号的に不可能**です。サーバ証明書に「cacert.crt が発行した」という署名を付けるには
+`cacert.key` が要るからです。そのため実際には別の CA (以下 `local-test-ca`) が
+サーバ証明書を発行し、チェーンは次のようになります。
+
+```
+サーバが提示するもの                クライアントが持っているもの
+─────────────────────────────      ─────────────────────────────
+[1] サーバ証明書                    トラストストア
+    issuer : local-test-ca            ├ (JDK 標準の公開 CA 群)
+[2] local-test-ca (自己署名)          └ cacert.crt   ← 入っている。が、関係ない
+      ↑ これがストアに無い  ✗ 検証失敗 (curl exit 60)
+```
+
+**取り込みは成功しているのに接続できない**のはこのためです。
+
+### 11.3 エラーメッセージの読み方
+
+#### curl
+
+| 終了コード / メッセージ | 意味 |
+| --- | --- |
+| `exit 60` + `self-signed certificate in certificate chain` | **チェーンの途中/最上位**に自己署名証明書があり、それを信頼していない。**本章の状況はこれ**。サーバ証明書自体が自己署名という意味ではない |
+| `exit 60` + `self-signed certificate` | **サーバ証明書そのもの**が自己署名 (CA を介していない)。その 1 枚をトラストストアへ入れる必要がある |
+| `exit 60` + `unable to get local issuer certificate` | 発行者 CA が見つからない。サーバが中間 CA を提示していない場合にも出る |
+| `exit 51` + `subject name does not match` | CA は信頼できているが、**ホスト名が SAN と一致しない** |
+| `exit 35` | TLS ハンドシェイク失敗 (プロトコル / 暗号スイート) |
+| `exit 7` / `exit 6` | 接続不可 / 名前解決失敗。**証明書以前の問題** |
+
+`exit 60` は「CA 証明書がこのストアに入っているか確認する」で止めず、
+**「どの CA が」入っていないのかまで**特定してください。証明書チェックの詳細診断
+(→ 5.4) がそれを出します。
+
+#### openssl verify
+
+| 出力 | 意味 |
+| --- | --- |
+| `error 19 … self-signed certificate in certificate chain` | チェーン最上位の自己署名 CA を信頼していない (**本章の状況**) |
+| `error 20 … unable to get local issuer certificate` | 発行者 CA をトラストストアから見つけられない |
+| `error 18 … self-signed certificate` | サーバ証明書そのものが自己署名 |
+| `error 10 … certificate has expired` | 期限切れ (コンテナの時刻ずれでも出る) |
+| `error 2 … unable to get issuer certificate` | 中間 CA が足りない |
+
+#### Java (JVM) 側
+
+同じ状態を JVM 側から見ると次の例外になります。curl の `exit 60` と同じ原因です。
+
+```
+javax.net.ssl.SSLHandshakeException: PKIX path building failed:
+  sun.security.provider.certpath.SunCertPathBuilderException:
+  unable to find valid certification path to requested target
+```
+
+### 11.4 手元で状態を確認する
+
+#### (1) 受領物に秘密鍵はあるか
+
+```bash
+ls -l cacert.crt cacert.key   # cacert.key が無ければ「鍵なし」
+
+# 鍵がある場合、その鍵が本当にその証明書の鍵かを確認する
+# (2 つの出力が一致すればペア。一致しなければ別物を渡されている)
+openssl x509 -noout -modulus -in cacert.crt | openssl sha256
+openssl rsa  -noout -modulus -in cacert.key | openssl sha256
+```
+
+#### (2) 受領物は「CA 証明書」か「自己署名リーフ」か
+
+```bash
+openssl x509 -in cacert.crt -noout -text | grep -A1 'Basic Constraints'
+```
+
+| 表示 | 種類 | 信頼できる範囲 |
+| --- | --- | --- |
+| `CA:TRUE` | 自己署名 **CA** 証明書 | その CA が発行した**すべての**サーバ証明書 |
+| `CA:FALSE` (または項目自体が無い) | 自己署名 **リーフ**証明書 | **その 1 枚だけ**。サーバ証明書そのものをストアへ入れる運用になる |
+
+自己署名リーフを受領した場合、そもそも「この CA が発行した証明書」という考え方が
+成立しません。サーバが提示する証明書そのものをトラストストアへ入れてください。
+
+#### (3) サーバが実際に何を提示しているか
+
+```bash
+openssl s_client -connect secure-api:8443 -servername secure-api -showcerts </dev/null
+```
+
+`Certificate chain` の各段の `s:` (subject) と `i:` (issuer) を見て、
+**最上位の issuer と同じ証明書が自分のトラストストアにあるか**を確認します。
+
+#### (4) トラストストアに何が入っているか
+
+```bash
+keytool -list -v -keystore /opt/jboss-eap/standalone/configuration/extraslb-truststore.p12 \
+        -storetype PKCS12 -storepass changeit | grep -E 'Alias name|Owner|SHA-256'
+```
+
+`build_and_verify.sh --keep-container-mode logs` の証明書チェックを使うと、
+(3) と (4) を突き合わせた結果と、**JDK 標準 `cacerts` に対して何を追加したのか**の
+差分まで自動で表示されます。エントリが 100 件を超えるストアでも、
+独自に足した CA だけが抜き出されます。
+
+### 11.5 対処 — 3 つの選択肢
+
+| | 方法 | 何をするか | 向いている場面 | 注意 |
+| --- | --- | --- | --- | --- |
+| **A** | 受領 CA で発行し直す | CSR を作り、CA 管理者に**その CA で**サーバ証明書を発行してもらう | 本番・本番相当の検証 | CA 側の作業が必要。リードタイムがかかる |
+| **B** | 発行元 CA も信頼する | サーバ証明書を発行した CA (`local-test-ca` 等) も**追加で**トラストストアへ入れる | ローカル検証で経路だけ確認したい | 「受領 CA で検証できている」ことの証明にはならない |
+| **C** | 秘密鍵も受領する | `cacert.key` を入手し、その CA でサーバ証明書を発行する | 検証用 CA を自分たちで管理している | **本番 CA の秘密鍵を配ってはいけません** |
+
+**どれを選ぶべきか**: 目的が「受領した自己証明書を配布・取り込みできているか」の確認なら
+**B** で十分です (取り込み確認は証明書チェックの `1-N.` セクションで別途できます)。
+目的が「受領 CA を信頼したから通る」ことの証明なら **A** しかありません。
+
+#### A: 受領 CA でサーバ証明書を発行してもらう
+
+```bash
+# 1) サーバ側で鍵と CSR を作る (秘密鍵はサーバから出さない)
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout server.key -out server.csr \
+  -subj "/C=JP/O=Example/CN=secure-api" \
+  -addext "subjectAltName=DNS:secure-api,DNS:secure-api.example.internal"
+
+# 2) server.csr を CA 管理者へ提出し、cacert.crt と同じ CA で発行してもらう
+#    → server.crt を受領
+
+# 3) サーバへ配置する。JBoss / Jetty 等は PKCS#12 を要求することが多い
+openssl pkcs12 -export -inkey server.key -in server.crt -certfile cacert.crt \
+  -name secure-api -out server.p12 -passout pass:<password>
+```
+
+**SAN を必ず依頼してください。** CN だけの証明書は最近の JVM / curl では
+名前検証に通りません (`exit 51`)。
+
+#### B: サーバ証明書を発行した CA もトラストストアへ入れる
+
+```bash
+keytool -importcert -trustcacerts -noprompt \
+  -alias local-test-ca \
+  -file  local-test-ca.crt \
+  -keystore  /opt/jboss-eap/standalone/configuration/extraslb-truststore.p12 \
+  -storetype PKCS12 \
+  -storepass <password>
+```
+
+イメージへ焼き込む構成 (`build-truststore.sh` 等) では、**実行中コンテナで
+`keytool` を叩いても次回起動で消えます**。Dockerfile 側を直してビルドし直してください。
+トラストストアは **JVM 起動時に読み込まれる**ため、いずれの場合も再起動が必要です。
+
+#### C: 秘密鍵も受領して発行し直す
+
+`cacert.key` を入手できるなら、受領 CA でサーバ証明書を発行できます。
+この場合トラストアンカーは `cacert.crt` 1 枚のままで全経路が通り、
+**「受領した自己証明書を信頼したから通っている」ことをそのまま示せます**。
+
+### 11.6 `Container_Compose_file` での動き
+
+参照先の
+[ProjectRubyRing/Container_Compose_file](https://github.com/ProjectRubyRing/Container_Compose_file)
+は、この状況を**設計として明示的に扱っています** (`compose/pki/gen-certs.sh`)。
+
+| 受領物 | サーバ証明書の発行元 | トラストストアへ入るもの |
+| --- | --- | --- |
+| `cacert.crt` + `cacert.key` | **受領 CA** | `cacert.crt` (これ 1 枚で全経路を検証できる) |
+| `cacert.crt` のみ (鍵なし) | `local-test-ca` (コンテナが生成) | `cacert.crt` + `local-test-ca.crt` (`PKI_TRUST_LOCAL_CA=1` のとき) |
+
+つまり**鍵なしで受領した場合、`local-test-ca.crt` も信頼させないと
+`https://secure-api:8443/api/v1/ping` は通りません**。関係する設定は次のとおりです。
+
+| 環境変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `PKI_MODE` | `auto` | `provided` (受領物必須) / `generate` (自動発行) / `auto` (受領物があれば使う) |
+| `PKI_TRUST_LOCAL_CA` | `1` | `1` = `local-test-ca` も配布して HTTPS の正常系を通す。`0` = 受領 `cacert.crt` 1 枚だけを信頼し、**PKIX で失敗するのが期待値**の対照実験 |
+| `PKI_PROVIDED_DIR` | `./compose/pki/provided` | 受領物の投入口 (ホストパス) |
+
+```bash
+# 鍵なしでも HTTPS 疎通の正常系まで通す (既定)
+PKI_TRUST_LOCAL_CA=1 docker compose up -d
+
+# 受領 cacert.crt 1 枚だけを信頼する = 失敗することを確認する対照実験
+PKI_TRUST_LOCAL_CA=0 docker compose up -d
+
+# 後から秘密鍵を入手したら置くだけでよい (入力の変化を検知して自動で作り直す)
+cp cacert.key compose/pki/provided/
+docker compose run --rm pki-init --oneshot
+```
+
+`docker logs pki-init` に、どちらの系統で動いているかが出ます。
+
+```
+受領物に秘密鍵が無いため、サーバ証明書は local-test-ca が発行しています
+  ・受領 cacert.crt   → トラストアンカーとして front/back へ配布 (trust/cacert.crt)
+  ・local-test-ca     → secure-api / alb(ca-issued) / rds-proxy の発行元
+```
+
+#### トラストストアをイメージへ焼き込んでいる場合
+
+`PKI_TRUST_LOCAL_CA=1` が効くのは、**起動時に `${PKI_TRUST_DIR}/*.crt` を取り込む**
+構成 (`Container_Compose_file` の `app-front` / `app-back`) です。
+`docker build --secret` でトラストストアを**ビルド時に作り込む**構成
+(`Container_ExtraSLB_JVM_https_outbounds` の `base/Dockerfile` +
+`build-truststore.sh` など) では、実行中コンテナで `keytool` を叩いても
+次回起動で消えるため、**ビルドし直す**必要があります。
+
+このとき、ビルドへ渡す証明書ファイルを `cacert.crt` 単体ではなく
+**`verify-bundle.crt` (受領 CA + サーバ証明書の発行元 CA)** にすれば、
+1 回のビルドで両方が入ります。`build-truststore.sh` は PEM が連結されていても
+1 枚ずつに分割して**すべて**取り込む実装のため、そのまま渡せます。
+
+```bash
+# 1) secure-api のサーバ証明書を検証できる CA バンドルを取り出す
+#    (鍵なし受領時は cacert.crt + local-test-ca.crt の連結になっている)
+docker compose exec -T pki-init cat /pki/ca/verify-bundle.crt > ./secrets/cacert.crt
+
+# 2) そのまま再ビルドする (alias は extraslb-ca-1, extraslb-ca-2 … と連番で入る)
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=extraslb_cacert,src=./secrets/cacert.crt \
+  -t eap81-extraslb-base:1.0 base/
+```
+
+ビルド後、`build_and_verify.sh --keep-container-mode logs` の証明書チェックで
+`独自に追加された CA: 2 件` と表示され、接続が `[PASS]` になれば完了です。
+
+### 11.7 秘密鍵が無くても確認できること / できないこと
+
+| 確認したいこと | 鍵なしでも可能か | 方法 |
+| --- | --- | --- |
+| 受領した `cacert.crt` がトラストストアへ正しく取り込まれたか | **可能** | 証明書チェックの `1-N.` (SHA-256 照合と、JDK 標準 `cacerts` との差分) |
+| 取り込み先・別名・有効期限が意図どおりか | **可能** | 同上 (`alias` / `有効期限` が出る) |
+| `keytool` / Dockerfile の取り込み手順が壊れていないか | **可能** | 同上 (`独自に追加された CA: 0 件` なら壊れている) |
+| その CA を信頼したことで HTTPS が通るか | **不可能** | サーバ証明書をその CA で発行できないため。→ 11.5 の A か C |
+| TLS の経路・SAN・プロトコルが正しいか | **可能** | 発行元 CA を信頼させた状態 (11.5 の B) で確認する |
+
+### 11.8 よくある取り違え
+
+| 症状 / 思い込み | 実際 |
+| --- | --- |
+| 「`exit 60` だからトラストストアへの取り込みに失敗している」 | 取り込みは成功していることが多い。**発行元が別 CA** なだけ。証明書チェックの `★取り込み自体は成功している` を確認する |
+| 「`self-signed certificate in certificate chain` だからサーバ証明書が自己署名」 | 違う。**チェーンの最上位 (CA) が自己署名**で、それを信頼していないという意味 |
+| 「対照テストが `--cacert` 無しで失敗しているから、ストアは効いている」 | 本命も失敗しているなら**何も示していない**。両方失敗 = どこからも CA を信頼できていない |
+| 「`keytool -importcert` をコンテナ内で実行したのに直らない」 | JVM は**起動時**にトラストストアを読む。再起動が必要。さらにイメージ焼き込み構成では次回起動で消える |
+| 「CA を入れたのに `exit 51`」 | CA の問題ではなく**ホスト名 (SAN) 不一致**。別の原因 |
+| 「`cacerts` に入れたのに効かない」 | `-Djavax.net.ssl.trustStore` で**別のストア**を指している。証明書チェックの `0.` で実際に使われているストアを確認する |
+| 「有効期限は先なのに期限切れと出る」 | **コンテナの時刻ずれ**。`docker exec <cid> date` を確認する |

@@ -6531,6 +6531,156 @@ cc_count_lines() {
   esac
 }
 
+# =====================================================================
+# 診断用ヘルパー
+#   curl の終了コードだけでは「何が足りないのか」まで分からない。
+#   openssl があるときはサーバが実際に提示した証明書チェーンを取得し、
+#   トラストストアの中身と突き合わせて原因まで出す。
+#   openssl が無くても curl による合否判定は行う (診断の粒度が落ちるだけ)。
+# =====================================================================
+CC_OPENSSL=''
+if command -v openssl >/dev/null 2>&1; then
+  CC_OPENSSL="$(command -v openssl)"
+fi
+CC_TIMEOUT=''
+if command -v timeout >/dev/null 2>&1; then
+  CC_TIMEOUT="$(command -v timeout)"
+fi
+
+# 原因コードを溜めておき、最後の「次の一手」でまとめて対処を出す。
+# 同じ原因を接続先・ストアの数だけ繰り返さないよう重複は落とす。
+CC_HINTS_FILE="$CC_DIR/hints.txt"
+: > "$CC_HINTS_FILE"
+cc_hint() {
+  grep -qxF -- "$1" "$CC_HINTS_FILE" 2>/dev/null && return 0
+  printf '%s\n' "$1" >> "$CC_HINTS_FILE"
+}
+cc_has_hint() { grep -qxF -- "$1" "$CC_HINTS_FILE" 2>/dev/null; }
+
+cc_x509() {  # $1=PEM ファイル, $2.. = openssl x509 のオプション
+  [ -n "$CC_OPENSSL" ] || return 1
+  cc_x509_file="$1"; shift
+  "$CC_OPENSSL" x509 -in "$cc_x509_file" -noout "$@" 2>/dev/null
+}
+cc_subject_of()      { cc_x509 "$1" -subject | sed 's/^subject=[[:space:]]*//'; }
+cc_issuer_of()       { cc_x509 "$1" -issuer  | sed 's/^issuer=[[:space:]]*//'; }
+cc_fp_of()           { cc_x509 "$1" -fingerprint -sha256 | sed 's/^.*=//' | tr -d '\r'; }
+cc_notbefore_of()    { cc_x509 "$1" -startdate | sed 's/^notBefore=//'; }
+cc_notafter_of()     { cc_x509 "$1" -enddate   | sed 's/^notAfter=//'; }
+# subject_hash / issuer_hash は DN の正規化ハッシュ。文字列表現の揺れ
+# (CN = foo と CN=foo など) に左右されずに「発行者 = この CA か」を判定できる。
+cc_subject_hash_of() { cc_x509 "$1" -subject_hash; }
+cc_issuer_hash_of()  { cc_x509 "$1" -issuer_hash; }
+cc_is_expired() {
+  [ -n "$CC_OPENSSL" ] || return 1
+  ! "$CC_OPENSSL" x509 -in "$1" -noout -checkend 0 >/dev/null 2>&1
+}
+cc_is_ca() { cc_x509 "$1" -text | grep -q 'CA:TRUE'; }
+# SAN は「X509v3 Subject Alternative Name:」の次の行に入る
+cc_san_of() {
+  cc_x509 "$1" -text \
+    | sed -n '/X509v3 Subject Alternative Name/{n;s/^[[:space:]]*//;p;}' \
+    | head -n 1
+}
+# subject と issuer が同じで、かつ自分自身の公開鍵で署名を検証できる = 自己署名。
+# 自己署名 CA はチェーンの最上位であり、クライアントが直接信頼している必要がある。
+cc_is_selfsigned() {
+  [ -n "$CC_OPENSSL" ] || return 1
+  [ "$(cc_subject_hash_of "$1")" = "$(cc_issuer_hash_of "$1")" ] || return 1
+  "$CC_OPENSSL" verify -CAfile "$1" "$1" >/dev/null 2>&1
+}
+
+# URL からホストとポートを取り出す (openssl s_client / 名前解決の確認で使う)。
+# 認証情報付き (user:pass@host) と IPv6 リテラル ([::1]:8443) にも対応する。
+cc_url_hostport() {
+  cc_hp="${1#*://}"
+  cc_hp="${cc_hp%%/*}"
+  cc_hp="${cc_hp##*@}"
+  case "$cc_hp" in
+    '['*']:'*) cc_uh="${cc_hp%%]*}]" ; cc_up="${cc_hp##*]:}" ;;
+    '['*']')   cc_uh="$cc_hp"        ; cc_up='443' ;;
+    *:*)       cc_uh="${cc_hp%%:*}"  ; cc_up="${cc_hp##*:}" ;;
+    *)         cc_uh="$cc_hp"        ; cc_up='443' ;;
+  esac
+  printf '%s\t%s\n' "$cc_uh" "$cc_up"
+}
+
+# 接続先ホスト名が証明書の SAN に含まれるか (ワイルドカードは 1 ラベルのみ)。
+# パイプの while はサブシェルで走り return が呼び出し元へ伝わらないため、
+# 一致はマーカーファイルの有無で受け渡す。
+cc_host_matches_san() {  # $1=ホスト名 $2=SAN 文字列
+  cc_hm_host="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  rm -f -- "$CC_DIR/hostmatch"
+  printf '%s' "$2" | tr ',' '\n' | tr 'A-Z' 'a-z' | while IFS= read -r cc_hm_ent; do
+    cc_hm_ent="$(printf '%s' "$cc_hm_ent" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    case "$cc_hm_ent" in
+      dns:*)          cc_hm_val="${cc_hm_ent#dns:}" ;;
+      'ip address:'*) cc_hm_val="${cc_hm_ent#ip address:}" ;;
+      *) continue ;;
+    esac
+    if [ "$cc_hm_val" = "$cc_hm_host" ]; then
+      : > "$CC_DIR/hostmatch"
+      continue
+    fi
+    case "$cc_hm_val" in
+      '*.'*)
+        cc_hm_suffix="${cc_hm_val#\*}"
+        case "$cc_hm_host" in
+          *"$cc_hm_suffix")
+            cc_hm_prefix="${cc_hm_host%"$cc_hm_suffix"}"
+            case "$cc_hm_prefix" in
+              ''|*.*) ;;
+              *) : > "$CC_DIR/hostmatch" ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+  done
+  [ -f "$CC_DIR/hostmatch" ]
+}
+
+# ストアを 1 枚ずつに分割したディレクトリから、subject_hash が一致する
+# 証明書 (= 探している発行者 CA) のパスを返す。
+cc_find_in_store() {  # $1=split ディレクトリ $2=探す subject_hash
+  [ -d "$1" ] && [ -n "${2:-}" ] || return 1
+  for cc_fis_pem in "$1"/cert-*.pem; do
+    [ -r "$cc_fis_pem" ] || continue
+    if [ "$(cc_subject_hash_of "$cc_fis_pem")" = "$2" ]; then
+      printf '%s\n' "$cc_fis_pem"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# JDK 同梱 cacerts に入っている証明書の SHA-256 一覧 (1 度だけ取得して使い回す)。
+# 「このトラストストアが JDK 標準に対して何を足したものか」を出すために使う。
+CC_JDK_FP_FILE="$CC_DIR/jdk-cacerts-fp.txt"
+CC_JDK_CACERTS=''
+cc_load_jdk_cacerts_fp() {
+  [ -f "$CC_JDK_FP_FILE" ] && return 0
+  : > "$CC_JDK_FP_FILE"
+  # JDK 同梱 cacerts の既定パスワードもリテラルでは書かず、cc_password_of 経由で
+  # 解決する (この文字列がホスト側のプロセス引数へ載らないようにするため)。
+  cc_jdk_pw="$(cc_password_of default)"
+  for cc_jc in "${JAVA_HOME:-}/lib/security/cacerts" \
+               "${JAVA_HOME:-}/jre/lib/security/cacerts" \
+               /etc/pki/ca-trust/extracted/java/cacerts; do
+    [ -r "$cc_jc" ] || continue
+    "$CC_KEYTOOL" -list -keystore "$cc_jc" -storepass "$cc_jdk_pw" \
+      > "$CC_DIR/jdk-list.out" 2>/dev/null < /dev/null || continue
+    # 指紋の 16 進表記だけを拾う。見出し行はロケール依存だが値は依存しない。
+    # JDK 8 の keytool は既定が SHA-1 のため 0 件になる (その場合は差分表示を諦める)。
+    grep -oE '([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}' "$CC_DIR/jdk-list.out" \
+      | tr 'a-f' 'A-F' | sort -u > "$CC_JDK_FP_FILE"
+    CC_JDK_CACERTS="$cc_jc"
+    break
+  done
+  cc_jdk_pw=''
+  return 0
+}
+
 CC_STORE_TOTAL="$(cc_count_lines "$CC_STORES_FILE")"
 CC_TARGET_TOTAL="$(cc_count_lines "$CC_TARGETS_FILE")"
 CC_CACERT_TOTAL="$(cc_count_lines "$CC_CACERTS_FILE")"
@@ -6550,6 +6700,11 @@ cc_truncation_note() {
 
 cc_section '0. コンテナ内から検出した設定'
 cc_info "keytool         : $CC_KEYTOOL"
+if [ -n "$CC_OPENSSL" ]; then
+  cc_info "openssl         : $CC_OPENSSL (チェーン解析と原因の特定に使用)"
+else
+  cc_info 'openssl         : 見つからない (curl の合否のみ。失敗理由の特定はできない)'
+fi
 if [ -n "$CC_JVM_ARGS" ]; then
   cc_info "JVM             : -Djavax.net.ssl.trustStore を検出した (${CC_JVM_SOURCE})"
 else
@@ -6616,15 +6771,19 @@ while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
   cc_keytool_err="$CC_DIR/keytool-${cc_store_index}.err"
   cc_listed='no'
   cc_used_token=''
+  # -J-Duser.language=en は keytool の見出し (Alias name: 等) を英語へ固定する。
+  # 後段で別名を拾うため、実行環境のロケールに左右されないようにしておく。
   for cc_token in "$cc_pwtoken" jvm default none; do
     [ -n "$cc_token" ] || continue
     cc_pw="$(cc_password_of "$cc_token")"
     if [ "$cc_token" = 'none' ] || [ -z "$cc_pw" ]; then
-      "$CC_KEYTOOL" -list -rfc -keystore "$cc_store" \
+      "$CC_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+        -list -rfc -keystore "$cc_store" \
         > "$cc_listing" 2> "$cc_keytool_err" < /dev/null \
         && { cc_listed='yes'; cc_used_token='none'; }
     else
-      "$CC_KEYTOOL" -list -rfc -keystore "$cc_store" -storepass "$cc_pw" \
+      "$CC_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+        -list -rfc -keystore "$cc_store" -storepass "$cc_pw" \
         > "$cc_listing" 2> "$cc_keytool_err" < /dev/null \
         && { cc_listed='yes'; cc_used_token="$cc_token"; }
     fi
@@ -6654,28 +6813,93 @@ while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
   esac
   if [ "$cc_certs" -gt 0 ]; then
     cc_pass "PEM バンドルを書き出した (証明書 ${cc_certs} 枚)"
-    printf '%s\t%s\t%s\n' "$cc_store" "$cc_source" "$cc_bundle" >> "$CC_READY_FILE"
   else
     cc_fail 'トラストストアから証明書を取り出せなかった'
     continue
   fi
 
+  # 以降の照合・失敗診断で 1 枚ずつ扱えるよう、バンドルを証明書ごとに分割する。
+  # 分割順は keytool の出力順なので、同じ順で拾った別名と添字で対応付けできる。
+  cc_split_dir="$CC_DIR/split-${cc_store_index}"
+  cc_alias_file="$CC_DIR/alias-${cc_store_index}.tsv"
+  mkdir -p "$cc_split_dir"
+  awk -v dir="$cc_split_dir" '
+    /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%03d.pem", dir, n); w = 1 }
+    w { print > out }
+    /-----END CERTIFICATE-----/   { w = 0 }
+  ' "$cc_bundle"
+  # keytool -rfc は証明書の直前に "Alias name: <別名>" を出す。
+  # 別名が分かると keytool -delete / -importcert の対象を迷わず示せる。
+  awk '
+    /^Alias name:/ { alias = $0; sub(/^Alias name:[ \t]*/, "", alias); next }
+    /-----BEGIN CERTIFICATE-----/ { n++; printf "%03d\t%s\n", n, alias }
+  ' "$cc_listing" > "$cc_alias_file" 2>/dev/null || : > "$cc_alias_file"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$cc_store" "$cc_source" "$cc_bundle" "$cc_split_dir" "$cc_alias_file" \
+    >> "$CC_READY_FILE"
+
+  # このストアが「JDK 標準 cacerts に何を足したものか」を示す。
+  # 独自 CA を足したつもりで足りていない / 別物を足していた、という取り違えは
+  # 100 件以上ある一覧の中では埋もれるため、差分だけを取り出して見せる。
+  if [ -z "$CC_OPENSSL" ]; then
+    cc_skip 'openssl が無いため、JDK 標準 cacerts との差分は表示しない'
+  else
+    cc_load_jdk_cacerts_fp
+    if [ ! -s "$CC_JDK_FP_FILE" ]; then
+      cc_info '独自に追加された CA: JDK 標準 cacerts を読めないため判定しない'
+    else
+      cc_extra_file="$CC_DIR/extra-${cc_store_index}.txt"
+      : > "$cc_extra_file"
+      for cc_pem in "$cc_split_dir"/cert-*.pem; do
+        [ -r "$cc_pem" ] || continue
+        cc_pem_fp="$(cc_fp_of "$cc_pem" | tr 'a-f' 'A-F')"
+        [ -n "$cc_pem_fp" ] || continue
+        grep -qxF -- "$cc_pem_fp" "$CC_JDK_FP_FILE" && continue
+        printf '%s\n' "$cc_pem" >> "$cc_extra_file"
+      done
+      cc_extra_total="$(cc_count_lines "$cc_extra_file")"
+      if [ "$cc_extra_total" -eq 0 ]; then
+        cc_warn "独自に追加された CA: 0 件 (このストアは JDK 標準 ${CC_JDK_CACERTS} と同じ内容)"
+        cc_info '  自己証明書を取り込んだつもりであれば、取り込み先のストアかビルド手順を確認する'
+        cc_hint 'no-extra-ca'
+      else
+        cc_info "独自に追加された CA: ${cc_extra_total} 件 (JDK 標準 cacerts に無い証明書)"
+        cc_extra_shown=0
+        while IFS= read -r cc_pem; do
+          [ -n "$cc_pem" ] || continue
+          cc_extra_shown=$((cc_extra_shown + 1))
+          if [ "$cc_extra_shown" -gt 10 ]; then
+            cc_info "  ... 残り $((cc_extra_total - 10)) 件は省略"
+            break
+          fi
+          cc_pem_idx="$(basename -- "$cc_pem" | sed 's/^cert-//; s/\.pem$//')"
+          cc_pem_alias="$(awk -F"$CC_TAB" -v i="$cc_pem_idx" '$1 == i { print $2 }' \
+            "$cc_alias_file" 2>/dev/null)"
+          cc_info "  - alias=${cc_pem_alias:-(不明)}"
+          cc_info "    subject : $(cc_subject_of "$cc_pem")"
+          cc_info "    SHA-256 : $(cc_fp_of "$cc_pem")"
+          cc_info "    有効期限: $(cc_notafter_of "$cc_pem")"
+          if cc_is_expired "$cc_pem"; then
+            cc_fail "追加された CA '${cc_pem_alias:-(不明)}' は有効期限が切れている"
+            cc_hint 'expired-anchor'
+          fi
+          if ! cc_is_ca "$cc_pem"; then
+            cc_info '    種別    : CA 証明書ではない (自己署名リーフ)。この 1 枚だけを信頼する形になる'
+          fi
+        done < "$cc_extra_file"
+      fi
+    fi
+  fi
+
   # 検出した CA 証明書がこのストアに登録されているかを SHA-256 で照合する。
   if [ "$CC_CACERT_TOTAL" -eq 0 ]; then
     cc_skip 'CA 証明書を検出できないためフィンガープリント照合は行わない'
-  elif ! command -v openssl >/dev/null 2>&1; then
+  elif [ -z "$CC_OPENSSL" ]; then
     cc_skip 'openssl が無いためフィンガープリント照合は行わない'
   else
-    cc_split_dir="$CC_DIR/split-${cc_store_index}"
-    mkdir -p "$cc_split_dir"
-    awk -v dir="$cc_split_dir" '
-      /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%03d.pem", dir, n) }
-      n > 0 { print > out }
-    ' "$cc_bundle"
     while IFS= read -r cc_cacert; do
       [ -n "$cc_cacert" ] || continue
-      cc_want="$(openssl x509 -in "$cc_cacert" -noout -fingerprint -sha256 2>/dev/null \
-        | sed 's/^.*=//' | tr -d '\r')"
+      cc_want="$(cc_fp_of "$cc_cacert")"
       if [ -z "$cc_want" ]; then
         cc_warn "CA 証明書のフィンガープリントを取得できない (PEM / DER 形式を確認する): ${cc_cacert}"
         continue
@@ -6683,9 +6907,7 @@ while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
       cc_found='no'
       for cc_pem in "$cc_split_dir"/cert-*.pem; do
         [ -r "$cc_pem" ] || continue
-        cc_have="$(openssl x509 -in "$cc_pem" -noout -fingerprint -sha256 2>/dev/null \
-          | sed 's/^.*=//' | tr -d '\r')"
-        if [ "$cc_have" = "$cc_want" ]; then
+        if [ "$(cc_fp_of "$cc_pem")" = "$cc_want" ]; then
           cc_found='yes'
           break
         fi
@@ -6696,6 +6918,7 @@ while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
         cc_fail "$(basename -- "$cc_cacert") はこのストアに登録されていない"
         cc_info "対処: ${CC_KEYTOOL} -importcert -trustcacerts -noprompt -alias cacert \\"
         cc_info "        -file ${cc_cacert} -keystore ${cc_store} -storepass <password>"
+        cc_hint 'cacert-not-imported'
       fi
     done < "$CC_CACERTS_FILE"
   fi
@@ -6712,7 +6935,147 @@ fi
 
 # =====================================================================
 # 2. 検出した接続先へ、各トラストストア由来の PEM で HTTPS 接続する
+#    失敗したときは curl の終了コードで止めず、サーバが実際に提示した
+#    証明書チェーンとトラストストアの中身を突き合わせ、
+#    「どの CA が足りないのか」「取り込みは成功しているのか」まで出す。
 # =====================================================================
+
+# 接続に失敗したストアについて、原因を切り分けて表示する。
+# 参照する chain 系の変数は接続先ループが設定したものを使う。
+cc_diagnose_failure() {  # $1=curl exit $2=ストアパス $3=ストア PEM $4=split ディレクトリ $5=別名 TSV
+  cc_df_rc="$1"; cc_df_store="$2"; cc_df_bundle="$3"
+  cc_df_split="$4"; cc_df_alias_file="$5"
+
+  # 名前解決・接続・タイムアウトは証明書以前の失敗。チェーン解析をしても
+  # 何も出ないため、ここで切り上げて調べる先を示す。
+  case "$cc_df_rc" in
+    6|7|28)
+      cc_info "  詳細診断: 証明書以前の失敗のため ${cc_df_store} の中身は原因ではない。"
+      cc_info '            宛先の起動状態と Compose のネットワーク / ポートを先に確認する。'
+      cc_hint 'dns'
+      return 0
+      ;;
+  esac
+
+  if [ -z "$CC_OPENSSL" ]; then
+    cc_info '  詳細診断: openssl が無いためここまで。openssl があると原因まで特定できる。'
+    return 0
+  fi
+  if [ "$cc_chain_n" -eq 0 ]; then
+    cc_info '  詳細診断: サーバの証明書チェーンを取得できていないため原因を特定できない。'
+    cc_info '            TLS ハンドシェイク以前 (経路 / ポート / 平文応答) を先に確認する。'
+    return 0
+  fi
+
+  # (a) openssl verify の原文を出す。curl の終了コードより粒度が細かく、
+  #     error 20 / 19 / 10 の区別がそのまま原因の切り分けになる。
+  cc_df_verify="$CC_DIR/verify.out"
+  if [ -s "$cc_chain_untrusted" ]; then
+    "$CC_OPENSSL" verify -CAfile "$cc_df_bundle" -untrusted "$cc_chain_untrusted" \
+      "$cc_chain_leaf" > "$cc_df_verify" 2>&1 || :
+  else
+    "$CC_OPENSSL" verify -CAfile "$cc_df_bundle" "$cc_chain_leaf" \
+      > "$cc_df_verify" 2>&1 || :
+  fi
+  cc_info '  詳細診断 (openssl verify の出力):'
+  sed 's/^/         /' "$cc_df_verify" 2>/dev/null | head -n 5
+  if grep -q 'unable to get local issuer certificate' "$cc_df_verify" 2>/dev/null; then
+    cc_info '         → error 20: 発行者 CA をこの CA 一式の中から見つけられない'
+  fi
+  if grep -q 'self.signed certificate in certificate chain' "$cc_df_verify" 2>/dev/null; then
+    cc_info '         → error 19: チェーンの最上位が自己署名 CA で、それを信頼していない'
+  fi
+  if grep -q 'certificate has expired' "$cc_df_verify" 2>/dev/null; then
+    cc_info '         → error 10: 期限切れの証明書がチェーンに含まれる'
+  fi
+
+  # (b) サーバ証明書の発行者が、このトラストストアに登録されているか。
+  #     DN の文字列表現ではなく正規化ハッシュで突き合わせる。
+  cc_df_issuer_hash="$(cc_issuer_hash_of "$cc_chain_leaf")"
+  cc_df_issuer_dn="$(cc_issuer_of "$cc_chain_leaf")"
+  if cc_df_anchor="$(cc_find_in_store "$cc_df_split" "$cc_df_issuer_hash")"; then
+    cc_df_idx="$(basename -- "$cc_df_anchor" | sed 's/^cert-//; s/\.pem$//')"
+    cc_df_alias="$(awk -F"$CC_TAB" -v i="$cc_df_idx" '$1 == i { print $2 }' \
+      "$cc_df_alias_file" 2>/dev/null)"
+    cc_info "  発行者 CA はこのストアに存在する: ${cc_df_issuer_dn}"
+    cc_info "    alias=${cc_df_alias:-(不明)}  SHA-256=$(cc_fp_of "$cc_df_anchor")"
+    if cc_is_expired "$cc_df_anchor"; then
+      cc_info '    → ただし有効期限が切れている。CA 証明書を更新して入れ直す。'
+      cc_hint 'expired-anchor'
+    else
+      cc_info '    → subject は一致するのに検証に失敗している。'
+      cc_info '      同じ名前で鍵の違う CA (再発行された CA) を掴んでいる可能性が高い。'
+      cc_info '      配布元の最新の CA 証明書と SHA-256 を突き合わせる。'
+      cc_hint 'anchor-mismatch'
+    fi
+  else
+    cc_info "  ★発行者 CA がこのトラストストアに無い: ${cc_df_issuer_dn}"
+    cc_hint 'missing-anchor'
+    # サーバが提示したチェーンの最上位 (= 足りていない CA の候補) を示す
+    cc_df_top=''
+    for cc_df_c in "$cc_chain_dir"/chain-*.pem; do
+      [ -r "$cc_df_c" ] && cc_df_top="$cc_df_c"
+    done
+    if [ -n "$cc_df_top" ] && [ "$cc_df_top" != "$cc_chain_leaf" ]; then
+      cc_info '  サーバが提示したチェーンの最上位 (これが不足している CA):'
+      cc_info "    subject : $(cc_subject_of "$cc_df_top")"
+      cc_info "    SHA-256 : $(cc_fp_of "$cc_df_top")"
+      if cc_is_selfsigned "$cc_df_top"; then
+        cc_info '    自己署名: YES → これを信頼していないことが exit 60 の直接原因。'
+        cc_info '    curl の "self-signed certificate in certificate chain" はこの状態を指す'
+        cc_info '    (サーバ証明書そのものが自己署名という意味ではない)。'
+      fi
+    else
+      cc_info '  サーバは中間 / ルート CA を提示していない (リーフ 1 枚のみ)。'
+      cc_info '  発行元 CA の証明書を配布元から入手してトラストストアへ入れる必要がある。'
+    fi
+  fi
+
+  # (c) 受領 CA はストアに入っているのに接続できない、という状態かどうか。
+  #     ここが「自己証明書だけがあり秘密鍵が無い」構成の典型的な見え方になる。
+  if [ "$CC_CACERT_TOTAL" -gt 0 ]; then
+    cc_df_cacert_in=0
+    cc_df_cacert_name=''
+    while IFS= read -r cc_df_ca; do
+      [ -n "$cc_df_ca" ] || continue
+      cc_df_ca_fp="$(cc_fp_of "$cc_df_ca")"
+      [ -n "$cc_df_ca_fp" ] || continue
+      for cc_df_p in "$cc_df_split"/cert-*.pem; do
+        [ -r "$cc_df_p" ] || continue
+        if [ "$(cc_fp_of "$cc_df_p")" = "$cc_df_ca_fp" ]; then
+          cc_df_cacert_in=1
+          cc_df_cacert_name="$(basename -- "$cc_df_ca")"
+          break
+        fi
+      done
+      [ "$cc_df_cacert_in" -eq 1 ] && break
+    done < "$CC_CACERTS_FILE"
+    if [ "$cc_df_cacert_in" -eq 1 ] && [ -z "${cc_df_anchor:-}" ]; then
+      cc_info "  ★取り込み自体は成功している: ${cc_df_cacert_name} はこのストアに入っている。"
+      cc_info '    それでも失敗するのは、サーバ証明書がその CA では発行されていないため'
+      cc_info '    (発行者が別の CA になっている)。自己証明書 (CA 証明書) だけを受領し'
+      cc_info '    秘密鍵が無い構成では、サーバ側は受領 CA 発行の証明書を提示できないため'
+      cc_info '    必ずこの状態になる。'
+      cc_hint 'cacert-present-other-issuer'
+    fi
+  fi
+
+  # (d) 「サーバが提示したチェーンを信頼すれば通るのか」を実際に試す。
+  #     通るなら不足は CA 1 点であり、経路・名前・期限は問題ないと確定できる。
+  if curl --silent --show-error \
+      --connect-timeout "$CC_CONNECT_TIMEOUT" --max-time "$CC_MAX_TIME" \
+      --output /dev/null --cacert "$cc_chain_all" "$cc_target_url" \
+      < /dev/null > /dev/null 2>&1; then
+    cc_info '  検証: サーバが提示したチェーンを CA として渡すと接続できた。'
+    cc_info '        → 不足しているのは上記の CA 証明書だけ。経路 / 名前 / 期限は問題ない。'
+    cc_hint 'anchor-only'
+  else
+    cc_info '  検証: サーバが提示したチェーンを CA として渡しても接続できない。'
+    cc_info '        → CA 不足以外の要因 (ホスト名不一致 / 有効期限 / プロトコル) も疑う。'
+  fi
+  cc_df_anchor=''
+}
+
 cc_target_index=0
 while IFS= read -r cc_target_line <&3; do
   [ -n "$cc_target_line" ] || continue
@@ -6720,11 +7083,109 @@ while IFS= read -r cc_target_line <&3; do
   [ "$cc_target_index" -le "$CC_MAX_TARGETS" ] || break
   cc_target_name="${cc_target_line%%=*}"
   cc_target_url="${cc_target_line#*=}"
+  cc_host="$(cc_url_hostport "$cc_target_url" | cut -f1)"
+  cc_port="$(cc_url_hostport "$cc_target_url" | cut -f2)"
 
   cc_section "2-${cc_target_index}. HTTPS 接続 ${cc_target_name}"
   cc_info "接続先: ${cc_target_url}"
+  cc_info "ホスト: ${cc_host}   ポート: ${cc_port}"
 
-  while IFS="$CC_TAB" read -r cc_store cc_source cc_bundle; do
+  # 名前解決。ここで落ちていれば証明書の話にすらなっていない。
+  if command -v getent >/dev/null 2>&1; then
+    cc_addrs="$(getent hosts "$cc_host" 2>/dev/null | awk '{ print $1 }' | tr '\n' ' ')"
+    if [ -n "$cc_addrs" ]; then
+      cc_info "名前解決: ${cc_host} -> ${cc_addrs}"
+    else
+      cc_warn "名前解決: ${cc_host} を解決できない (Compose のサービス名とネットワークを確認する)"
+      cc_hint 'dns'
+    fi
+  fi
+
+  # --- サーバが実際に提示している証明書チェーン ------------------------
+  cc_chain_dir="$CC_DIR/chain-${cc_target_index}"
+  mkdir -p "$cc_chain_dir"
+  cc_chain_n=0
+  cc_chain_all="$cc_chain_dir/presented.pem"
+  cc_chain_untrusted="$cc_chain_dir/untrusted.pem"
+  cc_chain_leaf="$cc_chain_dir/chain-001.pem"
+  cc_sclient_out="$cc_chain_dir/s_client.out"
+  : > "$cc_chain_all"
+  : > "$cc_chain_untrusted"
+  if [ -z "$CC_OPENSSL" ]; then
+    cc_skip 'openssl が無いため、サーバが提示する証明書チェーンは確認しない'
+    cc_hint 'no-openssl'
+  else
+    # -servername は SNI。名前ベースで証明書を出し分けるサーバでは必須。
+    if [ -n "$CC_TIMEOUT" ]; then
+      "$CC_TIMEOUT" "$CC_MAX_TIME" "$CC_OPENSSL" s_client \
+        -connect "${cc_host}:${cc_port}" -servername "$cc_host" -showcerts \
+        < /dev/null > "$cc_sclient_out" 2>&1 || :
+    else
+      "$CC_OPENSSL" s_client \
+        -connect "${cc_host}:${cc_port}" -servername "$cc_host" -showcerts \
+        < /dev/null > "$cc_sclient_out" 2>&1 || :
+    fi
+    awk -v dir="$cc_chain_dir" '
+      /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/chain-%03d.pem", dir, n); w = 1 }
+      w { print > out }
+      /-----END CERTIFICATE-----/   { w = 0 }
+    ' "$cc_sclient_out"
+    for cc_c in "$cc_chain_dir"/chain-*.pem; do
+      [ -r "$cc_c" ] || continue
+      cc_chain_n=$((cc_chain_n + 1))
+      cat "$cc_c" >> "$cc_chain_all"
+      [ "$cc_chain_n" -eq 1 ] || cat "$cc_c" >> "$cc_chain_untrusted"
+    done
+  fi
+
+  if [ -n "$CC_OPENSSL" ] && [ "$cc_chain_n" -eq 0 ]; then
+    cc_warn 'サーバから証明書チェーンを取得できなかった (TLS 以前で失敗している可能性)'
+    sed 's/^/       /' "$cc_sclient_out" 2>/dev/null | head -n 5
+    cc_hint 'no-chain'
+  elif [ "$cc_chain_n" -gt 0 ]; then
+    cc_info "サーバが提示した証明書: ${cc_chain_n} 枚 (openssl s_client -showcerts)"
+    cc_ci=0
+    for cc_c in "$cc_chain_dir"/chain-*.pem; do
+      [ -r "$cc_c" ] || continue
+      cc_ci=$((cc_ci + 1))
+      if [ "$cc_ci" -eq 1 ]; then
+        cc_info "  [${cc_ci}] サーバ証明書"
+      else
+        cc_info "  [${cc_ci}] チェーンに同梱された CA"
+      fi
+      cc_info "      subject : $(cc_subject_of "$cc_c")"
+      cc_info "      issuer  : $(cc_issuer_of "$cc_c")"
+      cc_info "      SHA-256 : $(cc_fp_of "$cc_c")"
+      cc_info "      有効期間: $(cc_notbefore_of "$cc_c") 〜 $(cc_notafter_of "$cc_c")"
+      if cc_is_selfsigned "$cc_c"; then
+        cc_info '      自己署名: YES (チェーンの最上位。クライアントが直接信頼している必要がある)'
+      fi
+      if cc_is_expired "$cc_c"; then
+        cc_fail "サーバが提示した証明書 [${cc_ci}] は有効期限が切れている"
+        cc_hint 'expired-presented'
+      fi
+    done
+
+    # ホスト名の一致 (SAN)。CA が正しくても SAN が合わなければ検証は通らない。
+    cc_leaf_san="$(cc_san_of "$cc_chain_leaf")"
+    if [ -n "$cc_leaf_san" ]; then
+      cc_info "  サーバ証明書の SAN : ${cc_leaf_san}"
+      if cc_host_matches_san "$cc_host" "$cc_leaf_san"; then
+        cc_pass "接続先ホスト名 ${cc_host} はサーバ証明書の SAN に含まれている"
+      else
+        cc_fail "接続先ホスト名 ${cc_host} がサーバ証明書の SAN に含まれていない"
+        cc_hint 'san'
+      fi
+    else
+      cc_warn 'サーバ証明書に SAN が無い (最近の JVM / curl は CN だけでは名前検証に通らない)'
+      cc_hint 'san'
+    fi
+  fi
+
+  # --- トラストストアごとの接続確認 ------------------------------------
+  cc_target_ok=0
+  cc_target_fail=0
+  while IFS="$CC_TAB" read -r cc_store cc_source cc_bundle cc_split cc_aliases; do
     [ -n "$cc_bundle" ] || continue
     cc_curl_err="$CC_DIR/curl.err"
     # このループは標準入力から $CC_READY_FILE を読んでいるため、curl には
@@ -6736,16 +7197,20 @@ while IFS= read -r cc_target_line <&3; do
     cc_rc=$?
     if [ "$cc_rc" -eq 0 ]; then
       cc_pass "${cc_store} 由来の PEM で接続成功 (HTTP ${cc_code})"
+      cc_target_ok=$((cc_target_ok + 1))
     else
       cc_fail "${cc_store} 由来の PEM で接続失敗 (curl exit=${cc_rc})"
+      cc_target_fail=$((cc_target_fail + 1))
       sed 's/^/       /' "$cc_curl_err" 2>/dev/null | head -n 3
       case "$cc_rc" in
-        60) cc_info 'exit 60 = 証明書を検証できない。CA 証明書がこのストアに入っているか確認する。' ;;
+        60) cc_info 'exit 60 = サーバ証明書をこの CA 一式では検証できない (信頼の連鎖がつながらない)。' ;;
+        51) cc_info 'exit 51 = サーバ証明書の名前 (SAN / CN) が接続先ホスト名と一致しない。' ;;
         35) cc_info 'exit 35 = TLS ハンドシェイク失敗。プロトコル / 暗号スイートの不一致を確認する。' ;;
         7)  cc_info 'exit 7 = 接続不可。宛先ホスト・ポート・Compose ネットワークを確認する。' ;;
         6)  cc_info 'exit 6 = 名前解決に失敗。Compose のサービス名を確認する。' ;;
         28) cc_info "exit 28 = タイムアウト (最大 ${CC_MAX_TIME} 秒)。宛先の起動状態を確認する。" ;;
       esac
+      cc_diagnose_failure "$cc_rc" "$cc_store" "$cc_bundle" "$cc_split" "$cc_aliases"
     fi
   done < "$CC_READY_FILE"
 
@@ -6756,13 +7221,96 @@ while IFS= read -r cc_target_line <&3; do
     < /dev/null > /dev/null 2> "$CC_DIR/curl-control.err"
   cc_control_rc=$?
   if [ "$cc_control_rc" -eq 60 ]; then
-    cc_pass '対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)'
+    if [ "$cc_target_ok" -gt 0 ]; then
+      cc_pass '対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)'
+    else
+      # トラストストア経由も失敗している状況では、この結果は「ストアの効果」を
+      # 何も示さない。PASS と数えると原因を取り違えるため情報として出す。
+      cc_info '対照テスト: --cacert 無しでも検証に失敗した (curl exit 60)。'
+      cc_info '  トラストストア経由も失敗しているため、この結果はストアの効果を示していない。'
+      cc_info '  OS 標準 CA でもストアの CA でも検証できない = 発行元 CA をどこからも信頼できていない。'
+    fi
   elif [ "$cc_control_rc" -eq 0 ]; then
     cc_warn '対照テスト: --cacert 無しでも接続できた。サーバ証明書が OS 標準の CA バンドルでも検証できるため、上の成功はトラストストアの効果を示していない。'
   else
     cc_warn "対照テスト: --cacert 無しの接続が exit=${cc_control_rc} で失敗した (証明書検証以外の理由の可能性)"
   fi
 done 3< "$CC_TARGETS_FILE"
+
+# =====================================================================
+# 3. 次の一手 (検出した原因ごとの対処)
+#    上のログを読み直さなくても、そのまま実行できる形で対処を出す。
+# =====================================================================
+if [ -s "$CC_HINTS_FILE" ]; then
+  cc_section '3. 次の一手'
+  if cc_has_hint 'cacert-present-other-issuer'; then
+    printf '  ● 受領した自己証明書はストアに入っているのに接続できない\n'
+    printf '     サーバ証明書の発行元が、その受領 CA ではありません。典型的には\n'
+    printf '     「自己証明書 (CA 証明書) だけを受領し、秘密鍵が無い」構成です。\n'
+    printf '     秘密鍵の無い CA では署名を作れないため、サーバ側は別の CA が発行した\n'
+    printf '     証明書を提示するしかなく、受領 CA だけを信頼しても必ず失敗します。\n'
+    printf '     対処は次のいずれかです。\n'
+    printf '       (a) サーバ証明書を受領 CA が発行したものへ差し替える (本番相当)\n'
+    printf '           CSR を作って CA 管理者へ提出し、発行された証明書をサーバへ入れる\n'
+    printf '       (b) サーバ証明書を発行したローカル CA もトラストストアへ入れる (検証用)\n'
+    printf '           Container_Compose_file なら PKI_TRUST_LOCAL_CA=1 で配布される\n'
+    printf '       (c) 秘密鍵も受領できるなら配置し、受領 CA で発行し直す\n'
+    printf '           Container_Compose_file なら compose/pki/provided/cacert.key\n'
+  fi
+  if cc_has_hint 'missing-anchor'; then
+    printf '  ● サーバ証明書の発行元 CA がトラストストアに入っていない\n'
+    printf '     1) 上に表示した「不足している CA」の SHA-256 を配布元と突き合わせる\n'
+    printf '     2) その CA 証明書をトラストストアへ取り込む:\n'
+    printf '        %s -importcert -trustcacerts -noprompt \\\n' "$CC_KEYTOOL"
+    printf '          -alias <別名> -file <CA 証明書> \\\n'
+    printf '          -keystore <トラストストア> -storepass <パスワード>\n'
+    printf '     3) JVM を再起動する (トラストストアは起動時に読み込まれる)\n'
+    printf '     イメージへ焼き込む構成なら、Dockerfile 側を直してビルドし直す\n'
+  fi
+  if cc_has_hint 'cacert-not-imported'; then
+    printf '  ● 検出した CA 証明書がトラストストアに入っていない\n'
+    printf '     取り込み手順そのものが効いていません。ビルド時に取り込む構成なら、\n'
+    printf '     証明書の配置漏れ (空ファイル / パス違い) とビルドログを確認してください。\n'
+  fi
+  if cc_has_hint 'no-extra-ca'; then
+    printf '  ● トラストストアが JDK 標準 cacerts と同じ内容\n'
+    printf '     自己証明書が 1 枚も追加されていません。取り込み先のストアを\n'
+    printf '     取り違えていないか (JDK の cacerts と AP 用ストアの混同) を確認してください。\n'
+  fi
+  if cc_has_hint 'anchor-mismatch'; then
+    printf '  ● 同じ名前の CA はあるが署名を検証できない\n'
+    printf '     CA が再発行され、配布された証明書が古いままの可能性があります。\n'
+    printf '     配布元の最新 CA 証明書を取得し、古い別名を削除してから入れ直します:\n'
+    printf '        %s -delete -alias <古い別名> -keystore <ストア> -storepass <パスワード>\n' "$CC_KEYTOOL"
+  fi
+  if cc_has_hint 'expired-anchor' || cc_has_hint 'expired-presented'; then
+    printf '  ● 有効期限切れの証明書がある\n'
+    printf '     期限切れは CA 側 / サーバ側のどちらでも検証を失敗させます。\n'
+    printf '     上に表示した有効期間を確認し、更新された証明書へ差し替えてください。\n'
+    printf '     コンテナの時刻がずれている場合も同じ症状になります (date で確認)。\n'
+  fi
+  if cc_has_hint 'san'; then
+    printf '  ● ホスト名がサーバ証明書の SAN と一致しない\n'
+    printf '     CA を信頼していても名前が合わなければ検証は通りません。\n'
+    printf '     接続先 URL のホスト名を SAN に含まれる名前へ合わせるか、\n'
+    printf '     その名前を SAN に含むサーバ証明書を発行し直してください。\n'
+  fi
+  if cc_has_hint 'dns' || cc_has_hint 'no-chain'; then
+    printf '  ● 接続先に到達できていない\n'
+    printf '     証明書以前の問題です。Compose のサービス名・ネットワーク・\n'
+    printf '     公開ポート・宛先コンテナの起動状態を確認してください。\n'
+  fi
+  if cc_has_hint 'anchor-only'; then
+    printf '  ● 不足しているのは CA 証明書 1 点だけ\n'
+    printf '     サーバ提示チェーンを CA として渡すと接続できています。\n'
+    printf '     上記の CA をトラストストアへ入れれば解消します。\n'
+  fi
+  if cc_has_hint 'no-openssl'; then
+    printf '  ● コンテナに openssl が無い\n'
+    printf '     チェーン解析ができないため原因の特定まで至りません。\n'
+    printf '     調査用イメージに openssl を入れると、この診断が原因まで出せます。\n'
+  fi
+fi
 
 cc_section '結果'
 printf '  PASS=%d  FAIL=%d  WARN=%d  SKIP=%d\n' "$CC_PASS" "$CC_FAIL" "$CC_WARN" "$CC_SKIP"
