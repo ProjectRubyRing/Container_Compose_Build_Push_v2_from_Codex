@@ -1,0 +1,18 @@
+# 読み取り専用ファイルシステム分析 (異常系) 用の compose 定義。
+# read_only: true を指定しているのに、書き込み先として /tmp の tmpfs しか
+# 用意していない状態。JBoss EAP が起動時に書く standalone/tmp・log・data・
+# configuration へは書き込めず、実際には起動やデプロイが失敗する。
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+
+  app:
+    image: j1/base.local
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=64m
+    environment:
+      APP_LOG_DIR: /var/log/app

@@ -56,6 +56,7 @@
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
 | 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
+| 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -97,6 +98,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 後半 | Docker 完全クリーンアップ | 対象の集計、確認フレーズ、削除、検証 |
 | 後半 | ビルドの停滞検知・進捗表示 | ビルド出力の読み手、監視プロセス、停滞診断、上限時間での中断 |
 | 後半 | WAR デプロイ時 Java 例外解析 | 解析ヘルパー (Python 3) の埋め込みと、ログ収集・実行・表示・レポート追記 |
+| 後半 | 読み取り専用ファイルシステム分析 | 分析ヘルパー (Python 3) の埋め込みと、`compose.yml` / 実行状況の収集・実行・表示・レポート追記 |
 | 後半 | 全量レポート | `write_build_report` |
 | 後半 | 後始末 (`cleanup_all`) | EXIT トラップ本体 |
 | 末尾 | メイン処理 | ビルド → 起動 → 起動確認 → URL 確認 → 対話 → 情報表示 |
@@ -120,8 +122,9 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | ビルド監視 | `run_build_with_watchdog` / `build_watchdog_reader` / `build_watchdog_monitor` / `diagnose_build_stall` / `build_phase_from_line` / `check_build_disk_space` | `exporting layers` などで出力が途切れたときの進捗表示・停滞診断・上限時間での中断 |
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
-| Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_deploy_exception_excel_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
-| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` | 全量レポートの生成 |
+| Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
+| 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `show_readonly_filesystem_analysis` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、コンテナの書き込み状況の収集、判定結果の表示と Excel / テキスト出力 |
+| レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` / `append_readonly_analysis_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
 ### 2.3 EXIT トラップ (`cleanup_all`)
@@ -131,17 +134,20 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 ```
 1. analyze_war_deploy_exceptions … デプロイ処理の Java 例外を解析 (削除より前・レポートより前)
                                    成功経路で実行済みなら何もしない
-2. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
-3. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
-4. teardown_container        … compose down (--keep-container 指定時は残す)
-5. prune_build_cache         … --prune-build-cache / --prune-build-cache-keep 指定時、
+2. analyze_readonly_filesystem … read_only の書き込み先を分析 (削除より前・レポートより前)
+                                   成功経路で実行済みなら何もしない
+3. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
+4. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
+5. teardown_container        … compose down (--keep-container 指定時は残す)
+6. prune_build_cache         … --prune-build-cache / --prune-build-cache-keep 指定時、
                                    ビルドキャッシュを削除 (コンテナ削除の後)
-6. report_disk_usage_at_exit … --disk-usage-report 指定時、終了時の使用量と増減を表示
-                                   (3 が実際に削除を行った場合は重複するため出さない)
-7. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
+7. report_disk_usage_at_exit … --disk-usage-report 指定時、終了時の使用量と増減を表示
+                                   (4 が実際に削除を行った場合は重複するため出さない)
+8. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
                                    (既存ファイルを強制上書きした分は削除せず、
                                     退避しておいた上書き前のファイルを復元)
-8. 一時ファイル削除          … Java 例外解析結果・URL 応答本文・HTTP ボディ・healthcheck 診断
+9. 一時ファイル削除          … Java 例外解析結果・読み取り専用 FS 分析結果・
+                                   URL 応答本文・HTTP ボディ・healthcheck 診断
 ```
 
 終了コードは、本処理が既に失敗していれば**元の終了コードを優先**します。
@@ -195,7 +201,8 @@ flowchart TD
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
     AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → Excel 出力]
-    AA5 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
+    AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + 実行状況 → tmpfs / マウントの要否判定 → Excel 出力]
+    AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
 ```
 
@@ -205,6 +212,11 @@ Java 例外解析は成功経路では主処理の末尾で、失敗経路では
 全量レポートを書く直前に実行します (いずれもコンテナ削除より前)。
 **`compose up` に失敗して主処理が途中で終わった場合も、この `EXIT` 経路で
 必ず実行します** (6.7 参照)。
+
+読み取り専用ファイルシステムの書き込み先分析も同じタイミングで実行します。
+こちらは `compose.yml` の定義だけでも判定できるため、**コンテナを起動しない実行
+(ビルドのみ / ビルド失敗) でも必ず実行**し、実行状況からの根拠が無いことを
+結果へ明記します (6.8 参照)。
 
 ### 3.2 ビルドフェーズの詳細
 
@@ -447,11 +459,14 @@ compose down (削除)
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする) |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析の Excel とテキストも同じディレクトリへ追加出力 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力 |
 | `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。`--no-deploy-exception-analysis` とは排他 |
 | `--deploy-exception-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 不可 | 詳細分析を行う例外の最大件数 |
 | `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析と Excel 出力を行わない |
+| `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 不可 | 読み取り専用ファイルシステム分析の Excel 出力先。`--no-readonly-analysis` とは排他 |
+| `--readonly-analysis-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他。Excel と同じパスは不可 |
+| `--no-readonly-analysis` | フラグ | `false` | 不可 | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |
 
 ### 4.8 終了時のクリーンアップ
 
@@ -931,6 +946,7 @@ bash build_and_verify.sh --no-cache --verify-startup \
 (URL 応答本文 先頭 20 行)
 (環境変数一覧 → ディレクトリツリー → JBoss デプロイ構造
  → JVM パラメータ → OpenTelemetry 環境変数・JVM パラメータ)
+(WAR デプロイ時 Java 例外解析 → 読み取り専用ファイルシステムの書き込み先分析)
 ```
 
 エラー終了時は、後始末の中で SIGTERM 送出後の終了ログも続けて表示します。
@@ -953,6 +969,9 @@ bash build_and_verify.sh --no-cache --verify-startup \
 | `--report-dir/build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | WAR デプロイ時 Java 例外エラー解析の Excel ブック |
 | `--report-dir/build_and_verify_<日時>_java_exceptions.txt` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | 同じ内容のテキスト版 (全スタックフレーム + 区分付きデプロイログ) |
 | `--deploy-exception-excel` / `--deploy-exception-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--report-dir/build_and_verify_<日時>_readonly_filesystem.xlsx` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 読み取り専用ファイルシステム分析の Excel ブック |
+| `--report-dir/build_and_verify_<日時>_readonly_filesystem.txt` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 同じ内容のテキスト版 (全ディレクトリの判定・根拠・参考知識) |
+| `--readonly-analysis-excel` / `--readonly-analysis-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
 
 全量レポートのセクション構成は次のとおりです。
 
@@ -968,6 +987,7 @@ bash build_and_verify.sh --no-cache --verify-startup \
 | `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送信状況チェックの段ごとの判定 (送達の段は `--cwagent-delivery-report` 未指定なら「情報」) | 設定ファイルチェックのみ記録し、送達は「未確認」 |
 | `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 | `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (画面と同じ全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
+| `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` の定義だけで判定し、その旨を記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -1405,6 +1425,112 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 
 ---
 
+### 6.8 読み取り専用ファイルシステム (`read_only`) の書き込み先分析
+
+既定で毎回実行されます (`--no-readonly-analysis` / `--dry-run` のときだけ行いません)。
+`compose.yml` の `read_only: true` は、コンテナのルートファイルシステムを丸ごと
+書き込み不可にします (ECS の `readonlyRootFilesystem: true` と同じ)。
+このとき、アプリケーションが実行時に書くディレクトリへ `tmpfs` かマウントを
+用意していないと、その書き込みは `EROFS` で失敗します。失敗するのは
+「起動時に 1 回だけ書く場所」であることが多く、ログには
+`java.io.FileNotFoundException: ... (Read-only file system)` が 1 行出るだけで、
+原因が `read_only` にあるとは気付きにくいのが実情です。
+
+この分析は、`compose.yml` の設定・実際に動いたコンテナの状態・ソフトウェア別の
+知識を突き合わせ、ディレクトリごとに「書き込むのに書き込み先が無い」状態を
+判定します。`read_only` を使っていない構成でも、**書き込みが発生するディレクトリを
+洗い出し、有効化するなら `tmpfs` とバインドマウントのどちらを割り当てるべきか**を
+出力します。
+
+#### 判定に使う情報
+
+| 分類 | 収集方法 | 内容 |
+| --- | --- | --- |
+| `compose.yml` の定義 | ファイルの解析 | サービスごとの `read_only` / `tmpfs` / `volumes` (短記法・長記法とも) / `image` / `user` / `environment` |
+| コンテナの実状態 | `docker inspect` | `HostConfig.ReadonlyRootfs`、`Mounts` (種別・ソース・マウント先・読み書き)、`HostConfig.Tmpfs` |
+| 書き込みの実績 | `docker diff` | 書き込み層に残った追加・変更・削除。**アプリが実行中に実際へ書いた場所** |
+| コンテナ内の状態 | `docker exec` (1 回) | `/proc/self/mounts` の `ro` フラグ、ディレクトリごとの存在・書き込み可否 (`test -w`)・ファイル数・起動後 (PID 1 より新しい) に更新されたファイル数、`JBOSS_HOME` の解決結果 |
+| 起動パラメータ | `/proc/<pid>/cmdline` | `-Djava.io.tmpdir` / `-XX:HeapDumpPath` / `-Xloggc` など書き込み先を明示している JVM パラメータ |
+| 環境変数 | `/proc/1/environ` | ディレクトリを指す名前 (`*_DIR` / `*_LOG` / `*_TMP` / `*_DATA` / `*_CACHE` など)。`*_HOME` はインストール先を指すため対象外。認証情報を持ちやすい名前は収集しない |
+| ログ | `compose logs` | `Read-only file system` / `EROFS` / `Permission denied` / `AccessDeniedException` / `FileSystemException` の各行 (値は `[REDACTED]` でマスク) |
+
+ファイル数の集計は、大きなディレクトリで時間を使わないよう深さ 3・2000 件で
+打ち切ります。`JBOSS_HOME` は環境変数、無ければ `bin` と `standalone` を持つ
+候補ディレクトリから特定するため、イメージごとにパスが違っても追随します。
+
+#### ソフトウェア別の知識
+
+| 対象 | ディレクトリ | 書き込む内容 | 推奨 |
+| --- | --- | --- | --- |
+| 全サービス | `/tmp` | JVM の `hsperfdata_*`・`.java_pid<pid>` (attach ソケット)、`java.io.tmpdir` を使う処理、JBoss の VFS 展開 | `tmpfs` (必須) |
+| 全サービス | `/run` / `/var/run` | PID ファイル、UNIX ソケット、ロック | `tmpfs` |
+| 全サービス | `/var/log` / `/var/tmp` / `/var/cache` | ログ、一時ファイル、キャッシュ | ログはボリューム、他は `tmpfs` |
+| JBoss EAP | `<JBOSS_HOME>/standalone/tmp` | VFS によるデプロイの展開、`vfs/temp` | `tmpfs` (必須) |
+| JBoss EAP | `<JBOSS_HOME>/standalone/log` | `server.log`、GC ログ | ボリューム (必須) |
+| JBoss EAP | `<JBOSS_HOME>/standalone/data` | content リポジトリ、`timer-service-data`、`tx-object-store` | `tmpfs` (必須) |
+| JBoss EAP | `<JBOSS_HOME>/standalone/configuration` | `standalone_xml_history/`、設定の書き戻し、Elytron CredentialStore | ボリューム (必須。`tmpfs` 不可) |
+| JBoss EAP | `<JBOSS_HOME>/standalone/deployments` | `.dodeploy` / `.deployed` / `.failed` マーカー | ボリューム (`tmpfs` 不可) |
+| CloudWatch Agent | `.../amazon-cloudwatch-agent/logs`・`var`・`etc` | 自身のログ、収集位置の記録、TOML への変換結果 | `logs` / `var` は `tmpfs`、`etc` はボリューム |
+| MySQL | `/var/lib/mysql` / `/var/run/mysqld` | テーブルデータ・InnoDB ログ / ソケット・PID | データはボリューム (必須。`tmpfs` 不可)、ソケットは `tmpfs` |
+| nginx | `/var/cache/nginx` | proxy / client / fastcgi の一時ファイル | `tmpfs` |
+| Tomcat | `work` / `temp` / `logs` | JSP のコンパイル結果、一時領域、ログ | work・temp は `tmpfs`、logs はボリューム |
+| JVM | `<JDK>/lib/security` | 実行中の `cacerts` へのインポート | 実行時は書かない構成にする |
+
+サービスの種別は `image` 名・コンテナ内のプロセス名・環境変数・サービス名から
+判定し、該当する知識だけを適用します。コンテナ内で確認して**存在しない
+ディレクトリは候補から外す**ため、使っていないソフトウェアの項目は出ません。
+
+#### 判定
+
+| 判定 | 条件 | 意味 |
+| --- | --- | --- |
+| `要対応` | `read_only` 有効 + 書き込み先が無い + (必須のディレクトリ、または書き込み実績がある) | そのままでは起動・デプロイが失敗する |
+| `要確認` | 書き込み先はあるが副作用がある / 書き込みの有無を確認したい | 永続が必要なディレクトリへ `tmpfs`、イメージ内のファイルを隠す `tmpfs`、読み取り専用マウント など |
+| `推奨` | `read_only` が未設定・`false` で、書き込みが発生する | 有効化するなら書き込み先の用意が必要 |
+| `OK` | 書き込み先が確保されている | 対応不要 |
+| `情報` | 必須でなく、書き込みの実績も確認できていない | 参考情報 |
+
+判定は**実際のコンテナの状態を優先**します。`compose.yml` が `read_only: true` でも
+コンテナを作り直していなければ実状態は `false` のことがあるため、両者が食い違う
+場合はその旨を結果へ残します。
+
+ディレクトリ 1 件ごとに、用途 / 書き込む内容 / 必須度 / 現在の設定 /
+推奨する設定 / 理由 / 対処 / 判定の根拠 (実測値・ログ) を出力し、
+不足分だけを埋めた **`compose.yml` の設定例**をサービス単位で生成します。
+
+`tmpfs` とボリュームの使い分けも判定に含みます。消えてよい一時領域は `tmpfs`、
+残す必要があるディレクトリ、またはイメージ内のファイルを読む必要がある
+ディレクトリはボリュームを推奨します。`tmpfs` は同じパスにあるイメージ内の
+ファイルを覆い隠すのに対し、名前付きボリュームは初回作成時にイメージの内容が
+コピーされるためです。
+
+#### 出力
+
+| 出力先 | 内容 |
+| --- | --- |
+| 画面 | 要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧、`compose.yml` の設定例) |
+| 全量レポート `[11]` | 画面と同じ要約と、出力ファイルのパス・情報の取得状況 |
+| Excel (`..._readonly_filesystem.xlsx`) | 概要 / サービス別判定 / ディレクトリ判定 / 判定の根拠 / 書き込み実績 / 推奨 compose 設定 / 参考: 書き込み先の知識 の 7 シート |
+| テキスト (`..._readonly_filesystem.txt`) | Excel と同じ内容。全ディレクトリの判定・根拠・参考知識を含む |
+
+Excel はフォント Meiryo UI、行高を内容と列幅から計算して明示し、見出し行の固定と
+オートフィルタ、判定の色分けを設定します (Java 例外解析の Excel と同じ作り)。
+
+#### 実行タイミングと前提
+
+| 項目 | 内容 |
+| --- | --- |
+| 実行タイミング | 成功時は主処理の末尾 (Java 例外解析の後)、失敗時は EXIT トラップで全量レポートを書く直前。いずれも**コンテナを削除する前** |
+| 二重実行 | しない (成功経路で実行済みなら EXIT 側は何もしない) |
+| 前提ツール | Python 3 (`python3` / `python` / `/usr/libexec/platform-python` のいずれか)。Excel は標準ライブラリだけで生成するため `openpyxl` などは不要 |
+| Python 3 が無い場合 | 分析をスキップし `[WARN]` を出す。ビルドの成否は変えない |
+| 終了コードへの影響 | **なし**。`要対応` を検出しても終了コードは変わらない |
+| `--dry-run` | 分析しない (全量レポート `[11]` へ理由を記録) |
+| コンテナ未起動 (ビルドのみ / ビルド失敗) | **分析する**。`compose.yml` の定義だけで判定し、実行状況からの根拠が無いことを `情報の取得状況` へ明記する |
+| `compose up` 失敗・起動確認失敗 | **分析する**。停止済みコンテナでもマウント定義と書き込み層の情報は取得できるため、分かる範囲を残す |
+
+---
+
 ## 7. 環境変数
 
 ### 7.1 入力として参照する環境変数
@@ -1448,7 +1574,7 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
 | `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、`--readonly-analysis-excel` が `.xlsx` でない、`--readonly-analysis-excel` と `--readonly-analysis-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 
@@ -1587,6 +1713,22 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 # 17-3) Java 例外解析を行わない (ログ量を抑えたい場合)
 ./build_and_verify.sh --verify-startup --no-deploy-exception-analysis
 
+# 17-4) 読み取り専用ファイルシステム (read_only) の書き込み先分析
+#       既定で毎回実行される。--report-dir があれば
+#       reports/build_and_verify_<日時>_readonly_filesystem.xlsx / .txt も出力される
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# 17-5) 読み取り専用ファイルシステム分析の Excel / テキストを任意のパスへ出力する
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --readonly-analysis-excel ./reports/readonly.xlsx \
+    --readonly-analysis-text ./reports/readonly.txt
+
+# 17-6) 読み取り専用ファイルシステムの分析を行わない
+./build_and_verify.sh --verify-startup --no-readonly-analysis
+
 # 18) ビルドが exporting layers から進まないときの調査
 #     進捗を 10 秒ごとに表示し、60 秒出力が途切れたら診断を出す
 ./build_and_verify.sh --build-progress-interval 10 --build-stall-timeout 60
@@ -1658,6 +1800,11 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
 | `--deploy-exception-text と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
 | `--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません` | 両方へ同じパスを指定した (exit 2) | 別々のパスにする |
+| `読み取り専用ファイルシステムの書き込み先分析をスキップしました: Python 3 が見つかりません` | 分析ヘルパーに必要な Python 3 が無い | Python 3 を入れる。分析以外の処理には影響しない |
+| `--readonly-analysis-excel には .xlsx で終わるパスを指定してください` | 拡張子が `.xlsx` でない (exit 2) | `.xlsx` で終わるパスにする |
+| `--readonly-analysis-excel と --no-readonly-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `--readonly-analysis-text と --no-readonly-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `--readonly-analysis-excel と --readonly-analysis-text に同じパスは指定できません` | 両方へ同じパスを指定した (exit 2) | 別々のパスにする |
 | `[NG] コンテナ内に設定ファイルがありません` | マウントが効いていない (ディレクトリが作られた・パス違い) | 表示された設定ディレクトリの内容と `compose.yml` の `volumes` を突き合わせる |
 | `[NG] ホスト側の … とコンテナ内の … の内容が一致しません` | 設定ファイルを編集したがコンテナを作り直していない | `docker compose up -d --force-recreate <cwagent>` で作り直す |
 | `[NG] … 秒待っても送達を確認できない送信先があります` | 収集対象ファイルへ誰も書いていない、送信先が listen していない、認証・権限不足など | 表示された cwagent の警告・エラーログを確認し、`--cwagent-delivery-timeout` を `force_flush_interval` より十分長くして再実行 |

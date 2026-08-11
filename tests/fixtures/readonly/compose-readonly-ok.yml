@@ -1,0 +1,36 @@
+# 読み取り専用ファイルシステム分析 (正常系) 用の compose 定義。
+# read_only: true のまま動かせるよう、JBoss EAP と JVM が書くディレクトリへ
+# tmpfs と名前付きボリュームを割り当てている。
+#   - 消えてよい一時領域 (tmp / data / content / run / cache) は tmpfs
+#   - 残す必要がある、またはイメージ内のファイルを隠せないディレクトリ
+#     (log / configuration / deployments) は名前付きボリューム
+#     (名前付きボリュームは初回作成時にイメージの内容がコピーされる)
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+
+  app:
+    image: j1/base.local
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=256m,mode=1777
+      - /var/tmp:rw,size=64m
+      - /run:rw,size=16m,mode=755
+      - /var/cache:rw,size=64m
+      - /opt/jboss-eap/standalone/tmp:rw,size=512m
+      - /opt/jboss-eap/standalone/data:rw,size=256m
+      - /opt/jboss-eap/standalone/content:rw,size=64m
+    volumes:
+      - app-server-log:/opt/jboss-eap/standalone/log
+      - app-configuration:/opt/jboss-eap/standalone/configuration
+      - app-deployments:/opt/jboss-eap/standalone/deployments
+      - app-var-log:/var/log
+
+volumes:
+  app-server-log:
+  app-configuration:
+  app-deployments:
+  app-var-log:

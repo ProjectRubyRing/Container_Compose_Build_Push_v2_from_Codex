@@ -67,6 +67,17 @@
 #                          Compose サービスへの bash 接続やログ確認を行える状態にする。
 #                          --exit-on-deploy-error 指定時は、従来どおりログを出力して
 #                          そのまま終了する。
+#  (14) 読み取り専用ファイルシステム分析:
+#                          compose.yml の read_only 指定と、実際に動いたコンテナの
+#                          書き込み状況を突き合わせ、tmpfs / バインドマウントを
+#                          割り当てるべきディレクトリを判定する。read_only: true の
+#                          サービスは「今の Compose 設定のままで書き込みに失敗しないか」
+#                          を、read_only が未設定・false のサービスは「有効化するなら
+#                          どこに書き込み先が要るか」を出力する。結果は画面・全量
+#                          レポートに加え、Excel ブック
+#                          (build_and_verify_<日時>_readonly_filesystem.xlsx) と
+#                          テキスト (同 _readonly_filesystem.txt) へも出力する。
+#                          既定で有効。--no-readonly-analysis で無効化できる。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -550,6 +561,75 @@ DEPLOY_EXCEPTION_LOG_COLLECTED="false" # 解析対象のログを 1 行でも取
 # 解析ヘルパーへ渡すログのサービス区切り。ログ本文の行頭には現れない制御文字を使う。
 DEPLOY_EXCEPTION_SERVICE_MARKER=$'\037'
 
+# ---- 読み取り専用ファイルシステム (read_only) の書き込み先分析 ----------------
+# compose.yml で read_only: true を指定すると、コンテナのルートファイルシステムは
+# 書き込み不可になる。アプリケーションが実行時に書くディレクトリ (JVM の /tmp、
+# JBoss EAP の standalone/tmp・log・data、PID ファイルを置く /run 等) へ tmpfs や
+# バインドマウントを割り当てていないと、起動やデプロイがその場で失敗する。
+# 失敗の仕方は「ログに 1 行だけ IOException が出て起動が止まる」ことも多く、
+# 原因が read_only にあると気付きにくい。
+# そこで次の 3 つを突き合わせ、「書き込むのに書き込み先が用意されていない
+# ディレクトリ」を判定する。
+#   (A) compose.yml の read_only / tmpfs / volumes の指定
+#   (B) 実際に動いたコンテナの状態 (マウント、書き込み層の変更、コンテナ内から見た
+#       書き込み可否、JVM パラメータ、ログに出た書き込みエラー)
+#   (C) ソフトウェアごとに分かっている書き込み先の知識 (JBoss EAP / JVM / cwagent /
+#       MySQL / nginx / Tomcat 等)
+# read_only が未設定・false のサービスについても、書き込みが発生するディレクトリを
+# 洗い出し、read_only を有効化するときに必要な設定を提示する。
+READONLY_ANALYSIS="true"            # false (--no-readonly-analysis): 分析を行わない
+READONLY_ANALYSIS_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名
+READONLY_ANALYSIS_EXCEL_SET="false" # 出力先が明示指定されたか
+READONLY_ANALYSIS_TEXT=""           # テキストの出力先。空なら --report-dir 配下へ自動命名
+READONLY_ANALYSIS_TEXT_SET="false"  # 出力先が明示指定されたか
+READONLY_ANALYSIS_DONE="false"      # 分析済みか (成功経路と EXIT 経路の二重実行防止)
+READONLY_ANALYSIS_EXCEL_FILE=""     # 実際に出力した Excel のパス
+READONLY_ANALYSIS_TEXT_OUTPUT=""    # 実際に出力したテキストのパス
+# 画面表示と全量レポートへ転記する要約の一時ファイル。独立して出力するテキスト
+# (READONLY_ANALYSIS_TEXT_OUTPUT) は Excel と同じ全量の内容を持つ。
+READONLY_ANALYSIS_DIGEST_FILE=""
+READONLY_ANALYSIS_SKIP_REASON=""    # 分析しなかった理由 (全量レポートへ記載する)
+READONLY_ANALYSIS_COLLECT_STATUS="" # 情報の取得状況 (compose.yml のみ / コンテナからも)
+READONLY_TOTAL="0"                  # 検出した書き込み先ディレクトリの総数
+READONLY_ACTION="0"                 # うち要対応 (read_only のままでは書き込みに失敗する)
+READONLY_CHECK="0"                  # うち要確認
+READONLY_RECOMMEND="0"              # うち推奨 (read_only 未使用のサービス)
+READONLY_OK="0"                     # うち OK (書き込み先が確保されている)
+READONLY_SERVICES="0"               # 分析したサービス数
+READONLY_ENABLED_SERVICES="0"       # read_only が有効なサービス数
+READONLY_VERDICT=""                 # 総合判定
+READONLY_FACT_SEPARATOR=$'\037'     # 収集した事実の区切り
+# コンテナ内で書き込み状況を調べるプローブの目印。コンテナへ渡すスクリプトは
+# 引用を壊さないよう変数展開せずに書くため、下のスクリプト側にも同じ文字列を
+# 直接記述している (変更するときは両方を合わせる)。
+READONLY_PROBE_MARK="__BUILD_AND_VERIFY_RO_PROBE__"
+READONLY_PROBE_MAX_DIRS="80"        # 1 コンテナあたりのプローブ対象ディレクトリ数の上限
+READONLY_DIFF_LIMIT="400"           # docker diff から取り込む変更の最大件数
+READONLY_LOG_ERROR_LIMIT="30"       # ログから取り込む書き込みエラーの最大件数
+# 読み取り専用のディレクトリへ書こうとしたときに出る代表的なメッセージ。
+READONLY_LOG_ERROR_PATTERN='Read-only file system|EROFS|Permission denied|AccessDeniedException|FileSystemException|ReadOnlyFileSystemException'
+# コンテナ内で必ず確認する一般的な書き込み先。JBoss EAP のディレクトリは
+# JBOSS_HOME をコンテナ内で解決してからプローブ側で追加する。
+READONLY_PROBE_BASE_DIRS=(
+  /tmp
+  /var/tmp
+  /run
+  /var/run
+  /var/log
+  /var/cache
+  /var/lib/mysql
+  /var/run/mysqld
+  /var/cache/nginx
+  /var/lib/otelcol
+  /opt/aws/amazon-cloudwatch-agent/logs
+  /opt/aws/amazon-cloudwatch-agent/var
+  /opt/aws/amazon-cloudwatch-agent/etc
+  /opt/java/openjdk/lib/security
+  /usr/local/tomcat/work
+  /usr/local/tomcat/temp
+  /usr/local/tomcat/logs
+)
+
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
 now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
@@ -901,12 +981,15 @@ JBoss マスターパスワードの伝搬検証:
                            繰り返し指定またはカンマ区切りで複数指定できる
   --report-dir DIR         ビルド結果、環境変数一覧、コンテナ内ツリー、JBoss EAP
                            デプロイ構造、JVM パラメータ、OpenTelemetry 設定、
-                           WAR デプロイ時 Java 例外解析を
-                           DIR/build_and_verify_<日時>.txt へ保存する。
+                           WAR デプロイ時 Java 例外解析、読み取り専用ファイル
+                           システム分析を DIR/build_and_verify_<日時>.txt へ保存する。
                            保存内容は画面の制限にかかわらず全深度・全ファイル名となる。
                            あわせて Java 例外解析を
                            DIR/build_and_verify_<日時>_java_exceptions.xlsx と
-                           DIR/build_and_verify_<日時>_java_exceptions.txt へ
+                           DIR/build_and_verify_<日時>_java_exceptions.txt へ、
+                           読み取り専用ファイルシステム分析を
+                           DIR/build_and_verify_<日時>_readonly_filesystem.xlsx と
+                           DIR/build_and_verify_<日時>_readonly_filesystem.txt へ
                            追加出力する (Excel とテキストは同じ内容)
 
 WAR デプロイ時の Java 例外解析:
@@ -955,6 +1038,45 @@ WAR デプロイ時の Java 例外解析:
                            無い場合は「未設定」として併せて表示する。
                            ※ 値に認証情報を含みやすい名前 (PASSWORD / TOKEN /
                              SECRET / HEADERS 等) は [REDACTED] で表示する
+
+読み取り専用ファイルシステム (read_only) の書き込み先分析:
+  (オプション指定不要。既定で毎回分析する)
+  分析内容               compose.yml の read_only / tmpfs / volumes の指定と、
+                         実際に動いたコンテナの状態を突き合わせ、アプリが書き込む
+                         ディレクトリに書き込み先が用意されているかを判定する。
+                         - read_only: true のサービス
+                           今の Compose 設定のままで書き込みに失敗しないかを判定し、
+                           tmpfs / バインドマウントが足りないディレクトリを
+                           「要対応」として理由・対処付きで出力する
+                         - read_only が未設定・false のサービス
+                           書き込みが発生するディレクトリを洗い出し、read_only を
+                           有効化するなら tmpfs とバインドマウントのどちらを
+                           割り当てるべきかを「推奨」として出力する
+                         判定には、コンテナのマウント定義、書き込み層の変更
+                         (docker diff)、コンテナ内から見た書き込み可否と
+                         起動後に更新されたファイル数、JVM パラメータ
+                         (-Djava.io.tmpdir / -XX:HeapDumpPath 等)、ディレクトリを
+                         指す環境変数、ログに出た書き込みエラーを使う。
+                         JBoss EAP の standalone/tmp・log・data・configuration・
+                         deployments、JVM の /tmp、CloudWatch Agent・MySQL・
+                         nginx・Tomcat の書き込み先といった、ソフトウェアごとの
+                         既知のディレクトリも併せて確認する。
+                         結果は画面と全量レポートへ出力し、不足分を埋めた
+                         compose.yml の設定例も生成する。
+  --readonly-analysis-excel FILE
+                         分析結果を Excel ブック (.xlsx) として FILE へ出力する。
+                         --report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_readonly_filesystem.xlsx へ
+                         自動出力する。ブックは「概要」「サービス別判定」
+                         「ディレクトリ判定」「判定の根拠」「書き込み実績」
+                         「推奨 compose 設定」「参考: 書き込み先の知識」の
+                         7 シート構成 (フォントは Meiryo UI)。出力には Python 3 が必要
+  --readonly-analysis-text FILE
+                         Excel と同じ内容をテキストファイルとして FILE へ出力する。
+                         --report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_readonly_filesystem.txt へ
+                         自動出力する
+  --no-readonly-analysis 読み取り専用ファイルシステムの分析とファイル出力を行わない
 
 CloudWatch Agent (cwagent) のログ送信検証:
   (compose.yml に cwagent サービスが定義されていれば自動で実行する)
@@ -1127,6 +1249,9 @@ while [ $# -gt 0 ]; do
     --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
     --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
     --no-deploy-exception-analysis) DEPLOY_EXCEPTION_ANALYSIS="false"; shift ;;
+    --readonly-analysis-excel) need_value "$1" $#; READONLY_ANALYSIS_EXCEL="$2"; READONLY_ANALYSIS_EXCEL_SET="true"; shift 2 ;;
+    --readonly-analysis-text)  need_value "$1" $#; READONLY_ANALYSIS_TEXT="$2"; READONLY_ANALYSIS_TEXT_SET="true"; shift 2 ;;
+    --no-readonly-analysis)    READONLY_ANALYSIS="false"; shift ;;
     --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
     --no-verify-cwagent)   VERIFY_CWAGENT="false"; shift ;;
     --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
@@ -1241,6 +1366,41 @@ fi
 if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] && [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
     && [ "$DEPLOY_EXCEPTION_EXCEL" = "$DEPLOY_EXCEPTION_TEXT" ]; then
   err "--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません: $DEPLOY_EXCEPTION_EXCEL"
+  exit 2
+fi
+
+# ---- 読み取り専用ファイルシステム分析の出力先の検証 --------------------------
+if [ "$READONLY_ANALYSIS_EXCEL_SET" = "true" ]; then
+  if [ -z "$READONLY_ANALYSIS_EXCEL" ] || [ "$READONLY_ANALYSIS_EXCEL" = "-" ]; then
+    err "--readonly-analysis-excel にはファイルパスを指定してください: $READONLY_ANALYSIS_EXCEL"
+    exit 2
+  fi
+  # 拡張子が .xlsx でないと Excel が形式を判別できず、開けないファイルになる。
+  case "$READONLY_ANALYSIS_EXCEL" in
+    *.xlsx) ;;
+    *)
+      err "--readonly-analysis-excel には .xlsx で終わるパスを指定してください: $READONLY_ANALYSIS_EXCEL"
+      exit 2
+      ;;
+  esac
+  if [ "$READONLY_ANALYSIS" != "true" ]; then
+    err "--readonly-analysis-excel と --no-readonly-analysis は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$READONLY_ANALYSIS_TEXT_SET" = "true" ]; then
+  if [ -z "$READONLY_ANALYSIS_TEXT" ] || [ "$READONLY_ANALYSIS_TEXT" = "-" ]; then
+    err "--readonly-analysis-text にはファイルパスを指定してください: $READONLY_ANALYSIS_TEXT"
+    exit 2
+  fi
+  if [ "$READONLY_ANALYSIS" != "true" ]; then
+    err "--readonly-analysis-text と --no-readonly-analysis は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$READONLY_ANALYSIS_EXCEL_SET" = "true" ] && [ "$READONLY_ANALYSIS_TEXT_SET" = "true" ] \
+    && [ "$READONLY_ANALYSIS_EXCEL" = "$READONLY_ANALYSIS_TEXT" ]; then
+  err "--readonly-analysis-excel と --readonly-analysis-text に同じパスは指定できません: $READONLY_ANALYSIS_EXCEL"
   exit 2
 fi
 
@@ -13736,7 +13896,8 @@ DEPLOY_EXCEPTION_ANALYZER_PY_EOF
 
 # 解析に使う Python 3 を探す。可観測性ヘルパーと同じ候補・同じ変数を使うが、
 # 見つからない場合もビルドは止めず、解析だけを省略する。
-resolve_deploy_exception_python() {
+# Java 例外解析と読み取り専用ファイルシステム分析で共用する。
+resolve_analysis_python() {
   local candidate
 
   [ -n "$OBSERVABILITY_PYTHON" ] && return 0
@@ -13753,7 +13914,8 @@ resolve_deploy_exception_python() {
 
 # メタ情報 1 行分を "キー<TAB>値" で書き出す。値に含まれるタブ・改行は、
 # ヘルパー側の行単位パースを壊すため空白へ置き換える。
-deploy_exception_meta_entry() {
+# Java 例外解析と読み取り専用ファイルシステム分析で共用する。
+analysis_meta_entry() {
   local key="$1" value="$2"
   value="$(printf '%s' "$value" | tr '\t\n\r' '   ')"
   printf '%s\t%s\n' "$key" "$value"
@@ -13787,24 +13949,24 @@ write_deploy_exception_meta() {
   fi
 
   {
-    deploy_exception_meta_entry "analyzed_at" "$(now_display_time)"
-    deploy_exception_meta_entry "run_started_at" "$RUN_STARTED_AT"
-    deploy_exception_meta_entry "script" "build_and_verify.sh"
-    deploy_exception_meta_entry "compose_file" "$COMPOSE_FILE"
+    analysis_meta_entry "analyzed_at" "$(now_display_time)"
+    analysis_meta_entry "run_started_at" "$RUN_STARTED_AT"
+    analysis_meta_entry "script" "build_and_verify.sh"
+    analysis_meta_entry "compose_file" "$COMPOSE_FILE"
     if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
-      deploy_exception_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
+      analysis_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
     else
-      deploy_exception_meta_entry "build_services" "全サービス"
+      analysis_meta_entry "build_services" "全サービス"
     fi
     if [ ${#COMPOSE_TARGET_SERVICES[@]} -gt 0 ]; then
-      deploy_exception_meta_entry "target_services" "${COMPOSE_TARGET_SERVICES[*]}"
+      analysis_meta_entry "target_services" "${COMPOSE_TARGET_SERVICES[*]}"
     else
-      deploy_exception_meta_entry "target_services" "全サービス"
+      analysis_meta_entry "target_services" "全サービス"
     fi
-    deploy_exception_meta_entry "overall_status" "$overall_status"
-    deploy_exception_meta_entry "report_file" "$report_file"
-    deploy_exception_meta_entry "log_scope" "$log_scope"
-    deploy_exception_meta_entry "log_status" "$DEPLOY_EXCEPTION_LOG_STATUS"
+    analysis_meta_entry "overall_status" "$overall_status"
+    analysis_meta_entry "report_file" "$report_file"
+    analysis_meta_entry "log_scope" "$log_scope"
+    analysis_meta_entry "log_status" "$DEPLOY_EXCEPTION_LOG_STATUS"
   } > "$meta_file"
 }
 
@@ -13835,8 +13997,10 @@ collect_deploy_exception_logs() {
 # 解析結果ファイル (Excel / テキスト) の出力先を決める。明示指定が最優先で、
 # 次に全量レポートと同じディレクトリ。どちらも無い場合は出力しない
 # (その場合も解析結果は画面と全量レポートへ出る)。
-resolve_deploy_exception_output_path() {
-  local explicit="$1" explicit_set="$2" extension="$3"
+# name_suffix は全量レポート (build_and_verify_<日時>.txt) と対で並ぶよう、
+# 同じ日時の後ろへ付ける識別子 (例: _java_exceptions)。
+resolve_analysis_output_path() {
+  local explicit="$1" explicit_set="$2" extension="$3" name_suffix="$4"
   local report_dir base candidate counter=1
 
   if [ "$explicit_set" = "true" ]; then
@@ -13846,8 +14010,7 @@ resolve_deploy_exception_output_path() {
   [ -n "$BUILD_REPORT_DIR" ] || return 1
   report_dir="${BUILD_REPORT_DIR%/}"
   [ -n "$report_dir" ] || report_dir="/"
-  # 全量レポート (build_and_verify_<日時>.txt) と対で並ぶ名前にする。
-  base="build_and_verify_${RUN_TIMESTAMP}_java_exceptions"
+  base="build_and_verify_${RUN_TIMESTAMP}${name_suffix}"
   candidate="${report_dir}/${base}.${extension}"
   while [ -e "$candidate" ]; do
     candidate="${report_dir}/${base}_${counter}.${extension}"
@@ -13859,13 +14022,14 @@ resolve_deploy_exception_output_path() {
 
 # 出力先を解決し、親ディレクトリまで作成する。作成できない場合は空を返して
 # その形式の出力だけを諦める (解析そのものは継続する)。
-prepare_deploy_exception_output() {
-  local explicit="$1" explicit_set="$2" extension="$3" label="$4" path=""
+prepare_analysis_output() {
+  local explicit="$1" explicit_set="$2" extension="$3" label="$4"
+  local name_suffix="$5" analysis_label="$6" path=""
 
-  if path="$(resolve_deploy_exception_output_path "$explicit" "$explicit_set" "$extension")" \
+  if path="$(resolve_analysis_output_path "$explicit" "$explicit_set" "$extension" "$name_suffix")" \
       && [ -n "$path" ]; then
     if ! mkdir -p -- "$(dirname -- "$path")" 2>/dev/null; then
-      warn "Java 例外解析${label}の出力先を作成できませんでした: $(dirname -- "$path")"
+      warn "${analysis_label}${label}の出力先を作成できませんでした: $(dirname -- "$path")"
       path=""
     fi
   else
@@ -13917,7 +14081,7 @@ analyze_war_deploy_exceptions() {
     log "[DRY-RUN] WAR デプロイ時 Java 例外解析をスキップします。"
     return 0
   fi
-  if ! resolve_deploy_exception_python; then
+  if ! resolve_analysis_python; then
     DEPLOY_EXCEPTION_ANALYZED="true"
     DEPLOY_EXCEPTION_SKIP_REASON="解析に必要な Python 3 が見つかりませんでした (python3 / python / /usr/libexec/platform-python)。"
     warn "WAR デプロイ時 Java 例外解析をスキップしました: Python 3 が見つかりません。"
@@ -13959,10 +14123,12 @@ analyze_war_deploy_exceptions() {
   fi
   write_deploy_exception_meta "$meta_file" "$exit_status"
 
-  excel_path="$(prepare_deploy_exception_output \
-      "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel")"
-  text_path="$(prepare_deploy_exception_output \
-      "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト")"
+  excel_path="$(prepare_analysis_output \
+      "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel" \
+      "_java_exceptions" "Java 例外解析")"
+  text_path="$(prepare_analysis_output \
+      "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト" \
+      "_java_exceptions" "Java 例外解析")"
 
   analyzer_args=(
     --log-file "$log_file"
@@ -14067,6 +14233,2384 @@ append_deploy_exception_report() {
   printf '取得範囲      : 終了ログ (SIGTERM 後) を取得する前のデプロイ処理ログ\n' >> "$report_file"
   printf '\n' >> "$report_file"
   cat -- "$DEPLOY_EXCEPTION_TEXT_FILE" >> "$report_file"
+  return 0
+}
+
+# =============================================================================
+# 読み取り専用ファイルシステム (read_only) の書き込み先分析
+# -----------------------------------------------------------------------------
+# compose.yml の read_only 指定は、コンテナのルートファイルシステムを丸ごと
+# 書き込み不可にする。アプリケーションが実行時に書くディレクトリへ tmpfs や
+# バインドマウントを割り当てていないと、その書き込みは EROFS で失敗する。
+# 失敗するのは「起動時に 1 回だけ書く場所」であることが多く、ログには
+# IOException が 1 行出るだけで、原因が read_only だとは分かりにくい。
+#
+# ここでは次の 3 つを突き合わせて、ディレクトリごとに判定する。
+#   (A) compose.yml の定義      : read_only / tmpfs / volumes (短記法・長記法とも)
+#   (B) 実際に動いたコンテナ    : マウント、書き込み層の変更 (docker diff)、
+#                                 コンテナ内から見た書き込み可否と起動後に更新された
+#                                 ファイル数、/proc/mounts の ro、JVM パラメータ、
+#                                 ディレクトリを指す環境変数、書き込みエラーのログ
+#   (C) ソフトウェア別の知識    : JBoss EAP / JVM / CloudWatch Agent / MySQL /
+#                                 nginx / Tomcat が実行時に書くディレクトリ
+# 判定と出力 (テキスト・Excel) は Python 3 のヘルパーへ委譲する。Excel も標準
+# ライブラリだけで生成するため、openpyxl などの追加パッケージは不要。
+# =============================================================================
+
+# 分析ヘルパー本体。プログラムは標準入力から渡すため、コマンドライン長の制限
+# (Windows の Git Bash など) を受けない。
+read -r -d '' READONLY_ANALYZER_PY <<'READONLY_ANALYZER_PY_EOF' || true
+import argparse
+import datetime
+import math
+import os
+import re
+import sys
+import zipfile
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+SEP = "\x1f"
+RULE = "-" * 67
+HEAVY = "=" * 67
+
+# 判定 (深刻な順)。画面・テキスト・Excel で同じ語を使う。
+V_ACTION = "要対応"      # read_only 有効で書き込みできず、失敗する / 失敗している
+V_CHECK = "要確認"       # 設定はあるが副作用がある、または書き込みの有無を確認したい
+V_RECOMMEND = "推奨"     # read_only 未設定。有効化するなら tmpfs / バインドマウントが要る
+V_OK = "OK"              # 書き込み先が確保されている
+V_INFO = "情報"          # 参考情報 (書き込みの実績も必要性も確認できていない)
+
+VERDICT_ORDER = {V_ACTION: 0, V_CHECK: 1, V_RECOMMEND: 2, V_OK: 3, V_INFO: 4}
+
+# 必須度。判定の重み付けと表示に使う。
+N_REQUIRED = "必須"
+N_LIKELY = "高"
+N_OPTIONAL = "中"
+NEED_ORDER = {N_REQUIRED: 0, N_LIKELY: 1, N_OPTIONAL: 2}
+
+
+# =============================================================================
+# 収集した事実の読み取り
+# =============================================================================
+
+class Service(object):
+    """1 つの Compose サービスについて集めた事実。"""
+
+    def __init__(self, name):
+        self.name = name
+        self.image = ""
+        self.user = ""
+        self.container_name = ""
+        self.compose_read_only = None        # None (未設定) / True / False
+        self.compose_tmpfs = []              # [(target, options)]
+        self.compose_volumes = []            # [{type, source, target, read_only}]
+        self.compose_env = {}
+        self.container = ""                  # 実際のコンテナ名
+        self.container_status = ""
+        self.runtime_read_only = None
+        self.runtime_mounts = []             # [{type, source, target, rw}]
+        self.runtime_tmpfs = []              # [(target, options)]
+        self.mountinfo = []                  # [(mountpoint, fstype, options)]
+        self.diff = []                       # [(kind, path)]
+        self.probe = {}                      # path -> {exists, writable, files, recent}
+        self.jvm_options = []
+        self.runtime_env = {}
+        self.log_errors = []
+        self.processes = []
+        self.jboss_home = ""
+        self.notes = []
+        self.findings = []
+        self.kinds = set()
+
+    # -- 判定の材料 ----------------------------------------------------------
+    def effective_read_only(self):
+        """実際に読み取り専用で動いているか。実行中の値を最優先する。"""
+        if self.runtime_read_only is not None:
+            return self.runtime_read_only
+        if self.compose_read_only is not None:
+            return self.compose_read_only
+        return False
+
+    def read_only_source(self):
+        if self.runtime_read_only is not None:
+            return "コンテナの実状態 (HostConfig.ReadonlyRootfs)"
+        if self.compose_read_only is not None:
+            return "compose.yml の read_only"
+        return "compose.yml に read_only の指定なし (既定: false)"
+
+    def has_runtime_facts(self):
+        return bool(self.container) or bool(self.mountinfo) or bool(self.probe)
+
+
+def parse_facts(path):
+    """収集した事実ファイルを Service の辞書へ読み込む (定義順を保つ)。"""
+    services = {}
+    order = []
+    named_volumes = []
+
+    def service_of(name):
+        if name not in services:
+            services[name] = Service(name)
+            order.append(name)
+        return services[name]
+
+    if not path or not os.path.exists(path):
+        return [], []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            raw = raw.rstrip("\r\n")
+            if not raw:
+                continue
+            fields = raw.split(SEP)
+            kind = fields[0]
+            rest = fields[1:]
+            if kind == "named_volume":
+                if rest:
+                    named_volumes.append(rest[0])
+                continue
+            if not rest:
+                continue
+            service = service_of(rest[0])
+            values = rest[1:]
+
+            def value(index, default=""):
+                return values[index] if len(values) > index else default
+
+            if kind == "service":
+                pass
+            elif kind == "image":
+                service.image = value(0)
+            elif kind == "user":
+                service.user = value(0)
+            elif kind == "container_name":
+                service.container_name = value(0)
+            elif kind == "read_only":
+                service.compose_read_only = (value(0).lower() == "true")
+            elif kind == "tmpfs":
+                service.compose_tmpfs.append((normalize_path(value(0)), value(1)))
+            elif kind == "volume":
+                service.compose_volumes.append({
+                    "type": value(0) or "unknown",
+                    "source": value(1),
+                    "target": normalize_path(value(2)),
+                    "read_only": value(3).lower() == "true",
+                })
+            elif kind == "env":
+                service.compose_env[value(0)] = value(1)
+            elif kind == "container":
+                service.container = value(0)
+                service.container_status = value(1)
+            elif kind == "rt_readonly":
+                service.runtime_read_only = (value(0).lower() == "true")
+            elif kind == "rt_mount":
+                service.runtime_mounts.append({
+                    "type": value(0) or "unknown",
+                    "source": value(1),
+                    "target": normalize_path(value(2)),
+                    "rw": value(3).lower() == "true",
+                })
+            elif kind == "rt_tmpfs":
+                service.runtime_tmpfs.append((normalize_path(value(0)), value(1)))
+            elif kind == "rt_mountinfo":
+                service.mountinfo.append((normalize_path(value(0)), value(1), value(2)))
+            elif kind == "rt_diff":
+                service.diff.append((value(0), normalize_path(value(1))))
+            elif kind == "rt_probe":
+                service.probe[normalize_path(value(0))] = {
+                    "exists": value(1) == "exists",
+                    "writable": value(2) == "rw",
+                    "files": to_int(value(3)),
+                    "recent": to_int(value(4)),
+                }
+            elif kind == "rt_jvm":
+                service.jvm_options.append(value(0))
+            elif kind == "rt_env":
+                service.runtime_env[value(0)] = value(1)
+            elif kind == "rt_log":
+                service.log_errors.append(value(0))
+            elif kind == "rt_process":
+                service.processes.append(value(0))
+            elif kind == "rt_jboss_home":
+                service.jboss_home = normalize_path(value(0))
+            elif kind == "note":
+                service.notes.append(value(0))
+    return [services[name] for name in order], named_volumes
+
+
+def to_int(text):
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_path(path):
+    """末尾のスラッシュを落とす (/ はそのまま)。前方一致の判定を安定させる。"""
+    path = (path or "").strip()
+    while len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def is_under(path, ancestor):
+    """path が ancestor と同じ、またはその配下か。"""
+    if not path or not ancestor:
+        return False
+    if ancestor == "/":
+        return path.startswith("/")
+    return path == ancestor or path.startswith(ancestor + "/")
+
+
+def parent_dir(path):
+    path = normalize_path(path)
+    if "/" not in path or path == "/":
+        return "/"
+    parent = path.rsplit("/", 1)[0]
+    return parent or "/"
+
+
+# =============================================================================
+# 書き込み先ディレクトリの知識
+# -----------------------------------------------------------------------------
+# read_only を有効にしたコンテナで実際に問題になるのは、「アプリが書くのに
+# 書き込み先が用意されていないディレクトリ」だけである。ここでは、その候補を
+# ソフトウェアごとに整理し、
+#   - 何を書くのか (書き込み内容)
+#   - 消えてよいのか (tmpfs で足りるのか、永続が要るのか)
+#   - read_only のまま動かすなら何を設定するのか
+# を対にして持たせる。判定はこの表と、実行中コンテナから集めた事実の
+# 突き合わせで行う。
+# =============================================================================
+
+class Knowledge(object):
+    __slots__ = ("path", "kinds", "purpose", "writes", "need", "recommend",
+                 "options", "persist", "tmpfs_ok", "reason", "action")
+
+    def __init__(self, path, kinds, purpose, writes, need, recommend, options,
+                 persist, tmpfs_ok, reason, action):
+        self.path = path            # {jboss_home} を含む場合は展開して使う
+        self.kinds = kinds          # 適用するサービス種別 ("*" は全サービス)
+        self.purpose = purpose      # 用途
+        self.writes = writes        # 書き込む内容
+        self.need = need            # 必須度
+        self.recommend = recommend  # 推奨する設定 (tmpfs / バインドマウント / ボリューム)
+        self.options = options      # tmpfs のオプション例
+        self.persist = persist      # 再起動をまたいで残す必要があるか
+        self.tmpfs_ok = tmpfs_ok    # tmpfs を被せてよいか (イメージ内の中身を隠さないか)
+        self.reason = reason        # なぜ書き込みが必要か
+        self.action = action        # 未対応のときに行うこと
+
+
+def kn(path, kinds, purpose, writes, need, recommend, options="", persist=False,
+       tmpfs_ok=True, reason="", action=""):
+    return Knowledge(path, kinds, purpose, writes, need, recommend, options,
+                     persist, tmpfs_ok, reason, action)
+
+
+KNOWLEDGE = [
+    kn("/tmp", ["*"],
+       "一時ディレクトリ (TMPDIR / java.io.tmpdir の既定値)",
+       "JVM の hsperfdata_<user> (性能統計)、.java_pid<pid> (attach ソケット)、"
+       "ライブラリが作る一時ファイル、JBoss の VFS 展開先",
+       N_REQUIRED, "tmpfs", "rw,size=256m,mode=1777",
+       reason="JVM は起動直後に /tmp へ hsperfdata を作る。読み取り専用だと "
+              "警告が出るだけで済むこともあるが、java.io.tmpdir を使う処理 "
+              "(ファイルアップロード、JAXB / JAX-RS の一時ファイル、"
+              "OpenTelemetry エージェントの展開) は IOException で失敗する。",
+       action="tmpfs へ /tmp を追加する (mode=1777 を付けて全ユーザーが書けるようにする)。"),
+    kn("/var/tmp", ["*"],
+       "再起動をまたいでもよい一時ディレクトリ",
+       "rpm / yum / 一部ライブラリの作業ファイル",
+       N_OPTIONAL, "tmpfs", "rw,size=64m,mode=1777",
+       reason="アプリが直接使うことは少ないが、OS のツールが書き込み先として使う。",
+       action="tmpfs へ /var/tmp を追加する。"),
+    kn("/run", ["*"],
+       "実行時状態 (PID ファイル・UNIX ソケット)",
+       "PID ファイル、ソケット、ロックファイル",
+       N_LIKELY, "tmpfs", "rw,size=16m,mode=755",
+       reason="デーモンとして動くプロセスが PID ファイルやソケットを作る。"
+              "read_only では起動時にここで失敗する。",
+       action="tmpfs へ /run を追加する (/var/run が /run へのシンボリックリンクのイメージが多い)。"),
+    kn("/var/run", ["*"],
+       "実行時状態 (/run への互換パス)",
+       "PID ファイル、ソケット",
+       N_OPTIONAL, "tmpfs", "rw,size=16m,mode=755",
+       reason="多くのイメージで /run へのシンボリックリンクだが、実体を持つイメージもある。",
+       action="実体を持つイメージでは tmpfs へ /var/run を追加する。"),
+    kn("/var/log", ["*"],
+       "ログ出力先",
+       "アプリケーション・ミドルウェアのログファイル",
+       N_LIKELY, "バインドマウント / ボリューム", "rw,size=128m", persist=True,
+       reason="ログをファイルへ書く構成では read_only のまま書けない。"
+              "tmpfs でも書けるようになるが、コンテナ終了と同時に消えるため、"
+              "CloudWatch Agent などが読む前に失われることがある。",
+       action="ログを標準出力へ出すか、収集する側と共有できるボリューム "
+              "(または CloudWatch Agent と同じボリューム) をマウントする。"),
+    kn("/var/cache", ["*"],
+       "キャッシュ",
+       "パッケージマネージャ・アプリのキャッシュ",
+       N_OPTIONAL, "tmpfs", "rw,size=64m",
+       reason="実行時にキャッシュを書くソフトウェアがある。",
+       action="必要な場合のみ tmpfs を追加する。"),
+
+    # ---- JVM ----------------------------------------------------------------
+    kn("/opt/java/openjdk/lib/security", ["java"],
+       "JDK のセキュリティ設定",
+       "cacerts へのインポート (実行中の証明書追加)",
+       N_OPTIONAL, "バインドマウント", persist=True, tmpfs_ok=False,
+       reason="実行中に keytool で証明書を追加する構成では書き込みが要る。"
+              "イメージへ焼き込んでいれば書き込みは発生しない。",
+       action="証明書はイメージビルド時に取り込み、実行時は書き込まない構成にする。"),
+
+    # ---- JBoss EAP / WildFly -------------------------------------------------
+    kn("{jboss_home}/standalone/tmp", ["jboss"],
+       "JBoss EAP の一時ディレクトリ",
+       "VFS によるデプロイの展開、auth ディレクトリ、vfs/temp 配下の作業ファイル",
+       N_REQUIRED, "tmpfs", "rw,size=512m",
+       reason="EAP は起動のたびに standalone/tmp を作り直し、WAR / EAR を "
+              "ここへ展開する。書き込めないとデプロイが WFLYSRV0021 で失敗し、"
+              "サーバーは起動してもアプリだけ落ちる。",
+       action="tmpfs へ <JBOSS_HOME>/standalone/tmp を追加する。"),
+    kn("{jboss_home}/standalone/log", ["jboss"],
+       "JBoss EAP のサーバーログ",
+       "server.log、gc.log、audit ログ",
+       N_REQUIRED, "バインドマウント / ボリューム", "rw,size=256m", persist=True,
+       reason="EAP は起動時に server.log を開く。書き込めないと "
+              "FileHandler の初期化に失敗して起動そのものが止まる。",
+       action="CloudWatch Agent と共有するボリュームをマウントする "
+              "(ログを収集しないなら tmpfs でもよい)。"),
+    kn("{jboss_home}/standalone/data", ["jboss"],
+       "JBoss EAP の実行時データ",
+       "content リポジトリ (デプロイ済みアーカイブ)、timer-service-data、"
+       "tx-object-store (トランザクションログ)",
+       N_REQUIRED, "tmpfs", "rw,size=256m",
+       reason="デプロイの管理情報とトランザクションログの置き場所。"
+              "書き込めないと起動時の初期化で失敗する。",
+       action="tmpfs で足りることが多い。ただし XA トランザクションの復旧が要る構成では"
+              "ボリュームで永続化する (tmpfs だと未完了トランザクションが消える)。"),
+    kn("{jboss_home}/standalone/configuration", ["jboss"],
+       "JBoss EAP の設定ディレクトリ",
+       "standalone_xml_history/ (起動ごとの設定履歴)、standalone.xml の書き戻し、"
+       "*.initial / *.boot / *.last、Elytron CredentialStore",
+       N_REQUIRED, "バインドマウント", persist=True, tmpfs_ok=False,
+       reason="EAP は起動時に設定履歴を書く。読み取り専用だと "
+              "起動時に書き込みエラーとなる。tmpfs を被せると standalone.xml "
+              "そのものが見えなくなり、今度は設定が読めずに起動できない。",
+       action="-Djboss.server.config.dir を書き込み可能な場所へ移すか、"
+              "設定ディレクトリごとバインドマウントする。"
+              "履歴が不要なら起動オプションで書き戻しを止める構成にする。"),
+    kn("{jboss_home}/standalone/deployments", ["jboss"],
+       "JBoss EAP のデプロイスキャナ監視ディレクトリ",
+       ".dodeploy / .deployed / .failed のマーカーファイル",
+       N_LIKELY, "バインドマウント", persist=True, tmpfs_ok=False,
+       reason="デプロイスキャナは WAR を配置したディレクトリへマーカーを書く。"
+              "読み取り専用だと WFLYDS0011 等でデプロイに失敗する。"
+              "tmpfs を被せるとイメージへ焼いた WAR が見えなくなる。",
+       action="WAR ごとバインドマウントするか、デプロイスキャナを使わず "
+              "管理 API / CLI でデプロイする構成にする。"),
+    kn("{jboss_home}/standalone/content", ["jboss"],
+       "JBoss EAP の content リポジトリ (構成によっては data 配下)",
+       "管理 API 経由でデプロイしたアーカイブ",
+       N_OPTIONAL, "tmpfs", "rw,size=256m",
+       reason="管理 API でデプロイする構成で書き込みが発生する。",
+       action="tmpfs かボリュームを割り当てる。"),
+
+    # ---- CloudWatch Agent ----------------------------------------------------
+    kn("/opt/aws/amazon-cloudwatch-agent/logs", ["cwagent"],
+       "CloudWatch Agent 自身のログ",
+       "amazon-cloudwatch-agent.log",
+       N_REQUIRED, "tmpfs", "rw,size=64m",
+       reason="エージェントは自身のログをファイルへ書く。書けないと起動直後に終了する。",
+       action="tmpfs へ /opt/aws/amazon-cloudwatch-agent/logs を追加する。"),
+    kn("/opt/aws/amazon-cloudwatch-agent/var", ["cwagent"],
+       "CloudWatch Agent の状態ファイル",
+       "収集済み位置 (file offset) の記録",
+       N_REQUIRED, "tmpfs", "rw,size=32m",
+       reason="tail した位置を保存する。書けないと毎回先頭から送り直す、"
+              "または送信自体が止まる。",
+       action="tmpfs で足りるが、再起動後の重複送信を避けたい場合はボリュームにする。"),
+    kn("/opt/aws/amazon-cloudwatch-agent/etc", ["cwagent"],
+       "CloudWatch Agent の設定ディレクトリ",
+       "TOML への変換結果 (amazon-cloudwatch-agent.toml)、環境変数ファイル",
+       N_REQUIRED, "ボリューム", tmpfs_ok=False,
+       reason="エージェントは起動時に JSON 設定を TOML へ変換して同じディレクトリへ書く。"
+              "読み取り専用だと変換に失敗して収集が始まらない。"
+              "設定ファイルを同じディレクトリへマウントしている場合、tmpfs を被せると"
+              "その設定が見えなくなる。",
+       action="設定は /etc/cwagentconfig へマウントし、"
+              "/opt/aws/amazon-cloudwatch-agent/etc は書き込み可能にする。"),
+
+    # ---- OpenTelemetry / ADOT Collector --------------------------------------
+    kn("/var/lib/otelcol", ["otel"],
+       "Collector の永続キュー (file_storage 拡張)",
+       "送信待ちデータのスプール",
+       N_OPTIONAL, "ボリューム", persist=True,
+       reason="file_storage 拡張を使う構成では書き込みが要る。",
+       action="file_storage を使う場合はボリュームを割り当てる。"),
+
+    # ---- MySQL --------------------------------------------------------------
+    kn("/var/lib/mysql", ["mysql"],
+       "MySQL のデータディレクトリ",
+       "テーブルデータ、InnoDB のログとテーブルスペース、バイナリログ",
+       N_REQUIRED, "ボリューム", persist=True, tmpfs_ok=False,
+       reason="データベースの実体。読み取り専用では起動すらできない。",
+       action="名前付きボリュームをマウントする。tmpfs は使わない "
+              "(コンテナ終了でデータが消える)。"),
+    kn("/var/run/mysqld", ["mysql"],
+       "MySQL のソケット・PID ファイル",
+       "mysqld.sock、mysqld.pid",
+       N_REQUIRED, "tmpfs", "rw,size=16m",
+       reason="起動時にソケットと PID ファイルを作る。",
+       action="tmpfs へ /var/run/mysqld を追加する。"),
+
+    # ---- nginx --------------------------------------------------------------
+    kn("/var/cache/nginx", ["nginx"],
+       "nginx のキャッシュ・一時ファイル",
+       "proxy_temp / client_temp / fastcgi_temp",
+       N_REQUIRED, "tmpfs", "rw,size=128m",
+       reason="リクエストのバッファリングで一時ファイルを書く。",
+       action="tmpfs へ /var/cache/nginx を追加する。"),
+
+    # ---- Tomcat -------------------------------------------------------------
+    kn("/usr/local/tomcat/work", ["tomcat"],
+       "Tomcat の作業ディレクトリ",
+       "JSP のコンパイル結果、セッションの永続化",
+       N_REQUIRED, "tmpfs", "rw,size=128m",
+       reason="JSP をコンパイルして書き出す。書けないと 500 エラーになる。",
+       action="tmpfs へ /usr/local/tomcat/work を追加する。"),
+    kn("/usr/local/tomcat/temp", ["tomcat"],
+       "Tomcat の一時ディレクトリ",
+       "アップロードファイルなどの一時領域",
+       N_REQUIRED, "tmpfs", "rw,size=64m",
+       reason="java.io.tmpdir として使われる。",
+       action="tmpfs へ /usr/local/tomcat/temp を追加する。"),
+    kn("/usr/local/tomcat/logs", ["tomcat"],
+       "Tomcat のログ",
+       "catalina.out、アクセスログ",
+       N_LIKELY, "バインドマウント / ボリューム", persist=True,
+       reason="ログをファイルへ書く既定構成。",
+       action="標準出力へ出すか、ボリュームをマウントする。"),
+]
+
+
+def knowledge_for(service):
+    """サービスの種別に合う知識を、パスを展開して返す。"""
+    entries = []
+    for entry in KNOWLEDGE:
+        if "*" not in entry.kinds and not (set(entry.kinds) & service.kinds):
+            continue
+        path = entry.path
+        if "{jboss_home}" in path:
+            if not service.jboss_home:
+                continue
+            path = path.replace("{jboss_home}", service.jboss_home)
+        entries.append((normalize_path(path), entry))
+    return entries
+
+
+# サービス種別の判定に使う手掛かり。image / プロセス名 / 環境変数から決める。
+KIND_IMAGE_PATTERNS = [
+    ("jboss", r"jboss|wildfly|eap"),
+    ("mysql", r"mysql|mariadb|aurora"),
+    ("nginx", r"nginx"),
+    ("tomcat", r"tomcat"),
+    ("cwagent", r"cloudwatch-agent|cloudwatch_agent"),
+    ("otel", r"otel|adot|opentelemetry|collector"),
+]
+KIND_PROCESS_PATTERNS = [
+    ("java", r"(^|/)java$"),
+    ("jboss", r"jboss|wildfly|standalone\.sh"),
+    ("mysql", r"mysqld"),
+    ("nginx", r"nginx"),
+    ("cwagent", r"amazon-cloudwatch-agent"),
+    ("otel", r"otelcol|aws-otel"),
+]
+
+
+def detect_kinds(service):
+    kinds = set()
+    image = (service.image or "").lower()
+    for kind, pattern in KIND_IMAGE_PATTERNS:
+        if image and re.search(pattern, image):
+            kinds.add(kind)
+    for process in service.processes:
+        lowered = process.lower()
+        for kind, pattern in KIND_PROCESS_PATTERNS:
+            if re.search(pattern, lowered):
+                kinds.add(kind)
+    name = service.name.lower()
+    for kind, pattern in KIND_IMAGE_PATTERNS:
+        if re.search(pattern, name):
+            kinds.add(kind)
+    if service.jvm_options or service.jboss_home:
+        kinds.add("java")
+    if service.jboss_home:
+        kinds.add("jboss")
+    if "CATALINA_HOME" in service.runtime_env or "CATALINA_BASE" in service.runtime_env:
+        kinds.add("tomcat")
+    if "jboss" in kinds:
+        kinds.add("java")
+    return kinds
+
+
+# =============================================================================
+# 判定
+# =============================================================================
+
+class Finding(object):
+    __slots__ = ("path", "purpose", "writes", "need", "recommend", "options",
+                 "persist", "tmpfs_ok", "reason", "action", "current", "verdict",
+                 "evidence", "origin")
+
+    def __init__(self, path, purpose, writes, need, recommend, options, persist,
+                 tmpfs_ok, reason, action, origin):
+        self.path = path
+        self.purpose = purpose
+        self.writes = writes
+        self.need = need
+        self.recommend = recommend
+        self.options = options
+        self.persist = persist
+        self.tmpfs_ok = tmpfs_ok
+        self.reason = reason
+        self.action = action
+        self.origin = origin          # 候補の出どころ (知識 / 実測 / JVM / 環境変数)
+        self.current = ""
+        self.verdict = V_INFO
+        self.evidence = []
+
+    def sort_key(self):
+        return (VERDICT_ORDER.get(self.verdict, 9), NEED_ORDER.get(self.need, 9), self.path)
+
+
+class Coverage(object):
+    __slots__ = ("kind", "target", "rw", "label", "source")
+
+    def __init__(self, kind, target, rw, label, source):
+        self.kind = kind        # tmpfs / bind / volume / rootfs
+        self.target = target
+        self.rw = rw
+        self.label = label
+        self.source = source    # 実状態 / compose.yml
+
+
+def mount_points(service):
+    """パスを覆うマウントの一覧を、実状態を優先して返す。"""
+    points = []
+    if service.runtime_tmpfs or service.runtime_mounts:
+        for target, options in service.runtime_tmpfs:
+            points.append(Coverage("tmpfs", target, True,
+                                   "tmpfs (%s)" % (options or "既定"), "実状態"))
+        for mount in service.runtime_mounts:
+            kind = mount["type"] if mount["type"] in ("bind", "volume", "tmpfs") else "bind"
+            if kind == "bind":
+                label = "バインドマウント (%s → %s%s)" % (
+                    mount["source"] or "?", mount["target"],
+                    "" if mount["rw"] else ", 読み取り専用")
+            elif kind == "volume":
+                label = "ボリューム (%s%s)" % (
+                    mount["source"] or "匿名", "" if mount["rw"] else ", 読み取り専用")
+            else:
+                label = "tmpfs"
+            points.append(Coverage(kind, mount["target"], mount["rw"], label, "実状態"))
+    else:
+        for target, options in service.compose_tmpfs:
+            points.append(Coverage("tmpfs", target, True,
+                                   "tmpfs (%s)" % (options or "既定"), "compose.yml"))
+        for volume in service.compose_volumes:
+            kind = volume["type"]
+            if kind == "tmpfs":
+                points.append(Coverage("tmpfs", volume["target"], True, "tmpfs", "compose.yml"))
+                continue
+            rw = not volume["read_only"]
+            if kind == "bind":
+                label = "バインドマウント (%s → %s%s)" % (
+                    volume["source"] or "?", volume["target"],
+                    "" if rw else ", 読み取り専用")
+            elif kind == "volume":
+                label = "ボリューム (%s%s)" % (
+                    volume["source"] or "匿名", "" if rw else ", 読み取り専用")
+            else:
+                label = "マウント (%s)" % kind
+            points.append(Coverage(kind, volume["target"], rw, label, "compose.yml"))
+    return points
+
+
+def resolve_coverage(service, path, points):
+    """path を覆う最も深いマウントを返す。無ければルートファイルシステム扱い。"""
+    best = None
+    for point in points:
+        if not is_under(path, point.target):
+            continue
+        if best is None or len(point.target) > len(best.target):
+            best = point
+    if best is not None:
+        return best
+    # マウントが無ければルートファイルシステム。read_only の指定がそのまま効く。
+    read_only = service.effective_read_only()
+    return Coverage("rootfs", "/", not read_only,
+                    "ルートファイルシステム (読み取り専用)" if read_only
+                    else "ルートファイルシステム (書き込み可)",
+                    "実状態" if service.runtime_read_only is not None else "compose.yml")
+
+
+def mountinfo_is_read_only(service, path):
+    """コンテナ内の /proc/mounts から、そのパスが読み取り専用かを判定する。"""
+    best = None
+    for mountpoint, fstype, options in service.mountinfo:
+        if not is_under(path, mountpoint):
+            continue
+        if best is None or len(mountpoint) > len(best[0]):
+            best = (mountpoint, fstype, options)
+    if best is None:
+        return None
+    flags = [flag.strip() for flag in (best[2] or "").split(",")]
+    return "ro" in flags
+
+
+def collect_evidence(service, path, finding):
+    """アプリの実行状況から、そのディレクトリへの書き込み実績を集める。"""
+    evidence = []
+    diff_paths = [entry for entry in service.diff if is_under(entry[1], path)]
+    if diff_paths:
+        sample = ", ".join(entry[1] for entry in diff_paths[:3])
+        evidence.append("書き込み実績: コンテナ内で %d 件の変更を検出 (docker diff)。例: %s"
+                        % (len(diff_paths), sample))
+    probe = service.probe.get(path)
+    if probe:
+        if not probe["exists"]:
+            evidence.append("このディレクトリはコンテナ内に存在しません。")
+        else:
+            if probe["recent"] > 0:
+                evidence.append("起動後に更新されたファイル %d 件 (コンテナ内で検出)。"
+                                % probe["recent"])
+            if probe["files"] > 0:
+                evidence.append("ファイル %d 件を保持。" % probe["files"])
+            evidence.append("コンテナ内からの書き込み可否: %s"
+                            % ("書き込み可" if probe["writable"] else "書き込み不可"))
+    read_only_mount = mountinfo_is_read_only(service, path)
+    if read_only_mount is True:
+        evidence.append("コンテナ内の /proc/mounts でも読み取り専用 (ro) でマウントされています。")
+    for line in service.log_errors:
+        if path != "/" and path in line:
+            evidence.append("ログ: %s" % line.strip())
+    return evidence
+
+
+def has_write_evidence(evidence):
+    for item in evidence:
+        if item.startswith("書き込み実績") or item.startswith("起動後に更新された") \
+                or item.startswith("ログ:"):
+            return True
+    return False
+
+
+def probe_says_missing(service, path):
+    probe = service.probe.get(path)
+    return bool(probe) and not probe["exists"]
+
+
+def judge(service, finding, coverage):
+    """1 ディレクトリの判定を決める。"""
+    read_only = service.effective_read_only()
+    writable = coverage.rw
+    mount_ro = mountinfo_is_read_only(service, finding.path)
+    if mount_ro is True:
+        writable = False
+    probe = service.probe.get(finding.path)
+    if probe and probe["exists"]:
+        writable = probe["writable"]
+
+    finding.current = coverage.label
+    evidence_has_write = has_write_evidence(finding.evidence)
+
+    if coverage.kind == "rootfs":
+        if not read_only:
+            # read_only 未設定 / false。今は書けるが、有効化するなら用意が要る。
+            # 必須でも書き込み実績も無いものは、確度が低いため参考情報に留める。
+            if finding.need == N_REQUIRED or evidence_has_write:
+                finding.verdict = V_RECOMMEND
+            elif finding.need == N_OPTIONAL:
+                finding.verdict = V_INFO
+            else:
+                finding.verdict = V_RECOMMEND
+            return
+        # read_only 有効でルートファイルシステムのまま = 書けない。
+        if finding.need == N_REQUIRED or evidence_has_write:
+            finding.verdict = V_ACTION
+        elif finding.need == N_OPTIONAL:
+            finding.verdict = V_INFO
+        else:
+            finding.verdict = V_CHECK
+        return
+
+    # 何らかのマウントで覆われている。
+    if not writable:
+        if read_only or mount_ro is True:
+            finding.verdict = V_ACTION if (finding.need == N_REQUIRED or evidence_has_write) else V_CHECK
+        else:
+            finding.verdict = V_CHECK
+        return
+    if coverage.kind == "tmpfs" and not finding.tmpfs_ok:
+        finding.verdict = V_CHECK
+        finding.evidence.append(
+            "tmpfs はイメージ内の同じパスの内容を隠します。このディレクトリは"
+            "イメージ側のファイルを読む必要があるため、tmpfs では動かない可能性があります。")
+        return
+    if coverage.kind == "tmpfs" and finding.persist:
+        finding.verdict = V_CHECK
+        finding.evidence.append(
+            "tmpfs のためコンテナ終了で内容が消えます。永続が必要ならボリュームへ変更してください。")
+        return
+    finding.verdict = V_OK
+
+
+def observed_write_dirs(service, known_paths):
+    """知識に無いディレクトリで、実際に書き込みが起きたものを拾う。"""
+    counts = {}
+    for _kind, path in service.diff:
+        directory = parent_dir(path)
+        if any(is_under(directory, known) for known in known_paths):
+            continue
+        counts[directory] = counts.get(directory, 0) + 1
+    # docker diff は書き込んだファイルだけでなく、その親ディレクトリも変更として
+    # 挙げる (/opt/appdata へ書くと /opt も C として出る)。より深い検出がある
+    # ディレクトリは、そちらだけを候補にする (/opt へ tmpfs を勧めないため)。
+    paths = list(counts)
+    counts = {path: count for path, count in counts.items()
+              if not any(other != path and is_under(other, path) for other in paths)}
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return ordered
+
+
+# 値がディレクトリらしい環境変数だけを拾う。*_HOME はインストール先を指すもの
+# (JAVA_HOME / JBOSS_HOME / CATALINA_HOME) がほとんどで、書き込み先ではないため
+# 対象にしない。PATH のように複数値を持つものも除く。
+PATH_ENV_NAME_RE = re.compile(r"(DIR|TMP|TEMP|LOG|LOGS|STORAGE|DATA|CACHE)$")
+SKIP_ENV_NAMES = ("PATH", "LD_LIBRARY_PATH", "CLASSPATH", "MANPATH", "PYTHONPATH")
+JVM_PATH_OPTION_RE = re.compile(
+    r"^-(?:D(?P<dprop>[\w.]*(?:dir|tmpdir|path|log|logs|store)[\w.]*)"
+    r"|XX:(?P<xx>HeapDumpPath|LogFile|ErrorFile)"
+    r"|Xloggc)[:=](?P<value>/[^\s]*)$", re.IGNORECASE)
+# インストール先やモジュールの探索先を指すシステムプロパティ (-Djboss.home.dir、
+# -Dcatalina.home 等) は書き込み先ではないため、候補から外す。
+JVM_PATH_OPTION_SKIP_RE = re.compile(
+    r"(?:^|\.)(?:home|install|modules|classpath|library)(?:\.dir)?$", re.IGNORECASE)
+
+
+def derive_env_candidates(service):
+    """ディレクトリを指す環境変数から、書き込み先候補を導く。"""
+    candidates = []
+    merged = {}
+    merged.update(service.compose_env)
+    merged.update(service.runtime_env)
+    for name, value in merged.items():
+        if name in SKIP_ENV_NAMES or not PATH_ENV_NAME_RE.search(name.upper()):
+            continue
+        value = (value or "").strip()
+        if not value.startswith("/") or ":" in value or value == "/":
+            continue
+        value = normalize_path(value)
+        # インストール先そのもの (JBOSS_HOME 等) は書き込み先ではないため除く。
+        if service.jboss_home and value == service.jboss_home:
+            continue
+        candidates.append((value, name))
+    return candidates
+
+
+def derive_jvm_candidates(service):
+    """JVM パラメータで明示された書き込み先を導く。"""
+    candidates = []
+    for option in service.jvm_options:
+        matched = JVM_PATH_OPTION_RE.match(option.strip())
+        if not matched:
+            continue
+        if matched.group("dprop") and JVM_PATH_OPTION_SKIP_RE.search(matched.group("dprop")):
+            continue
+        value = normalize_path(matched.group("value"))
+        if not value or value == "/" or value == service.jboss_home:
+            continue
+        # ファイルを指す指定 (HeapDumpPath=/dump/heap.hprof) は親ディレクトリを対象にする。
+        if re.search(r"\.[A-Za-z0-9]{1,6}$", value):
+            value = parent_dir(value)
+        name = matched.group("dprop") or matched.group("xx") or "Xloggc"
+        candidates.append((value, option.split("=")[0] if "=" in option else option, name))
+    return candidates
+
+
+def analyze_service(service):
+    service.kinds = detect_kinds(service)
+    points = mount_points(service)
+    findings = {}
+
+    def add(path, purpose, writes, need, recommend, options, persist, tmpfs_ok,
+            reason, action, origin):
+        path = normalize_path(path)
+        if not path or path == "/":
+            return None
+        existing = findings.get(path)
+        if existing is not None:
+            # 同じディレクトリが複数の根拠で挙がった場合、必須度の高い方を残す。
+            if NEED_ORDER.get(need, 9) < NEED_ORDER.get(existing.need, 9):
+                existing.need = need
+                existing.recommend = recommend
+                existing.options = options
+            existing.origin = "%s / %s" % (existing.origin, origin)
+            return existing
+        finding = Finding(path, purpose, writes, need, recommend, options, persist,
+                          tmpfs_ok, reason, action, origin)
+        findings[path] = finding
+        return finding
+
+    known_paths = []
+    for path, entry in knowledge_for(service):
+        known_paths.append(path)
+        # 実在を確認できたディレクトリだけを対象にする。存在しないものは、
+        # そのソフトウェアが使っていないだけなので候補から外す。
+        if probe_says_missing(service, path):
+            continue
+        add(path, entry.purpose, entry.writes, entry.need, entry.recommend,
+            entry.options, entry.persist, entry.tmpfs_ok, entry.reason, entry.action,
+            "ソフトウェア別の既知の書き込み先")
+
+    for path, option_name, _prop in derive_jvm_candidates(service):
+        if probe_says_missing(service, path):
+            continue
+        add(path, "JVM パラメータが指す書き込み先 (%s)" % option_name,
+            "起動オプションで明示された出力先",
+            N_LIKELY, "tmpfs", "rw,size=128m", False, True,
+            "%s で書き込み先として指定されているため、実行時に書き込みが発生します。" % option_name,
+            "tmpfs かボリュームを割り当てるか、書き込みの要らない値へ変更する。",
+            "JVM パラメータ")
+
+    for path, env_name in derive_env_candidates(service):
+        if probe_says_missing(service, path):
+            continue
+        add(path, "環境変数 %s が指すディレクトリ" % env_name,
+            "アプリケーションが用途に応じて読み書きする",
+            N_OPTIONAL, "tmpfs / バインドマウント", "rw,size=64m", False, True,
+            "環境変数 %s でディレクトリが指定されているため、書き込みに使われる可能性があります。"
+            % env_name,
+            "書き込む場合は tmpfs かボリュームを割り当てる。",
+            "環境変数")
+
+    for path, count in observed_write_dirs(service, known_paths)[:20]:
+        if path == "/":
+            continue
+        add(path, "実行中に書き込みが発生したディレクトリ",
+            "アプリ・ミドルウェアが実行中に作成・更新したファイル",
+            N_LIKELY, "tmpfs", "rw,size=64m", False, True,
+            "コンテナの書き込み層に %d 件の変更が残っており、実行時に書き込みが起きています。"
+            "read_only を有効にすると、この書き込みは失敗します。" % count,
+            "tmpfs かボリュームを割り当てる。",
+            "実測 (docker diff)")
+
+    for finding in findings.values():
+        finding.evidence = collect_evidence(service, finding.path, finding)
+        judge(service, finding, resolve_coverage(service, finding.path, points))
+        if not finding.tmpfs_ok:
+            finding.action += (
+                " (tmpfs はイメージ内の同じパスを覆い隠すため使わない。"
+                "名前付きボリュームなら初回作成時にイメージの内容がコピーされるため、"
+                "既存ファイルを保ったまま書き込めるようになる)")
+
+    # compose.yml の指定と実際のコンテナが食い違っている場合は、
+    # どちらを見て判定したのかが分かるように残す。
+    if service.compose_read_only is not None and service.runtime_read_only is not None \
+            and service.compose_read_only != service.runtime_read_only:
+        service.notes.append(
+            "compose.yml の read_only (%s) と実際のコンテナ (%s) が一致していません。"
+            "コンテナを作り直していない可能性があります。判定は実際のコンテナに合わせています。"
+            % ("true" if service.compose_read_only else "false",
+               "true" if service.runtime_read_only else "false"))
+
+    service.findings = sorted(findings.values(), key=lambda item: item.sort_key())
+    return service
+
+
+def service_verdict(service):
+    counts = verdict_counts(service)
+    if not service.findings:
+        return "未評価 (書き込み先の候補を検出できませんでした)"
+    if counts[V_ACTION]:
+        return "要対応 %d 件" % counts[V_ACTION]
+    if counts[V_CHECK]:
+        return "要確認 %d 件" % counts[V_CHECK]
+    if service.effective_read_only():
+        return "問題なし (読み取り専用のまま動作可能)"
+    if counts[V_RECOMMEND]:
+        return "read_only 未使用 (有効化するなら %d 件の設定が必要)" % counts[V_RECOMMEND]
+    return "問題なし"
+
+
+def verdict_counts(service):
+    counts = {V_ACTION: 0, V_CHECK: 0, V_RECOMMEND: 0, V_OK: 0, V_INFO: 0}
+    for finding in service.findings:
+        counts[finding.verdict] = counts.get(finding.verdict, 0) + 1
+    return counts
+
+
+def compose_snippet(service):
+    """未対応のディレクトリを埋めた compose.yml の設定例を組み立てる。"""
+    tmpfs_lines = []
+    volume_lines = []
+    for finding in service.findings:
+        if finding.verdict not in (V_ACTION, V_CHECK, V_RECOMMEND):
+            continue
+        # 「推奨する設定」の先頭が tmpfs のものだけ tmpfs へ回す。イメージ内の
+        # ファイルを隠せないディレクトリと永続が要るディレクトリは、初回作成時に
+        # イメージの内容をコピーする名前付きボリュームを使う。
+        if finding.recommend.startswith("tmpfs") and finding.tmpfs_ok:
+            options = finding.options or "rw,size=64m"
+            tmpfs_lines.append("      - %s:%s" % (finding.path, options))
+        else:
+            source = "%s-%s" % (service.name, finding.path.strip("/").replace("/", "-"))
+            volume_lines.append("      - %s:%s" % (source, finding.path))
+    if not tmpfs_lines and not volume_lines:
+        return ""
+    lines = ["services:", "  %s:" % service.name, "    read_only: true"]
+    if tmpfs_lines:
+        lines.append("    tmpfs:")
+        lines.extend(tmpfs_lines)
+    if volume_lines:
+        lines.append("    volumes:")
+        lines.extend(volume_lines)
+        lines.append("")
+        lines.append("volumes:")
+        for line in volume_lines:
+            name = line.strip()[2:].split(":", 1)[0]
+            lines.append("  %s:" % name)
+    return "\n".join(lines)
+
+
+def compute_stats(services):
+    stats = {
+        "services": len(services),
+        "read_only_services": 0,
+        "total": 0,
+        V_ACTION: 0,
+        V_CHECK: 0,
+        V_RECOMMEND: 0,
+        V_OK: 0,
+        V_INFO: 0,
+    }
+    for service in services:
+        if service.effective_read_only():
+            stats["read_only_services"] += 1
+        counts = verdict_counts(service)
+        stats["total"] += len(service.findings)
+        for key in (V_ACTION, V_CHECK, V_RECOMMEND, V_OK, V_INFO):
+            stats[key] += counts[key]
+    return stats
+
+
+def overall_verdict(services, stats):
+    if not services:
+        return "未評価 (compose.yml からサービスを読み取れませんでした)"
+    if stats[V_ACTION]:
+        return "要対応 %d 件 (読み取り専用のままでは書き込みに失敗します)" % stats[V_ACTION]
+    if stats[V_CHECK]:
+        return "要確認 %d 件" % stats[V_CHECK]
+    if stats["read_only_services"]:
+        if stats[V_RECOMMEND]:
+            return "read_only 有効のサービスは問題なし / 未使用のサービスに推奨設定 %d 件" \
+                % stats[V_RECOMMEND]
+        return "問題なし (read_only を有効にした全サービスで書き込み先が確保されています)"
+    if stats[V_RECOMMEND]:
+        return "read_only 未使用。有効化する場合は %d 件の書き込み先設定が必要です" % stats[V_RECOMMEND]
+    return "問題なし"
+
+
+# =============================================================================
+# テキスト出力
+# =============================================================================
+
+def bullet_lines(items, indent="  ", marker="- "):
+    return ["%s%s%s" % (indent, marker, item) for item in items]
+
+
+def read_only_label(service):
+    if service.compose_read_only is None:
+        compose_label = "未設定 (既定 false)"
+    else:
+        compose_label = "true" if service.compose_read_only else "false"
+    if service.runtime_read_only is None:
+        runtime_label = "未確認"
+    else:
+        runtime_label = "true" if service.runtime_read_only else "false"
+    return compose_label, runtime_label
+
+
+def build_text_report(meta, services, stats, digest):
+    """digest=True なら画面・全量レポート向けの要約、False なら全量のテキスト。"""
+    out = []
+    out.append(HEAVY)
+    out.append("読み取り専用ルートファイルシステム (read_only) の書き込み先分析")
+    out.append(HEAVY)
+    out.append("解析日時       : %s" % meta.get("analyzed_at", ""))
+    out.append("Compose 定義   : %s" % meta.get("compose_file", ""))
+    out.append("解析対象       : %s" % meta.get("analyzed_services", ""))
+    out.append("取得状況       : %s" % meta.get("collect_status", ""))
+    out.append("総合判定       : %s" % meta.get("verdict", ""))
+    out.append("検出ディレクトリ: %d 件 (要対応 %d / 要確認 %d / 推奨 %d / OK %d / 情報 %d)"
+               % (stats["total"], stats[V_ACTION], stats[V_CHECK], stats[V_RECOMMEND],
+                  stats[V_OK], stats[V_INFO]))
+    out.append("")
+
+    if not services:
+        out.append("compose.yml からサービスを読み取れなかったため、分析できませんでした。")
+        return "\n".join(out) + "\n"
+
+    for index, service in enumerate(services, start=1):
+        compose_label, runtime_label = read_only_label(service)
+        out.append(RULE)
+        out.append("[%d] サービス: %s" % (index, service.name))
+        out.append(RULE)
+        out.append("  read_only        : compose.yml=%s / 実状態=%s" % (compose_label, runtime_label))
+        out.append("  イメージ         : %s" % (service.image or "(未指定)"))
+        out.append("  コンテナ         : %s" % (service.container or "(未起動)"))
+        if service.jboss_home:
+            out.append("  JBOSS_HOME       : %s" % service.jboss_home)
+        if service.kinds:
+            out.append("  検出した種別     : %s" % ", ".join(sorted(service.kinds)))
+        out.append("  判定             : %s" % service_verdict(service))
+        for note in service.notes:
+            out.append("  補足             : %s" % note)
+        out.append("")
+
+        # 要約では、対応が要るものだけを詳細に出し、read_only 未使用のサービスの
+        # 「推奨」は 1 行ずつの一覧に畳む (毎回の実行で画面が埋まらないようにする)。
+        shown = service.findings
+        listed = []
+        if digest:
+            shown = [item for item in service.findings
+                     if item.verdict in (V_ACTION, V_CHECK)][:10]
+            listed = [item for item in service.findings if item.verdict == V_RECOMMEND]
+            if not shown and not listed:
+                out.append("  対応が必要なディレクトリはありません。")
+                out.append("")
+                continue
+        if not shown and not listed:
+            out.append("  書き込み先の候補を検出できませんでした。")
+            out.append("")
+            continue
+
+        for finding in shown:
+            out.append("  [%s] %s" % (finding.verdict, finding.path))
+            out.append("      用途        : %s" % finding.purpose)
+            out.append("      書き込み内容: %s" % finding.writes)
+            out.append("      必須度      : %s / 推奨する設定: %s%s"
+                       % (finding.need, finding.recommend,
+                          " (%s)" % finding.options if finding.options else ""))
+            out.append("      現在の設定  : %s" % finding.current)
+            if not digest:
+                out.append("      検出の根拠  : %s" % finding.origin)
+                out.append("      理由        : %s" % finding.reason)
+            if finding.verdict != V_OK:
+                out.append("      対処        : %s" % finding.action)
+            for item in finding.evidence if not digest else finding.evidence[:2]:
+                out.append("      根拠        : %s" % item)
+            out.append("")
+
+        if digest:
+            hidden = len([item for item in service.findings
+                          if item.verdict in (V_ACTION, V_CHECK)]) - len(shown)
+            if hidden > 0:
+                out.append("  (ほか %d 件の要対応・要確認があります。全件はテキスト / Excel を参照)"
+                           % hidden)
+                out.append("")
+            if listed:
+                out.append("  read_only を有効にするなら書き込み先の用意が要るディレクトリ:")
+                for finding in listed:
+                    out.append("    [%s] %s : %s / 推奨: %s%s"
+                               % (finding.verdict, finding.path, finding.purpose,
+                                  finding.recommend,
+                                  " (%s)" % finding.options if finding.options else ""))
+                out.append("")
+
+        snippet = compose_snippet(service)
+        if snippet:
+            out.append("  compose.yml の設定例 (不足しているディレクトリのみ):")
+            for line in snippet.split("\n"):
+                out.append(("    %s" % line).rstrip())
+            out.append("")
+
+    if not digest:
+        out.append(HEAVY)
+        out.append("参考: 書き込みが発生しやすいディレクトリの一覧")
+        out.append(HEAVY)
+        for entry in KNOWLEDGE:
+            out.append("- %s [%s]" % (entry.path, "/".join(entry.kinds)))
+            out.append("    用途        : %s" % entry.purpose)
+            out.append("    書き込み内容: %s" % entry.writes)
+            out.append("    必須度      : %s / 推奨: %s" % (entry.need, entry.recommend))
+            out.append("    消えてよいか: %s" % ("永続が必要" if entry.persist else "消えてよい"))
+            out.append("    tmpfs 可否  : %s" % ("可" if entry.tmpfs_ok
+                                                 else "不可 (イメージ内のファイルを隠すため)"))
+            out.append("    理由        : %s" % entry.reason)
+            out.append("")
+    return "\n".join(out) + "\n"
+
+
+# =============================================================================
+# xlsx 出力 (標準ライブラリのみ)
+# =============================================================================
+
+XML_INVALID_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CELL_LIMIT = 32000
+
+
+def xml_escape(text):
+    text = XML_INVALID_RE.sub("", str(text))
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("\"", "&quot;")
+
+
+def column_name(index):
+    name = ""
+    index += 1
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name
+
+
+class Cell(object):
+    __slots__ = ("value", "style", "numeric")
+
+    def __init__(self, value, style=0, numeric=False):
+        self.value = value
+        self.style = style
+        self.numeric = numeric
+
+
+class Sheet(object):
+    def __init__(self, name, widths=None, freeze_rows=0, autofilter_row=0, autofilter_cols=0):
+        self.name = name
+        self.widths = widths or []
+        self.freeze_rows = freeze_rows
+        self.autofilter_row = autofilter_row
+        self.autofilter_cols = autofilter_cols
+        self.rows = []
+        self.merges = []
+
+    def add(self, cells):
+        self.rows.append(cells)
+
+    def add_notice(self, message, style=None):
+        span = max(len(self.widths), 1)
+        self.add([Cell(message, S_BODY if style is None else style)]
+                 + [Cell("", S_BODY) for _ in range(span - 1)])
+        self.merges.append((len(self.rows), 0, span - 1))
+
+    def merged_width(self, row_number):
+        for number, start, end in self.merges:
+            if number == row_number:
+                return sum(float(self.widths[index])
+                           for index in range(start, min(end + 1, len(self.widths))))
+        return None
+
+
+S_DEFAULT = 0
+S_TITLE = 1
+S_HEADER = 2
+S_BODY = 3
+S_LABEL = 4
+S_FATAL = 5
+S_MAJOR = 6
+S_WARN = 7
+S_MONO = 8
+S_CENTER = 9
+S_SECTION = 10
+S_OK = 11
+
+VERDICT_STYLE = {V_ACTION: S_FATAL, V_CHECK: S_MAJOR, V_RECOMMEND: S_WARN,
+                 V_OK: S_OK, V_INFO: S_CENTER}
+
+STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="0"/>
+<fonts count="8">
+<font><sz val="11"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="16"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF9C0006"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF9C5700"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><sz val="10"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="12"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FF006100"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+</fonts>
+<fills count="8">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border><left/><right/><top/><bottom/><diagonal/></border>
+<border>
+<left style="thin"><color rgb="FFBFBFBF"/></left>
+<right style="thin"><color rgb="FFBFBFBF"/></right>
+<top style="thin"><color rgb="FFBFBFBF"/></top>
+<bottom style="thin"><color rgb="FFBFBFBF"/></bottom>
+<diagonal/></border>
+</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="12">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="6" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+<xf numFmtId="0" fontId="7" fillId="7" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+<dxfs count="0"/>
+<tableStyles count="0"/>
+</styleSheet>
+"""
+
+ROW_LINE_HEIGHT = 16.5
+ROW_HEIGHT_MIN = 19.5
+ROW_HEIGHT_MAX = 409.0
+HEADER_ROW_HEIGHT = 33.0
+
+
+def east_asian_wide(char):
+    code = ord(char)
+    return (
+        0x1100 <= code <= 0x115F or 0x2E80 <= code <= 0xA4CF or
+        0xAC00 <= code <= 0xD7A3 or 0xF900 <= code <= 0xFAFF or
+        0xFE30 <= code <= 0xFE6F or 0xFF00 <= code <= 0xFF60 or
+        0xFFE0 <= code <= 0xFFE6 or 0x20000 <= code <= 0x3FFFD
+    )
+
+
+def display_width(text):
+    return sum(2 if east_asian_wide(char) else 1 for char in text)
+
+
+def wrapped_line_count(text, column_width):
+    if text is None or text == "":
+        return 1
+    usable = max(float(column_width) - 1.0, 4.0)
+    total = 0
+    for line in str(text).split("\n"):
+        width = display_width(line)
+        total += 1 if width <= 0 else int(math.ceil(width / usable))
+    return max(total, 1)
+
+
+def calculate_row_height(cells, widths):
+    lines = 1
+    for index, cell in enumerate(cells):
+        if cell is None or cell.numeric:
+            continue
+        width = widths[index] if index < len(widths) else 20
+        lines = max(lines, wrapped_line_count(cell.value, width))
+    return min(max(lines * ROW_LINE_HEIGHT, ROW_HEIGHT_MIN), ROW_HEIGHT_MAX)
+
+
+def sheet_xml(sheet):
+    out = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+           "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"]
+    if sheet.freeze_rows:
+        out.append(
+            "<sheetViews><sheetView workbookViewId=\"0\">"
+            "<pane ySplit=\"%d\" topLeftCell=\"A%d\" activePane=\"bottomLeft\" state=\"frozen\"/>"
+            "</sheetView></sheetViews>" % (sheet.freeze_rows, sheet.freeze_rows + 1)
+        )
+    out.append("<sheetFormatPr defaultRowHeight=\"%s\"/>" % ROW_HEIGHT_MIN)
+    if sheet.widths:
+        cols = ["<cols>"]
+        for index, width in enumerate(sheet.widths):
+            cols.append("<col min=\"%d\" max=\"%d\" width=\"%s\" customWidth=\"1\"/>"
+                        % (index + 1, index + 1, width))
+        cols.append("</cols>")
+        out.append("".join(cols))
+    out.append("<sheetData>")
+    for row_index, cells in enumerate(sheet.rows, 1):
+        merged_width = sheet.merged_width(row_index)
+        if sheet.freeze_rows and row_index <= sheet.freeze_rows:
+            height = HEADER_ROW_HEIGHT
+        elif merged_width is not None:
+            height = calculate_row_height(cells[:1], [merged_width])
+        else:
+            height = calculate_row_height(cells, sheet.widths)
+        parts = ["<row r=\"%d\" ht=\"%.1f\" customHeight=\"1\">" % (row_index, height)]
+        for col_index, cell in enumerate(cells):
+            if cell is None:
+                continue
+            ref = "%s%d" % (column_name(col_index), row_index)
+            if cell.numeric:
+                parts.append("<c r=\"%s\" s=\"%d\"><v>%s</v></c>" % (ref, cell.style, cell.value))
+                continue
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > CELL_LIMIT:
+                value = value[:CELL_LIMIT] + "\n... (以降は省略)"
+            if not value:
+                parts.append("<c r=\"%s\" s=\"%d\"/>" % (ref, cell.style))
+                continue
+            parts.append("<c r=\"%s\" s=\"%d\" t=\"inlineStr\"><is><t xml:space=\"preserve\">%s</t></is></c>"
+                         % (ref, cell.style, xml_escape(value)))
+        parts.append("</row>")
+        out.append("".join(parts))
+    out.append("</sheetData>")
+    if sheet.autofilter_row and sheet.autofilter_cols:
+        out.append("<autoFilter ref=\"A%d:%s%d\"/>"
+                   % (sheet.autofilter_row, column_name(sheet.autofilter_cols - 1),
+                      max(len(sheet.rows), sheet.autofilter_row)))
+    if sheet.merges:
+        merges = ["<mergeCells count=\"%d\">" % len(sheet.merges)]
+        for row_number, start, end in sheet.merges:
+            merges.append("<mergeCell ref=\"%s%d:%s%d\"/>"
+                          % (column_name(start), row_number, column_name(end), row_number))
+        merges.append("</mergeCells>")
+        out.append("".join(merges))
+    out.append("</worksheet>")
+    return "".join(out)
+
+
+def write_xlsx(path, sheets, title, creator):
+    content_types = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+                     "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+                     "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+                     "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
+                     "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+                     "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>",
+                     "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"]
+    for index in range(len(sheets)):
+        content_types.append("<Override PartName=\"/xl/worksheets/sheet%d.xml\" "
+                             "ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+                             % (index + 1))
+    content_types.append("</Types>")
+
+    root_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+        "</Relationships>"
+    )
+
+    sheet_entries = "".join(
+        "<sheet name=\"%s\" sheetId=\"%d\" r:id=\"rId%d\"/>" % (xml_escape(sheet.name), index + 1, index + 1)
+        for index, sheet in enumerate(sheets)
+    )
+    workbook = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<sheets>%s</sheets></workbook>" % sheet_entries
+    )
+
+    workbook_rels = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"]
+    for index in range(len(sheets)):
+        workbook_rels.append(
+            "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" "
+            "Target=\"worksheets/sheet%d.xml\"/>" % (index + 1, index + 1)
+        )
+    workbook_rels.append(
+        "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
+        "Target=\"styles.xml\"/>" % (len(sheets) + 1)
+    )
+    workbook_rels.append("</Relationships>")
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    core = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+        "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+        "<dc:title>%s</dc:title><dc:creator>%s</dc:creator><cp:lastModifiedBy>%s</cp:lastModifiedBy>"
+        "<dcterms:created xsi:type=\"dcterms:W3CDTF\">%s</dcterms:created>"
+        "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">%s</dcterms:modified>"
+        "</cp:coreProperties>" % (xml_escape(title), xml_escape(creator), xml_escape(creator), now, now)
+    )
+    app = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+        "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+        "<Application>%s</Application></Properties>" % xml_escape(creator)
+    )
+
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", "".join(content_types))
+        book.writestr("_rels/.rels", root_rels)
+        book.writestr("docProps/core.xml", core)
+        book.writestr("docProps/app.xml", app)
+        book.writestr("xl/workbook.xml", workbook)
+        book.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
+        book.writestr("xl/styles.xml", STYLES_XML)
+        for index, sheet in enumerate(sheets):
+            book.writestr("xl/worksheets/sheet%d.xml" % (index + 1), sheet_xml(sheet))
+
+
+def header_row(labels):
+    return [Cell(label, S_HEADER) for label in labels]
+
+
+def build_summary_sheet(meta, services, stats):
+    sheet = Sheet("概要", widths=[28, 88, 44])
+    sheet.add([Cell("読み取り専用ファイルシステム (read_only) の書き込み先分析", S_TITLE)])
+    sheet.add([])
+
+    def kv(label, value):
+        sheet.add([Cell(label, S_LABEL), Cell(value, S_BODY)])
+
+    sheet.add([Cell("1. 実行情報", S_SECTION)])
+    kv("解析日時", meta.get("analyzed_at", ""))
+    kv("処理開始日時", meta.get("run_started_at", ""))
+    kv("スクリプト", meta.get("script", "build_and_verify.sh"))
+    kv("Compose 定義", meta.get("compose_file", ""))
+    kv("ビルド対象サービス", meta.get("build_services", ""))
+    kv("起動対象サービス", meta.get("target_services", ""))
+    kv("解析対象サービス", meta.get("analyzed_services", ""))
+    kv("全体結果", meta.get("overall_status", ""))
+    kv("全量レポート", meta.get("report_file", "") or "(未出力)")
+    kv("情報の取得状況", meta.get("collect_status", ""))
+    sheet.add([])
+
+    sheet.add([Cell("2. 判定サマリ", S_SECTION)])
+    kv("総合判定", meta.get("verdict", ""))
+    kv("read_only 有効のサービス", "%d / %d サービス"
+       % (stats["read_only_services"], stats["services"]))
+    kv("検出したディレクトリ", "%d 件" % stats["total"])
+    kv("要対応", "%d 件 (読み取り専用のままでは書き込みに失敗する)" % stats[V_ACTION])
+    kv("要確認", "%d 件 (設定はあるが副作用・確認が必要)" % stats[V_CHECK])
+    kv("推奨", "%d 件 (read_only を有効にするなら設定が必要)" % stats[V_RECOMMEND])
+    kv("OK", "%d 件 (書き込み先が確保されている)" % stats[V_OK])
+    sheet.add([])
+
+    sheet.add([Cell("3. この分析について", S_SECTION)])
+    sheet.add_notice(
+        "compose.yml の read_only 指定と、実際に起動したコンテナの状態 "
+        "(マウント・書き込み層の変更・コンテナ内の書き込み可否・ログのエラー) を突き合わせ、"
+        "アプリケーションが書き込むディレクトリに書き込み先が用意されているかを判定します。"
+        "read_only が未設定・false のサービスでも、書き込みが発生するディレクトリを "
+        "「推奨」として一覧し、read_only を有効化するときに必要な tmpfs / "
+        "バインドマウントの設定例を出力します。")
+    return sheet
+
+
+def build_service_sheet(services):
+    sheet = Sheet("サービス別判定",
+                  widths=[18, 20, 16, 16, 34, 10, 10, 10, 8, 30],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=10)
+    sheet.add(header_row(["サービス", "イメージ", "read_only (compose)",
+                          "read_only (実状態)", "判定", "要対応", "要確認", "推奨",
+                          "OK", "コンテナ"]))
+    if not services:
+        sheet.add_notice("compose.yml からサービスを読み取れませんでした。")
+        return sheet
+    for service in services:
+        compose_label, runtime_label = read_only_label(service)
+        counts = verdict_counts(service)
+        verdict = service_verdict(service)
+        style = S_BODY
+        if counts[V_ACTION]:
+            style = S_FATAL
+        elif counts[V_CHECK]:
+            style = S_MAJOR
+        sheet.add([
+            Cell(service.name, S_LABEL),
+            Cell(service.image or "(未指定)", S_BODY),
+            Cell(compose_label, S_CENTER),
+            Cell(runtime_label, S_CENTER),
+            Cell(verdict, style),
+            Cell(counts[V_ACTION], S_CENTER, numeric=True),
+            Cell(counts[V_CHECK], S_CENTER, numeric=True),
+            Cell(counts[V_RECOMMEND], S_CENTER, numeric=True),
+            Cell(counts[V_OK], S_CENTER, numeric=True),
+            Cell(service.container or "(未起動)", S_BODY),
+        ])
+    return sheet
+
+
+def build_directory_sheet(services):
+    sheet = Sheet("ディレクトリ判定",
+                  widths=[14, 40, 10, 8, 30, 34, 34, 40, 26],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=9)
+    sheet.add(header_row(["サービス", "ディレクトリ", "判定", "必須度", "用途",
+                          "書き込み内容", "現在の設定", "推奨する設定と対処", "検出の根拠"]))
+    rows = 0
+    for service in services:
+        for finding in service.findings:
+            recommend = finding.recommend
+            if finding.options:
+                recommend += " (%s)" % finding.options
+            sheet.add([
+                Cell(service.name, S_LABEL),
+                Cell(finding.path, S_MONO),
+                Cell(finding.verdict, VERDICT_STYLE.get(finding.verdict, S_CENTER)),
+                Cell(finding.need, S_CENTER),
+                Cell(finding.purpose, S_BODY),
+                Cell(finding.writes, S_BODY),
+                Cell(finding.current, S_BODY),
+                Cell("%s\n%s" % (recommend, finding.action), S_BODY),
+                Cell(finding.origin, S_BODY),
+            ])
+            rows += 1
+    if rows == 0:
+        sheet.add_notice("書き込み先の候補を検出できませんでした。")
+    return sheet
+
+
+def build_evidence_sheet(services):
+    sheet = Sheet("判定の根拠", widths=[14, 34, 12, 92], freeze_rows=1,
+                  autofilter_row=1, autofilter_cols=4)
+    sheet.add(header_row(["サービス", "ディレクトリ", "判定", "根拠・理由"]))
+    rows = 0
+    for service in services:
+        for finding in service.findings:
+            details = [finding.reason]
+            details.extend(finding.evidence)
+            sheet.add([
+                Cell(service.name, S_LABEL),
+                Cell(finding.path, S_MONO),
+                Cell(finding.verdict, VERDICT_STYLE.get(finding.verdict, S_CENTER)),
+                Cell("\n".join(details), S_BODY),
+            ])
+            rows += 1
+        for note in service.notes:
+            sheet.add([Cell(service.name, S_LABEL), Cell("(サービス全体)", S_MONO),
+                       Cell("情報", S_CENTER), Cell(note, S_BODY)])
+            rows += 1
+    if rows == 0:
+        sheet.add_notice("判定の根拠として記録した情報はありません。")
+    return sheet
+
+
+def build_write_activity_sheet(services):
+    sheet = Sheet("書き込み実績", widths=[14, 14, 58, 60], freeze_rows=1,
+                  autofilter_row=1, autofilter_cols=4)
+    sheet.add(header_row(["サービス", "種別", "対象", "内容"]))
+    rows = 0
+    for service in services:
+        for kind, path in service.diff[:400]:
+            label = {"A": "追加", "C": "変更", "D": "削除"}.get(kind, kind)
+            sheet.add([Cell(service.name, S_LABEL), Cell("書き込み層", S_CENTER),
+                       Cell(path, S_MONO), Cell("コンテナ起動後に%sされました。" % label, S_BODY)])
+            rows += 1
+        for path, probe in sorted(service.probe.items()):
+            if not probe["exists"]:
+                continue
+            if probe["files"] == 0 and probe["recent"] == 0:
+                continue
+            sheet.add([
+                Cell(service.name, S_LABEL), Cell("コンテナ内", S_CENTER), Cell(path, S_MONO),
+                Cell("ファイル %d 件 / 起動後に更新 %d 件 / 書き込み %s"
+                     % (probe["files"], probe["recent"],
+                        "可" if probe["writable"] else "不可"), S_BODY),
+            ])
+            rows += 1
+        for line in service.log_errors:
+            sheet.add([Cell(service.name, S_LABEL), Cell("ログ", S_CENTER),
+                       Cell("(ログ本文)", S_MONO), Cell(line, S_MONO)])
+            rows += 1
+    if rows == 0:
+        sheet.add_notice("実行中の書き込みは検出されませんでした "
+                         "(コンテナ未起動、または書き込みが発生していません)。")
+    return sheet
+
+
+def build_recommendation_sheet(services):
+    sheet = Sheet("推奨 compose 設定", widths=[16, 100])
+    sheet.add([Cell("read_only を有効にしたまま動かすための compose.yml 設定例", S_TITLE)])
+    sheet.add([])
+    sheet.add_notice(
+        "「要対応」「要確認」「推奨」と判定したディレクトリだけを対象に、"
+        "不足している tmpfs / ボリュームの指定を組み立てたものです。"
+        "サイズはめやすのため、実際の使用量に合わせて調整してください。")
+    sheet.add([])
+    sheet.add(header_row(["サービス", "compose.yml の設定例"]))
+    found = False
+    for service in services:
+        snippet = compose_snippet(service)
+        if not snippet:
+            continue
+        sheet.add([Cell(service.name, S_LABEL), Cell(snippet, S_MONO)])
+        found = True
+    if not found:
+        sheet.add_notice("追加が必要な設定はありません。")
+    return sheet
+
+
+def build_knowledge_sheet():
+    sheet = Sheet("参考: 書き込み先の知識", widths=[34, 14, 30, 34, 8, 24, 12, 44],
+                  freeze_rows=1, autofilter_row=1, autofilter_cols=8)
+    sheet.add(header_row(["ディレクトリ", "対象", "用途", "書き込み内容", "必須度",
+                          "推奨する設定", "永続の要否", "補足 (tmpfs 可否・理由)"]))
+    for entry in KNOWLEDGE:
+        note = "tmpfs 可" if entry.tmpfs_ok else "tmpfs 不可 (イメージ内のファイルを隠すため)"
+        sheet.add([
+            Cell(entry.path, S_MONO),
+            Cell("/".join(entry.kinds) if "*" not in entry.kinds else "全サービス", S_CENTER),
+            Cell(entry.purpose, S_BODY),
+            Cell(entry.writes, S_BODY),
+            Cell(entry.need, S_CENTER),
+            Cell(entry.recommend + (" (%s)" % entry.options if entry.options else ""), S_BODY),
+            Cell("永続が必要" if entry.persist else "消えてよい", S_CENTER),
+            Cell("%s\n%s" % (note, entry.reason), S_BODY),
+        ])
+    return sheet
+
+
+# =============================================================================
+# エントリポイント
+# =============================================================================
+
+def write_text_file(path, text):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def read_meta(path):
+    meta = {}
+    if not path or not os.path.exists(path):
+        return meta
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            raw = raw.rstrip("\r\n")
+            if not raw or "\t" not in raw:
+                continue
+            key, value = raw.split("\t", 1)
+            meta[key] = value
+    return meta
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--facts-file", required=True)
+    parser.add_argument("--meta-file", default="")
+    parser.add_argument("--text-out", default="")
+    parser.add_argument("--full-text-out", default="")
+    parser.add_argument("--excel-out", default="")
+    args = parser.parse_args(argv)
+
+    meta = read_meta(args.meta_file)
+    services, _named_volumes = parse_facts(args.facts_file)
+    for service in services:
+        analyze_service(service)
+
+    stats = compute_stats(services)
+    verdict = overall_verdict(services, stats)
+    meta["verdict"] = verdict
+    meta.setdefault("analyzed_services", " ".join(service.name for service in services) or "(なし)")
+
+    if args.text_out:
+        write_text_file(args.text_out, build_text_report(meta, services, stats, True))
+    if args.full_text_out:
+        write_text_file(args.full_text_out, build_text_report(meta, services, stats, False))
+    if args.excel_out:
+        sheets = [
+            build_summary_sheet(meta, services, stats),
+            build_service_sheet(services),
+            build_directory_sheet(services),
+            build_evidence_sheet(services),
+            build_write_activity_sheet(services),
+            build_recommendation_sheet(services),
+            build_knowledge_sheet(),
+        ]
+        write_xlsx(args.excel_out, sheets,
+                   "読み取り専用ファイルシステム分析", "build_and_verify.sh")
+
+    print("READONLY_TOTAL=%d" % stats["total"], file=sys.stderr)
+    print("READONLY_ACTION=%d" % stats[V_ACTION], file=sys.stderr)
+    print("READONLY_CHECK=%d" % stats[V_CHECK], file=sys.stderr)
+    print("READONLY_RECOMMEND=%d" % stats[V_RECOMMEND], file=sys.stderr)
+    print("READONLY_OK=%d" % stats[V_OK], file=sys.stderr)
+    print("READONLY_SERVICES=%d" % stats["services"], file=sys.stderr)
+    print("READONLY_ENABLED_SERVICES=%d" % stats["read_only_services"], file=sys.stderr)
+    print("READONLY_VERDICT=%s" % verdict, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+READONLY_ANALYZER_PY_EOF
+
+# 収集した事実を 1 行 1 レコードで書き出す。値に含まれる改行・タブ・区切り文字は
+# ヘルパー側の行単位パースを壊すため空白へ置き換える。
+readonly_fact() {
+  local kind="$1" field out=""
+  shift
+  for field in "$@"; do
+    field="${field//$'\t'/ }"
+    field="${field//$'\n'/ }"
+    field="${field//$'\r'/ }"
+    field="${field//"$READONLY_FACT_SEPARATOR"/ }"
+    out="${out}${READONLY_FACT_SEPARATOR}${field}"
+  done
+  printf '%s%s\n' "$kind" "$out"
+}
+
+# YAML / docker inspect の真偽値を true / false へ揃える。
+readonly_bool() {
+  case "${1,,}" in
+    true|yes|on|1) printf 'true\n' ;;
+    *)             printf 'false\n' ;;
+  esac
+}
+
+# tmpfs の指定 ("/tmp" または "/tmp:rw,size=64m") を対象とオプションへ分ける。
+readonly_emit_tmpfs() {
+  local out_file="$1" service="$2" spec="$3" target options=""
+  [ -n "$spec" ] || return 0
+  case "$spec" in
+    *:*) target="${spec%%:*}"; options="${spec#*:}" ;;
+    *)   target="$spec" ;;
+  esac
+  [ -n "$target" ] || return 0
+  readonly_fact tmpfs "$service" "$target" "$options" >> "$out_file"
+}
+
+# volumes の長記法 (- type: bind / source: ... / target: ...) は、compose_yaml_entries が
+# 「項目の 1 行目 = list、2 行目以降 = kv」で順に出すため、1 項目ぶんを組み立ててから
+# 書き出す。組み立て中の値はこのグローバル変数で持ち回る。
+READONLY_VOL_SERVICE=""
+READONLY_VOL_TYPE=""
+READONLY_VOL_SOURCE=""
+READONLY_VOL_TARGET=""
+READONLY_VOL_READ_ONLY="false"
+READONLY_VOL_ACTIVE="false"
+
+readonly_reset_volume_item() {
+  READONLY_VOL_SERVICE=""
+  READONLY_VOL_TYPE=""
+  READONLY_VOL_SOURCE=""
+  READONLY_VOL_TARGET=""
+  READONLY_VOL_READ_ONLY="false"
+  READONLY_VOL_ACTIVE="false"
+}
+
+# 組み立て中の長記法 volumes 項目を 1 レコードとして確定する。
+readonly_flush_volume_item() {
+  local out_file="$1" volume_type
+  [ "$READONLY_VOL_ACTIVE" = "true" ] || return 0
+  if [ -n "$READONLY_VOL_TARGET" ]; then
+    volume_type="$READONLY_VOL_TYPE"
+    [ -n "$volume_type" ] || volume_type="unknown"
+    readonly_fact volume "$READONLY_VOL_SERVICE" "$volume_type" "$READONLY_VOL_SOURCE" \
+        "$READONLY_VOL_TARGET" "$READONLY_VOL_READ_ONLY" >> "$out_file"
+  fi
+  readonly_reset_volume_item
+}
+
+# 長記法 volumes の 1 フィールドを取り込む。
+readonly_set_volume_field() {
+  local service="$1" field="$2" value="$3"
+  READONLY_VOL_ACTIVE="true"
+  READONLY_VOL_SERVICE="$service"
+  case "$field" in
+    type)      READONLY_VOL_TYPE="$value" ;;
+    source)    READONLY_VOL_SOURCE="$value" ;;
+    target)    READONLY_VOL_TARGET="$value" ;;
+    read_only) READONLY_VOL_READ_ONLY="$(readonly_bool "$value")" ;;
+  esac
+}
+
+# compose.yml の短記法 volumes ("SOURCE:TARGET[:MODE]") を 1 レコードとして書き出す。
+# ホスト側のパス (/ . ~ で始まる) はバインドマウント、それ以外は名前付きボリューム、
+# 区切りが無いものは匿名ボリュームとして扱う。
+readonly_emit_short_volume() {
+  local out_file="$1" service="$2" spec="$3"
+  local source target mode volume_type read_only="false"
+
+  IFS="$COMPOSE_YAML_SEPARATOR" read -r source target mode \
+      < <(cwagent_split_volume_spec "$spec")
+  [ -n "$target" ] || return 0
+  if [ -z "$source" ]; then
+    volume_type="volume"
+  else
+    case "$source" in
+      /*|./*|../*|~*) volume_type="bind" ;;
+      *)              volume_type="volume" ;;
+    esac
+  fi
+  case ",${mode}," in
+    *,ro,*) read_only="true" ;;
+  esac
+  readonly_fact volume "$service" "$volume_type" "$source" "$target" "$read_only" >> "$out_file"
+}
+
+# compose.yml から read_only / tmpfs / volumes / image / 環境変数を取り出す。
+readonly_collect_compose_facts() {
+  local out_file="$1"
+  local kind entry_path value rest service field env_name env_value
+  local -A seen_services=()
+
+  [ -f "$COMPOSE_FILE" ] || return 1
+  readonly_reset_volume_item
+
+  while IFS="$COMPOSE_YAML_SEPARATOR" read -r kind entry_path value; do
+    [ -n "$kind" ] || continue
+    case "$entry_path" in
+      services.*) ;;
+      volumes.*)
+        # 最上位の volumes: (名前付きボリュームの定義)。1 階層目だけを名前とする。
+        readonly_flush_volume_item "$out_file"
+        rest="${entry_path#volumes.}"
+        case "$rest" in
+          *.*) ;;
+          *) [ -n "$rest" ] && readonly_fact named_volume "$rest" >> "$out_file" ;;
+        esac
+        continue
+        ;;
+      *)
+        readonly_flush_volume_item "$out_file"
+        continue
+        ;;
+    esac
+    rest="${entry_path#services.}"
+    service="${rest%%.*}"
+    [ -n "$service" ] || continue
+    rest="${rest#"$service"}"
+    rest="${rest#.}"
+
+    # 組み立て中の長記法 volumes 項目は、別のキーへ移った時点で確定する。
+    case "$kind:$rest" in
+      kv:volumes.*) ;;
+      *) readonly_flush_volume_item "$out_file" ;;
+    esac
+
+    if [ -z "${seen_services[$service]:-}" ]; then
+      seen_services["$service"]="true"
+      readonly_fact service "$service" >> "$out_file"
+    fi
+
+    case "$kind:$rest" in
+      kv:image)          readonly_fact image "$service" "$value" >> "$out_file" ;;
+      kv:user)           readonly_fact user "$service" "$value" >> "$out_file" ;;
+      kv:container_name) readonly_fact container_name "$service" "$value" >> "$out_file" ;;
+      kv:read_only)      readonly_fact read_only "$service" "$(readonly_bool "$value")" >> "$out_file" ;;
+      kv:tmpfs)          readonly_emit_tmpfs "$out_file" "$service" "$value" ;;
+      list:tmpfs)        readonly_emit_tmpfs "$out_file" "$service" "$value" ;;
+      kv:environment.*)  readonly_fact env "$service" "${rest#environment.}" "$value" >> "$out_file" ;;
+      list:environment)
+        # リスト記法 (- NAME=VALUE) は = の前後で分ける。値なしは空文字とする。
+        env_name="${value%%=*}"
+        env_value="${value#*=}"
+        [ "$env_value" = "$value" ] && env_value=""
+        [ -n "$env_name" ] && readonly_fact env "$service" "$env_name" "$env_value" >> "$out_file"
+        ;;
+      list:volumes)
+        case "$value" in
+          type:*|source:*|target:*|read_only:*|bind:*|volume:*|tmpfs:*|consistency:*)
+            # 長記法の 1 行目。"キー: 値" を分解して組み立てを始める。
+            field="${value%%:*}"
+            env_value="${value#*:}"
+            env_value="${env_value# }"
+            readonly_set_volume_field "$service" "$field" "$env_value"
+            ;;
+          *) readonly_emit_short_volume "$out_file" "$service" "$value" ;;
+        esac
+        ;;
+      kv:volumes.*)
+        # 長記法の 2 行目以降 (source: / target: / read_only: 等)。
+        field="${rest#volumes.}"
+        case "$field" in
+          type|source|target|read_only) readonly_set_volume_field "$service" "$field" "$value" ;;
+        esac
+        ;;
+    esac
+  done < <(compose_yaml_entries "$COMPOSE_FILE" "$COMPOSE_YAML_SEPARATOR")
+  readonly_flush_volume_item "$out_file"
+  return 0
+}
+
+# コンテナの中から、書き込みに関わる状態を 1 回の exec でまとめて取得する。
+#   - /proc/self/mounts       : どのパスが読み取り専用 (ro) でマウントされているか
+#   - JBOSS_HOME の解決結果   : JBoss EAP のディレクトリを対象へ加えるため
+#   - 対象ディレクトリごとの   : 存在 / 書き込み可否 / ファイル数 /
+#                               起動後 (PID 1 より新しい) に更新されたファイル数
+# コンテナへ渡すスクリプトは引用が壊れないよう変数展開せずに書き、対象ディレクトリは
+# sh の位置パラメータとして渡す。ファイル数の集計は大きなディレクトリで時間を
+# 使わないよう、深さ 3・2000 件で打ち切る。
+readonly_container_probe() {
+  local cid="$1"
+  shift
+  docker exec "$cid" /bin/sh -c '
+printf "%s\n" "__BUILD_AND_VERIFY_RO_PROBE__MOUNTS"
+cat /proc/self/mounts 2>/dev/null || cat /proc/mounts 2>/dev/null || true
+jboss_home="${JBOSS_HOME:-${JBOSS_EAP_HOME:-}}"
+if [ -z "$jboss_home" ]; then
+  for candidate in /opt/jboss-eap /opt/eap /opt/jboss/jboss-eap /opt/jboss /opt/wildfly /usr/local/jboss-eap /usr/local/wildfly; do
+    if [ -d "$candidate/bin" ] && [ -d "$candidate/standalone" ]; then
+      jboss_home="$candidate"
+      break
+    fi
+  done
+fi
+printf "%s\n" "__BUILD_AND_VERIFY_RO_PROBE__JBOSS"
+if [ -n "$jboss_home" ]; then
+  printf "%s\n" "$jboss_home"
+fi
+printf "%s\n" "__BUILD_AND_VERIFY_RO_PROBE__DIRS"
+probe_directory() {
+  target="$1"
+  [ -n "$target" ] || return 0
+  if [ ! -d "$target" ]; then
+    printf "%s|missing|-|0|0\n" "$target"
+    return 0
+  fi
+  writable=ro
+  if [ -w "$target" ]; then
+    writable=rw
+  fi
+  files=$(find "$target" -xdev -maxdepth 3 -type f 2>/dev/null | head -n 2000 | wc -l | tr -d " ")
+  recent=$(find "$target" -xdev -maxdepth 3 -type f -newer /proc/1 2>/dev/null | head -n 2000 | wc -l | tr -d " ")
+  printf "%s|exists|%s|%s|%s\n" "$target" "$writable" "${files:-0}" "${recent:-0}"
+}
+for target in "$@"; do
+  probe_directory "$target"
+done
+if [ -n "$jboss_home" ]; then
+  for suffix in standalone/tmp standalone/log standalone/data standalone/configuration standalone/deployments standalone/content; do
+    probe_directory "$jboss_home/$suffix"
+  done
+fi
+printf "%s\n" "__BUILD_AND_VERIFY_RO_PROBE__END"
+' probe "$@" 2>/dev/null
+}
+
+# プローブ対象のディレクトリを 1 件加える。呼び出し元
+# (readonly_collect_runtime_facts) のローカル変数 probe_dirs / probe_seen へ足すため、
+# この関数は単独では使えない。パスに使える文字だけを通し、重複と件数の上限を守る。
+readonly_add_probe_dir() {
+  local dir="$1"
+  case "$dir" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  # 末尾がファイル名 (拡張子付き) の指定は、その親ディレクトリを対象にする。
+  # 例: -XX:HeapDumpPath=/var/dumps/heap.hprof → /var/dumps
+  case "${dir##*/}" in
+    *.*) dir="${dir%/*}" ;;
+  esac
+  dir="${dir%/}"
+  [ -n "$dir" ] || return 0
+  # 制御文字や引用を含むパスはコンテナへ渡さない。
+  case "$dir" in
+    *[!A-Za-z0-9._+@/-]*) return 0 ;;
+  esac
+  [ -z "${probe_seen[$dir]:-}" ] || return 0
+  [ ${#probe_dirs[@]} -lt "$READONLY_PROBE_MAX_DIRS" ] || return 0
+  probe_seen["$dir"]="true"
+  probe_dirs+=("$dir")
+  return 0
+}
+
+# 起動した (または起動しようとした) コンテナから、書き込みに関わる実状態を集める。
+# 停止済みのコンテナでもマウント定義と書き込み層の変更は取得できるため、
+# 起動に失敗した実行でも分かる範囲を残す。
+readonly_collect_runtime_facts() {
+  local out_file="$1"
+  local service cid container_name state value line rest first_arg option
+  local section probe_line target exists writable files recent
+  local mount_type mount_source mount_target mount_rw tmpfs_target tmpfs_options
+  local change path env_name env_value mount_device mount_fstype mount_options
+  local diff_count collected="false"
+  local -a probe_dirs=()
+  local -a args=()
+  local -A probe_seen=()
+
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    cid="$(compose_container_ids_all "$service" 2>/dev/null | head -n 1)"
+    [ -n "$cid" ] || continue
+    collected="true"
+
+    container_name="$(normalize_container_name \
+        "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    # 状態は他の箇所と同じ書式で取得し、状態だけを取り出す。
+    state="$(docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}' "$cid" 2>/dev/null || true)"
+    state="${state%%|*}"
+    [ -n "$state" ] || state="不明"
+    readonly_fact container "$service" "$container_name" "$state" >> "$out_file"
+
+    # ルートファイルシステムが読み取り専用で起動しているか (compose の read_only の結果)。
+    value="$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$cid" 2>/dev/null || true)"
+    if [ -n "$value" ]; then
+      readonly_fact rt_readonly "$service" "$(readonly_bool "$value")" >> "$out_file"
+    fi
+
+    # 実際に効いているマウント (バインド / ボリューム / tmpfs)。
+    while IFS='|' read -r mount_type mount_source mount_target mount_rw; do
+      [ -n "$mount_target" ] || continue
+      readonly_fact rt_mount "$service" "$mount_type" "$mount_source" "$mount_target" \
+          "$(readonly_bool "$mount_rw")" >> "$out_file"
+    done < <(docker inspect \
+        -f '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
+        "$cid" 2>/dev/null || true)
+
+    while IFS='|' read -r tmpfs_target tmpfs_options; do
+      [ -n "$tmpfs_target" ] || continue
+      readonly_fact rt_tmpfs "$service" "$tmpfs_target" "$tmpfs_options" >> "$out_file"
+    done < <(docker inspect \
+        -f '{{range $target, $options := .HostConfig.Tmpfs}}{{$target}}|{{$options}}{{"\n"}}{{end}}' \
+        "$cid" 2>/dev/null || true)
+
+    # 書き込み層の変更 = 実行中に実際へ書かれた場所。read_only のコンテナでは
+    # 書き込み自体ができないため何も出ない (それ自体が判定の材料になる)。
+    diff_count=0
+    while read -r change path; do
+      [ -n "$path" ] || continue
+      diff_count=$((diff_count + 1))
+      [ "$diff_count" -le "$READONLY_DIFF_LIMIT" ] || break
+      readonly_fact rt_diff "$service" "$change" "$path" >> "$out_file"
+    done < <(docker diff "$cid" 2>/dev/null || true)
+
+    if [ "$state" = "running" ]; then
+      # コンテナ内で確認するディレクトリ。一般的な書き込み先から始め、JVM パラメータや
+      # 環境変数で名指しされた場所を足していく (JBoss EAP の配下はプローブ側で足す)。
+      probe_dirs=("${READONLY_PROBE_BASE_DIRS[@]}")
+      probe_seen=()
+      for target in "${probe_dirs[@]}"; do
+        probe_seen["$target"]="true"
+      done
+
+      # プロセスと JVM パラメータ。-Djava.io.tmpdir や -XX:HeapDumpPath のように
+      # 書き込み先を明示している指定は、そのままディレクトリの候補になる。
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS="$JVM_FIELD_SEPARATOR" read -r -a args <<< "$line"
+        [ ${#args[@]} -gt 1 ] || continue
+        first_arg="${args[1]}"
+        readonly_fact rt_process "$service" "$first_arg" >> "$out_file"
+        for option in "${args[@]:2}"; do
+          case "$option" in
+            -D*=/*|-XX:*=/*)
+              readonly_fact rt_jvm "$service" "$option" >> "$out_file"
+              readonly_add_probe_dir "${option#*=}"
+              ;;
+            -Xloggc:/*)
+              readonly_fact rt_jvm "$service" "$option" >> "$out_file"
+              readonly_add_probe_dir "${option#-Xloggc:}"
+              ;;
+          esac
+        done
+      done < <(collect_container_process_cmdlines "$cid")
+
+      # ディレクトリを指す環境変数。値がパスでないもの、認証情報を持ちやすい名前は除く。
+      while IFS= read -r line; do
+        case "$line" in
+          *=*) ;;
+          *) continue ;;
+        esac
+        env_name="${line%%=*}"
+        env_value="${line#*=}"
+        [ -n "$env_name" ] || continue
+        is_sensitive_setting_name "$env_name" && continue
+        case "$env_value" in
+          /*) ;;
+          *) continue ;;
+        esac
+        case "$env_value" in
+          *:*) continue ;;
+        esac
+        readonly_fact rt_env "$service" "$env_name" "$env_value" >> "$out_file"
+        # ディレクトリを指す名前のものだけ、実在と書き込み可否まで確認する。
+        # (*_HOME はインストール先を指すため対象にしない)
+        case "${env_name^^}" in
+          *DIR|*TMP|*TEMP|*LOG|*LOGS|*DATA|*CACHE|*STORAGE)
+            readonly_add_probe_dir "$env_value"
+            ;;
+        esac
+      done < <(collect_container_pid1_env "$cid")
+
+      # コンテナ内から見た書き込み可否・ファイル数・マウント状態。
+      section=""
+      while IFS= read -r probe_line; do
+        case "$probe_line" in
+          "${READONLY_PROBE_MARK}MOUNTS") section="mounts"; continue ;;
+          "${READONLY_PROBE_MARK}JBOSS")  section="jboss"; continue ;;
+          "${READONLY_PROBE_MARK}DIRS")   section="dirs"; continue ;;
+          "${READONLY_PROBE_MARK}END")    section=""; continue ;;
+        esac
+        [ -n "$probe_line" ] || continue
+        case "$section" in
+          mounts)
+            read -r mount_device mount_target mount_fstype mount_options rest \
+                <<< "$probe_line"
+            [ -n "$mount_target" ] || continue
+            readonly_fact rt_mountinfo "$service" "$mount_target" "$mount_fstype" \
+                "$mount_options" >> "$out_file"
+            ;;
+          jboss)
+            readonly_fact rt_jboss_home "$service" "$probe_line" >> "$out_file"
+            ;;
+          dirs)
+            IFS='|' read -r target exists writable files recent <<< "$probe_line"
+            [ -n "$target" ] || continue
+            readonly_fact rt_probe "$service" "$target" "$exists" "$writable" \
+                "$files" "$recent" >> "$out_file"
+            ;;
+        esac
+      done < <(readonly_container_probe "$cid" "${probe_dirs[@]}")
+    else
+      readonly_fact note "$service" \
+          "コンテナが停止しているため (状態: ${state})、コンテナ内の書き込み可否は確認できていません。compose.yml の定義とマウント・書き込み層の情報だけで判定しています。" \
+          >> "$out_file"
+    fi
+
+    # 読み取り専用のディレクトリへ書こうとして失敗したログ。原因の直接の証拠になる。
+    # 本文には認証情報が混ざり得るため、cwagent 検証と同じ規則で伏せてから記録する。
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      readonly_fact rt_log "$service" "$line" >> "$out_file"
+    done < <(compose_logs "$service" 2>/dev/null | strip_ansi_codes \
+        | grep -E "$READONLY_LOG_ERROR_PATTERN" 2>/dev/null \
+        | head -n "$READONLY_LOG_ERROR_LIMIT" | cwagent_redact_text || true)
+  done < <(compose_all_service_names)
+
+  [ "$collected" = "true" ]
+}
+
+# 分析ヘルパーへ渡すメタ情報を書き出す。Excel の「概要」シートに載る。
+write_readonly_analysis_meta() {
+  local meta_file="$1" exit_status="$2" overall_status report_file
+
+  # 分析は全量レポートを書く直前に走るため、この時点ではレポートのファイル名が
+  # まだ確定していない。対で参照できるよう、確定前は予定のパスを記載する。
+  if [ -n "$BUILD_REPORT_FILE" ]; then
+    report_file="$BUILD_REPORT_FILE"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    report_file="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}.txt (出力予定)"
+  else
+    report_file=""
+  fi
+
+  if [ "$exit_status" -eq 0 ]; then
+    overall_status="成功"
+  else
+    overall_status="失敗 (exit=${exit_status})"
+  fi
+
+  {
+    analysis_meta_entry "analyzed_at" "$(now_display_time)"
+    analysis_meta_entry "run_started_at" "$RUN_STARTED_AT"
+    analysis_meta_entry "script" "build_and_verify.sh"
+    analysis_meta_entry "compose_file" "$COMPOSE_FILE"
+    if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
+      analysis_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
+    else
+      analysis_meta_entry "build_services" "全サービス"
+    fi
+    if [ ${#COMPOSE_TARGET_SERVICES[@]} -gt 0 ]; then
+      analysis_meta_entry "target_services" "${COMPOSE_TARGET_SERVICES[*]}"
+    else
+      analysis_meta_entry "target_services" "全サービス"
+    fi
+    analysis_meta_entry "overall_status" "$overall_status"
+    analysis_meta_entry "report_file" "$report_file"
+    analysis_meta_entry "collect_status" "$READONLY_ANALYSIS_COLLECT_STATUS"
+  } > "$meta_file"
+}
+
+# ヘルパーが標準エラーへ返す集計値を読み取る。
+read_readonly_analysis_summary() {
+  local summary_file="$1" line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      READONLY_TOTAL=*)             READONLY_TOTAL="${line#*=}" ;;
+      READONLY_ACTION=*)            READONLY_ACTION="${line#*=}" ;;
+      READONLY_CHECK=*)             READONLY_CHECK="${line#*=}" ;;
+      READONLY_RECOMMEND=*)         READONLY_RECOMMEND="${line#*=}" ;;
+      READONLY_OK=*)                READONLY_OK="${line#*=}" ;;
+      READONLY_SERVICES=*)          READONLY_SERVICES="${line#*=}" ;;
+      READONLY_ENABLED_SERVICES=*)  READONLY_ENABLED_SERVICES="${line#*=}" ;;
+      READONLY_VERDICT=*)           READONLY_VERDICT="${line#*=}" ;;
+    esac
+  done < "$summary_file"
+}
+
+# compose.yml の read_only 設定と、アプリの実行状況から、tmpfs / バインドマウントを
+# 割り当てるべきディレクトリを分析する。成功経路 (主処理の末尾) と失敗経路 (EXIT
+# トラップ) の双方から呼ばれるため、二重に実行しないよう守る。コンテナを削除する
+# 前に呼ぶ必要がある (docker diff / docker exec / compose logs が使えなくなるため)。
+#
+# コンテナを起動しない実行 (ビルドのみ) でも、compose.yml の定義だけで
+# 「read_only を有効にするならどこに書き込み先が要るか」は判定できるため、必ず実行する。
+analyze_readonly_filesystem() {
+  local exit_status="${1:-0}"
+  local facts_file="" meta_file="" summary_file="" excel_path="" text_path="" line=""
+  local analyzer_status=0
+  local -a analyzer_args=()
+
+  [ "$READONLY_ANALYSIS_DONE" = "true" ] && return 0
+
+  if [ "$READONLY_ANALYSIS" != "true" ]; then
+    READONLY_ANALYSIS_DONE="true"
+    READONLY_ANALYSIS_SKIP_REASON="--no-readonly-analysis が指定されたため分析していません。"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    READONLY_ANALYSIS_DONE="true"
+    READONLY_ANALYSIS_SKIP_REASON="DRY-RUN のため分析していません。"
+    log "[DRY-RUN] 読み取り専用ファイルシステムの書き込み先分析をスキップします。"
+    return 0
+  fi
+  if ! resolve_analysis_python; then
+    READONLY_ANALYSIS_DONE="true"
+    READONLY_ANALYSIS_SKIP_REASON="分析に必要な Python 3 が見つかりませんでした (python3 / python / /usr/libexec/platform-python)。"
+    warn "読み取り専用ファイルシステムの書き込み先分析をスキップしました: Python 3 が見つかりません。"
+    return 0
+  fi
+  READONLY_ANALYSIS_DONE="true"
+
+  if ! facts_file="$(mktemp 2>/dev/null)" \
+      || ! meta_file="$(mktemp 2>/dev/null)" \
+      || ! summary_file="$(mktemp 2>/dev/null)" \
+      || ! READONLY_ANALYSIS_DIGEST_FILE="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$facts_file" "$meta_file" "$summary_file" "$READONLY_ANALYSIS_DIGEST_FILE"
+    READONLY_ANALYSIS_DIGEST_FILE=""
+    READONLY_ANALYSIS_SKIP_REASON="分析用の一時ファイルを作成できませんでした。"
+    warn "読み取り専用ファイルシステム分析用の一時ファイルを作成できませんでした。"
+    return 1
+  fi
+
+  if ! readonly_collect_compose_facts "$facts_file"; then
+    READONLY_ANALYSIS_SKIP_REASON="compose ファイルを読み取れませんでした: ${COMPOSE_FILE}"
+    warn "読み取り専用ファイルシステム分析: compose ファイルを読み取れませんでした: ${COMPOSE_FILE}"
+    rm -f -- "$facts_file" "$meta_file" "$summary_file" "$READONLY_ANALYSIS_DIGEST_FILE"
+    READONLY_ANALYSIS_DIGEST_FILE=""
+    return 1
+  fi
+
+  # 実行状況からの判定は、今回の実行でコンテナへ触れている場合だけ行う。
+  # 前回の実行が残したコンテナを今回の結果として扱わないための条件。
+  if [ "$COMPOSE_UP_ATTEMPTED" = "true" ] && readonly_collect_runtime_facts "$facts_file"; then
+    READONLY_ANALYSIS_COLLECT_STATUS="compose.yml の定義と、実際に動いたコンテナの状態 (マウント・書き込み層・コンテナ内から見た書き込み可否・JVM パラメータ・ログ) から判定しました。"
+  elif [ "$COMPOSE_UP_ATTEMPTED" = "true" ]; then
+    READONLY_ANALYSIS_COLLECT_STATUS="コンテナが 1 つも見つからなかったため、compose.yml の定義だけで判定しました。"
+  else
+    READONLY_ANALYSIS_COLLECT_STATUS="コンテナを起動していないため、compose.yml の定義だけで判定しました (--verify-startup または --verify-url を併用すると、実際の書き込み状況まで確認します)。"
+  fi
+  write_readonly_analysis_meta "$meta_file" "$exit_status"
+
+  excel_path="$(prepare_analysis_output \
+      "$READONLY_ANALYSIS_EXCEL" "$READONLY_ANALYSIS_EXCEL_SET" "xlsx" " Excel" \
+      "_readonly_filesystem" "読み取り専用ファイルシステム分析")"
+  text_path="$(prepare_analysis_output \
+      "$READONLY_ANALYSIS_TEXT" "$READONLY_ANALYSIS_TEXT_SET" "txt" "テキスト" \
+      "_readonly_filesystem" "読み取り専用ファイルシステム分析")"
+
+  analyzer_args=(
+    --facts-file "$facts_file"
+    --meta-file "$meta_file"
+    --text-out "$READONLY_ANALYSIS_DIGEST_FILE"
+  )
+  [ -n "$excel_path" ] && analyzer_args+=(--excel-out "$excel_path")
+  [ -n "$text_path" ] && analyzer_args+=(--full-text-out "$text_path")
+
+  # 出力は日本語と罫線文字を含むため、ロケール既定の文字コード (Windows の cp932 等)
+  # で落ちないよう UTF-8 を明示する。
+  printf '%s' "$READONLY_ANALYZER_PY" \
+    | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" - "${analyzer_args[@]}" 2> "$summary_file"
+  analyzer_status=$?
+  if [ "$analyzer_status" -ne 0 ]; then
+    warn "読み取り専用ファイルシステムの書き込み先分析に失敗しました (exit=${analyzer_status})。"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] && diag "  $line"
+    done < "$summary_file"
+    READONLY_ANALYSIS_SKIP_REASON="分析ヘルパーの実行に失敗しました (exit=${analyzer_status})。"
+    rm -f -- "$facts_file" "$meta_file" "$summary_file" "$READONLY_ANALYSIS_DIGEST_FILE"
+    READONLY_ANALYSIS_DIGEST_FILE=""
+    return 1
+  fi
+  read_readonly_analysis_summary "$summary_file"
+  rm -f -- "$facts_file" "$meta_file" "$summary_file"
+
+  if [ -n "$excel_path" ] && [ -s "$excel_path" ]; then
+    READONLY_ANALYSIS_EXCEL_FILE="$excel_path"
+  fi
+  if [ -n "$text_path" ] && [ -s "$text_path" ]; then
+    READONLY_ANALYSIS_TEXT_OUTPUT="$text_path"
+  fi
+
+  show_readonly_filesystem_analysis
+  return 0
+}
+
+# 分析結果を画面へ出す。要約は「要対応・要確認・推奨」のディレクトリだけを載せた
+# 短い形になっているため、判定にかかわらずそのまま表示する。
+show_readonly_filesystem_analysis() {
+  if [ -s "$READONLY_ANALYSIS_DIGEST_FILE" ]; then
+    diag ""
+    cat -- "$READONLY_ANALYSIS_DIGEST_FILE" >&2
+  fi
+  if [ "${READONLY_ACTION:-0}" -gt 0 ] 2>/dev/null; then
+    err "読み取り専用ファイルシステム分析: 書き込み先が用意されていないディレクトリを ${READONLY_ACTION} 件検出しました。"
+    err "  判定: ${READONLY_VERDICT}"
+  elif [ "${READONLY_CHECK:-0}" -gt 0 ] 2>/dev/null; then
+    warn "読み取り専用ファイルシステム分析: 確認が必要なディレクトリが ${READONLY_CHECK} 件あります。"
+    warn "  判定: ${READONLY_VERDICT}"
+  else
+    log "読み取り専用ファイルシステム分析: ${READONLY_VERDICT}"
+  fi
+  log "  対象 ${READONLY_SERVICES} サービス (うち read_only 有効 ${READONLY_ENABLED_SERVICES})、検出ディレクトリ ${READONLY_TOTAL} 件 (要対応 ${READONLY_ACTION} / 要確認 ${READONLY_CHECK} / 推奨 ${READONLY_RECOMMEND} / OK ${READONLY_OK})"
+  if [ -n "$READONLY_ANALYSIS_EXCEL_FILE" ]; then
+    log "読み取り専用ファイルシステム分析の Excel ブックを出力しました: $READONLY_ANALYSIS_EXCEL_FILE"
+  fi
+  if [ -n "$READONLY_ANALYSIS_TEXT_OUTPUT" ]; then
+    log "読み取り専用ファイルシステム分析のテキストを出力しました: $READONLY_ANALYSIS_TEXT_OUTPUT"
+  fi
+  if [ -z "$READONLY_ANALYSIS_EXCEL_FILE" ] && [ -z "$READONLY_ANALYSIS_TEXT_OUTPUT" ] \
+      && [ -z "$BUILD_REPORT_DIR" ]; then
+    log "読み取り専用ファイルシステム分析のファイル出力は、--report-dir または --readonly-analysis-excel / --readonly-analysis-text の指定時に行います。"
+  fi
+  return 0
+}
+
+# 全量レポートへ読み取り専用ファイルシステム分析の結果を追記する。
+append_readonly_analysis_report() {
+  local report_file="$1"
+
+  if [ -z "$READONLY_ANALYSIS_DIGEST_FILE" ] || [ ! -s "$READONLY_ANALYSIS_DIGEST_FILE" ]; then
+    printf '%s\n' "${READONLY_ANALYSIS_SKIP_REASON:-分析結果を取得できなかったため記載できません。}" \
+        >> "$report_file"
+    return 0
+  fi
+  if [ -n "$READONLY_ANALYSIS_EXCEL_FILE" ]; then
+    printf 'Excel ブック  : %s\n' "$READONLY_ANALYSIS_EXCEL_FILE" >> "$report_file"
+  else
+    printf 'Excel ブック  : (未出力)\n' >> "$report_file"
+  fi
+  if [ -n "$READONLY_ANALYSIS_TEXT_OUTPUT" ]; then
+    printf 'テキスト      : %s (Excel と同じ内容。全ディレクトリの判定と根拠を含む)\n' \
+        "$READONLY_ANALYSIS_TEXT_OUTPUT" >> "$report_file"
+  else
+    printf 'テキスト      : (未出力)\n' >> "$report_file"
+  fi
+  printf '情報の取得状況: %s\n' "${READONLY_ANALYSIS_COLLECT_STATUS:-(不明)}" >> "$report_file"
+  printf '\n' >> "$report_file"
+  cat -- "$READONLY_ANALYSIS_DIGEST_FILE" >> "$report_file"
   return 0
 }
 
@@ -14274,6 +16818,8 @@ write_build_report() {
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
     printf '                デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)\n'
     printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
+    printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
+    printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -14374,6 +16920,11 @@ write_build_report() {
   printf '\n[10] WAR デプロイ時 Java 例外解析\n' >> "$report_tmp"
   append_deploy_exception_report "$report_tmp"
 
+  # 読み取り専用ファイルシステムの書き込み先分析。こちらもコンテナを停止する前に
+  # 済ませてあり、ここではその結果を書き出すだけとする。
+  printf '\n[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析\n' >> "$report_tmp"
+  append_readonly_analysis_report "$report_tmp"
+
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートを確定できませんでした: $candidate"
@@ -14398,6 +16949,10 @@ cleanup_all() {
   # レポート出力より先に実行する。成功経路では主処理の末尾で実行済みのため、
   # ここでの呼び出しは何もしない (二重実行の防止は関数側で行う)。
   analyze_war_deploy_exceptions "$original_status"
+  # 読み取り専用ファイルシステムの書き込み先分析も、コンテナを停止・削除する前に
+  # 済ませる必要がある (docker diff / docker exec / compose logs を使うため)。
+  # ビルドのみの実行や失敗した実行でも、compose.yml の定義から分かる範囲は出力する。
+  analyze_readonly_filesystem "$original_status"
   if ! write_build_report "$original_status"; then
     cleanup_status=1
   fi
@@ -14423,6 +16978,7 @@ cleanup_all() {
   cleanup_copied_files
   # 解析結果の一時ファイルは、全量レポートへ転記し終えたここで削除する。
   [ -n "$DEPLOY_EXCEPTION_TEXT_FILE" ] && rm -f "$DEPLOY_EXCEPTION_TEXT_FILE"
+  [ -n "$READONLY_ANALYSIS_DIGEST_FILE" ] && rm -f "$READONLY_ANALYSIS_DIGEST_FILE"
   [ -n "$URL_BODY_FILE" ] && rm -f "$URL_BODY_FILE"
   [ -n "$INTERACTIVE_HTTP_BODY_FILE" ] && rm -f "$INTERACTIVE_HTTP_BODY_FILE"
   [ -n "$HEALTHCHECK_DIAGNOSTIC_FILE" ] && rm -f "$HEALTHCHECK_DIAGNOSTIC_FILE"
@@ -14707,6 +17263,11 @@ show_verified_container_otel_settings
 # 起動確認が成功していても、デプロイ済みアプリの初期化で例外が出ている
 # ことがあるため、成功経路でも必ず実行する。
 analyze_war_deploy_exceptions 0
+
+# read_only 指定と実際の書き込み状況から、tmpfs / バインドマウントを割り当てる
+# べきディレクトリを分析する。起動に成功した実行でこそ「どこへ書いたか」が
+# 分かるため、成功経路でもコンテナを片付ける前に実行する。
+analyze_readonly_filesystem 0
 
 # jboss-cli が生成した standalone.xml と Elytron CredentialStore まで確認し、
 # ビルド前の段と合わせて伝搬検証の結果をまとめて出力する。

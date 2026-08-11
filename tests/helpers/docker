@@ -458,10 +458,153 @@ if [ "${1:-}" = "inspect" ]; then
     *".Config.Env"*)
       printf 'PATH=/usr/bin\n'
       ;;
+    # 読み取り専用ファイルシステム分析: ルートファイルシステムを読み取り専用に
+    # したかどうか (compose.yml の read_only が反映された結果)。
+    *".HostConfig.ReadonlyRootfs"*)
+      printf '%s\n' "${FAKE_READONLY_ROOTFS:-false}"
+      ;;
+    # 実際に効いているマウント ("type|source|destination|rw" の行)。
+    *"range .Mounts"*)
+      if [ -n "${FAKE_CONTAINER_MOUNTS:-}" ]; then
+        printf '%s\n' "$FAKE_CONTAINER_MOUNTS"
+      fi
+      ;;
+    # tmpfs マウント ("target|options" の行)。
+    *".HostConfig.Tmpfs"*)
+      if [ -n "${FAKE_CONTAINER_TMPFS:-}" ]; then
+        printf '%s\n' "$FAKE_CONTAINER_TMPFS"
+      fi
+      ;;
     *)
       fail "$@"
       ;;
   esac
+  exit 0
+fi
+
+# 書き込み層の変更一覧 (読み取り専用ファイルシステム分析で「実際に書かれた場所」
+# として使う)。read_only のコンテナでは何も返らない状態も再現できるようにする。
+if [ "${1:-}" = "diff" ]; then
+  if [ -n "${FAKE_DOCKER_DIFF:-}" ]; then
+    printf '%s\n' "$FAKE_DOCKER_DIFF"
+  fi
+  exit 0
+fi
+
+# 読み取り専用ファイルシステム分析のコンテナ内プローブ。
+# 実際のスクリプトと同じ区切り (MOUNTS / JBOSS / DIRS / END) で、
+#   - /proc/self/mounts 相当のマウント一覧
+#   - JBOSS_HOME の解決結果
+#   - 対象ディレクトリごとの 存在 / 書き込み可否 / ファイル数 / 起動後の更新数
+# を返す。read_only の有無 (FAKE_READONLY_ROOTFS) と tmpfs の指定
+# (FAKE_CONTAINER_TMPFS) に応じて、書き込み可否が変わる様子を再現する。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"__BUILD_AND_VERIFY_RO_PROBE__"* ]]; then
+  # distroless イメージにはシェルが無いため、プローブ自体が実行できない。
+  if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ] && [ "${2:-}" = "cid-adot-collector" ]; then
+    printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory: unknown\n' >&2
+    exit 126
+  fi
+  fake_probe_mark="__BUILD_AND_VERIFY_RO_PROBE__"
+  fake_probe_jboss_home="${FAKE_PROBE_JBOSS_HOME:-/opt/jboss-eap}"
+  fake_probe_tmpfs_targets=""
+  if [ -n "${FAKE_CONTAINER_TMPFS:-}" ]; then
+    while IFS='|' read -r fake_tmpfs_target _fake_tmpfs_options; do
+      [ -n "$fake_tmpfs_target" ] || continue
+      fake_probe_tmpfs_targets="${fake_probe_tmpfs_targets} ${fake_tmpfs_target}"
+    done <<< "$FAKE_CONTAINER_TMPFS"
+  fi
+  # 書き込み可能なマウント (バインド / ボリューム) も、読み取り専用ルートの中で
+  # 書ける場所として扱う。
+  fake_probe_rw_mounts=""
+  if [ -n "${FAKE_CONTAINER_MOUNTS:-}" ]; then
+    while IFS='|' read -r _fake_mount_type _fake_mount_source fake_mount_target fake_mount_rw; do
+      [ -n "$fake_mount_target" ] || continue
+      [ "$fake_mount_rw" = "true" ] || continue
+      fake_probe_rw_mounts="${fake_probe_rw_mounts} ${fake_mount_target}"
+    done <<< "$FAKE_CONTAINER_MOUNTS"
+  fi
+
+  # コンテナ内に存在するディレクトリ。JBoss EAP を入れた AP コンテナを想定する。
+  fake_probe_exists() {
+    case "$1" in
+      /tmp|/var/tmp|/run|/var/log|/var/cache|/opt/java/openjdk/lib/security) return 0 ;;
+      "$fake_probe_jboss_home"/standalone/*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  # 読み取り専用ルートでは、tmpfs か書き込み可能なマウントを割り当てたパス
+  # (とその配下) だけが書ける。
+  fake_probe_writable() {
+    [ "${FAKE_READONLY_ROOTFS:-false}" = "true" ] || return 0
+    for fake_probe_target in $fake_probe_tmpfs_targets $fake_probe_rw_mounts; do
+      case "$1" in
+        "$fake_probe_target"|"$fake_probe_target"/*) return 0 ;;
+      esac
+    done
+    return 1
+  }
+
+  fake_probe_directory() {
+    if ! fake_probe_exists "$1"; then
+      printf '%s|missing|-|0|0\n' "$1"
+      return 0
+    fi
+    fake_probe_files=0
+    fake_probe_recent=0
+    case "$1" in
+      /tmp) fake_probe_files=4; fake_probe_recent=3 ;;
+      "$fake_probe_jboss_home"/standalone/log) fake_probe_files=2; fake_probe_recent=2 ;;
+      "$fake_probe_jboss_home"/standalone/configuration) fake_probe_files=6 ;;
+      "$fake_probe_jboss_home"/standalone/deployments) fake_probe_files=2 ;;
+      "$fake_probe_jboss_home"/standalone/data) fake_probe_files=3 ;;
+      /var/log) fake_probe_files=1 ;;
+    esac
+    if fake_probe_writable "$1"; then
+      printf '%s|exists|rw|%s|%s\n' "$1" "$fake_probe_files" "$fake_probe_recent"
+    else
+      printf '%s|exists|ro|%s|0\n' "$1" "$fake_probe_files"
+    fi
+  }
+
+  printf '%sMOUNTS\n' "$fake_probe_mark"
+  if [ "${FAKE_READONLY_ROOTFS:-false}" = "true" ]; then
+    printf 'overlay / overlay ro,relatime 0 0\n'
+  else
+    printf 'overlay / overlay rw,relatime 0 0\n'
+  fi
+  printf 'proc /proc proc rw,nosuid,nodev,noexec 0 0\n'
+  for fake_probe_target in $fake_probe_tmpfs_targets; do
+    printf 'tmpfs %s tmpfs rw,nosuid,nodev 0 0\n' "$fake_probe_target"
+  done
+  if [ -n "${FAKE_CONTAINER_MOUNTS:-}" ]; then
+    while IFS='|' read -r _fake_mount_type _fake_mount_source fake_mount_target fake_mount_rw; do
+      [ -n "$fake_mount_target" ] || continue
+      if [ "$fake_mount_rw" = "true" ]; then
+        printf '/dev/sda1 %s ext4 rw,relatime 0 0\n' "$fake_mount_target"
+      else
+        printf '/dev/sda1 %s ext4 ro,relatime 0 0\n' "$fake_mount_target"
+      fi
+    done <<< "$FAKE_CONTAINER_MOUNTS"
+  fi
+  printf '%sJBOSS\n' "$fake_probe_mark"
+  if [ "$fake_probe_jboss_home" != "none" ]; then
+    printf '%s\n' "$fake_probe_jboss_home"
+  fi
+  printf '%sDIRS\n' "$fake_probe_mark"
+  # $5 がスクリプト、$6 が sh の $0、$7 以降が対象ディレクトリ。
+  shift 6
+  for fake_probe_arg in "$@"; do
+    fake_probe_directory "$fake_probe_arg"
+  done
+  if [ "$fake_probe_jboss_home" != "none" ]; then
+    for fake_probe_suffix in standalone/tmp standalone/log standalone/data \
+        standalone/configuration standalone/deployments standalone/content; do
+      fake_probe_directory "${fake_probe_jboss_home}/${fake_probe_suffix}"
+    done
+  fi
+  printf '%sEND\n' "$fake_probe_mark"
   exit 0
 fi
 

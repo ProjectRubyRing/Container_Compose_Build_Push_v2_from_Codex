@@ -49,14 +49,16 @@ assert_matches() {
 
 # 全量レポート (build_and_verify_<日時>.txt) だけを DIR から取り出し、REPORT_FILES へ入れる。
 # 同じディレクトリには Java 例外解析のテキスト
-# (build_and_verify_<日時>_java_exceptions.txt) も出力されるため、素の glob では
-# 2 件に増えてしまう。レポートの件数を数えるテストはこの関数を使う。
+# (build_and_verify_<日時>_java_exceptions.txt) と、読み取り専用ファイルシステム
+# 分析のテキスト (build_and_verify_<日時>_readonly_filesystem.txt) も出力される
+# ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
+# この関数を使う。
 collect_report_files() {
   local dir="$1" path
   REPORT_FILES=()
   for path in "$dir"/build_and_verify_*.txt; do
     case "$path" in
-      *_java_exceptions.txt) continue ;;
+      *_java_exceptions.txt|*_readonly_filesystem.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -2760,6 +2762,238 @@ if (
   fail "--deploy-exception-limit accepted 0"
 fi
 assert_contains "$deploy_exception_limit_output" "--deploy-exception-limit には 1 以上の整数を指定してください: 0"
+
+# =============================================================================
+# 読み取り専用ファイルシステム (read_only) の書き込み先分析
+# =============================================================================
+# compose.yml の read_only 指定と、実際に動いたコンテナの書き込み状況から、
+#   - read_only: true で書き込み先が足りないディレクトリを「要対応」とすること
+#   - 足りている構成では「問題なし」と判定すること
+#   - read_only 未設定でも、書き込みが起きるディレクトリを「推奨」で出すこと
+#   - テキストと Excel を出力し、全量レポートの [11] へ同じ内容を残すこと
+#   - --no-readonly-analysis で一切行わないこと
+# を確認する。
+readonly_fixture_dir="$TEST_DIR/fixtures/readonly"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+
+# --- read_only: true だが tmpfs が /tmp しか無い (書き込み先が足りない) ---
+readonly_missing_output="$TEST_TMP/readonly-missing.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_READONLY_ROOTFS="true"
+export FAKE_CONTAINER_TMPFS='/tmp|rw,size=64m'
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-missing.yml" \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --report-dir "$TEST_TMP/readonly-missing-reports"
+) >"$readonly_missing_output" 2>&1; then
+  cat "$readonly_missing_output" >&2
+  fail "readonly filesystem analysis (missing tmpfs) returned a non-zero status"
+fi
+
+# 分析ヘルパーは Python 3 を必要とする。無い環境では省略した旨だけを確認する。
+if grep -Fq "書き込み先分析をスキップしました: Python 3 が見つかりません" "$readonly_missing_output"; then
+  printf 'SKIP: readonly filesystem analysis assertions (Python 3 is unavailable)\n'
+else
+  assert_contains "$readonly_missing_output" \
+    "読み取り専用ルートファイルシステム (read_only) の書き込み先分析"
+  assert_contains "$readonly_missing_output" "read_only        : compose.yml=true / 実状態=true"
+  # JBoss EAP が起動時に必ず書くディレクトリを、要対応として理由付きで挙げること
+  assert_contains "$readonly_missing_output" "[要対応] /opt/jboss-eap/standalone/tmp"
+  assert_contains "$readonly_missing_output" "[要対応] /opt/jboss-eap/standalone/log"
+  assert_contains "$readonly_missing_output" "[要対応] /opt/jboss-eap/standalone/configuration"
+  assert_contains "$readonly_missing_output" "現在の設定  : ルートファイルシステム (読み取り専用)"
+  assert_contains "$readonly_missing_output" \
+    "根拠        : コンテナ内の /proc/mounts でも読み取り専用 (ro) でマウントされています。"
+  # tmpfs を割り当て済みの /tmp は要対応にしないこと
+  assert_not_contains "$readonly_missing_output" "[要対応] /tmp"
+  # 不足分を埋めた compose.yml の設定例を出すこと
+  assert_contains "$readonly_missing_output" "compose.yml の設定例 (不足しているディレクトリのみ):"
+  assert_contains "$readonly_missing_output" "- /opt/jboss-eap/standalone/tmp:rw,size=512m"
+  # tmpfs でイメージの中身を隠せないディレクトリはボリュームを提案すること
+  assert_contains "$readonly_missing_output" \
+    "app-opt-jboss-eap-standalone-configuration:/opt/jboss-eap/standalone/configuration"
+  assert_contains "$readonly_missing_output" \
+    "読み取り専用ファイルシステム分析: 書き込み先が用意されていないディレクトリを"
+  # 実行状況の収集に使ったコマンド
+  assert_contains "$FAKE_DOCKER_CALLS" "diff cid-app"
+  assert_contains "$FAKE_DOCKER_CALLS" "__BUILD_AND_VERIFY_RO_PROBE__"
+
+  # --- 出力ファイル (テキスト / Excel) ---
+  readonly_missing_texts=("$TEST_TMP/readonly-missing-reports"/build_and_verify_*_readonly_filesystem.txt)
+  readonly_missing_excels=("$TEST_TMP/readonly-missing-reports"/build_and_verify_*_readonly_filesystem.xlsx)
+  readonly_missing_text_file="${readonly_missing_texts[0]}"
+  readonly_missing_excel_file="${readonly_missing_excels[0]}"
+  [ -f "$readonly_missing_text_file" ] || fail "readonly filesystem analysis text was not created"
+  [ -f "$readonly_missing_excel_file" ] || fail "readonly filesystem analysis workbook was not created"
+  # xlsx は ZIP コンテナ (先頭が PK)
+  [ "$(head -c 2 "$readonly_missing_excel_file")" = "PK" ] \
+    || fail "readonly filesystem analysis workbook is not a zip container"
+  # テキストは要約より詳しく、検出の根拠と参考知識まで含むこと
+  assert_contains "$readonly_missing_text_file" "検出の根拠  : ソフトウェア別の既知の書き込み先"
+  assert_contains "$readonly_missing_text_file" "参考: 書き込みが発生しやすいディレクトリの一覧"
+  assert_contains "$readonly_missing_text_file" "{jboss_home}/standalone/tmp"
+
+  # --- 全量レポート ---
+  collect_report_files "$TEST_TMP/readonly-missing-reports"
+  readonly_missing_reports=("${REPORT_FILES[@]}")
+  [ -f "${readonly_missing_reports[0]}" ] || fail "readonly analysis report was not created"
+  assert_contains "${readonly_missing_reports[0]}" \
+    "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
+  assert_contains "${readonly_missing_reports[0]}" "[要対応] /opt/jboss-eap/standalone/tmp"
+  assert_contains "${readonly_missing_reports[0]}" "Excel ブック  : ${readonly_missing_excel_file}"
+  assert_before "${readonly_missing_reports[0]}" \
+    "[10] WAR デプロイ時 Java 例外解析" \
+    "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
+fi
+
+# --- read_only: true で tmpfs / ボリュームを揃えた構成 (問題なし) ---
+readonly_ok_output="$TEST_TMP/readonly-ok.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_CONTAINER_TMPFS='/tmp|rw,size=256m,mode=1777
+/var/tmp|rw,size=64m
+/run|rw,size=16m,mode=755
+/var/cache|rw,size=64m
+/opt/jboss-eap/standalone/tmp|rw,size=512m
+/opt/jboss-eap/standalone/data|rw,size=256m
+/opt/jboss-eap/standalone/content|rw,size=64m'
+export FAKE_CONTAINER_MOUNTS='volume|/var/lib/docker/volumes/app-server-log/_data|/opt/jboss-eap/standalone/log|true
+volume|/var/lib/docker/volumes/app-configuration/_data|/opt/jboss-eap/standalone/configuration|true
+volume|/var/lib/docker/volumes/app-deployments/_data|/opt/jboss-eap/standalone/deployments|true
+volume|/var/lib/docker/volumes/app-var-log/_data|/var/log|true'
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-ok.yml" \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$readonly_ok_output" 2>&1; then
+  cat "$readonly_ok_output" >&2
+  fail "readonly filesystem analysis (sufficient settings) returned a non-zero status"
+fi
+if ! grep -Fq "書き込み先分析をスキップしました: Python 3 が見つかりません" "$readonly_ok_output"; then
+  assert_contains "$readonly_ok_output" "判定             : 問題なし (読み取り専用のまま動作可能)"
+  assert_contains "$readonly_ok_output" "対応が必要なディレクトリはありません。"
+  assert_not_contains "$readonly_ok_output" "[要対応] /opt/jboss-eap/standalone/tmp"
+  # ファイル出力先の指定が無い実行では、その旨を案内すること
+  assert_contains "$readonly_ok_output" \
+    "読み取り専用ファイルシステム分析のファイル出力は、--report-dir または"
+fi
+
+# --- read_only 未設定でも、書き込みが起きるディレクトリを推奨として出すこと ---
+readonly_writable_output="$TEST_TMP/readonly-writable.out"
+: > "$FAKE_DOCKER_CALLS"
+unset FAKE_CONTAINER_TMPFS FAKE_CONTAINER_MOUNTS
+export FAKE_READONLY_ROOTFS="false"
+export FAKE_DOCKER_DIFF='C /opt/appdata
+A /opt/appdata/session-store.db
+A /tmp/hsperfdata_jboss'
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-ok.yml" \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --readonly-analysis-text "$TEST_TMP/readonly-writable.txt" \
+    --readonly-analysis-excel "$TEST_TMP/readonly-writable.xlsx"
+) >"$readonly_writable_output" 2>&1; then
+  cat "$readonly_writable_output" >&2
+  fail "readonly filesystem analysis (writable rootfs) returned a non-zero status"
+fi
+if ! grep -Fq "書き込み先分析をスキップしました: Python 3 が見つかりません" "$readonly_writable_output"; then
+  # base サービスは read_only の指定が無い。有効化に必要な設定を推奨として出すこと
+  assert_contains "$readonly_writable_output" \
+    "read_only        : compose.yml=未設定 (既定 false)"
+  assert_contains "$readonly_writable_output" \
+    "read_only を有効にするなら書き込み先の用意が要るディレクトリ:"
+  assert_contains "$readonly_writable_output" \
+    "[推奨] /tmp : 一時ディレクトリ (TMPDIR / java.io.tmpdir の既定値)"
+  # docker diff で実際に書き込みを検出したディレクトリも候補に挙げること
+  assert_contains "$readonly_writable_output" "[推奨] /opt/appdata"
+  # 親ディレクトリ (/opt) は、より深い検出があるため候補にしないこと
+  assert_not_contains "$readonly_writable_output" "[推奨] /opt : "
+  assert_contains "$readonly_writable_output" "read_only 未使用"
+  # compose.yml の指定と実際のコンテナが食い違う場合は、その旨を残すこと
+  assert_contains "$readonly_writable_output" \
+    "compose.yml の read_only (true) と実際のコンテナ (false) が一致していません。"
+  # 明示指定した出力先へ書くこと
+  [ -f "$TEST_TMP/readonly-writable.txt" ] || fail "--readonly-analysis-text did not write the file"
+  [ -f "$TEST_TMP/readonly-writable.xlsx" ] || fail "--readonly-analysis-excel did not write the workbook"
+  assert_contains "$TEST_TMP/readonly-writable.txt" "書き込み実績: コンテナ内で"
+fi
+unset FAKE_DOCKER_DIFF FAKE_READONLY_ROOTFS
+
+# --- --no-readonly-analysis では一切行わないこと ---
+readonly_disabled_output="$TEST_TMP/readonly-disabled.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-missing.yml" \
+    --compose-service app \
+    --suppress-removed-logs \
+    --no-readonly-analysis \
+    --report-dir "$TEST_TMP/readonly-disabled-reports"
+) >"$readonly_disabled_output" 2>&1; then
+  cat "$readonly_disabled_output" >&2
+  fail "--no-readonly-analysis returned a non-zero status"
+fi
+assert_not_contains "$readonly_disabled_output" \
+  "読み取り専用ルートファイルシステム (read_only) の書き込み先分析"
+collect_report_files "$TEST_TMP/readonly-disabled-reports"
+readonly_disabled_reports=("${REPORT_FILES[@]}")
+[ -f "${readonly_disabled_reports[0]}" ] || fail "report was not created with --no-readonly-analysis"
+assert_contains "${readonly_disabled_reports[0]}" \
+  "--no-readonly-analysis が指定されたため分析していません。"
+for readonly_disabled_path in "$TEST_TMP/readonly-disabled-reports"/build_and_verify_*_readonly_filesystem.*; do
+  if [ -e "$readonly_disabled_path" ]; then
+    fail "--no-readonly-analysis still produced an analysis file: $readonly_disabled_path"
+  fi
+done
+
+# --- 出力先オプションの検証 ---
+readonly_ext_output="$TEST_TMP/readonly-ext.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --readonly-analysis-excel "$TEST_TMP/readonly.xls"
+) >"$readonly_ext_output" 2>&1; then
+  cat "$readonly_ext_output" >&2
+  fail "--readonly-analysis-excel accepted a non-xlsx path"
+fi
+assert_contains "$readonly_ext_output" \
+  "--readonly-analysis-excel には .xlsx で終わるパスを指定してください"
+
+readonly_conflict_output="$TEST_TMP/readonly-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --no-readonly-analysis \
+    --readonly-analysis-text "$TEST_TMP/readonly.txt"
+) >"$readonly_conflict_output" 2>&1; then
+  cat "$readonly_conflict_output" >&2
+  fail "--readonly-analysis-text was accepted together with --no-readonly-analysis"
+fi
+assert_contains "$readonly_conflict_output" \
+  "--readonly-analysis-text と --no-readonly-analysis は同時に指定できません。"
+
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 
 # ---- --copy-file の事前コピー (強制上書き / 上書き禁止) ----------------------
 # 既定はコピー先の同名ファイルを強制上書きし、上書き前のファイルは処理終了時に

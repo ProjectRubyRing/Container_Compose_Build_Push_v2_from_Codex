@@ -79,6 +79,9 @@ xlsx は標準ライブラリだけで組み立てます)。
 **全量テキストレポートの保存**、
 **WAR デプロイ時 Java 例外エラー解析** (スタックトレースと例外クラスから原因分析と
 対処提案を生成し、Excel ブックとテキストファイルにも出力)、
+**読み取り専用ファイルシステム (`read_only`) の書き込み先分析** (tmpfs や
+バインドマウントを割り当てるべきディレクトリを判定し、Excel ブックとテキスト
+ファイルにも出力)、
 **JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 **CloudWatch Agent (cwagent) のログ送信検証** (設定ファイルのチェックと、
 `--cwagent-delivery-report` 指定時の設定済みロググループへの送達確認)、
@@ -185,11 +188,14 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt` (同じ内容) として同じディレクトリへ追加出力する | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (いずれも Excel とテキストは同じ内容) として同じディレクトリへ追加出力する | (なし) |
 | `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
 | `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
 | `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
+| `--readonly-analysis-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) 分析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
+| `--readonly-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
+| `--no-readonly-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -425,6 +431,9 @@ ECR 関連オプションを除いた引数がそのまま渡されます。ECR 
   出力します。必要な場合は `BUILDKIT_PROGRESS` 環境変数で変更できます。
 - ビルド完了後は対象イメージを検査し、イメージ ID・作成日時・サイズを
   `ビルド結果` として出力します。対象イメージが存在しない場合は失敗終了します。
+- **読み取り専用ファイルシステム (`read_only`) の書き込み先分析**は、ビルドのみの
+  実行でも `compose.yml` の定義から実行します (後述)。起動確認を併用すると、
+  実際に書き込んだ場所まで含めて判定します。
 
 ```bash
 # ビルドのみ (事前ファイルコピーあり)
@@ -656,7 +665,8 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   `[4] JBoss EAP デプロイ構造` / `[5] Java JVM パラメータ` /
   `[6] OpenTelemetry 環境変数・JVM パラメータ` / `[7] JBoss マスターパスワードの伝搬検証` /
   `[8] CloudWatch Logs 送信検証 (cwagent)` / `[9] Compose サービス別ログ` /
-  `[10] WAR デプロイ時 Java 例外解析` です。
+  `[10] WAR デプロイ時 Java 例外解析` /
+  `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` です。
 - `--report-dir DIR` を指定すると、デプロイ結果ファイルとは**別に**
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` と、同じ内容の
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.txt` を追加出力します。
@@ -665,6 +675,13 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   残る状態にはなりません)。解析対象のログを取得できなかった場合は、その理由と
   `未評価` の判定を記録したうえで同じ 2 ファイルを出力します。詳細は後述の
   [WAR デプロイ時の Java 例外エラー解析](#war-デプロイ時の-java-例外エラー解析) を参照してください。
+- 同じく `--report-dir DIR` の指定で、
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_readonly_filesystem.xlsx` と、同じ内容の
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_readonly_filesystem.txt` も追加出力します。
+  `read_only` を有効にしたまま動かすために `tmpfs` やマウントが要るディレクトリを
+  まとめたもので、**コンテナを起動しない実行 (ビルドのみ) でも出力します**
+  (その場合は `compose.yml` の定義だけで判定します)。詳細は後述の
+  [読み取り専用ファイルシステム (`read_only`) の書き込み先分析](#読み取り専用ファイルシステム-read_only-の書き込み先分析) を参照してください。
 - ビルドや動作確認が失敗した場合、レポート末尾の
   **`[9] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
   起動確認対象だけでなく、adot collector などのサイドカーを含む
@@ -1001,6 +1018,124 @@ Excel ブックと、同じ内容のテキストファイルを追加出力**し
   起動確認や URL 応答確認の結果で決まります。
 - `--dry-run` および起動確認を伴わないビルドのみの実行では解析しません
   (全量レポートの `[10]` へ理由を記録します)。
+
+### 読み取り専用ファイルシステム (`read_only`) の書き込み先分析
+
+`compose.yml` の `read_only: true` は、コンテナのルートファイルシステムを丸ごと
+書き込み不可にします。ECS のタスク定義でいう `readonlyRootFilesystem: true` と同じで、
+改ざん耐性を上げる代わりに、**アプリケーションが実行時に書くディレクトリへ
+`tmpfs` かマウントを用意していないと、その書き込みは `EROFS` で失敗**します。
+
+失敗するのは「起動時に 1 回だけ書く場所」であることが多く、ログには
+`java.io.FileNotFoundException: ... (Read-only file system)` が 1 行出るだけで、
+原因が `read_only` にあるとは気付きにくいのが実情です。
+
+`build_and_verify.sh` は**専用オプションなしに**この分析を毎回実行し、
+ディレクトリごとに「書き込むのに書き込み先が無い」状態を判定します。
+`read_only` を使っていない構成でも、**書き込みが発生するディレクトリを洗い出し、
+有効化するなら `tmpfs` とバインドマウントのどちらを割り当てるべきか**を出力します。
+
+#### 判定に使う情報
+
+| 分類 | 内容 |
+| --- | --- |
+| `compose.yml` の定義 | サービスごとの `read_only` / `tmpfs` / `volumes` (短記法・長記法とも) / `image` / `environment` |
+| コンテナの実状態 | `HostConfig.ReadonlyRootfs`、マウント (バインド / ボリューム / tmpfs) とその読み書き属性 |
+| アプリの実行状況 | 書き込み層の変更 (`docker diff`) = **実際に書かれた場所**、コンテナ内から見た書き込み可否 (`test -w`)、起動後 (PID 1 より新しい) に更新されたファイル数、`/proc/mounts` の `ro` |
+| 起動パラメータ | `-Djava.io.tmpdir` / `-XX:HeapDumpPath` / `-Xloggc` など**書き込み先を明示している JVM パラメータ**、ディレクトリを指す環境変数 (`*_DIR` / `*_LOG` / `*_TMP` など) |
+| ログ | `Read-only file system` / `EROFS` / `Permission denied` / `AccessDeniedException` などの書き込みエラー (認証情報はマスクして記録) |
+| ソフトウェア別の知識 | JBoss EAP の `standalone/tmp`・`log`・`data`・`configuration`・`deployments`、JVM の `/tmp` (hsperfdata・attach ソケット)、CloudWatch Agent の `logs` / `var` / `etc`、MySQL の `/var/lib/mysql`・`/var/run/mysqld`、nginx の `/var/cache/nginx`、Tomcat の `work` / `temp` / `logs`、一般的な `/run`・`/var/log`・`/var/tmp`・`/var/cache` |
+
+JBoss EAP のインストール先は `JBOSS_HOME` / `JBOSS_EAP_HOME`、またはコンテナ内の
+候補ディレクトリ (`bin` と `standalone` を持つもの) から自動で特定するため、
+イメージごとにパスが違っても追随します。
+
+#### 判定
+
+| 判定 | 意味 |
+| --- | --- |
+| `要対応` | `read_only` が有効で、**必ず書き込むディレクトリ (または実際に書き込みを検出したディレクトリ) に書き込み先が無い**。そのままでは起動・デプロイが失敗する |
+| `要確認` | 書き込み先はあるが副作用がある (永続が必要なディレクトリに `tmpfs` を割り当てている、イメージ内のファイルを隠している)、または書き込みの有無を確認したい |
+| `推奨` | `read_only` が未設定・`false`。**有効化するなら書き込み先の用意が必要**なディレクトリ |
+| `OK` | 書き込み先が確保されている |
+| `情報` | 参考情報 (書き込みの実績も必要性も確認できていない) |
+
+ディレクトリ 1 件ごとに、用途 / 書き込む内容 / 必須度 / 現在の設定 / 推奨する設定 /
+理由 / 対処 / 判定の根拠 (実測値・ログ) を出力します。さらに、不足分だけを埋めた
+**`compose.yml` の設定例**をサービス単位で生成します。
+
+```yaml
+services:
+  app:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=256m,mode=1777
+      - /opt/jboss-eap/standalone/tmp:rw,size=512m
+      - /opt/jboss-eap/standalone/data:rw,size=256m
+    volumes:
+      - app-opt-jboss-eap-standalone-log:/opt/jboss-eap/standalone/log
+      - app-opt-jboss-eap-standalone-configuration:/opt/jboss-eap/standalone/configuration
+```
+
+`tmpfs` と ボリュームの使い分けも判定に含みます。**消えてよい一時領域は `tmpfs`**、
+**残す必要があるディレクトリ、またはイメージ内のファイルを読む必要があるディレクトリ
+(`standalone/configuration` や `deployments` など) はボリューム**を推奨します。
+`tmpfs` は同じパスにあるイメージ内のファイルを覆い隠してしまうのに対し、
+名前付きボリュームは初回作成時にイメージの内容がコピーされるためです。
+
+#### 出力ファイル (Excel とテキスト)
+
+`--report-dir DIR` を指定していれば、デプロイ結果ファイルと同じディレクトリへ
+追加で次の 2 つを出力します (出力先は `--readonly-analysis-excel FILE` /
+`--readonly-analysis-text FILE` で個別に明示できます)。
+
+| ファイル | 内容 |
+| --- | --- |
+| `build_and_verify_<日時>_readonly_filesystem.xlsx` | 下表の 7 シート構成の Excel ブック |
+| `build_and_verify_<日時>_readonly_filesystem.txt` | **同じ内容のテキスト版**。Excel を開けない環境や `grep` / `diff` で追跡したい場合に使う |
+
+| シート | 内容 |
+| --- | --- |
+| 概要 | 実行情報、判定サマリ、情報の取得状況、この分析の説明 |
+| サービス別判定 | 1 行 1 サービス。`read_only` (compose / 実状態)、判定、要対応・要確認・推奨・OK の件数、コンテナ |
+| ディレクトリ判定 | 1 行 1 ディレクトリ。判定 / 必須度 / 用途 / 書き込み内容 / 現在の設定 / 推奨する設定と対処 / 検出の根拠 |
+| 判定の根拠 | ディレクトリごとの理由と、実測値・ログなどの根拠 |
+| 書き込み実績 | `docker diff` の変更、コンテナ内のファイル数・更新数、書き込みエラーのログ |
+| 推奨 compose 設定 | サービスごとの `compose.yml` 設定例 |
+| 参考: 書き込み先の知識 | ソフトウェア別の書き込み先一覧 (用途 / 書き込む内容 / 推奨 / 永続の要否 / `tmpfs` 可否) |
+
+画面と全量レポート `[11]` には要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧)
+を出力し、全件と参考知識はテキスト / Excel に残します。
+
+```bash
+# 既定。分析は毎回実行され、--report-dir があれば Excel とテキストも出力される
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# Excel / テキストの出力先を明示する
+./build_and_verify.sh --verify-startup \
+    --readonly-analysis-excel ./reports/readonly.xlsx \
+    --readonly-analysis-text ./reports/readonly.txt
+
+# 分析を行わない
+./build_and_verify.sh --verify-startup --no-readonly-analysis
+```
+
+#### 前提と影響範囲
+
+- 分析には **Python 3** が必要です (Java 例外解析と同じ)。Excel は標準ライブラリ
+  だけで生成するため追加パッケージは不要です。Python 3 が無い場合は分析を
+  スキップして `[WARN]` を出し、ビルドの成否は変えません。
+- **コンテナを起動しない実行 (ビルドのみ / ビルド失敗) でも分析します。**
+  その場合は `compose.yml` の定義だけで判定し、「実行状況からの根拠は無い」ことを
+  `情報の取得状況` に明記します。起動確認 (`--verify-startup` / `--verify-url`) を
+  併用すると、実際に書き込んだ場所まで含めて判定します。
+- 分析は成功時は主処理の末尾、失敗時は `EXIT` の後始末で実行します。いずれも
+  **コンテナを削除する前**なので、起動確認に失敗した実行でも結果が残ります。
+- **`要対応` を検出しても終了コードは変わりません**。終了コードは従来どおり、
+  起動確認や URL 応答確認の結果で決まります。
+- `--dry-run` では分析しません (全量レポートの `[11]` へ理由を記録します)。
 
 ### CloudWatch Logs 送信検証 (cwagent)
 
