@@ -279,6 +279,41 @@ STARTUP_WAIT="false"
 STARTUP_WAIT_TIMEOUT="600"        # --wait の最大待機秒数
 # 起動確認中に停止していても失敗扱いにしないサービス (初期化専用の短命サービス等)
 ALLOW_SERVICE_EXIT=()
+
+# ---- コンテナ起動時のイメージ取得と一過性エラーの再試行 ----------------------
+# 「docker のイメージ・ビルドキャッシュを削除した直後 (コールド実行) の 1 回目だけ
+# compose up が失敗し、そのまま再実行すると成功する」事象への対策。
+#
+# 起動対象のうち build セクションを持たないサービス (mysql / wiremock / valkey 等)
+# のイメージは、これまで compose up の中で暗黙に取得されていた。ウォーム実行では
+# ローカルに残っているため取得自体が起きないが、コールド実行では
+#   (1) レジストリからの取得が実際に走る
+#       → toomanyrequests / TLS handshake timeout などの一過性エラーがそのまま
+#         「コンテナの起動に失敗しました」になり、再試行の余地が無かった
+#   (2) 取得・展開の I/O が、先に起動したコンテナの healthcheck と競合する
+#       → depends_on の condition: service_healthy を満たせず
+#         "dependency failed to start" で中断する
+# のどちらかで失敗しやすい。2 回目はイメージが揃っていて取得が起きないため成功する。
+#
+# そこで、
+#   (A) compose up の前にイメージ取得だけを切り出し、再試行付きで実行する
+#   (B) それでも compose up が一過性の理由で失敗した場合は、原因を診断したうえで
+#       再試行する (利用者が手作業で再実行しているのと同じことを自動で行う)
+# の 2 段構えにする。(A) はウォーム実行では取得済みイメージを問い合わせないため
+# ほぼ無処理で終わる。
+PULL_IMAGES="true"                # false (--no-pull-images): 事前のイメージ取得を行わない
+PULL_RETRY="2"                    # 事前取得の再試行回数 (0 で再試行しない)
+PULL_RETRY_INTERVAL="10"          # 事前取得の再試行間隔 (秒)
+UP_RETRY="1"                      # compose up の再試行回数 (0 で再試行しない)
+UP_RETRY_INTERVAL="15"            # compose up の再試行間隔 (秒)
+COMPOSE_PULL_SUMMARY=""           # 事前取得の結果 (全量レポート用)
+COMPOSE_UP_SUMMARY=""             # compose up の試行結果 (全量レポート用)
+COMPOSE_PULL_HELP_CACHE=""        # compose pull が受け付けるオプションの判定結果
+COMPOSE_CAPTURE_FILE=""           # 実行中の compose 出力の記録先 (EXIT で削除)
+DIAGNOSTIC_HEALTH_LOG_LINES="40"  # 起動失敗の診断で表示する healthcheck 履歴の行数
+# 実行開始時点の Docker の状態。コールド実行かどうかは失敗時の診断材料になる。
+DOCKER_STATE_SUMMARY=""           # ローカルイメージ件数 / ビルドキャッシュ量
+DOCKER_STATE_COLD="unknown"       # true: コールド実行 / false: ウォーム / unknown: 未判定
 KEEP_CONTAINER="false"            # true: 確認後もコンテナを停止・削除せずに残す
 KEEP_CONTAINER_MODE=""            # bash/http/logs: 確認後に実行する対話操作 (指定時はコンテナを残す)
 # デプロイエラー (AP サーバ自体は起動したが、アプリのデプロイに失敗した状態) を
@@ -916,6 +951,26 @@ JBoss マスターパスワードの伝搬検証:
                            service_healthy を定義しておくこと。
   --wait-timeout SEC       --wait の最大待機秒数 (既定: 600)。指定すると
                            --wait-healthy も暗黙に有効化する
+  --no-pull-images         compose up の前に行うイメージの事前取得を行わない。
+                           既定では、起動対象のうちビルド対象でないサービス
+                           (mysql / wiremock 等) のイメージを compose up の前に
+                           まとめて取得する。docker のイメージ・キャッシュを
+                           削除した直後の実行で、レジストリ側の一過性エラーが
+                           そのまま起動失敗になるのを防ぐための段。
+                           取得済みのイメージは問い合わせないため、通常の実行では
+                           ほぼ時間がかからない。
+  --pull-retry N           事前取得が一過性のエラー (toomanyrequests /
+                           TLS handshake timeout など) で失敗したときの再試行回数
+                           (既定: 2 / 0 で再試行しない)
+  --pull-retry-interval SEC
+                           事前取得の再試行間隔・秒 (既定: 10)
+  --up-retry N             compose up が一過性のエラー、または依存サービスが期限内に
+                           healthy にならずに失敗したときの再試行回数 (既定: 1)。
+                           再試行の前に必ず原因の診断を表示する。
+                           コールド実行では DB の初期化やモックの JVM 起動が
+                           間に合わないことがあり、同じ操作をやり直すと成功する。
+  --no-up-retry            compose up の再試行を行わない (--up-retry 0 と同じ)
+  --up-retry-interval SEC  compose up の再試行間隔・秒 (既定: 15)
   --allow-service-exit NAME
                            起動確認中に停止していても失敗扱いにしないサービス名。
                            繰り返し指定またはカンマ区切りで複数指定できる。
@@ -1257,6 +1312,12 @@ while [ $# -gt 0 ]; do
     --startup-log-lines)   need_value "$1" $#; STARTUP_LOG_LINES="$2"; shift 2 ;;
     --wait-healthy)        STARTUP_WAIT="true"; shift ;;
     --wait-timeout)        need_value "$1" $#; STARTUP_WAIT_TIMEOUT="$2"; STARTUP_WAIT="true"; shift 2 ;;
+    --no-pull-images)      PULL_IMAGES="false"; shift ;;
+    --pull-retry)          need_value "$1" $#; PULL_RETRY="$2"; shift 2 ;;
+    --pull-retry-interval) need_value "$1" $#; PULL_RETRY_INTERVAL="$2"; shift 2 ;;
+    --up-retry)            need_value "$1" $#; UP_RETRY="$2"; shift 2 ;;
+    --no-up-retry)         UP_RETRY="0"; shift ;;
+    --up-retry-interval)   need_value "$1" $#; UP_RETRY_INTERVAL="$2"; shift 2 ;;
     --allow-service-exit)  need_value "$1" $#; append_services ALLOW_SERVICE_EXIT "$2"; shift 2 ;;
     --suppress-startup-logs) SUPPRESS_STARTUP_LOGS="true"; shift ;;
     --shutdown-timeout)    need_value "$1" $#; SHUTDOWN_LOG_TIMEOUT="$2"; shift 2 ;;
@@ -1340,6 +1401,11 @@ validate_non_negative_integer "$BUILD_STALL_TIMEOUT" "--build-stall-timeout" || 
 validate_non_negative_integer "$BUILD_TIMEOUT" "--build-timeout" || exit 2
 validate_positive_integer "$STARTUP_TIMEOUT" "--startup-timeout" || exit 2
 validate_positive_integer "$STARTUP_WAIT_TIMEOUT" "--wait-timeout" || exit 2
+# 再試行の各値は「0 = 再試行しない」を意味するため 0 を許す。
+validate_non_negative_integer "$PULL_RETRY" "--pull-retry" || exit 2
+validate_non_negative_integer "$PULL_RETRY_INTERVAL" "--pull-retry-interval" || exit 2
+validate_non_negative_integer "$UP_RETRY" "--up-retry" || exit 2
+validate_non_negative_integer "$UP_RETRY_INTERVAL" "--up-retry-interval" || exit 2
 # 0 を許すと SIGTERM 直後に SIGKILL となり、終了処理のログが残らないため 1 以上とする。
 validate_positive_integer "$SHUTDOWN_LOG_TIMEOUT" "--shutdown-timeout" || exit 2
 validate_positive_integer "$URL_TIMEOUT" "--url-timeout" || exit 2
@@ -4763,6 +4829,284 @@ target_services_all_running() {
   [ ${#STOPPED_TARGET_SERVICES[@]} -eq 0 ]
 }
 
+# =============================================================================
+# コールド実行 (イメージ・キャッシュ削除直後) への対策
+# -----------------------------------------------------------------------------
+# ウォーム実行がローカルのイメージとキャッシュで飛ばしている処理を、コールド実行は
+# すべて実際に行う。その差が出るのは主に「イメージの取得」と「起動の遅さ」で、
+# どちらも 1 回目だけ失敗し、再実行すると成功するという同じ見え方になる。
+# 判定材料 (実行開始時の状態) を控えたうえで、取得を分離して再試行し、失敗時には
+# どちらが原因かを診断できるようにする。
+# =============================================================================
+
+# 実行開始時点のローカルイメージ件数とビルドキャッシュ量を控える。
+# コールド実行かどうかは、失敗時に「一過性の可能性が高いか」を判断する材料になる。
+detect_docker_cold_state() {
+  if [ "$DRY_RUN" = "true" ]; then
+    DOCKER_STATE_SUMMARY="DRY-RUN のため未取得"
+    return 0
+  fi
+  # 起動に使うイメージがローカルに残っているかが、そのまま「compose up で取得が
+  # 走るか」になる。docker system df は呼ばない (使用量レポートの計測と二重に
+  # なるうえ、判定にはイメージの有無だけで足りる)。
+  local image_count
+  image_count="$(docker_object_count docker image ls -aq || true)"
+  DOCKER_STATE_SUMMARY="ローカルイメージ ${image_count} 件"
+  case "$image_count" in
+    0)           DOCKER_STATE_COLD="true" ;;
+    ''|*[!0-9]*) DOCKER_STATE_COLD="unknown" ;;
+    *)           DOCKER_STATE_COLD="false" ;;
+  esac
+  if [ "$DOCKER_STATE_COLD" = "true" ]; then
+    log "コールド実行です (${DOCKER_STATE_SUMMARY})。"
+    log "  イメージの取得とビルドがすべて実際に走るため、時間がかかり、"
+    log "  レジストリ起因の一過性エラーや起動の遅れも起こりやすくなります。"
+  else
+    log "実行開始時の Docker の状態: ${DOCKER_STATE_SUMMARY}"
+  fi
+  return 0
+}
+
+# 同じ操作をやり直せば成功する見込みが高い、レジストリ / ネットワーク起因のエラー。
+# コールド実行では取得が実際に走るため、これらに当たる確率が跳ね上がる。
+#
+# "failed to resolve" は「イメージが存在しない」でも出るため入れない
+# (やり直しても直らないものを再試行の対象にしない)。
+COMPOSE_TRANSIENT_ERROR_PATTERN='toomanyrequests|too many requests|TLS handshake timeout|i/o timeout|context deadline exceeded|unexpected EOF|connection reset by peer|temporary failure in name resolution|no such host|Client\.Timeout exceeded|net/http: request canceled|http2: server sent GOAWAY|error pulling image configuration|failed to (fetch|do request|copy)|received unexpected HTTP status: (429|5[0-9][0-9])'
+# 依存サービスが期限内に healthy にならなかったことを示すエラー。コールド実行では
+# DB の初期化やモックの JVM 起動が healthcheck の猶予に間に合わないことがある。
+COMPOSE_COLD_START_ERROR_PATTERN='dependency failed to start|is unhealthy|health status is unhealthy|timeout waiting for'
+
+# 取得したコマンド出力から、失敗の種類を判定する。
+#   transient  … レジストリ / ネットワークの一過性エラー
+#   cold-start … 依存サービスが期限内に healthy にならなかった
+#   fatal      … 上記以外 (やり直しても直る見込みが無い)
+classify_compose_failure() {
+  local capture_file="$1"
+  if [ -z "$capture_file" ] || [ ! -s "$capture_file" ]; then
+    printf 'fatal\n'
+    return 0
+  fi
+  if grep -qEi -- "$COMPOSE_TRANSIENT_ERROR_PATTERN" "$capture_file"; then
+    printf 'transient\n'
+  elif grep -qEi -- "$COMPOSE_COLD_START_ERROR_PATTERN" "$capture_file"; then
+    printf 'cold-start\n'
+  else
+    printf 'fatal\n'
+  fi
+}
+
+# 失敗の種類を日本語の説明にする (診断表示・レポート共通)。
+compose_failure_kind_label() {
+  case "$1" in
+    transient)  printf 'レジストリ / ネットワークの一過性エラー' ;;
+    cold-start) printf '依存サービスが期限内に healthy にならなかった' ;;
+    *)          printf '一過性と判断できないエラー' ;;
+  esac
+}
+
+# コマンドを実行し、出力を画面へ流しながら一時ファイルへも記録する。
+# 失敗理由を出力から判定するために必要 (画面表示は従来どおり残す)。
+run_capturing_output() {
+  local capture_file="$1"
+  shift
+  : > "$capture_file"
+  "$@" 2>&1 | tee -a "$capture_file"
+  return "${PIPESTATUS[0]}"
+}
+
+# 一時ファイルを作る。作れない場合は空文字を返し、呼び出し側は記録なしで続行する。
+# 途中で中断されても残さないよう、現在使用中のパスは EXIT トラップからも消す。
+make_capture_file() {
+  local prefix="$1" path
+  path="$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null)" || path=""
+  COMPOSE_CAPTURE_FILE="$path"
+  printf '%s' "$path"
+}
+
+remove_capture_file() {
+  [ -n "$1" ] || return 0
+  rm -f -- "$1"
+  [ "$1" = "$COMPOSE_CAPTURE_FILE" ] && COMPOSE_CAPTURE_FILE=""
+  return 0
+}
+
+# compose pull が受け付けるオプションかを --help から判定する (版差を吸収する)。
+compose_pull_option_supported() {
+  local option="$1"
+  if [ -z "$COMPOSE_PULL_HELP_CACHE" ]; then
+    COMPOSE_PULL_HELP_CACHE="$("${COMPOSE_CMD[@]}" pull --help 2>&1)" || true
+    [ -n "$COMPOSE_PULL_HELP_CACHE" ] || COMPOSE_PULL_HELP_CACHE="(取得できませんでした)"
+  fi
+  case "$COMPOSE_PULL_HELP_CACHE" in
+    *"$option"*) return 0 ;;
+  esac
+  return 1
+}
+
+# 起動に必要なイメージを compose up の前に取得する。
+#
+# compose up の中で取得させると、レジストリ側の一過性エラーがそのまま
+# 「コンテナの起動に失敗しました」となり、取得だけをやり直すことができない。
+# また、取得と展開の I/O が先に起動したコンテナの healthcheck と競合し、
+# depends_on の condition: service_healthy を満たせなくなる原因にもなる。
+#
+# ここでの失敗は警告に留めて処理を続ける。取得できなかったイメージは compose up
+# 側でもう一度取得が試みられるため、この段を追加したことで新たに失敗する経路を
+# 作らない (オフラインでイメージを事前投入している環境などを壊さない)。
+pull_required_images() {
+  if [ "$PULL_IMAGES" != "true" ]; then
+    COMPOSE_PULL_SUMMARY="未実行 (--no-pull-images)"
+    return 0
+  fi
+
+  local -a pull_args=(-f "$COMPOSE_FILE" pull)
+  local policy_note=""
+  # build セクションを持つサービスのイメージは、今回のビルドで作ったローカル
+  # イメージでレジストリには存在しない。取得対象から外す。
+  if compose_pull_option_supported '--ignore-buildable'; then
+    pull_args+=(--ignore-buildable)
+  elif compose_pull_option_supported '--ignore-pull-failures'; then
+    # 除外できない版では、ビルド対象の取得失敗で全体が止まらないようにする。
+    pull_args+=(--ignore-pull-failures)
+  fi
+  # 取得済みのイメージはレジストリへ問い合わせない。ウォーム実行を遅くせず、
+  # レジストリへ到達できない環境でも無用な失敗を起こさないための指定。
+  if compose_pull_option_supported '--policy'; then
+    pull_args+=(--policy missing)
+    policy_note=", 未取得のイメージのみ"
+  fi
+  pull_args+=(${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"})
+
+  if [ "$DRY_RUN" = "true" ]; then
+    printf '[%s] [DRY-RUN] %s %s\n' "$(now_display_time)" \
+      "${COMPOSE_CMD[*]}" "${pull_args[*]}"
+    COMPOSE_PULL_SUMMARY="DRY-RUN (未実行)"
+    return 0
+  fi
+
+  local capture_file attempt=0 status kind
+  local max_attempts=$(( PULL_RETRY + 1 ))
+  capture_file="$(make_capture_file compose-pull)"
+  while :; do
+    attempt=$(( attempt + 1 ))
+    if [ "$attempt" -eq 1 ]; then
+      log "起動に必要なイメージを取得します (compose pull${policy_note}) ..."
+    else
+      log "イメージの取得を再試行します (試行 ${attempt}/${max_attempts}) ..."
+    fi
+    if [ -n "$capture_file" ]; then
+      run_capturing_output "$capture_file" "${COMPOSE_CMD[@]}" "${pull_args[@]}"
+      status=$?
+    else
+      "${COMPOSE_CMD[@]}" "${pull_args[@]}"
+      status=$?
+    fi
+    if [ "$status" -eq 0 ]; then
+      COMPOSE_PULL_SUMMARY="成功 (試行 ${attempt} 回)"
+      log "イメージの取得が完了しました。"
+      break
+    fi
+    kind="$(classify_compose_failure "$capture_file")"
+    if [ "$attempt" -ge "$max_attempts" ] || [ "$kind" != "transient" ]; then
+      COMPOSE_PULL_SUMMARY="失敗 (試行 ${attempt} 回, 分類: $(compose_failure_kind_label "$kind"))"
+      warn "イメージの事前取得に失敗しました ($(compose_failure_kind_label "$kind"))。"
+      warn "  取得できなかったイメージは compose up 側で再度取得が試みられます。"
+      warn "  取得を行わない場合: --no-pull-images"
+      break
+    fi
+    warn "イメージの取得に失敗しました ($(compose_failure_kind_label "$kind"))。${PULL_RETRY_INTERVAL}s 後に再試行します ..."
+    [ "$PULL_RETRY_INTERVAL" -gt 0 ] && sleep "$PULL_RETRY_INTERVAL"
+  done
+  remove_capture_file "$capture_file"
+  return 0
+}
+
+# compose up が失敗した理由を、コンテナを削除する前に採取して表示する。
+# どのサービスが停止・unhealthy なのかと、その healthcheck の実行結果まで出す。
+diagnose_compose_up_failure() {
+  local kind="$1"
+  local svc cid health_state health_status health_history line count
+  local -a services=()
+
+  diag ""
+  diag "────────────────────────────────────────────────────────────────────"
+  diag " コンテナ起動失敗の診断 (compose up)"
+  diag "────────────────────────────────────────────────────────────────────"
+  diag "  失敗の分類          : $(compose_failure_kind_label "$kind")"
+  diag "  実行開始時の Docker : ${DOCKER_STATE_SUMMARY:-(未取得)}"
+  diag "  イメージの事前取得  : ${COMPOSE_PULL_SUMMARY:-(未実行)}"
+
+  mapfile -t services < <(compose_started_services)
+  if [ ${#services[@]} -gt 0 ]; then
+    diag ""
+    diag "  Compose サービスの状態:"
+    for svc in "${services[@]}"; do
+      [ -n "$svc" ] || continue
+      diag "    - ${svc}: $(compose_service_container_summary "$svc")"
+    done
+  fi
+
+  # healthcheck が failing しているコンテナは、Docker が記録した実行履歴に
+  # 失敗理由 (接続拒否・タイムアウト等) がそのまま残っている。
+  for svc in ${services[@]+"${services[@]}"}; do
+    [ -n "$svc" ] || continue
+    while IFS= read -r cid; do
+      [ -n "$cid" ] || continue
+      health_state="$(docker inspect -f \
+        '{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{end}}' \
+        "$cid" 2>/dev/null)" || health_state=""
+      [ -n "$health_state" ] || continue
+      health_status="${health_state%%|*}"
+      [ "$health_status" = "healthy" ] && continue
+      diag ""
+      diag "  [${svc}] healthcheck: 状態 ${health_status} / 連続失敗 ${health_state#*|} 回"
+      health_history="$(docker inspect -f \
+        '{{if .State.Health}}{{range .State.Health.Log}}終了コード: {{.ExitCode}}{{"\n"}}出力:{{"\n"}}{{.Output}}{{"\n"}}────────────────────{{"\n"}}{{end}}{{end}}' \
+        "$cid" 2>/dev/null)" || health_history=""
+      if [ -n "$health_history" ]; then
+        count=0
+        while IFS= read -r line; do
+          count=$(( count + 1 ))
+          [ "$count" -gt "$DIAGNOSTIC_HEALTH_LOG_LINES" ] && break
+          printf '    %s\n' "$line"
+        done < <(printf '%s\n' "$health_history" | redact_healthcheck_text) >&2
+        [ "$count" -gt "$DIAGNOSTIC_HEALTH_LOG_LINES" ] \
+          && diag "    ... healthcheck の実行履歴を ${DIAGNOSTIC_HEALTH_LOG_LINES} 行で省略しました。"
+      else
+        diag "    healthcheck の実行履歴は取得できませんでした。"
+      fi
+    done < <(compose_container_ids_all "$svc")
+  done
+
+  diag ""
+  case "$kind" in
+    transient)
+      diag "  レジストリからの取得に失敗しています。確認するところ:"
+      diag "   1. Docker Hub の pull 回数制限 (toomanyrequests)"
+      diag "      → docker login、またはミラー / ECR パブリックの利用を検討する。"
+      diag "   2. プロキシ / DNS / 一時的な通信断"
+      diag "      → HTTP_PROXY / HTTPS_PROXY / NO_PROXY と名前解決を確認する。"
+      diag "   3. 再試行で解消することが多い (--pull-retry / --up-retry で回数を調整できる)。"
+      ;;
+    cold-start)
+      diag "  依存サービスが期限内に healthy になっていません。確認するところ:"
+      diag "   1. イメージ・キャッシュを削除した直後の実行では、DB の初期化や"
+      diag "      モック (WireMock 等) の JVM 起動が healthcheck の猶予を超えることがある。"
+      diag "      → compose.yml の healthcheck の start_period / retries を広げる。"
+      diag "   2. ボリュームも削除した場合、DB は初期化からやり直しになる。"
+      diag "      → 上の状態表示で、どのサービスが unhealthy のままかを確認する。"
+      diag "   3. --wait-healthy を使っている場合は --wait-timeout SEC を広げる。"
+      ;;
+    *)
+      diag "  一過性のエラーとして判断できませんでした。上の状態と healthcheck の"
+      diag "  実行結果、および compose up の出力をそのまま確認してください。"
+      ;;
+  esac
+  diag "────────────────────────────────────────────────────────────────────"
+  diag ""
+}
+
 # コンテナを起動する (バックグラウンド)。対象サービスは 1 回の compose up で
 # 同時に起動される。
 start_container() {
@@ -4793,10 +5137,56 @@ start_container() {
   fi
   up_args+=(${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"})
   COMPOSE_UP_ATTEMPTED="true"
-  if ! run "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${up_args[@]}"; then
-    err "コンテナの起動に失敗しました (compose up)"
-    return 1
+
+  if [ "$DRY_RUN" = "true" ]; then
+    run "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${up_args[@]}"
+    COMPOSE_UP_SUMMARY="DRY-RUN (未実行)"
+    STARTED_CONTAINER="true"
+    return 0
   fi
+
+  # イメージ・キャッシュを削除した直後の実行では、レジストリからの取得や
+  # 依存サービスの healthcheck が間に合わずに compose up が失敗し、そのまま
+  # 再実行すると成功することがある。利用者が手作業で行っている再実行を、
+  # 失敗の種類を判定したうえで自動化する (--no-up-retry で無効化できる)。
+  local capture_file attempt=0 status kind
+  local max_attempts=$(( UP_RETRY + 1 ))
+  if [ "$UP_RETRY" -gt 0 ]; then
+    log "  一過性の失敗と判断した場合は最大 ${UP_RETRY} 回再試行します (--no-up-retry で無効)。"
+  fi
+  capture_file="$(make_capture_file compose-up)"
+  while :; do
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -gt 1 ] && log "コンテナの起動を再試行します (試行 ${attempt}/${max_attempts}) ..."
+    if [ -n "$capture_file" ]; then
+      run_capturing_output "$capture_file" "${COMPOSE_CMD[@]}" \
+        ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${up_args[@]}"
+      status=$?
+    else
+      "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${up_args[@]}"
+      status=$?
+    fi
+    if [ "$status" -eq 0 ]; then
+      COMPOSE_UP_SUMMARY="成功 (試行 ${attempt} 回)"
+      [ "$attempt" -gt 1 ] && log "再試行でコンテナの起動に成功しました (試行 ${attempt} 回目)。"
+      break
+    fi
+    kind="$(classify_compose_failure "$capture_file")"
+    # 再試行するかどうかに関わらず、コンテナを消す前に必ず原因を採取して出す。
+    diagnose_compose_up_failure "$kind"
+    if [ "$attempt" -ge "$max_attempts" ] || [ "$kind" = "fatal" ]; then
+      COMPOSE_UP_SUMMARY="失敗 (試行 ${attempt} 回, 分類: $(compose_failure_kind_label "$kind"))"
+      if [ "$kind" != "fatal" ] && [ "$UP_RETRY" -eq 0 ]; then
+        warn "compose up の再試行は無効です (--no-up-retry / --up-retry 0)。"
+      fi
+      err "コンテナの起動に失敗しました (compose up)"
+      remove_capture_file "$capture_file"
+      return 1
+    fi
+    warn "compose up に失敗しました ($(compose_failure_kind_label "$kind"))。${UP_RETRY_INTERVAL}s 後に再試行します (残り $(( max_attempts - attempt )) 回) ..."
+    [ "$UP_RETRY_INTERVAL" -gt 0 ] && sleep "$UP_RETRY_INTERVAL"
+  done
+  remove_capture_file "$capture_file"
   STARTED_CONTAINER="true"
   return 0
 }
@@ -18395,6 +18785,11 @@ write_build_report() {
     printf '詳細          : %s\n' "${BUILD_RESULT_DETAIL:-(なし)}"
     printf 'イメージ      : %s\n' "${BUILD_IMAGE_INFO:-(未確認)}"
     printf 'ビルド監視    : %s\n' "${BUILD_WATCHDOG_SUMMARY:-(未実行)}"
+    # コールド実行 (イメージ・キャッシュ削除直後) は、取得と起動の両方が遅く
+    # なるため失敗しやすい。後から切り分けられるよう開始時の状態を残す。
+    printf '開始時の Docker: %s\n' "${DOCKER_STATE_SUMMARY:-(未取得)}"
+    printf 'イメージ取得  : %s\n' "${COMPOSE_PULL_SUMMARY:-(未実行)}"
+    printf 'コンテナ起動  : %s\n' "${COMPOSE_UP_SUMMARY:-(未実行)}"
     printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
@@ -18565,6 +18960,8 @@ cleanup_all() {
   [ -n "$URL_BODY_FILE" ] && rm -f "$URL_BODY_FILE"
   [ -n "$INTERACTIVE_HTTP_BODY_FILE" ] && rm -f "$INTERACTIVE_HTTP_BODY_FILE"
   [ -n "$HEALTHCHECK_DIAGNOSTIC_FILE" ] && rm -f "$HEALTHCHECK_DIAGNOSTIC_FILE"
+  # compose pull / compose up の出力記録は、中断された場合ここで片付ける。
+  [ -n "$COMPOSE_CAPTURE_FILE" ] && rm -f -- "$COMPOSE_CAPTURE_FILE"
   # ビルド中に中断した場合、監視用の一時ディレクトリが残るためここで片付ける。
   case "${BUILD_WATCHDOG_DIR:-}" in
     */build-watchdog.*) rm -rf -- "$BUILD_WATCHDOG_DIR" ;;
@@ -18646,6 +19043,9 @@ fi
 report_disk_usage "ビルド前"
 # exporting layers の書き出し先が足りているかを、ビルドを始める前に確認する。
 check_build_disk_space
+# イメージ・キャッシュを削除した直後の実行 (コールド実行) かどうかを控える。
+# 失敗したときに「一過性の可能性が高いか」を判断する材料になる。
+detect_docker_cold_state
 remember_current_image_id
 
 # ローカルベースイメージが生成されたか確認する。
@@ -18800,6 +19200,9 @@ if [ "$NEED_CONTAINER" != "true" ]; then
 fi
 
 # ---- コンテナ起動 -----------------------------------------------------------
+# 起動に必要なイメージの取得は compose up 任せにせず、先に済ませておく。
+# コールド実行ではここが最も失敗しやすく、取得だけなら安全に再試行できるため。
+pull_required_images
 if ! start_container; then
   exit 1
 fi

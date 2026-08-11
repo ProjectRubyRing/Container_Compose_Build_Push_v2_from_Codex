@@ -33,12 +33,25 @@ if [ "${1:-}" = "compose" ]; then
   subcommand=""
   for arg in "$@"; do
     case "$arg" in
-      version|build|up|logs|ps|down|stop|config)
+      version|build|up|logs|ps|down|stop|config|pull)
         subcommand="$arg"
         break
         ;;
     esac
   done
+
+  # 呼び出し回数を数え、「N 回目までは失敗し、それ以降は成功する」を再現する。
+  # コールド実行の 1 回目だけ失敗して再実行では成功する事象の検証に使う。
+  fake_attempt_count() {
+    local counter_file="$1" count
+    count="$(cat "$counter_file" 2>/dev/null || printf '0')"
+    case "$count" in
+      ''|*[!0-9]*) count=0 ;;
+    esac
+    count=$(( count + 1 ))
+    printf '%s\n' "$count" > "$counter_file"
+    printf '%s\n' "$count"
+  }
 
   case "$subcommand" in
     version)
@@ -79,12 +92,63 @@ if [ "${1:-}" = "compose" ]; then
           > "$FAKE_DOCKER_IMAGE_ID_FILE"
       fi
       ;;
+    pull)
+      # 実装側は使えるオプションを --help で確認してから渡す。
+      # FAKE_COMPOSE_PULL_NO_OPTIONS=true で、いずれも持たない古い版を再現する。
+      if [[ " $* " == *" --help "* ]]; then
+        printf 'Usage:  docker compose pull [OPTIONS] [SERVICE...]\n\nOptions:\n'
+        if [ "${FAKE_COMPOSE_PULL_NO_OPTIONS:-false}" != "true" ]; then
+          printf '      --ignore-buildable       Ignore images that can be built\n'
+          printf '      --ignore-pull-failures   Pull what it can and ignores images with pull failures\n'
+          printf '      --policy string          Apply pull policy ("missing"|"always")\n'
+        fi
+        printf '  -q, --quiet                  Pull without printing progress information\n'
+        exit 0
+      fi
+      # FAKE_COMPOSE_PULL_FAIL_TIMES 回目までは失敗する (再試行の検証用)。
+      # FAKE_COMPOSE_PULL_FAIL_MODE=fatal で、再試行しても直らない失敗を再現する。
+      if [ -n "${FAKE_COMPOSE_PULL_FAIL_TIMES:-}" ] \
+          && [ -n "${FAKE_COMPOSE_PULL_COUNTER:-}" ]; then
+        pull_attempt="$(fake_attempt_count "$FAKE_COMPOSE_PULL_COUNTER")"
+        if [ "$pull_attempt" -le "$FAKE_COMPOSE_PULL_FAIL_TIMES" ]; then
+          if [ "${FAKE_COMPOSE_PULL_FAIL_MODE:-transient}" = "fatal" ]; then
+            printf 'Error response from daemon: pull access denied for j1/base.local\n' >&2
+          else
+            printf 'failed to fetch oauth token: unexpected status from GET request: 429 Too Many Requests\n' >&2
+            printf 'toomanyrequests: You have reached your pull rate limit.\n' >&2
+          fi
+          exit 1
+        fi
+      fi
+      printf 'fake images pulled\n'
+      ;;
     up)
       # 依存サービス (adot collector) の healthcheck 失敗で
       # compose up --wait が失敗する状況の再現。
       if [ "${FAKE_COMPOSE_UP_FAIL:-false}" = "true" ]; then
         printf 'dependency failed to start: container adot-collector is unhealthy\n' >&2
         exit 1
+      fi
+      # FAKE_COMPOSE_UP_FAIL_TIMES 回目までは失敗し、それ以降は成功する。
+      # イメージ・キャッシュ削除直後の 1 回目だけ失敗する事象の再現に使う。
+      # FAKE_COMPOSE_UP_FAIL_MODE: cold-start (既定) / transient / fatal
+      if [ -n "${FAKE_COMPOSE_UP_FAIL_TIMES:-}" ] \
+          && [ -n "${FAKE_COMPOSE_UP_COUNTER:-}" ]; then
+        up_attempt="$(fake_attempt_count "$FAKE_COMPOSE_UP_COUNTER")"
+        if [ "$up_attempt" -le "$FAKE_COMPOSE_UP_FAIL_TIMES" ]; then
+          case "${FAKE_COMPOSE_UP_FAIL_MODE:-cold-start}" in
+            transient)
+              printf 'Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout\n' >&2
+              ;;
+            fatal)
+              printf 'Error response from daemon: driver failed programming external connectivity: port is already allocated\n' >&2
+              ;;
+            *)
+              printf 'dependency failed to start: container mysql is unhealthy\n' >&2
+              ;;
+          esac
+          exit 1
+        fi
       fi
       printf 'fake app container started\n'
       ;;

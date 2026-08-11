@@ -605,6 +605,7 @@ if (
     --compose-service app,adot-collector \
     --startup-service app \
     --wait-healthy \
+    --no-up-retry \
     --report-dir "$TEST_TMP/shutdown-reports"
 ) >"$shutdown_logs_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
@@ -647,6 +648,7 @@ if (
     --compose-service app,adot-collector \
     --startup-service app \
     --wait-healthy \
+    --no-up-retry \
     --no-shutdown-logs
 ) >"$no_shutdown_logs_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
@@ -659,6 +661,207 @@ unset FAKE_COMPOSE_SHUTDOWN_MARKER
 
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml stop"
 assert_not_contains "$no_shutdown_logs_output" "終了 (SIGTERM) 時のコンテナログ"
+
+# =============================================================================
+# コールド実行 (docker のイメージ・キャッシュを削除した直後) への対策
+# -----------------------------------------------------------------------------
+# ウォーム実行ではローカルのイメージで飛ばしている取得処理が、コールド実行では
+# 実際に走る。そこでの一過性エラーや、依存サービスが healthy になるまでの遅れが
+# そのまま compose up の失敗になり、再実行だけで直る事象への対策を確認する。
+# =============================================================================
+
+# --- 事前取得が一過性エラーで失敗しても、再試行して起動まで進むこと ---
+cold_pull_retry_output="$TEST_TMP/cold-pull-retry.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="base app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_COMPOSE_PULL_COUNTER="$TEST_TMP/cold-pull.count"
+export FAKE_COMPOSE_PULL_FAIL_TIMES="1"
+rm -f "$FAKE_COMPOSE_PULL_COUNTER"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --pull-retry-interval 0 \
+    --report-dir "$TEST_TMP/cold-pull-reports"
+) >"$cold_pull_retry_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES \
+        FAKE_COMPOSE_PULL_COUNTER FAKE_COMPOSE_PULL_FAIL_TIMES
+  cat "$cold_pull_retry_output" >&2
+  fail "transient pull failure should be retried and succeed"
+fi
+unset FAKE_COMPOSE_PULL_COUNTER FAKE_COMPOSE_PULL_FAIL_TIMES
+
+# 取得は compose up 任せにせず、事前に切り出して実行する。
+# ビルド対象のイメージはレジストリに無いため --ignore-buildable で除外し、
+# 取得済みのイメージは問い合わせないよう --policy missing を付ける。
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml pull --ignore-buildable --policy missing app"
+assert_contains "$cold_pull_retry_output" "起動に必要なイメージを取得します (compose pull, 未取得のイメージのみ) ..."
+assert_contains "$cold_pull_retry_output" "イメージの取得に失敗しました (レジストリ / ネットワークの一過性エラー)"
+assert_contains "$cold_pull_retry_output" "イメージの取得を再試行します (試行 2/3) ..."
+assert_contains "$cold_pull_retry_output" "イメージの取得が完了しました。"
+# 取得は compose up より前に終わっていること (起動と取得の I/O を競合させない)。
+assert_before "$cold_pull_retry_output" \
+  "イメージの取得が完了しました。" \
+  "コンテナを同時に起動します (compose up -d, 対象サービス: app)"
+collect_report_files "$TEST_TMP/cold-pull-reports"
+cold_pull_reports=("${REPORT_FILES[@]}")
+[ ${#cold_pull_reports[@]} -eq 1 ] || fail "expected one report for the cold pull scenario"
+assert_contains "${cold_pull_reports[0]}" "イメージ取得  : 成功 (試行 2 回)"
+assert_contains "${cold_pull_reports[0]}" "コンテナ起動  : 成功 (試行 1 回)"
+assert_matches "${cold_pull_reports[0]}" '^開始時の Docker: ローカルイメージ [0-9]+ 件$'
+
+# --- 事前取得が直らない失敗でも、警告に留めて compose up まで進むこと ---
+# オフラインでイメージを投入済みの環境など、取得できなくても起動できる構成を
+# この段の追加で壊さないことの確認。
+cold_pull_giveup_output="$TEST_TMP/cold-pull-giveup.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PULL_COUNTER="$TEST_TMP/cold-pull-giveup.count"
+export FAKE_COMPOSE_PULL_FAIL_TIMES="9"
+export FAKE_COMPOSE_PULL_FAIL_MODE="fatal"
+rm -f "$FAKE_COMPOSE_PULL_COUNTER"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --pull-retry 1 \
+    --pull-retry-interval 0
+) >"$cold_pull_giveup_output" 2>&1; then
+  unset FAKE_COMPOSE_PULL_COUNTER FAKE_COMPOSE_PULL_FAIL_TIMES FAKE_COMPOSE_PULL_FAIL_MODE
+  cat "$cold_pull_giveup_output" >&2
+  fail "pull failure should not abort the run"
+fi
+unset FAKE_COMPOSE_PULL_COUNTER FAKE_COMPOSE_PULL_FAIL_TIMES FAKE_COMPOSE_PULL_FAIL_MODE
+assert_contains "$cold_pull_giveup_output" "イメージの事前取得に失敗しました (一過性と判断できないエラー)。"
+assert_contains "$cold_pull_giveup_output" "取得できなかったイメージは compose up 側で再度取得が試みられます。"
+# 一過性ではないため再試行せず 1 回で切り上げる。
+assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml pull --ignore-buildable --policy missing app" 1
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build app"
+
+# --- 事前取得のオプションを持たない compose では、素の pull を発行すること ---
+cold_pull_legacy_output="$TEST_TMP/cold-pull-legacy.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PULL_NO_OPTIONS="true"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --verify-startup --compose-service app --startup-service app
+) >"$cold_pull_legacy_output" 2>&1; then
+  unset FAKE_COMPOSE_PULL_NO_OPTIONS
+  cat "$cold_pull_legacy_output" >&2
+  fail "legacy compose pull scenario unexpectedly returned non-zero"
+fi
+unset FAKE_COMPOSE_PULL_NO_OPTIONS
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml pull app"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml pull --ignore-buildable"
+
+# --- --no-pull-images では事前取得を行わないこと ---
+no_pull_output="$TEST_TMP/no-pull-images.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --no-pull-images \
+    --report-dir "$TEST_TMP/no-pull-reports"
+) >"$no_pull_output" 2>&1; then
+  cat "$no_pull_output" >&2
+  fail "--no-pull-images scenario unexpectedly returned non-zero"
+fi
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml pull"
+assert_not_contains "$no_pull_output" "起動に必要なイメージを取得します"
+collect_report_files "$TEST_TMP/no-pull-reports"
+no_pull_reports=("${REPORT_FILES[@]}")
+[ ${#no_pull_reports[@]} -eq 1 ] || fail "expected one report for the --no-pull-images scenario"
+assert_contains "${no_pull_reports[0]}" "イメージ取得  : 未実行 (--no-pull-images)"
+
+# --- 依存サービスが healthy にならず失敗しても、診断を出して再試行すること ---
+# コールド実行では DB の初期化やモックの JVM 起動が healthcheck の猶予を超え、
+# 1 回目だけ失敗して再実行すると成功する。利用者が手作業でやり直している
+# 再実行を、失敗の種類を判定したうえで自動で行う。
+cold_up_retry_output="$TEST_TMP/cold-up-retry.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_UP_COUNTER="$TEST_TMP/cold-up.count"
+export FAKE_COMPOSE_UP_FAIL_TIMES="1"
+export FAKE_HEALTHCHECK_STATE_FAIL="true"
+rm -f "$FAKE_COMPOSE_UP_COUNTER"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --up-retry-interval 0 \
+    --report-dir "$TEST_TMP/cold-up-reports"
+) >"$cold_up_retry_output" 2>&1; then
+  unset FAKE_COMPOSE_UP_COUNTER FAKE_COMPOSE_UP_FAIL_TIMES FAKE_HEALTHCHECK_STATE_FAIL
+  cat "$cold_up_retry_output" >&2
+  fail "cold start up failure should be retried and succeed"
+fi
+unset FAKE_COMPOSE_UP_COUNTER FAKE_COMPOSE_UP_FAIL_TIMES FAKE_HEALTHCHECK_STATE_FAIL
+
+assert_contains "$cold_up_retry_output" "コンテナ起動失敗の診断 (compose up)"
+assert_contains "$cold_up_retry_output" "失敗の分類          : 依存サービスが期限内に healthy にならなかった"
+assert_matches "$cold_up_retry_output" '実行開始時の Docker : ローカルイメージ [0-9]+ 件'
+# コンテナを削除する前に、どのサービスが unhealthy なのかまで採取する。
+assert_contains "$cold_up_retry_output" "[app] healthcheck: 状態 unhealthy / 連続失敗 3 回"
+assert_contains "$cold_up_retry_output" "コンテナの起動を再試行します (試行 2/2) ..."
+assert_contains "$cold_up_retry_output" "再試行でコンテナの起動に成功しました (試行 2 回目)。"
+assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build app" 2
+collect_report_files "$TEST_TMP/cold-up-reports"
+cold_up_reports=("${REPORT_FILES[@]}")
+[ ${#cold_up_reports[@]} -eq 1 ] || fail "expected one report for the cold up retry scenario"
+assert_contains "${cold_up_reports[0]}" "コンテナ起動  : 成功 (試行 2 回)"
+
+# --- 一過性と判断できない失敗は再試行せず、その場で終了すること ---
+fatal_up_output="$TEST_TMP/cold-up-fatal.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_UP_COUNTER="$TEST_TMP/fatal-up.count"
+export FAKE_COMPOSE_UP_FAIL_TIMES="1"
+export FAKE_COMPOSE_UP_FAIL_MODE="fatal"
+rm -f "$FAKE_COMPOSE_UP_COUNTER"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --up-retry-interval 0 \
+    --no-shutdown-logs \
+    --report-dir "$TEST_TMP/fatal-up-reports"
+) >"$fatal_up_output" 2>&1; then
+  unset FAKE_COMPOSE_UP_COUNTER FAKE_COMPOSE_UP_FAIL_TIMES FAKE_COMPOSE_UP_FAIL_MODE
+  cat "$fatal_up_output" >&2
+  fail "fatal compose up failure unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_UP_COUNTER FAKE_COMPOSE_UP_FAIL_TIMES FAKE_COMPOSE_UP_FAIL_MODE
+assert_contains "$fatal_up_output" "失敗の分類          : 一過性と判断できないエラー"
+assert_contains "$fatal_up_output" "コンテナの起動に失敗しました (compose up)"
+# やり直しても直らない失敗は 1 回で切り上げる。
+assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build app" 1
+collect_report_files "$TEST_TMP/fatal-up-reports"
+fatal_up_reports=("${REPORT_FILES[@]}")
+[ ${#fatal_up_reports[@]} -eq 1 ] || fail "expected one report for the fatal up scenario"
+assert_contains "${fatal_up_reports[0]}" "コンテナ起動  : 失敗 (試行 1 回, 分類: 一過性と判断できないエラー)"
+
+# --- 再試行の回数指定を検証すること ---
+invalid_up_retry_output="$TEST_TMP/up-retry-invalid.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --up-retry -1
+) >"$invalid_up_retry_output" 2>&1; then
+  cat "$invalid_up_retry_output" >&2
+  fail "invalid --up-retry unexpectedly returned zero"
+fi
+assert_contains "$invalid_up_retry_output" "--up-retry には 0 以上の整数を指定してください: -1"
+
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 
 invalid_shutdown_timeout_output="$TEST_TMP/shutdown-timeout-invalid.out"
 if (
@@ -2591,6 +2794,7 @@ if (
     --compose-service app \
     --startup-service app \
     --env-list-limit 1 \
+    --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-upfail-reports" \
     --suppress-removed-logs
 ) >"$deploy_exception_upfail_output" 2>&1; then
@@ -2644,6 +2848,7 @@ if (
     --compose-service app \
     --startup-service app \
     --env-list-limit 1 \
+    --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-nolog-reports" \
     --suppress-removed-logs
 ) >"$deploy_exception_nolog_output" 2>&1; then

@@ -173,6 +173,12 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--wait-healthy` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` に `--wait` を付け、起動対象サービスが healthy (healthcheck 未定義なら running) になるまで compose 側で待ってから起動確認へ進む。依存サービスの準備完了前にアプリが起動して失敗するのを防ぐ | `false` |
 | `--wait-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--wait` の最大待機秒数。指定すると `--wait-healthy` も暗黙に有効化する | `600` |
 | `--allow-service-exit NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。起動確認中に停止していても失敗扱いにしないサービス名。繰り返し指定またはカンマ区切りで複数指定できる | (なし) |
+| `--no-pull-images` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` の前に行うイメージの事前取得 (`docker compose pull`) を行わない | `false` (= 事前取得する) |
+| `--pull-retry N` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。事前取得が一過性のエラー (`toomanyrequests` / TLS handshake timeout 等) で失敗したときの再試行回数。`0` で再試行しない | `2` |
+| `--pull-retry-interval SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。事前取得の再試行間隔・秒 | `10` |
+| `--up-retry N` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` が一過性のエラー、または依存サービスが期限内に healthy にならずに失敗したときの再試行回数。再試行の前に必ず原因の診断を表示する | `1` |
+| `--no-up-retry` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` の再試行を行わない (`--up-retry 0` と同じ) | `false` |
+| `--up-retry-interval SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` の再試行間隔・秒 | `15` |
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
@@ -585,6 +591,109 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   正常に終了しうるサービスは `--allow-service-exit NAME` で除外できます。
 - 1サービスだけを指定した場合と、`--compose-service` を省略した場合は、従来どおり
   1回の `docker compose build` を実行します。
+
+### イメージ・キャッシュを削除した直後の実行 (コールド実行)
+
+`docker system prune -a` や `--cleanup-all-docker-data` で **Docker のイメージ・
+ビルドキャッシュ・ボリュームを削除した直後**の実行は、**1 回目だけ `compose up` で
+失敗し、そのまま再実行すると成功する**ことがあります。
+
+原因は、ウォーム実行がローカルのイメージで飛ばしている処理を、コールド実行が
+すべて実際に行う点にあります。
+
+| | ウォーム実行 (2 回目以降) | コールド実行 (削除直後) |
+| --- | --- | --- |
+| ビルド対象でないサービスのイメージ (`mysql` / `wiremock` / `valkey` 等) | ローカルにあるため取得は起きない | レジストリからの取得が実際に走る |
+| 依存サービスの起動 | ページキャッシュが温まっており速い | 取得・展開の I/O と競合して遅い |
+| DB のデータボリューム | 初期化済み | 初期化からやり直し |
+
+このため、コールド実行では
+
+1. レジストリ側の一過性エラー (`toomanyrequests` / TLS handshake timeout /
+   `unexpected EOF` など)
+2. 依存サービスが `healthcheck` の猶予内に healthy にならず
+   `dependency failed to start: container xxx is unhealthy` で中断
+
+のどちらかで `compose up` が失敗しやすくなります。どちらも 2 回目はイメージが
+揃い、ボリュームも初期化済みのため成功します。
+
+これに対して `build_and_verify.sh` は次の 2 段構えで対応します。
+
+**(1) `compose up` の前にイメージの取得だけを分離して実行する (既定で有効)**
+
+```
+[2026-08-12 04:43:44 JST] 起動に必要なイメージを取得します (compose pull, 未取得のイメージのみ) ...
+```
+
+- 起動対象サービス (とその依存) のうち、**ビルド対象でないサービスのイメージ**を
+  `docker compose pull --ignore-buildable --policy missing` でまとめて取得します。
+  今回ビルドしたローカルイメージはレジストリに存在しないため取得対象から外し、
+  取得済みのイメージはレジストリへ問い合わせません。**ウォーム実行ではほぼ無処理**
+  で終わり、レジストリへ到達できない環境でも余計な失敗を起こしません。
+- 一過性のエラーと判断した場合は `--pull-retry` 回 (既定 2 回) まで再試行します。
+- **取得に失敗しても警告に留め、処理は続行します**。取得できなかったイメージは
+  `compose up` 側で再度取得が試みられるため、この段の追加によって新たに失敗する
+  経路を作りません。
+- 取得を `compose up` から切り離すことで、取得・展開の I/O が先に起動した
+  コンテナの `healthcheck` と競合することも避けられます。
+- 事前取得を行わない場合は `--no-pull-images` を指定します。
+
+**(2) `compose up` の失敗を診断し、一過性であれば再試行する (既定 1 回)**
+
+`compose up` が失敗した場合、**コンテナを削除する前に**次を採取して表示します。
+
+```
+────────────────────────────────────────────────────────────────────
+ コンテナ起動失敗の診断 (compose up)
+────────────────────────────────────────────────────────────────────
+  失敗の分類          : 依存サービスが期限内に healthy にならなかった
+  実行開始時の Docker : ローカルイメージ 0 件
+  イメージの事前取得  : 成功 (試行 2 回)
+
+  Compose サービスの状態:
+    - app-front: app-front (状態: created)
+    - mysql: mysql (状態: running)
+
+  [mysql] healthcheck: 状態 unhealthy / 連続失敗 12 回
+    終了コード: 1
+    出力:
+    ERROR 2002 (HY000): Can't connect to local MySQL server through socket
+```
+
+失敗は次の 3 つに分類します。
+
+| 分類 | 判断の手掛かり | 再試行 |
+| --- | --- | --- |
+| レジストリ / ネットワークの一過性エラー | `toomanyrequests` / `TLS handshake timeout` / `i/o timeout` / `unexpected EOF` / `429`・`5xx` など | する |
+| 依存サービスが期限内に healthy にならなかった | `dependency failed to start` / `is unhealthy` など | する |
+| 一過性と判断できないエラー | 上記以外 (ポート衝突・イメージ不在など) | **しない** (その場で終了) |
+
+- 再試行は `--up-retry N` (既定 1 回)、間隔は `--up-retry-interval SEC` (既定 15 秒)。
+  再試行を行わない場合は `--no-up-retry` を指定します。
+- 再試行するかどうかに関わらず、**診断は必ず表示します**。「勝手にやり直して
+  成功したので原因が分からない」状態にはなりません。
+- やり直しても直らない失敗 (ポートの衝突など) は 1 回で切り上げます。
+
+**全量レポート (`--report-dir`) への記録**
+
+```
+開始時の Docker: ローカルイメージ 0 件
+イメージ取得  : 成功 (試行 2 回)
+コンテナ起動  : 成功 (試行 2 回)
+```
+
+コールド実行だったか、取得と起動が何回目で成功したかが残るため、後から
+「1 回目だけ失敗した」事象を切り分けられます。
+
+**再試行では直らない場合**
+
+再試行はあくまで一過性の失敗を吸収するためのものです。コールド実行で毎回
+`dependency failed to start` になる場合は、compose 側の猶予が足りていません。
+
+- `compose.yml` の `healthcheck` の `start_period` / `retries` を広げる
+  (MySQL のコールド初期化は数分かかることがあります)
+- `--wait-healthy` を使っている場合は `--wait-timeout SEC` を広げる
+- 起動確認そのものが遅い場合は `--startup-timeout SEC` を広げる
 
 ### 起動確認 (`--verify-startup`)
 

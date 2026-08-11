@@ -182,7 +182,8 @@ flowchart TD
     Q --> Q2[伝搬検証 3: /run/secrets の到達値<br/>プローブビルド --no-cache]
     Q2 --> R{起動が必要?<br/>--verify-startup / --verify-url}
     R -- 不要 --> Z1[ビルドのみ完了 exit 0]
-    R -- 必要 --> S[compose up -d --no-build<br/>--wait-healthy 指定時は --wait]
+    R -- 必要 --> R2[イメージ事前取得<br/>compose pull --ignore-buildable --policy missing<br/>一過性エラーは --pull-retry 回まで再試行 / 失敗しても続行]
+    R2 --> S[compose up -d --no-build<br/>--wait-healthy 指定時は --wait<br/>失敗時は診断を出し、一過性なら --up-retry 回まで再試行]
     S --> T{--verify-startup?}
     T -- あり --> U[起動完了ログを待つ<br/>WFLYSRV0025 検出まで]
     T -- なし --> V
@@ -421,6 +422,12 @@ compose down (削除)
 | `--wait-healthy` | フラグ | `false` | — | `compose up` に `--wait` を付け、healthy になるまで compose 側で待つ |
 | `--wait-timeout SEC` | 1 以上の整数 | `600` | 不可 | `--wait` の最大待機秒数。指定すると `--wait-healthy` を暗黙に有効化 |
 | `--allow-service-exit NAME` | サービス名 | (なし) | **可** | 起動確認中に停止していても失敗扱いにしないサービス |
+| `--no-pull-images` | フラグ | `false` | — | `compose up` の前に行うイメージの事前取得 (`compose pull`) を行わない |
+| `--pull-retry N` | 0 以上の整数 | `2` | 不可 | 事前取得が一過性のエラーで失敗したときの再試行回数 |
+| `--pull-retry-interval SEC` | 0 以上の整数 | `10` | 不可 | 事前取得の再試行間隔 |
+| `--up-retry N` | 0 以上の整数 | `1` | 不可 | `compose up` が一過性の理由で失敗したときの再試行回数 |
+| `--no-up-retry` | フラグ | `false` | — | `compose up` の再試行を行わない (`--up-retry 0` と同じ) |
+| `--up-retry-interval SEC` | 0 以上の整数 | `15` | 不可 | `compose up` の再試行間隔 |
 | `--suppress-startup-logs` | フラグ | `false` | — | 起動ログの表示を抑制 (判定は継続。失敗時は表示される) |
 | `--shutdown-timeout SEC` | 1 以上の整数 | `30` | 不可 | エラー終了時の SIGTERM から SIGKILL までの猶予秒数 (ECS の StopTimeout 既定と同じ) |
 | `--no-shutdown-logs` | フラグ | `false` | — | エラー終了時の SIGTERM 停止と終了ログ取得を行わない |
@@ -663,6 +670,41 @@ services:
 `dependency failed to start: container ... is unhealthy` で失敗します。
 この場合もエラー終了時の SIGTERM 停止が働くため、依存サービス側の
 終了処理ログまで画面と全量レポートに残ります (3.6 参照)。
+
+### 5.3-2 イメージ・キャッシュ削除直後の実行 (コールド実行)
+
+`docker system prune -a` や `--cleanup-all-docker-data` の直後に実行すると、
+**1 回目だけ `compose up` で失敗し、再実行すると成功する**ことがあります。
+ウォーム実行がローカルのイメージで飛ばしている取得処理が、コールド実行では
+実際に走るためです。
+
+| 起きること | 症状 |
+| --- | --- |
+| レジストリからの取得が実際に走る | `toomanyrequests` / TLS handshake timeout などで `compose up` が失敗 |
+| 取得・展開の I/O が healthcheck と競合する | `dependency failed to start: container ... is unhealthy` |
+| DB のデータボリュームが初期化からやり直しになる | 同上 (猶予内に healthy にならない) |
+
+対策は 2 段構えです。
+
+1. **事前取得** — `compose up` の前に
+   `compose pull --ignore-buildable --policy missing` でイメージだけを取得します。
+   一過性のエラーなら `--pull-retry` 回 (既定 2) 再試行し、**失敗しても警告に留めて
+   処理を続行**します (取得は `compose up` 側でも再度試みられるため)。
+   取得済みイメージは問い合わせないので、ウォーム実行はほぼ無処理です。
+   `--no-pull-images` で無効化できます。
+2. **`compose up` の診断と再試行** — 失敗時はコンテナを削除する前に、失敗の分類・
+   実行開始時のローカルイメージ件数・サービスごとの状態・unhealthy なコンテナの
+   healthcheck 実行履歴を表示します。分類が「一過性」または「依存サービスが期限内に
+   healthy にならなかった」の場合のみ `--up-retry` 回 (既定 1) 再試行します。
+   ポート衝突などやり直しても直らない失敗は 1 回で切り上げます。
+   `--no-up-retry` で再試行を無効化できます。
+
+全量レポートには `開始時の Docker` / `イメージ取得` / `コンテナ起動` の 3 行が
+残るため、後から「コールド実行の 1 回目だけ失敗した」ことを切り分けられます。
+
+コールド実行で毎回 `dependency failed to start` になる場合は、再試行ではなく
+`compose.yml` の `healthcheck` の `start_period` / `retries`、`--wait-timeout`、
+`--startup-timeout` を広げてください。
 
 ### 5.4 `--keep-container-mode` の 3 モード
 
@@ -1811,7 +1853,9 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 (デプロイエラー) | 既定ではコンテナを残したまま調査用の対話操作へ入る (→ 5.4-2)。表示された失敗行と Java 例外解析を確認 |
 | `対話操作を開始できなかったため、通常のエラー終了として後始末します` | デプロイエラーを検出したが、端末から入力できず調査モードへ入れなかった (CI 等) | 対話実行するか、`--keep-container` を併用してコンテナを残す |
 | `起動中のコンテナが無いため、デプロイエラーの調査用対話操作へは入りません` | デプロイエラー検出後にコンテナが残っていない | コンテナが落ちた原因を起動ログで確認する |
-| `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | `dependency failed to start` の対象サービスと、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |
+| `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | 直前に表示される「コンテナ起動失敗の診断 (compose up)」の失敗の分類・サービス状態・healthcheck 実行履歴と、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |
+| `compose up に失敗しました (…)。… 後に再試行します` | イメージ・キャッシュ削除直後 (コールド実行) に起きやすい一過性の失敗を検知した | 再試行で成功すればそのまま続行する。毎回失敗する場合は `healthcheck` の `start_period` / `retries` や `--wait-timeout` を広げる (→ 5.3-2) |
+| `イメージの事前取得に失敗しました (…)` | `compose pull` が失敗 (レジストリ到達不可・イメージ不在など) | 警告のみで処理は続行する。`compose up` 側の取得も失敗する場合はレジストリ認証・プロキシ設定を確認する (→ 5.3-2) |
 | `コンテナが起動途中で停止しました` | アプリの異常終了 | 表示されたログで原因を確認 |
 | `SIGTERM による停止に失敗しました (compose stop, exit=…)` | `compose stop` が失敗 (daemon 応答なし等) | 終了処理のログが欠ける場合がある。`docker ps -a` で状態を確認 |
 | `起動対象の Compose サービスが停止しました` | 依存サービスの準備不足など | `--wait-healthy` の利用、`--allow-service-exit` での除外を検討 |
