@@ -213,6 +213,11 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--jboss-cli-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の `jboss-cli.sh` のパス | (自動探索) |
 | `--jboss-elytron-tool PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の `elytron-tool.sh` のパス | (自動探索) |
 | `--jboss-credential-store PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内の CredentialStore ファイルのパス | (`standalone.xml` から特定) |
+| `--cacert-dir DIR` | CA 証明書 (`cacert.crt`) を置いたディレクトリ。**繰り返し指定可**。指定した全ディレクトリ分の証明書を 1 つの tar にまとめ、BuildKit シークレットとしてビルドへ渡す (後述) | (なし) |
+| `--cacert-secret-id ID` | CA 証明書アーカイブのシークレット id。**buildx 版**は `--secret id=...` に使い、**compose 版**は `compose.yml` の secrets 名と一致させる。いずれも Dockerfile の `RUN --mount=type=secret,id=...` と一致させる | `cacerts` |
+| `--cacert-bundle PATH` | 生成する tar の出力先を明示指定する。指定した場合は**自動削除しない** | (一時ファイル。終了時に自動削除) |
+| `--cacert-bundle-env NAME` | **compose 版のみ** (`build_and_push.sh` / `build_and_verify.sh`)。tar のパスを compose へ渡す環境変数名。`compose.yml` の `secrets.<id>.file` が参照する変数名と一致させる | `CACERT_BUNDLE_FILE` |
+| `--cacert-glob PATTERN` | 各ディレクトリから取り込む証明書ファイルのパターン。**繰り返し指定可**。指定するとこの値だけが対象になる | `*.crt` と `*.pem` |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
 | `--auto-switchback` | ECR 権限が無い場合に自動でスイッチバックして継続する | `false` |
 | `--warn-only` | ECR 権限が無い場合に警告して終了する (既定) | (既定) |
@@ -1917,6 +1922,122 @@ pa$word  →  clear-text="pa$$word"
   `/run/secrets/<compose のシークレット名>` を参照するため、段 3 のプローブが実際とは
   違うマウント先を見ないよう、表示された名前を `--jboss-secret-id` に指定してください。
 - `--dry-run` 併用時は、実際の値を取得しないため検証を行いません。
+
+## CA 証明書の tar アーカイブと BuildKit シークレット注入 (`--cacert-dir`)
+
+自己署名証明書などの CA 証明書を、**提供元ごとにディレクトリを分けて配置**し、
+まとめてイメージへ取り込むための仕組みです。3 スクリプトとも同じオプションで使えます。
+
+```bash
+# 提供元ごとに cacert.crt を配置しておく
+#   secrets/extraslb/cacert.crt
+#   secrets/others1/cacert.crt
+#   secrets/others2/cacert.crt
+
+./build_and_push.sh --account-id 123456789012 \
+  --cacert-dir secrets/extraslb \
+  --cacert-dir secrets/others1 \
+  --cacert-dir secrets/others2
+```
+
+スクリプトは指定された全ディレクトリ直下の証明書 (既定で `*.crt` / `*.pem`) を集め、
+**1 つの tar** へまとめます。tar の中身は `<ディレクトリ名>/<ファイル名>` になり、
+**ディレクトリ名がそのまま提供元名**になります。
+
+```
+extraslb/cacert.crt
+others1/cacert.crt
+others2/cacert.crt
+```
+
+### なぜ tar でまとめるのか
+
+BuildKit のシークレットは**ディレクトリをマウントできません**
+([moby/buildkit#970](https://github.com/moby/buildkit/issues/970))。
+提供元ごとにシークレットを分けると Dockerfile の `RUN --mount` 行も提供元の数だけ
+増えてしまうため、1 ファイル (tar) に詰めて**シークレットは常に 1 つ**とし、
+展開と提供元の列挙はビルドコンテナ側で行います。
+これにより**提供元が増えても Dockerfile / `compose.yml` / ビルドコマンドは変更不要**で、
+増やすのは `--cacert-dir` の指定だけになります。
+
+tar はビルド中のみマウントされるシークレットのため、**イメージのレイヤ・履歴には残りません**。
+
+### スクリプトごとの渡し方の違い
+
+| スクリプト | 渡し方 |
+| --- | --- |
+| `buildx_build_and_push.sh` | `docker buildx build` に `--secret id=<id>,src=<生成した tar>` を追加する |
+| `build_and_push.sh` / `build_and_verify.sh` | `docker compose build` には `--secret` が無いため、tar のパスを環境変数 (既定 `CACERT_BUNDLE_FILE`) へ `export` し、`compose.yml` の **file 型シークレット**経由で渡す |
+
+同梱の `compose.yml` には受け取り側の定義を追加済みです。
+
+```yaml
+services:
+  base:
+    build:
+      secrets:
+        - jboss_master_password
+        - cacerts                            # ← --cacert-secret-id と一致させる
+secrets:
+  jboss_master_password:
+    environment: JBOSS_MASTER_PASSWORD
+  cacerts:
+    file: ${CACERT_BUNDLE_FILE:-/dev/null}   # ← --cacert-bundle-env と一致させる
+```
+
+Dockerfile 側は、提供元の数によらず 1 つの `RUN --mount` で受け取れます。
+
+```dockerfile
+RUN --mount=type=secret,id=cacerts \
+    mkdir -p /tmp/cacerts && \
+    tar -xf /run/secrets/cacerts -C /tmp/cacerts && \
+    for cert in /tmp/cacerts/*/*; do \
+        [ -f "$cert" ] || continue; \
+        alias_name="$(basename "$(dirname "$cert")")-$(basename "$cert")"; \
+        cp "$cert" "/usr/local/share/ca-certificates/${alias_name}.crt"; \
+    done && \
+    update-ca-certificates && \
+    rm -rf /tmp/cacerts
+```
+
+> tar の展開にはイメージ内の `tar` が必要です。`*-minimal` 系のベースイメージへ
+> 差し替える場合は `tar` を導入してください。
+
+compose 版は `compose.yml` を展開し、`secrets.<id>.file` の定義と
+`services.<名前>.build.secrets` からの参照が揃っているかを確認します。
+足りない場合は追加すべき定義を添えて警告します (処理は継続します)。
+
+### 配置漏れをその場で失敗させる
+
+証明書の入っていないイメージが黙って完成しないよう、次はいずれもエラーで終了します。
+
+| 状況 | 動作 |
+| --- | --- |
+| 指定したディレクトリが存在しない | エラー終了 (exit 1) |
+| ディレクトリに証明書が 1 つも無い | エラー終了 (exit 1) |
+| 指定したディレクトリ名が重複する | エラー終了 (exit 1)。tar の中で同じパスになり片方が失われるため |
+| シークレット id が `--jboss-secret-id` や既存の `--secret` と衝突 | エラー終了 (exit 2) |
+| 証明書ファイルが空 | 警告して 1 件スキップ (他に証明書があれば継続) |
+
+取り込んだ提供元と件数はビルドログに出ます。`build_and_verify.sh` では
+全量レポートの `[1] ビルド結果` にも
+`CA 証明書 : 提供元: extraslb others1 others2 / 証明書 3 件 / シークレット id=cacerts`
+として残るため、想定した提供元が全て並んでいるかを後から突き合わせられます。
+
+### 既定の挙動 (`--cacert-dir` を指定しない場合)
+
+従来どおり、証明書なしでビルドされます。compose 版は `compose.yml` の file 型
+シークレットが必ず実ファイルを指すよう、**中身が空の tar** を作ってそのパスを
+`CACERT_BUNDLE_FILE` へ入れます (終了時に自動削除)。
+事前に `CACERT_BUNDLE_FILE` を `export` 済みの場合は、その指定を優先します。
+
+スクリプトを使わず手動で `docker compose build` する場合は、事前に tar を作って
+環境変数を定義してください (未定義なら `/dev/null` = 中身なしになります)。
+
+```bash
+tar -cf /tmp/cacerts-bundle.tar -C secrets extraslb others1 others2
+CACERT_BUNDLE_FILE=/tmp/cacerts-bundle.tar docker compose -f compose.yml build
+```
 
 ## push 失敗時の原因診断 / 調査ガイド
 

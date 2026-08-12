@@ -3365,6 +3365,120 @@ assert_contains "$copy_dry_run_output" \
   "[DRY-RUN] 上書き前のファイルを復元: $copy_dry_run_dir/copy-src.npmrc"
 assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
 
+# ---- --cacert-dir の証明書アーカイブ (BuildKit シークレット) -----------------
+# 提供元ごとのディレクトリを繰り返し指定すると、各ディレクトリ直下の証明書が
+# <ディレクトリ名>/<ファイル名> の構成で 1 つの tar にまとまり、compose のビルド
+# 開始時点でその tar が実在することを確認する。証明書以外のファイルは混ぜない。
+cacert_root="$TEST_TMP/cacerts"
+mkdir -p "$cacert_root/extraslb" "$cacert_root/others1" "$cacert_root/others2"
+printf -- '-----BEGIN CERTIFICATE-----\nEXTRASLB\n-----END CERTIFICATE-----\n' \
+  > "$cacert_root/extraslb/cacert.crt"
+printf -- '-----BEGIN CERTIFICATE-----\nOTHERS1\n-----END CERTIFICATE-----\n' \
+  > "$cacert_root/others1/cacert.crt"
+printf -- '-----BEGIN CERTIFICATE-----\nOTHERS2\n-----END CERTIFICATE-----\n' \
+  > "$cacert_root/others2/cacert.crt"
+# 同じ提供元に複数枚 (ルート + 中間) 置いた場合も両方取り込む
+printf -- '-----BEGIN CERTIFICATE-----\nOTHERS2-INTERMEDIATE\n-----END CERTIFICATE-----\n' \
+  > "$cacert_root/others2/intermediate.pem"
+# 証明書ではないファイルは tar へ入れない
+printf 'not a certificate\n' > "$cacert_root/others2/README.md"
+
+# --cacert-bundle で出力先を固定し、ビルド時点のアーカイブを控えて中身を確かめる。
+cacert_bundle="$TEST_TMP/cacerts-bundle.tar"
+cacert_output="$TEST_TMP/cacert.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_BUILD_SNAPSHOT="$TEST_TMP/cacert.snapshot" \
+  FAKE_BUILD_SNAPSHOT_SRC="$cacert_bundle" \
+  bash ./build_and_verify.sh \
+    --cacert-bundle "$cacert_bundle" \
+    --cacert-dir "$cacert_root/extraslb" \
+    --cacert-dir "$cacert_root/others1/" \
+    --cacert-dir "$cacert_root/others2" \
+    --report-dir "$TEST_TMP/cacert-reports"
+) >"$cacert_output" 2>&1; then
+  cat "$cacert_output" >&2
+  fail "--cacert-dir returned a non-zero status"
+fi
+assert_contains "$cacert_output" "CA 証明書を 1 つの tar へまとめます (3 ディレクトリ / シークレット id=cacerts) ..."
+assert_contains "$cacert_output" "extraslb: 証明書 1 件 <- $cacert_root/extraslb"
+# 末尾に / を付けて指定しても提供元名は others1 になる
+assert_contains "$cacert_output" "others1: 証明書 1 件 <- $cacert_root/others1"
+assert_contains "$cacert_output" "others2: 証明書 2 件 <- $cacert_root/others2"
+assert_contains "$cacert_output" "提供元: extraslb others1 others2 / 証明書 4 件"
+assert_contains "$cacert_output" "ビルド中のマウント先: /run/secrets/cacerts"
+# 同梱 compose.yml には受け取り側の定義があるため、警告ではなく確認のログが出る
+assert_contains "$cacert_output" "CA 証明書シークレットの受け取り定義を確認しました"
+# 全量レポートにも取り込んだ提供元が残る (配置漏れの事後確認用)
+collect_report_files "$TEST_TMP/cacert-reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] || fail "expected 1 report for --cacert-dir, found ${#REPORT_FILES[@]}"
+assert_contains "${REPORT_FILES[0]}" \
+  "CA 証明書     : 提供元: extraslb others1 others2 / 証明書 4 件 / シークレット id=cacerts"
+# ビルド開始時点でアーカイブが実在し、中身が <提供元名>/<ファイル名> になっている
+[ -f "$TEST_TMP/cacert.snapshot" ] \
+  || fail "--cacert-dir did not have the bundle in place when the build started"
+cacert_entries="$TEST_TMP/cacert-entries.txt"
+tar -tf "$TEST_TMP/cacert.snapshot" > "$cacert_entries" 2>/dev/null \
+  || fail "--cacert-dir produced an archive that tar could not read"
+assert_contains "$cacert_entries" "extraslb/cacert.crt"
+assert_contains "$cacert_entries" "others1/cacert.crt"
+assert_contains "$cacert_entries" "others2/cacert.crt"
+assert_contains "$cacert_entries" "others2/intermediate.pem"
+assert_not_contains "$cacert_entries" "README.md"
+
+# 指定したディレクトリが無い / 証明書が無い / 名前が重複する場合は、証明書の
+# 入らないイメージが黙って完成しないよう、その場で失敗させる。
+cacert_missing_output="$TEST_TMP/cacert-missing.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --cacert-dir "$cacert_root/nosuchdir"
+) >"$cacert_missing_output" 2>&1; then
+  cat "$cacert_missing_output" >&2
+  fail "--cacert-dir accepted a directory that does not exist"
+fi
+assert_contains "$cacert_missing_output" "証明書ディレクトリが見つかりません: $cacert_root/nosuchdir"
+
+mkdir -p "$cacert_root/empty"
+cacert_empty_output="$TEST_TMP/cacert-empty.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --cacert-dir "$cacert_root/empty"
+) >"$cacert_empty_output" 2>&1; then
+  cat "$cacert_empty_output" >&2
+  fail "--cacert-dir accepted a directory without any certificate"
+fi
+assert_contains "$cacert_empty_output" "証明書が見つかりません: $cacert_root/empty"
+
+mkdir -p "$TEST_TMP/cacerts-other/others1"
+printf -- '-----BEGIN CERTIFICATE-----\nDUP\n-----END CERTIFICATE-----\n' \
+  > "$TEST_TMP/cacerts-other/others1/cacert.crt"
+cacert_dup_output="$TEST_TMP/cacert-dup.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --cacert-dir "$cacert_root/others1" \
+    --cacert-dir "$TEST_TMP/cacerts-other/others1"
+) >"$cacert_dup_output" 2>&1; then
+  cat "$cacert_dup_output" >&2
+  fail "--cacert-dir accepted duplicated directory names"
+fi
+assert_contains "$cacert_dup_output" "--cacert-dir のディレクトリ名が重複しています: others1"
+
+# --cacert-dir を指定しない実行は従来どおり (証明書関連の出力を一切増やさない)。
+cacert_absent_output="$TEST_TMP/cacert-absent.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --report-dir "$TEST_TMP/cacert-absent-reports"
+) >"$cacert_absent_output" 2>&1; then
+  cat "$cacert_absent_output" >&2
+  fail "build without --cacert-dir returned a non-zero status"
+fi
+assert_not_contains "$cacert_absent_output" "CA 証明書を 1 つの tar へまとめます"
+assert_not_contains "$cacert_absent_output" "証明書アーカイブを作成しました"
+collect_report_files "$TEST_TMP/cacert-absent-reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] || fail "expected 1 report without --cacert-dir, found ${#REPORT_FILES[@]}"
+assert_contains "${REPORT_FILES[0]}" "CA 証明書     : (未指定)"
+
 # =============================================================================
 # ビルドの停滞検知・進捗表示
 # -----------------------------------------------------------------------------

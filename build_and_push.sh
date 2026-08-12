@@ -28,6 +28,18 @@
 #     シークレット定義を通じて BuildKit シークレットとして安全にビルドへ
 #     注入する (イメージのレイヤや履歴には残らない)。
 #
+# CA 証明書 (BuildKit シークレット):
+#   - --cacert-dir で指定したディレクトリ群 (繰り返し指定可。例: secrets/extraslb,
+#     secrets/others1, secrets/others2) の直下にある cacert.crt をまとめて
+#     1 つの tar へ固め、compose.yml の file 型シークレット (既定 id: cacerts)
+#     を通じてビルドへ渡す。tar の中身は <ディレクトリ名>/<ファイル名> となる。
+#   - compose build には --secret オプションが無いため、tar のパスを環境変数
+#     (--cacert-bundle-env, 既定: CACERT_BUNDLE_FILE) へ export し、
+#     compose.yml 側の secrets.<id>.file がそれを参照する形で受け渡す。
+#   - BuildKit のシークレットはディレクトリをマウントできない
+#     (moby/buildkit#970) ため、1 ファイルに詰めて 1 つのシークレットとして渡す。
+#     提供元が増えても Dockerfile / compose.yml は変更不要。
+#
 # 使い方:
 #   ./build_and_push.sh --account-id 123456789012 --region ap-northeast-1 \
 #       --jboss-password-param /j1/jboss/master-password \
@@ -130,6 +142,36 @@ JBOSS_PASSWORD_VALUE=""           # 直接指定されたマスターパスワ�
 JBOSS_PASSWORD_ENV="JBOSS_MASTER_PASSWORD"  # シークレット受け渡しに使う環境変数名
 JBOSS_PASSWORD_ENV_SET="false"    # --jboss-password-env が明示指定されたか
 JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシークレットとして注入するか
+
+# ---- CA 証明書アーカイブ (BuildKit シークレット) 関連 -------------------------
+# 提供元ごとのディレクトリ (例: secrets/extraslb, secrets/others1, secrets/others2)
+# に置いた CA 証明書を 1 つの tar へまとめ、BuildKit シークレットとしてビルドへ渡す。
+#
+# tar でまとめるのは、BuildKit のシークレットがディレクトリをマウントできない
+# (moby/buildkit#970) ため。提供元ごとにシークレットを増やすと Dockerfile の
+# RUN --mount 行も提供元の数だけ増えてしまうので、まとめて 1 つのシークレット
+# (既定 id: cacerts) として渡し、展開と提供元の列挙はビルドコンテナ側で行う。
+# これにより提供元が増えても Dockerfile / compose.yml は変更不要になる。
+# tar の中身は <ディレクトリ名>/<ファイル名> となり、ディレクトリ名をそのまま
+# 提供元名 (トラストストアのエイリアス接頭辞など) として使える。
+#
+# compose build には buildx のような --secret オプションが無いため、生成した
+# tar のパスを環境変数 (--cacert-bundle-env, 既定: CACERT_BUNDLE_FILE) へ
+# export し、compose.yml の file 型シークレット定義
+#   secrets:
+#     cacerts:
+#       file: ${CACERT_BUNDLE_FILE:-/dev/null}
+# 経由でビルドへ渡す (JBoss マスターパスワードの environment 型と同じ考え方)。
+# シークレットはビルド中のみマウントされ、イメージのレイヤ・履歴には残らない。
+CACERT_DIRS=()                    # --cacert-dir で指定された証明書ディレクトリ (繰り返し指定可)
+CACERT_SECRET_ID="cacerts"        # compose.yml の secrets 名 = BuildKit シークレットの id
+CACERT_BUNDLE=""                  # --cacert-bundle 指定時の tar 出力先 (未指定なら一時ファイル)
+CACERT_BUNDLE_ENV="CACERT_BUNDLE_FILE"  # tar のパスを compose へ渡す環境変数名
+CACERT_GLOBS=()                   # --cacert-glob で指定した取り込み対象パターン
+CACERT_GLOBS_DEFAULT=('*.crt' '*.pem')  # --cacert-glob 未指定時に取り込むパターン
+CACERT_ENABLED="false"            # --cacert-dir が 1 つ以上指定されたか
+CACERT_BUNDLE_FILE=""             # 実際に生成する tar のパス
+CACERT_WORK_DIR=""                # tar の組み立てに使う一時ディレクトリ (EXIT で削除)
 
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # スクリプト開始時刻 (処理実行時間の算出に使用)
@@ -290,6 +332,53 @@ Options:
                            このオプションのみを指定した場合は、事前に export
                            済みの環境変数の値をそのままパスワードとして使う。
 
+  --cacert-dir DIR         CA 証明書 (cacert.crt) を置いたディレクトリ (繰り返し指定可)。
+                           指定した全ディレクトリ分の証明書を 1 つの tar へまとめ、
+                           BuildKit シークレット (既定 id: cacerts) としてビルドへ
+                           渡す。
+                           例: --cacert-dir secrets/extraslb \
+                               --cacert-dir secrets/others1 \
+                               --cacert-dir secrets/others2
+                           - tar の中身は <ディレクトリ名>/<ファイル名> となり、
+                             ディレクトリ名がそのまま提供元名になる
+                             (上の例では extraslb/cacert.crt, others1/cacert.crt, ...)
+                           - compose build には --secret オプションが無いため、
+                             生成した tar のパスを --cacert-bundle-env の環境変数へ
+                             export し、compose.yml の file 型シークレット定義
+                             経由でビルドへ渡す。compose.yml には次の定義が必要:
+                               services:
+                                 <サービス>:
+                                   build:
+                                     secrets:
+                                       - cacerts
+                               secrets:
+                                 cacerts:
+                                   file: ${CACERT_BUNDLE_FILE:-/dev/null}
+                             Dockerfile からは
+                               RUN --mount=type=secret,id=cacerts \
+                                   tar -xf /run/secrets/cacerts -C <展開先>
+                             の形で参照できる
+                           - 提供元が増えても Dockerfile / compose.yml は変更不要
+                             (BuildKit のシークレットはディレクトリをマウントできない
+                              ため、1 ファイルに詰めて 1 つのシークレットとして渡す)
+                           - tar はビルド中のみマウントされ、イメージのレイヤ・履歴には
+                             残らない。生成した tar は終了時に自動削除する
+                           - ディレクトリ不在 / 証明書 0 件 / ディレクトリ名の重複は
+                             その場でエラーにする (証明書の入らないイメージが黙って
+                             出来上がることを防ぐため)
+  --cacert-secret-id ID    CA 証明書アーカイブのシークレット id (既定: cacerts)。
+                           compose.yml の secrets 名、および Dockerfile の
+                           RUN --mount=type=secret,id=... と一致させる。
+  --cacert-bundle PATH     生成する tar の出力先を明示指定する
+                           (既定: 一時ファイル。終了時に自動削除)。
+                           指定した場合は自動削除しないため、不要になったら削除すること。
+  --cacert-bundle-env NAME tar のパスを compose へ渡す環境変数名
+                           (既定: CACERT_BUNDLE_FILE)。compose.yml の
+                           secrets の file: が参照する変数名と一致させること。
+  --cacert-glob PATTERN    各ディレクトリから取り込む証明書ファイルのパターン
+                           (既定: '*.crt' と '*.pem')。繰り返し指定可。
+                           指定するとこの値だけが対象になる (既定は使われない)。
+
   --switchback-shell PATH  別チーム提供のスイッチバック用シェルのパス (source で呼び出し)
   --auto-switchback        ECR 権限が無い場合に自動でスイッチバックして継続する
   --warn-only              ECR 権限が無い場合に警告して終了する (既定)
@@ -316,6 +405,7 @@ arg_takes_value() {
     --container-name|--compose-file|--compose-service|--output|--log-dir|--copy-file) return 0 ;;
     --build-progress-interval|--build-stall-timeout|--build-timeout) return 0 ;;
     --jboss-password-param|--jboss-password|--jboss-password-env|--switchback-shell) return 0 ;;
+    --cacert-dir|--cacert-secret-id|--cacert-bundle|--cacert-bundle-env|--cacert-glob) return 0 ;;
     # 委譲先 build_and_verify.sh のオプション (--build-only 時にそのまま透過する)
     --startup-service|--startup-log-pattern|--startup-timeout|--startup-interval) return 0 ;;
     --startup-log-lines|--wait-timeout|--allow-service-exit|--keep-container-mode) return 0 ;;
@@ -461,6 +551,11 @@ while [ $# -gt 0 ]; do
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
     --jboss-password-env)   need_value "$1" $#; JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --cacert-dir)           need_value "$1" $#; CACERT_DIRS+=("$2"); shift 2 ;;
+    --cacert-secret-id)     need_value "$1" $#; CACERT_SECRET_ID="$2"; shift 2 ;;
+    --cacert-bundle)        need_value "$1" $#; CACERT_BUNDLE="$2"; shift 2 ;;
+    --cacert-bundle-env)    need_value "$1" $#; CACERT_BUNDLE_ENV="$2"; shift 2 ;;
+    --cacert-glob)          need_value "$1" $#; CACERT_GLOBS+=("$2"); shift 2 ;;
     --switchback-shell) need_value "$1" $#; SWITCHBACK_SHELL="$2"; shift 2 ;;
     --auto-switchback)  AUTO_SWITCHBACK="true"; shift ;;
     --warn-only)        AUTO_SWITCHBACK="false"; shift ;;
@@ -501,6 +596,27 @@ if [ -n "$JBOSS_PASSWORD_PARAM" ] || [ -n "$JBOSS_PASSWORD_VALUE" ] || [ "$JBOSS
 fi
 if ! printf '%s' "$JBOSS_PASSWORD_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
   err "--jboss-password-env に不正な環境変数名が指定されました: $JBOSS_PASSWORD_ENV"
+  exit 2
+fi
+
+# ---- CA 証明書アーカイブ関連オプションの検証 --------------------------------
+# --cacert-dir が 1 つでもあれば、tar を作って compose のシークレットとして渡す。
+if [ ${#CACERT_DIRS[@]} -gt 0 ]; then
+  CACERT_ENABLED="true"
+fi
+# シークレット id はビルド中のマウント先 (/run/secrets/<id>) のファイル名になるため、
+# パス要素として安全な文字だけに限る。
+if ! printf '%s' "$CACERT_SECRET_ID" | grep -qE '^[A-Za-z0-9._-]+$'; then
+  err "--cacert-secret-id には英数字と . _ - のみ指定できます: $CACERT_SECRET_ID"
+  exit 2
+fi
+if ! printf '%s' "$CACERT_BUNDLE_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+  err "--cacert-bundle-env に不正な環境変数名が指定されました: $CACERT_BUNDLE_ENV"
+  exit 2
+fi
+# 同じ環境変数を使うと、パスワードと tar のパスが互いを上書きしてしまう。
+if [ "$CACERT_BUNDLE_ENV" = "$JBOSS_PASSWORD_ENV" ]; then
+  err "--cacert-bundle-env と --jboss-password-env に同じ環境変数名は指定できません: $CACERT_BUNDLE_ENV"
   exit 2
 fi
 
@@ -746,11 +862,250 @@ cleanup_copied_files() {
   done
   COPIED_FILES=()
 }
+
+# ---- CA 証明書の tar アーカイブ生成 (BuildKit シークレット) -------------------
+# --cacert-dir で指定された各ディレクトリ直下の証明書ファイル (既定: *.crt / *.pem)
+# を集め、<ディレクトリ名>/<ファイル名> の構成で 1 つの tar へまとめ、そのパスを
+# 環境変数 (--cacert-bundle-env) へ export する。compose.yml の file 型シークレット
+# 定義がこの環境変数を参照することで、BuildKit シークレットとしてビルドへ届く。
+# 生成先は既定で一時ディレクトリ配下 (EXIT トラップで削除)。--cacert-bundle を
+# 指定した場合はそのパスへ生成する (指定したファイルは自動削除しない)。
+#
+# 「指定したのにビルドへ届かない」を防ぐため、ディレクトリ不在・証明書 0 件・
+# ディレクトリ名の重複はいずれもその場で失敗させる (証明書の入っていない
+# イメージが黙って完成することを防ぐ)。
+prepare_cacert_bundle() {
+  if [ "$CACERT_ENABLED" != "true" ]; then
+    prepare_cacert_placeholder_bundle
+    return 0
+  fi
+
+  local -a globs=()
+  if [ ${#CACERT_GLOBS[@]} -gt 0 ]; then
+    globs=("${CACERT_GLOBS[@]}")
+  else
+    globs=("${CACERT_GLOBS_DEFAULT[@]}")
+  fi
+
+  if ! command -v tar >/dev/null 2>&1; then
+    err "tar コマンドが見つかりません (--cacert-dir で指定した証明書をまとめられません)。"
+    err "  tar を導入するか、--cacert-dir の指定を外して再実行してください。"
+    exit 1
+  fi
+
+  log "CA 証明書を 1 つの tar へまとめます (${#CACERT_DIRS[@]} ディレクトリ / シークレット id=${CACERT_SECRET_ID}) ..."
+
+  # 証明書を集める作業場所。tar へ入れるパスを <ディレクトリ名>/<ファイル名> に
+  # 揃えるため、指定されたディレクトリの場所に関わらずここへ集約してから固める。
+  local work_dir=""
+  if ! work_dir="$(mktemp -d "${TMPDIR:-/tmp}/cacert-bundle.XXXXXX" 2>/dev/null)" \
+      || [ -z "$work_dir" ]; then
+    err "証明書アーカイブ用の一時ディレクトリを作成できませんでした。TMPDIR を確認してください。"
+    exit 1
+  fi
+  CACERT_WORK_DIR="$work_dir"
+  local src_root="${work_dir}/src"
+  if ! mkdir -p "$src_root"; then
+    err "証明書アーカイブ用の作業ディレクトリを作成できませんでした: $src_root"
+    exit 1
+  fi
+
+  if [ -n "$CACERT_BUNDLE" ]; then
+    CACERT_BUNDLE_FILE="$CACERT_BUNDLE"
+  else
+    CACERT_BUNDLE_FILE="${work_dir}/cacerts-bundle.tar"
+  fi
+
+  local dir name file glob total=0 seen_names=" "
+  local -a names=() files=()
+  for dir in "${CACERT_DIRS[@]}"; do
+    # 末尾の / を落としてから basename を取る ("secrets/extraslb/" → extraslb)。
+    while [ "$dir" != "/" ] && [ "${dir%/}" != "$dir" ]; do
+      dir="${dir%/}"
+    done
+    if [ ! -d "$dir" ]; then
+      err "証明書ディレクトリが見つかりません: $dir"
+      err "  --cacert-dir には cacert.crt を配置したディレクトリを指定してください (例: secrets/extraslb)。"
+      exit 1
+    fi
+    name="$(basename -- "$dir")"
+    case "$name" in
+      ''|'.'|'..'|'/')
+        err "--cacert-dir から提供元名を決められません: $dir"
+        err "  tar の中では <ディレクトリ名>/<ファイル名> になるため、名前のあるディレクトリを指定してください。"
+        exit 1
+        ;;
+    esac
+    # 別の場所にある同名ディレクトリを両方指定すると、tar の中で同じパスになり
+    # あとから入れた方だけが残る。取り違えに気付けないためエラーにする。
+    case "$seen_names" in
+      *" ${name} "*)
+        err "--cacert-dir のディレクトリ名が重複しています: ${name} (${dir})"
+        err "  tar の中で同じ名前になり、片方が失われます。ディレクトリ名を分けてください。"
+        exit 1
+        ;;
+    esac
+    seen_names="${seen_names}${name} "
+
+    # ディレクトリ直下のみを対象にする (1 提供元にルート + 中間など複数枚あってもよい)。
+    # nullglob には依存せず、マッチしなかったパターンは [ -f ] で落とす。
+    files=()
+    for glob in "${globs[@]}"; do
+      for file in "$dir"/$glob; do
+        [ -f "$file" ] || continue
+        if [ ! -s "$file" ]; then
+          warn "証明書ファイルが空のため取り込みません: $file"
+          continue
+        fi
+        files+=("$file")
+      done
+    done
+    if [ ${#files[@]} -eq 0 ]; then
+      err "証明書が見つかりません: ${dir} (対象パターン: ${globs[*]})"
+      err "  ${dir}/cacert.crt の構成で配置してください。"
+      exit 1
+    fi
+    if [ ! -s "${dir}/cacert.crt" ]; then
+      log "  注記: ${dir} に cacert.crt はありませんが、見つかった証明書を取り込みます。"
+    fi
+
+    if [ "$DRY_RUN" != "true" ]; then
+      if ! mkdir -p "${src_root}/${name}"; then
+        err "証明書の集約先ディレクトリを作成できませんでした: ${src_root}/${name}"
+        exit 1
+      fi
+      for file in "${files[@]}"; do
+        if ! cp -- "$file" "${src_root}/${name}/"; then
+          err "証明書のコピーに失敗しました: $file"
+          exit 1
+        fi
+      done
+    fi
+    names+=("$name")
+    total=$(( total + ${#files[@]} ))
+    log "  ${name}: 証明書 ${#files[@]} 件 <- ${dir}"
+  done
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] tar -cf ${CACERT_BUNDLE_FILE} -C <作業ディレクトリ> ${names[*]} (実際には作成しません)"
+    log "[DRY-RUN] export ${CACERT_BUNDLE_ENV}=${CACERT_BUNDLE_FILE}"
+    cleanup_cacert_work_dir
+    return 0
+  fi
+
+  # --cacert-bundle で出力先を明示された場合のみ、上書き前に相手を確認する
+  # (ディレクトリやデバイスファイルを指定された場合の事故を避ける)。
+  if [ -n "$CACERT_BUNDLE" ]; then
+    if [ -e "$CACERT_BUNDLE_FILE" ] && [ ! -f "$CACERT_BUNDLE_FILE" ]; then
+      err "--cacert-bundle の出力先が通常ファイルではありません: $CACERT_BUNDLE_FILE"
+      exit 1
+    fi
+    [ -f "$CACERT_BUNDLE_FILE" ] && warn "既存のファイルを上書きします: $CACERT_BUNDLE_FILE"
+    if ! mkdir -p "$(dirname -- "$CACERT_BUNDLE_FILE")"; then
+      err "--cacert-bundle の出力先ディレクトリを作成できませんでした: $CACERT_BUNDLE_FILE"
+      exit 1
+    fi
+    rm -f -- "$CACERT_BUNDLE_FILE"
+  fi
+
+  # 集めたファイルだけを明示列挙して固める。ディレクトリごと固めないのは、
+  # 証明書以外のファイル (README や .DS_Store 等) を混入させないため。
+  # 提供元名が - で始まってもオプションとして解釈されないよう -- で区切る。
+  if ! tar -cf "$CACERT_BUNDLE_FILE" -C "$src_root" -- "${names[@]}"; then
+    err "証明書アーカイブの作成に失敗しました: $CACERT_BUNDLE_FILE"
+    exit 1
+  fi
+  if [ ! -s "$CACERT_BUNDLE_FILE" ]; then
+    err "証明書アーカイブが空です: $CACERT_BUNDLE_FILE"
+    exit 1
+  fi
+  # 平文の証明書コピーは tar へ入れ終えた時点で不要になるため、ここで消す。
+  rm -rf -- "$src_root"
+
+  export "${CACERT_BUNDLE_ENV}=${CACERT_BUNDLE_FILE}"
+  log "証明書アーカイブを作成しました: ${CACERT_BUNDLE_FILE}"
+  log "  提供元: ${names[*]} / 証明書 ${total} 件"
+  log "  環境変数 ${CACERT_BUNDLE_ENV} 経由で compose の file 型シークレット (${CACERT_SECRET_ID}) へ渡します。"
+  log "  ビルド中のマウント先: /run/secrets/${CACERT_SECRET_ID} (中身は <提供元名>/<ファイル名>)"
+  if [ -n "$CACERT_BUNDLE" ]; then
+    log "  ※ --cacert-bundle 指定のため自動削除しません。不要になったら削除してください。"
+  fi
+  return 0
+}
+
+# --cacert-dir 未指定時に、compose.yml の file 型シークレットへ渡す「空の tar」を作る。
+# compose.yml 側は ${CACERT_BUNDLE_FILE:-/dev/null} の形で解決するため、環境変数が
+# 空だと /dev/null が渡る。/dev/null は通常ファイルではなく BuildKit の扱いが
+# 環境によって変わりうるため、スクリプト経由のビルドでは必ず「中身が空の正しい
+# tar」を渡し、証明書を使わない従来どおりのビルドが確実に通るようにする。
+# 事前に環境変数が設定済みならその指定を優先し、tar が無い環境では何もしない
+# (compose.yml 側の既定にそのまま任せる)。
+prepare_cacert_placeholder_bundle() {
+  [ "$DRY_RUN" = "true" ] && return 0
+  [ -n "${!CACERT_BUNDLE_ENV:-}" ] && return 0
+  command -v tar >/dev/null 2>&1 || return 0
+  local work_dir=""
+  work_dir="$(mktemp -d "${TMPDIR:-/tmp}/cacert-bundle.XXXXXX" 2>/dev/null)" || return 0
+  [ -n "$work_dir" ] || return 0
+  CACERT_WORK_DIR="$work_dir"
+  if ! tar -cf "${work_dir}/cacerts-bundle.tar" -T /dev/null 2>/dev/null; then
+    cleanup_cacert_work_dir
+    return 0
+  fi
+  CACERT_BUNDLE_FILE="${work_dir}/cacerts-bundle.tar"
+  export "${CACERT_BUNDLE_ENV}=${CACERT_BUNDLE_FILE}"
+  return 0
+}
+
+# --cacert-dir を指定したのに compose.yml へ受け取り側の定義が無いと、tar は
+# 作られるだけでビルドへ届かない (証明書の入らないイメージが黙って完成する)。
+# 気付けるよう、定義が見当たらない場合は必要な記述を添えて警告する。
+# 判定は行単位の単純な照合のため、確実な検出ではなく「気付きのための警告」として
+# 扱い、処理は中断しない (id は英数字と . _ - のみに検証済み)。
+warn_missing_compose_cacert_definition() {
+  [ "$CACERT_ENABLED" = "true" ] || return 0
+  [ -f "$COMPOSE_FILE" ] || return 0
+  local has_definition="false" has_reference="false"
+  if grep -Eq "^[[:space:]]+${CACERT_SECRET_ID}:[[:space:]]*$" "$COMPOSE_FILE"; then
+    has_definition="true"
+  fi
+  if grep -Eq "^[[:space:]]*-[[:space:]]+${CACERT_SECRET_ID}[[:space:]]*$" "$COMPOSE_FILE"; then
+    has_reference="true"
+  fi
+  if [ "$has_definition" = "true" ] && [ "$has_reference" = "true" ]; then
+    return 0
+  fi
+  warn "${COMPOSE_FILE} に CA 証明書シークレット '${CACERT_SECRET_ID}' の定義が見当たりません。"
+  [ "$has_definition" = "true" ] || warn "  secrets: 直下の '${CACERT_SECRET_ID}:' 定義が見つかりません。"
+  [ "$has_reference" = "true" ] || warn "  build.secrets からの '- ${CACERT_SECRET_ID}' 参照が見つかりません。"
+  warn "  このままでは tar を作ってもビルドへ渡らず、証明書の入らないイメージが出来上がります。"
+  warn "  ${COMPOSE_FILE} へ次の定義を追加してください:"
+  warn "    services:"
+  warn "      <ビルド対象サービス>:"
+  warn "        build:"
+  warn "          secrets:"
+  warn "            - ${CACERT_SECRET_ID}"
+  warn "    secrets:"
+  warn "      ${CACERT_SECRET_ID}:"
+  warn "        file: \${${CACERT_BUNDLE_ENV}:-/dev/null}"
+  return 0
+}
+
+# EXIT トラップから呼び出す、証明書アーカイブ用一時ディレクトリの削除処理。
+# mktemp -d で作った自分のディレクトリ以外を消さないよう、名前を確認してから消す。
+cleanup_cacert_work_dir() {
+  case "${CACERT_WORK_DIR:-}" in
+    */cacert-bundle.*) rm -rf -- "$CACERT_WORK_DIR" ;;
+  esac
+  CACERT_WORK_DIR=""
+  return 0
+}
+
 # ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に削除する。
 # 併せて一時ファイルの削除と処理実行時間 (経過秒数) の記録を行い、最後にログ複製を
 # 閉じる (冒頭の暫定トラップを差し替える)。SIGINT / SIGTERM で中断した場合も
-# EXIT トラップが実行されるため、コピーしたファイルは残らない。
-trap 'cleanup_copied_files; cleanup_temp_files; log_elapsed; finish_logging' EXIT
+# EXIT トラップが実行されるため、コピーしたファイルと証明書アーカイブは残らない。
+trap 'cleanup_copied_files; cleanup_cacert_work_dir; cleanup_temp_files; log_elapsed; finish_logging' EXIT
 
 # ---- docker push 失敗時の原因診断 / 調査ガイド ------------------------------
 # 各原因カテゴリごとの詳細な説明・AWS CLI 調査コマンド・AWS コンソール確認箇所を出力する。
@@ -1571,6 +1926,14 @@ run_build_with_watchdog() {
 # ここでコピーしたファイルは EXIT トラップ (cleanup_copied_files) により
 # ビルド終了後 / 途中終了時のいずれでも自動削除される。
 prepare_copy_files
+
+# ---- CA 証明書アーカイブの生成 (BuildKit シークレット) ----------------------
+# --cacert-dir で指定したディレクトリ群の証明書を 1 つの tar へまとめ、
+# そのパスを環境変数 (CACERT_BUNDLE_ENV) へ export する。compose.yml の
+# file 型シークレットがこの環境変数を参照してビルドへ渡す。
+# 生成した tar は EXIT トラップ (cleanup_cacert_work_dir) で自動削除される。
+prepare_cacert_bundle
+warn_missing_compose_cacert_definition
 
 # ---- ビルド -----------------------------------------------------------------
 # 監視は BuildKit の出力を行単位で読むため、行末が改行にならない tty 形式とは

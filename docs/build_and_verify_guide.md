@@ -372,6 +372,18 @@ compose down (削除)
 | `--jboss-secret-id ID` | シークレット id | `jboss_master_password` | `compose.yml` の secrets 名 / Dockerfile の `RUN --mount=type=secret,id=...` と一致させる |
 | `--region REGION` | AWS リージョン名 | `ap-northeast-1` (env `AWS_REGION`) | パラメータストア参照時のリージョン |
 
+### 4.2-2 CA 証明書 (BuildKit シークレット)
+
+| オプション | 値の形式 | 既定値 | 複数 | 説明 |
+| --- | --- | --- | --- | --- |
+| `--cacert-dir DIR` | ディレクトリのパス | (なし) | **可** | `cacert.crt` を置いたディレクトリ。指定した全ディレクトリ分を 1 つの tar にまとめてビルドへ渡す |
+| `--cacert-secret-id ID` | 英数字と `. _ -` | `cacerts` | | シークレット id。`compose.yml` の secrets 名 / Dockerfile の `RUN --mount=type=secret,id=...` と一致させる |
+| `--cacert-bundle PATH` | tar のパス | 一時ファイル | | 生成する tar の出力先。指定時は**自動削除しない** |
+| `--cacert-bundle-env NAME` | 環境変数名 | `CACERT_BUNDLE_FILE` | | tar のパスを compose へ渡す環境変数名。`compose.yml` の `file:` が参照する変数名と一致させる |
+| `--cacert-glob PATTERN` | glob パターン | `*.crt` と `*.pem` | **可** | 各ディレクトリから取り込むファイルのパターン。指定するとこの値だけが対象になる |
+
+詳細は [5.9-2](#59-2-ca-証明書の渡し方---cacert-dir) を参照してください。
+
 ### 4.3 マスターパスワードの伝搬検証
 
 | オプション | 値の形式 | 既定値 | 説明 |
@@ -969,6 +981,89 @@ bash build_and_verify.sh --no-cache --verify-startup \
 | `--prune-build-cache` | 削除せず `[DRY-RUN] docker builder prune ...` と実行予定を表示 |
 | `--disk-usage-report` | `docker system df` は読み取りのみのため通常どおり測定・表示する |
 | AWS 未認証 (`--jboss-password-param` 時) | 中止せず警告のみ |
+| `--cacert-dir` | tar を作成せず、作成予定と `export` 予定を表示 |
+
+### 5.9-2 CA 証明書の渡し方 (`--cacert-dir`)
+
+提供元ごとにディレクトリを分けて `cacert.crt` を置き、そのディレクトリを
+`--cacert-dir` で**繰り返し指定**します。
+
+```bash
+./build_and_verify.sh \
+  --cacert-dir secrets/extraslb \
+  --cacert-dir secrets/others1 \
+  --cacert-dir secrets/others2
+```
+
+スクリプトは指定された全ディレクトリの証明書 (既定で `*.crt` / `*.pem`) を
+1 つの tar へまとめます。tar の中身は `<ディレクトリ名>/<ファイル名>` になり、
+**ディレクトリ名がそのまま提供元名**になります。
+
+```
+extraslb/cacert.crt
+others1/cacert.crt
+others2/cacert.crt
+```
+
+#### なぜ tar でまとめるのか
+
+BuildKit のシークレットは**ディレクトリをマウントできません**
+([moby/buildkit#970](https://github.com/moby/buildkit/issues/970))。
+提供元ごとにシークレットを分けると Dockerfile の `RUN --mount` 行も提供元の数だけ
+増えてしまうため、1 ファイル (tar) に詰めて**シークレットは常に 1 つ**とし、
+展開と提供元の列挙はビルドコンテナ側で行います。
+これにより**提供元が増えても Dockerfile と `compose.yml` は変更不要**です
+(増やすのは `--cacert-dir` の指定だけ)。
+
+#### compose への受け渡し
+
+`docker compose build` には buildx のような `--secret` オプションがありません。
+そこで生成した tar のパスを環境変数 (既定 `CACERT_BUNDLE_FILE`) へ `export` し、
+`compose.yml` の file 型シークレット定義経由で渡します。
+
+```yaml
+# compose.yml (抜粋)
+services:
+  base:
+    build:
+      secrets:
+        - cacerts                            # ← --cacert-secret-id と一致させる
+secrets:
+  cacerts:
+    file: ${CACERT_BUNDLE_FILE:-/dev/null}   # ← --cacert-bundle-env と一致させる
+```
+
+```dockerfile
+# Dockerfile (抜粋) — tar はレイヤ・履歴に残らない
+RUN --mount=type=secret,id=cacerts \
+    mkdir -p /tmp/cacerts && \
+    tar -xf /run/secrets/cacerts -C /tmp/cacerts && \
+    ...  # /tmp/cacerts/<提供元名>/<ファイル名> を取り込む
+```
+
+`compose.yml` を展開して受け取り側の定義 (`secrets.<id>.file` と
+`services.<名前>.build.secrets` の参照) が揃っているかを確認し、
+足りない場合は追加すべき定義を添えて警告します (処理は継続します)。
+
+#### 配置漏れをその場で失敗させる
+
+証明書の入っていないイメージが黙って完成しないよう、次はいずれもエラーで終了します。
+
+| 状況 | 動作 |
+| --- | --- |
+| 指定したディレクトリが存在しない | エラー終了 (exit 1) |
+| ディレクトリに証明書が 1 つも無い | エラー終了 (exit 1) |
+| 指定したディレクトリ名が重複する | エラー終了 (exit 1)。tar の中で同じパスになり片方が失われるため |
+| `--cacert-secret-id` が `--jboss-secret-id` と衝突 | エラー終了 (exit 2) |
+| 証明書ファイルが空 | 警告して 1 件スキップ (他に証明書があれば継続) |
+
+取り込んだ提供元と件数は全量レポートの `[1] ビルド結果` に
+`CA 証明書 : 提供元: extraslb others1 others2 / 証明書 3 件 / シークレット id=cacerts`
+として残るため、想定した提供元が全て並んでいるかを後から突き合わせられます。
+
+> 生成した tar は EXIT トラップ (`cleanup_all`) で自動削除されます
+> (`--cacert-bundle` で出力先を明示した場合のみ残ります)。
+> `--cacert-dir` を指定しない実行では、従来どおり証明書なしでビルドされます。
 
 ---
 
@@ -1625,6 +1720,7 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | --- | --- |
 | `AWS_REGION` → `AWS_DEFAULT_REGION` | `--region` の既定値 (パラメータストア参照時) |
 | `JBOSS_MASTER_PASSWORD` (既定名) | `--jboss-password-env` 単独指定時に使用 |
+| `CACERT_BUNDLE_FILE` (既定名) | `--cacert-dir` 未指定時、事前 export 済みならその tar のパスをそのまま使用 |
 | `BUILDKIT_PROGRESS` | ビルドログの表示形式。未指定時は `plain` を使用 |
 | `NO_COLOR` | 定義されていれば色分けを無効化 |
 | `CLICOLOR_FORCE` | `0` 以外なら、非 tty でも色分けを強制 |
@@ -1638,6 +1734,7 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | `BUILDKIT_PROGRESS` | 既定 `plain`。tty の上書き表示でビルドログが欠落するのを防ぐ |
 | `<--jboss-password-env の値>` | BuildKit シークレットとして compose へ渡す |
 | `JBOSS_MASTER_PASSWORD` | 同梱 `compose.yml` 用に必ず定義 (未使用時は空文字) |
+| `<--cacert-bundle-env の値>` | CA 証明書をまとめた tar のパス。compose の file 型シークレットへ渡す。`--cacert-dir` 未指定時は「空の tar」のパスが入り、従来どおり証明書なしでビルドされる |
 
 ### 7.3 コンテナ側で検出する環境変数
 

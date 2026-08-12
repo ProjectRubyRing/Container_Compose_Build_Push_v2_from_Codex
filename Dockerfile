@@ -24,4 +24,28 @@ RUN apk add --no-cache ca-certificates
 # RUN --mount=type=secret,id=jboss_master_password \
 #     /opt/jboss/bin/setup-credential-store.sh "$(cat /run/secrets/jboss_master_password)"
 
+# 例: 提供元ごとの CA 証明書を BuildKit シークレットとして受け取る場合。
+# compose 版 / buildx 版とも --cacert-dir で指定したディレクトリ群
+# (例: secrets/extraslb, secrets/others1, secrets/others2) の cacert.crt を
+# 1 つの tar へまとめ、シークレット (既定 id: cacerts) として渡す。
+# BuildKit のシークレットはディレクトリをマウントできないため tar 1 ファイルで
+# 受け取り、展開と提供元の列挙はここ (ビルドコンテナ側) で行う。これにより
+# **提供元が増えてもこの Dockerfile とビルドコマンドは変更不要**になる。
+# tar の中身は <提供元名>/<ファイル名> (例: extraslb/cacert.crt)。
+# シークレットはビルド中のみマウントされ、イメージのレイヤ・履歴には残らない。
+#
+# RUN --mount=type=secret,id=cacerts \
+#     mkdir -p /tmp/cacerts && \
+#     tar -xf /run/secrets/cacerts -C /tmp/cacerts && \
+#     for cert in /tmp/cacerts/*/*; do \
+#         [ -f "$cert" ] || continue; \
+#         alias_name="$(basename "$(dirname "$cert")")-$(basename "$cert")"; \
+#         cp "$cert" "/usr/local/share/ca-certificates/${alias_name}.crt"; \
+#     done && \
+#     update-ca-certificates && \
+#     rm -rf /tmp/cacerts
+#
+# ※ tar の展開にはイメージ内の tar が必要。*-minimal 系のベースイメージへ
+#    差し替える場合は tar を導入すること。
+
 CMD ["/bin/sh"]
