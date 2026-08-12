@@ -732,7 +732,7 @@ services:
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェックを繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -748,8 +748,9 @@ services:
 | CloudWatch Logs 送達診断 | `cwagent` / `cloudwatch-logs-mock` への偽装送達を確認 | `curl` + Python 3 |
 | X-Ray トレース診断 | `otel` / `adot-collector` / `jaeger` への偽装トレースを確認 | `curl` + Python 3 |
 | 証明書チェック | 自己証明書を取り込んだコンテナ (front / back 等) から、HTTPS の REST API (`secure-api` / ALB 等) へ接続できるかを確認 | コンテナ内の `curl` + `keytool` |
+| ALB ヘルスチェック確認 | ALB ヘルスチェック偽装サービス (`alb-healthcheck`) の状態を確認し、そこから ALB と同じヘルスチェックを実行して**ステータスコードと成功失敗判定**を表示 | 偽装サービスが起動しており、選択サービスがそのターゲットであること |
 
-証明書チェックは常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
+証明書チェックと ALB ヘルスチェック確認は常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
 表示条件と検出内容は次のとおりで、選択後の入力は一切ありません。
 
 | 項目 | 内容 |
@@ -790,6 +791,47 @@ services:
 対照テスト (`--cacert` 無しの接続) は、**トラストストア経由の接続が成功しているときだけ**
 `[PASS]` になります。両方失敗している状態では対照テストは何も証明しないため、
 `[PASS]` とは数えず情報行として表示します。
+
+#### ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)
+
+ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でももう片方は NG になり得ます**。
+
+| | 定義 | 実行場所 | 判定材料 | 失敗時 |
+| --- | --- | --- | --- | --- |
+| コンテナ | タスク定義の `healthCheck` (= compose の `healthcheck:`) | コンテナの**中** | コマンドの終了コード | ECS がコンテナを置き換え |
+| ALB | ターゲットグループのヘルスチェック設定 | コンテナの**外** | **HTTP ステータスコード**と連続成功・連続失敗の回数 | ALB がルーティングを外す |
+
+前者は「healthcheck 調査」で確認できます。後者はコンテナの外から投げられるため
+コンテナ内からは確認できず、ローカルでは**偽装サービス**が肩代わりします
+(このリポジトリの姉妹構成では `alb-healthcheck` サービス。実装は
+`Container_Compose_file/compose/alb-healthcheck/`)。この操作はその偽装サービスの状態を
+確認し、そこからヘルスチェックを実行して結果を表示します。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | `alb-healthcheck` サービスが起動しており、選択サービスがそのターゲット (`frontend` / `backend` 等) であること。偽装サービス自身を選ぶと全ターゲットをまとめて確認する |
+| 表示対象の判定 | 偽装サービスのコンテナ内 CLI へ `has-service <サービス名>` を問い合わせる。対象一覧は偽装サービスのターゲット定義 (`targets.json`) が唯一の情報源なので、ターゲットを増やせば自動で増える |
+| CLI の解決 | コンテナの環境変数 `ALB_HEALTHCHECK_CLI` → 既定 `/opt/alb-healthcheck/healthcheck.py`。インタプリタ (`python3` / `python`) もコンテナ内で解決するため、ホスト側に Python は不要 |
+| (1) 偽装サービスの状態 | 起動状態・自身の `healthcheck`・連続失敗回数・再起動回数・起動時刻・状態参照 API の URL。`running` でない / `unhealthy` のときは警告を出す (判定元が壊れていれば以降の判定は当てにならない) |
+| (2) ターゲットの状態 | ALB と同じ規則で導出した `initial` / `healthy` / `unhealthy`、理由コード (`Elb.RegistrationInProgress` / `Elb.InitialHealthChecking` / `Target.ResponseCodeMismatch` / `Target.Timeout` / `Target.FailedHealthChecks`)、連続成功・連続失敗回数、定期チェックの履歴 (ステータスコード・`matcher` 判定・成否・戻り値) |
+| (3) その場のチェック | 偽装サービスのコンテナから ALB と同じ要求 (`GET <path>` / `User-Agent: ELB-HealthChecker/2.0`) を 1 回投げた結果。ステータスコード・`matcher` 判定・成功失敗判定・戻り値 (exit)・応答本文。**ALB の状態機械 (連続回数) には反映しない** |
+| 判定表示 | `OK` (healthy かつその場のチェックも成功) / `NG` (unhealthy またはその場のチェックが失敗) / `判定保留` (`initial`。healthy の連続成功回数に未到達) |
+| 終了扱い | `NG` と `判定保留` は診断結果としてそのまま操作選択へ戻る。偽装サービスから状態を取得できない場合のみヘルパー失敗として扱う |
+
+戻り値 (exit) は、コンテナ内 healthcheck が使う `curl -fs` の終了コードに合わせてあるため、
+「healthcheck 調査」の結果と同じ尺度で比べられます。
+
+| 戻り値 | 意味 | ALB の理由コード |
+| --- | --- | --- |
+| `0` | ステータスコードが `matcher` に合致 (成功) | — |
+| `22` | ステータスコードが `matcher` に合致しない | `Target.ResponseCodeMismatch` |
+| `28` | `timeout` 超過 | `Target.Timeout` |
+| `7` | 接続できない | `Target.FailedHealthChecks` |
+| `6` | 名前解決できない | `Target.FailedHealthChecks` |
+| `56` | 応答を解釈できない / TLS ハンドシェイク失敗 | `Target.FailedHealthChecks` |
+
+偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
+`ALB_HEALTHCHECK_SERVICE` (既定 `alb-healthcheck`) を合わせてください。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 

@@ -182,7 +182,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェックも選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--exit-on-deploy-error` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。デプロイエラー (AP サーバは起動したがアプリのデプロイに失敗) を検出しても調査用の対話操作へ入らず、従来どおりログを出力して終了する。既定ではコンテナと AP サーバを起動したまま残し、各 Compose サービスへ接続して調査できる状態にする | `false` |
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
@@ -1567,7 +1567,8 @@ CloudWatch Logs には届きません。
 - `logs`: 現在起動している Compose サービスを番号付きで表示します。サービス選択後、
   `1` で今回の起動以降のログ表示、`2` で対象コンテナの対話式 `/bin/bash` 接続を
   選べます。`3` では Docker healthcheck の設定・実行履歴・通信内容を確認できます。
-  さらに、コンテナの設定に応じて MySQL 接続・送達診断・証明書チェックが追加されます。
+  さらに、コンテナの設定に応じて MySQL 接続・送達診断・証明書チェック・ALB ヘルスチェック
+  確認（ステータスコード / 成功失敗判定）が追加されます。
   bash セッション内では `cd` で移動しながら任意のコマンドを実行でき、
   bash 終了後は同じサービスの操作選択へ戻ります。同一サービスに複数コンテナがある場合は
   警告を表示して先頭の実行中コンテナへ接続します。ログ表示後も Enter キーで操作選択へ
@@ -1724,6 +1725,50 @@ Jaegerへの到達確認であり、実AWS CloudWatch LogsまたはX-Rayへの�
 認証ヘッダーは出力せず、パスワードやトークンを示す属性値は伏せ字にします。ただしログ本文や
 トレースには業務データが含まれる可能性があるため、画面出力と`--log-dir`の取り扱いには
 引き続き注意してください。
+
+### ALB ヘルスチェック確認（ステータスコード / 成功失敗判定）
+
+ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でももう片方は NG になり得ます**。
+
+| | 定義 | 実行場所 | 判定材料 | 失敗したとき |
+|------|------|----------|----------|--------------|
+| コンテナ | タスク定義の `healthCheck`（= compose の `healthcheck:`） | コンテナの**中**（`curl -fs http://127.0.0.1:8080/`） | コマンドの終了コード | ECS がコンテナを置き換える |
+| ALB | ターゲットグループのヘルスチェック設定 | コンテナの**外**（ALB → ターゲットの IP:ポート） | **HTTP ステータスコード**が `matcher` に合致するか、連続成功・連続失敗が閾値に達したか | ALB がルーティングを外す |
+
+前者は操作 `3`（healthcheck 調査）で確認できます。後者はコンテナの外から投げられるため
+コンテナ内からは確認できず、ローカルでは**偽装サービス**（参照先 Compose の
+`alb-healthcheck`）が肩代わりします。`logs` モードでその偽装サービスが起動していると、
+偽装サービスのターゲットに登録されたサービス（`frontend` / `backend` 等）と偽装サービス
+自身に `ALB ヘルスチェック確認` が**最後の操作番号**として追加されます。既存操作の番号は
+変わりません。対象かどうかは偽装サービスのコンテナ内 CLI へ問い合わせるため、
+ターゲット定義（`targets.json`）を増やせば表示対象も自動で増えます。
+
+選択すると次の 3 段を順に表示します。
+
+1. **偽装サービスの状態** — 起動状態・自身の `healthcheck`・連続失敗回数・再起動回数・
+   起動時刻・状態参照 API の URL。`running` でない、または `unhealthy` のときは警告します
+   （判定元が壊れていればターゲットの判定も当てになりません）
+2. **ALB が導出したターゲットの状態** — `initial` / `healthy` / `unhealthy`、ALB と同じ
+   理由コード（`Elb.RegistrationInProgress` / `Elb.InitialHealthChecking` /
+   `Target.ResponseCodeMismatch` / `Target.Timeout` / `Target.FailedHealthChecks`）、
+   連続成功・連続失敗回数、定期チェックの履歴（ステータスコード・`matcher` 判定・成否・戻り値）
+3. **その場で実行したヘルスチェック** — 偽装サービスのコンテナから ALB と同じ要求
+   （`GET <path>`、`User-Agent: ELB-HealthChecker/2.0`）を 1 回投げた結果。
+   ステータスコード・`matcher` 判定・成功失敗判定・戻り値（exit）・応答本文。
+   **ALB の状態機械（連続回数）には反映しません**
+
+判定は `OK`（healthy かつその場のチェックも成功）/ `NG`（unhealthy またはその場のチェックが
+失敗）/ `判定保留`（`initial`。healthy の連続成功回数に未到達）として表示します。`NG` と
+`判定保留` は診断結果であり、そのまま操作選択へ戻ります。偽装サービスから状態を取得できない
+場合だけヘルパーの失敗として扱います。
+
+戻り値（exit）は、コンテナ内 healthcheck が使う `curl -fs` の終了コードに合わせているため、
+操作 `3` の結果と同じ尺度で比較できます（`0` 成功 / `22` ステータスコード不一致 /
+`28` timeout / `7` 接続不可 / `6` 名前解決不可 / `56` 応答不正）。
+
+ホスト側に Python は不要です（CLI のパスとインタプリタはコンテナ内で解決します）。
+偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
+`ALB_HEALTHCHECK_SERVICE`（既定 `alb-healthcheck`）を合わせてください。
 
 HTTP モードでは、`WFLYUT0021` からコンテキストルート、`WFLYUT0006` から
 コンテナ側 HTTP リスナーポートを取得します。コンテキストルートが複数ある場合は

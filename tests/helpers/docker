@@ -202,6 +202,13 @@ if [ "${1:-}" = "compose" ]; then
           aurora84) printf 'cid-mysql84\n' ;;
           nohealth) printf 'cid-nohealth\n' ;;
           tlsapp) printf 'cid-tlsapp\n' ;;
+          # ALB ヘルスチェック偽装サービスは、FAKE_COMPOSE_PS_SERVICES へ
+          # 含めたときだけ「起動している」ものとして扱う (未導入の構成を再現する)。
+          alb-healthcheck)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" alb-healthcheck "*) printf 'cid-alb-healthcheck\n' ;;
+            esac
+            ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -239,6 +246,12 @@ fi
 
 if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-cloudwatch-logs-mock" ] && [ "${3:-}" = "8080/tcp" ]; then
   printf '0.0.0.0:18480\n'
+  exit 0
+fi
+
+# ALB ヘルスチェック偽装サービスの状態参照 API (ホストへ公開したポート)。
+if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-alb-healthcheck" ] && [ "${3:-}" = "8080/tcp" ]; then
+  printf '0.0.0.0:18580\n'
   exit 0
 fi
 
@@ -437,6 +450,15 @@ fi
 
 if [ "${1:-}" = "inspect" ]; then
   case "$*" in
+    # ALB ヘルスチェック偽装サービスの状態行 (起動状態|自身の health|連続失敗|再起動回数|起動時刻)。
+    # .State.Health.Status を含むため、後段の分岐より先に拾う必要がある。
+    *".State.StartedAt"*)
+      if [ "${FAKE_ALB_HEALTHCHECK_SERVICE_DOWN:-false}" = "true" ]; then
+        printf 'restarting|unhealthy|4|3|2026-07-24T01:00:00.000000000Z\n'
+      else
+        printf 'running|healthy|0|0|2026-07-24T01:00:00.000000000Z\n'
+      fi
+      ;;
     *".Config.Healthcheck.Test"*)
       case "$*" in
         *"cid-nohealth"*) ;;
@@ -510,6 +532,7 @@ if [ "${1:-}" = "inspect" ]; then
         *"cid-mysql84"*) printf '/aurora-mysql-8.4\n' ;;
         *"cid-nohealth"*) printf '/no-healthcheck\n' ;;
         *"cid-tlsapp"*) printf '/app-front\n' ;;
+        *"cid-alb-healthcheck"*) printf '/alb-healthcheck\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
       ;;
@@ -966,6 +989,74 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
       printf '  PASS=4  FAIL=0  WARN=0  SKIP=0\n'
       printf '判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。\n'
       exit 0
+      ;;
+  esac
+fi
+
+# ALB ヘルスチェック偽装サービスが待ち受けるポートの取得 (状態参照 API の URL 案内)。
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-alb-healthcheck" ] \
+    && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"ALB_HEALTHCHECK_LISTEN_PORT"* ]]; then
+  printf '8080'
+  exit 0
+fi
+
+# ALB ヘルスチェック偽装サービスのコンテナ内 CLI。
+# ここで拾わないと汎用 exec ハンドラが成功を返し、対象外のサービスにも
+# 「ALB ヘルスチェック確認」が出てしまう。
+#   $6 = $0 (alb-healthcheck-cli) / $7 = サブコマンド / $8 = 対象
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"alb-healthcheck-cli"* ]]; then
+  [ "${2:-}" = "cid-alb-healthcheck" ] || exit 2
+  case "${7:-}" in
+    has-service)
+      # targets.json に定義されたターゲット (frontend / backend) だけ対象にする。
+      case "${8:-}" in
+        frontend|backend|tg-frontend|tg-backend) exit 0 ;;
+        *) exit 1 ;;
+      esac
+      ;;
+    report)
+      if [ "${FAKE_ALB_HEALTHCHECK_RESULT:-ok}" = "unavailable" ]; then
+        printf '[ERROR] 偽装サービスの状態 API (http://127.0.0.1:8080) へ接続できません\n' >&2
+        exit 2
+      fi
+      printf '\n'
+      printf '════════════ ALB ヘルスチェック偽装レポート: %s ════════════\n' "${8:-}"
+      printf 'ターゲットグループ : tg-%s\n' "${8:-}"
+      printf 'User-Agent         : ELB-HealthChecker/2.0\n'
+      printf 'matcher (HttpCode) : 200  ← このステータスコードだけを成功と判定\n'
+      case "${FAKE_ALB_HEALTHCHECK_RESULT:-ok}" in
+        ng)
+          printf '状態               : unhealthy (ALB はルーティングを止める / ECS はタスクを置き換える)\n'
+          printf '理由コード         : Target.ResponseCodeMismatch\n'
+          printf '  2026-07-24 10:00:00 JST  status=404  matcher=不一致    判定=失敗  戻り値(exit)=22\n'
+          printf 'ステータスコード   : 404 Not Found\n'
+          printf '成功失敗判定       : 失敗\n'
+          printf '判定結果           : NG (この場のヘルスチェックが失敗)\n'
+          exit 1
+          ;;
+        initial)
+          printf '状態               : initial (登録直後。healthy 閾値に未到達)\n'
+          printf '理由コード         : Elb.InitialHealthChecking\n'
+          printf 'ステータスコード   : 200 OK\n'
+          printf '成功失敗判定       : 成功\n'
+          printf '判定結果           : 判定保留 (initial。healthy には 5 回連続成功が必要 / 現在 2 回)\n'
+          exit 3
+          ;;
+        *)
+          printf '状態               : healthy (ルーティング対象)\n'
+          printf '  2026-07-24 10:00:00 JST  status=200  matcher=一致     判定=成功  戻り値(exit)=0\n'
+          printf 'ステータスコード   : 200 OK\n'
+          printf '成功失敗判定       : 成功\n'
+          printf '戻り値 (exit)      : 0  ← curl -fs 相当の終了コード\n'
+          printf '判定結果           : OK (healthy かつこの場のチェックも成功)\n'
+          exit 0
+          ;;
+      esac
+      ;;
+    *)
+      fail "alb-healthcheck-cli ${7:-} ${8:-}"
       ;;
   esac
 fi

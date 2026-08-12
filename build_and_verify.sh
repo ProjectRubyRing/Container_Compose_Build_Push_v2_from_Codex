@@ -425,6 +425,23 @@ OBSERVABILITY_TRACE_LIMIT="5"
 # healthcheck コマンドを実行できない場合の代替確認先として使う。
 OTEL_HEALTH_CHECK_PORT="13133"
 
+# ---- ALB ターゲットグループのヘルスチェック偽装 --------------------------------
+# ECS/Fargate では、コンテナ自身の healthcheck (タスク定義の healthCheck。コンテナ内で
+# curl を実行する) とは別に、ALB がターゲットへ★コンテナの外から★定期的に要求を投げ、
+# ステータスコードが matcher に合致するか / 連続成功・連続失敗が閾値に達したかで
+# initial・healthy・unhealthy を判定する。unhealthy になると ALB はルーティングを
+# 止め、ECS はタスクを置き換えるため、コンテナ内の healthcheck が OK でも
+# 「ALB から見ると NG」という食い違いが起こり得る。
+# ローカル構成ではこの判定を偽装する Compose サービスを別に立てるため、その状態を
+# 参照して「ALB から見たヘルスチェックのステータスコードと成功失敗判定」を確認する。
+ALB_HEALTHCHECK_SERVICE="alb-healthcheck"   # 偽装サービスの Compose サービス名
+# 偽装サービスのコンテナ内 CLI。コンテナの環境変数 ALB_HEALTHCHECK_CLI があれば
+# そちらを優先し、無い場合にこの既定パスを使う (compose 側の定義変更に追従する)。
+ALB_HEALTHCHECK_CLI_DEFAULT="/opt/alb-healthcheck/healthcheck.py"
+# 偽装サービスが状態参照 API を待ち受けるコンテナ側ポート。ホストから叩く URL の
+# 案内にだけ使う (コンテナの ALB_HEALTHCHECK_LISTEN_PORT があればそちらを優先)。
+ALB_HEALTHCHECK_API_PORT="8080"
+
 # ---- CloudWatch Agent (cwagent) のログ送信検証 --------------------------------
 # ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml で起動する構成では、
 # 「設定ファイルがコンテナへ届いていない」「logs.endpoint_override の送信先を名前解決
@@ -1221,7 +1238,14 @@ JBoss マスターパスワードの伝搬検証:
                                     設定済みのコンテナ (front / back 等) では
                                     証明書チェックも選択でき、コンテナ内の
                                     設定だけで自己証明書による HTTPS 接続を
-                                    確認する (パラメータ入力なし)
+                                    確認する (パラメータ入力なし)。
+                                    ALB ヘルスチェック偽装サービス
+                                    (alb-healthcheck) が起動していれば、その
+                                    ターゲット (frontend / backend 等) と偽装
+                                    サービス自身で「ALB ヘルスチェック確認」も
+                                    選択でき、ALB から見たステータスコード・
+                                    成功失敗判定・initial/healthy/unhealthy を
+                                    確認する
                                     (bash 接続先には /bin/bash が必要)
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
@@ -8578,6 +8602,176 @@ CERT_CHECK_SCRIPT
   return 0
 }
 
+# ---- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
+# ALB ヘルスチェック偽装サービスのコンテナ内 CLI を実行する共通経路。
+# CLI のパスとインタプリタはコンテナ内で解決するため、ホスト側に Python は不要。
+# docker のコマンドラインへ渡すのはサブコマンドと対象名だけ (機微情報を載せない)。
+alb_healthcheck_exec() {
+  local container_id="$1"
+  shift
+  docker exec "$container_id" /bin/sh -c '
+    # alb-healthcheck-cli: 偽装サービスの CLI をコンテナ内で解決して実行する
+    alb_hc_cli="${ALB_HEALTHCHECK_CLI:-'"$ALB_HEALTHCHECK_CLI_DEFAULT"'}"
+    if [ ! -f "$alb_hc_cli" ]; then
+      printf "ALB ヘルスチェック偽装の CLI が見つかりません: %s\n" "$alb_hc_cli" >&2
+      exit 2
+    fi
+    for alb_hc_python in python3 python; do
+      if command -v "$alb_hc_python" >/dev/null 2>&1; then
+        exec "$alb_hc_python" "$alb_hc_cli" "$@"
+      fi
+    done
+    printf "python3 がコンテナ内に見つかりません。\n" >&2
+    exit 2
+  ' alb-healthcheck-cli "$@"
+}
+
+# 選択された Compose サービスに ALB ヘルスチェック確認を出すかを、偽装サービスへ
+# 問い合わせて決める。サービス名を build_and_verify.sh 側へ固定で持たず、偽装サービスの
+# ターゲット定義 (targets.json) を唯一の情報源にすることで、対象の追加・変更に追従する。
+compose_service_supports_alb_healthcheck() {
+  local service_name="$1" container_id
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$ALB_HEALTHCHECK_SERVICE")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  container_id="${container_ids[0]}"
+  # 偽装サービス自身を選んだ場合は、全ターゲットグループをまとめて確認できる
+  [ "$service_name" = "$ALB_HEALTHCHECK_SERVICE" ] && return 0
+  alb_healthcheck_exec "$container_id" has-service "$service_name" >/dev/null 2>&1
+}
+
+# 偽装サービスのコンテナ状態 (Docker から見た起動状態と自身の healthcheck) を表示する。
+# ここが unhealthy / 再起動を繰り返している場合、以降のターゲット判定は当てにならない。
+print_alb_healthcheck_service_state() {
+  local container_id="$1" container_name="$2"
+  local state_line="" state_status="" health_status="" failing_streak=""
+  local restart_count="" started_at="" api_url=""
+  local listen_port=""
+
+  if state_line="$(
+    docker inspect -f \
+      '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{else}}(healthcheck なし)|-{{end}}|{{.RestartCount}}|{{.State.StartedAt}}' \
+      "$container_id" 2>/dev/null
+  )"; then
+    state_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    health_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    failing_streak="${state_line%%|*}"; state_line="${state_line#*|}"
+    restart_count="${state_line%%|*}"; started_at="${state_line#*|}"
+  fi
+
+  diag ""
+  diag "[偽装サービスの状態 (これが健全でないとターゲットの判定も当てにならない)]"
+  diag "コンテナ           : ${container_name}"
+  diag "起動状態           : ${state_status:-取得できず}"
+  diag "自身の healthcheck : ${health_status:-取得できず} (連続失敗 ${failing_streak:--})"
+  diag "再起動回数         : ${restart_count:-取得できず}"
+  if [ -n "$started_at" ]; then
+    diag "起動時刻           : $(to_jst_display_time "$started_at")"
+  fi
+
+  # 状態参照 API のホストからの URL を案内する (公開されていれば)。
+  listen_port="$(
+    docker exec "$container_id" /bin/sh -c 'printf "%s" "${ALB_HEALTHCHECK_LISTEN_PORT:-}"' 2>/dev/null || true
+  )"
+  case "$listen_port" in
+    ''|*[!0-9]*) listen_port="$ALB_HEALTHCHECK_API_PORT" ;;
+  esac
+  if resolve_compose_service_http_endpoint "$ALB_HEALTHCHECK_SERVICE" "$listen_port" >/dev/null 2>&1 \
+      && [ -n "$OBSERVABILITY_HTTP_BASE_URL" ]; then
+    api_url="$OBSERVABILITY_HTTP_BASE_URL"
+    diag "状態参照 API       : ${api_url}/targets"
+    diag "                     (ターゲット単体は ${api_url}/targets/<サービス名>、"
+    diag "                      その場のチェックは ${api_url}/targets/<サービス名>/check)"
+  else
+    diag "状態参照 API       : ホストへ未公開 (コンテナ内 :${listen_port})"
+  fi
+  if [ "$state_status" != "running" ] || [ "$health_status" = "unhealthy" ]; then
+    warn "ALB ヘルスチェック偽装サービスが健全ではありません。docker compose logs ${ALB_HEALTHCHECK_SERVICE} を確認してください。"
+  fi
+}
+
+# ALB (ターゲットグループ) から見たヘルスチェックを確認する。
+# 表示する内容は 3 つ:
+#   (1) 偽装サービス自身の状態          … 判定元が生きているか
+#   (2) ALB が導出したターゲットの状態  … initial / healthy / unhealthy と理由コード、
+#                                        定期チェックの履歴 (ステータスコードと成否)
+#   (3) その場で実行したヘルスチェック  … 偽装サービスのコンテナから ALB と同じ要求を
+#                                        投げ、ステータスコード・戻り値 (exit)・成功失敗判定
+# (2)(3) の本文は偽装サービスのコンテナ内 CLI が出力する (判定規則を 1 か所に集約する)。
+run_interactive_compose_alb_healthcheck() {
+  local service_name="$1" container_id container_name capture_file="" exec_status=0
+  local report_target=""
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$ALB_HEALTHCHECK_SERVICE")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "ALB ヘルスチェック偽装の Compose サービス '${ALB_HEALTHCHECK_SERVICE}' が実行中ではありません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${ALB_HEALTHCHECK_SERVICE}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  if [ "$service_name" = "$ALB_HEALTHCHECK_SERVICE" ]; then
+    report_target="--all"
+  else
+    report_target="$service_name"
+  fi
+
+  diag ""
+  diag "════════════════ ALB ヘルスチェック確認 ════════════════"
+  diag "確認対象           : ${service_name}"
+  diag "偽装サービス       : ${ALB_HEALTHCHECK_SERVICE}"
+  diag "位置づけ           : コンテナ内で実行する healthcheck (タスク定義の healthCheck) とは別に、"
+  diag "                     ALB がターゲットへ外から投げるヘルスチェックを同じ規則で再現する。"
+  diag "                     ステータスコードが matcher に合致するかと連続成功・連続失敗の回数から"
+  diag "                     initial / healthy / unhealthy を判定する。"
+
+  print_alb_healthcheck_service_state "$container_id" "$container_name"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "ALB ヘルスチェック確認の保存用一時ファイルを作成できませんでした。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  alb_healthcheck_exec "$container_id" report "$report_target" \
+    > "$capture_file" 2>&1 || exec_status=$?
+  print_healthcheck_capture "$capture_file" "(ALB ヘルスチェック確認の出力がありません)"
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "ALB ヘルスチェック判定 : OK (healthy かつその場のチェックも成功)"
+      ;;
+    1)
+      diag "ALB ヘルスチェック判定 : NG (unhealthy、またはその場のチェックが失敗)"
+      diag "ステータスコードと失敗理由コード (Target.ResponseCodeMismatch / Target.Timeout /"
+      diag "Target.FailedHealthChecks) を上のレポートで確認してください。"
+      ;;
+    3)
+      diag "ALB ヘルスチェック判定 : 判定保留 (initial。healthy の連続成功回数に未到達)"
+      diag "ALB も同様に、登録直後は閾値に達するまで initial のままルーティング対象になりません。"
+      ;;
+    2)
+      warn "ALB ヘルスチェック偽装サービスから状態を取得できませんでした。"
+      diag "docker compose logs ${ALB_HEALTHCHECK_SERVICE} と、ターゲット定義 (targets.json) を確認してください。"
+      diag "════════════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' の ALB ヘルスチェック確認を実行できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
+  diag "注意: その場のチェックは ALB の状態機械 (連続回数) には反映しません。"
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
 # 可観測性ヘルパーの JSON は認証ヘッダー等を含み得るため、生データを表示せず
 # Python 3 で必要な項目だけを抽出する。logs モード全体の必須依存にはせず、
 # 専用ヘルパーが選択された時点で利用可否を確認する。
@@ -10793,8 +10987,8 @@ run_otel_jaeger_trace_helper() {
 }
 
 # 選択済み Compose サービスについて、ログ表示、対話式 bash / MySQL 接続、
-# healthcheck 診断、対応サービスのローカル可観測性診断を繰り返す。
-# 0 を選択すると、起動中 Compose サービスの選択へ戻る。
+# healthcheck 診断、対応サービスのローカル可観測性診断、ALB ヘルスチェック確認を
+# 繰り返す。0 を選択すると、起動中 Compose サービスの選択へ戻る。
 compose_service_observability_helper_kind() {
   case "$1" in
     cwagent|cloudwatch-logs-mock) printf 'cloudwatch\n' ;;
@@ -10814,6 +11008,7 @@ pause_compose_service_actions() {
 run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
   local mysql_action=0 observability_action=0 cert_check_action=0
+  local alb_healthcheck_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -10828,6 +11023,11 @@ run_interactive_compose_service_actions() {
   if compose_service_supports_cert_check "$service_name"; then
     max_action=$(( max_action + 1 ))
     cert_check_action="$max_action"
+  fi
+  # ALB ヘルスチェック確認も同様に、証明書チェックの後ろへ採番する。
+  if compose_service_supports_alb_healthcheck "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    alb_healthcheck_action="$max_action"
   fi
   while :; do
     diag ""
@@ -10848,6 +11048,9 @@ run_interactive_compose_service_actions() {
     esac
     if [ "$cert_check_action" -gt 0 ]; then
       diag "  ${cert_check_action}) 証明書チェック (トラストストアと HTTPS 接続先を自動検出して確認)"
+    fi
+    if [ "$alb_healthcheck_action" -gt 0 ]; then
+      diag "  ${alb_healthcheck_action}) ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -10901,6 +11104,11 @@ run_interactive_compose_service_actions() {
         elif [ "$cert_check_action" -gt 0 ] && [ "$action" = "$cert_check_action" ]; then
           if ! run_interactive_compose_cert_check "$service_name"; then
             warn "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$alb_healthcheck_action" -gt 0 ] && [ "$action" = "$alb_healthcheck_action" ]; then
+          if ! run_interactive_compose_alb_healthcheck "$service_name"; then
+            warn "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
         else
@@ -10974,7 +11182,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェックを繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) を繰り返し実行します。"
         ;;
     esac
     return 0

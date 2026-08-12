@@ -1307,6 +1307,184 @@ assert_contains "$cert_check_undetectable_output" "証明書チェックに必�
 assert_contains "$cert_check_undetectable_output" "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
 assert_contains "$cert_check_undetectable_output" "Compose サービスの対話操作を終了しました。"
 
+# --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
+# ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された
+# サービスだけで操作が増え、既存操作の番号は変わらないこと。
+alb_healthcheck_output="$TEST_TMP/keep-mode-alb-healthcheck.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app frontend alb-healthcheck"
+if ! printf '2\n4\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,frontend,alb-healthcheck \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$alb_healthcheck_output" >&2
+  fail "ALB health check helper returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$alb_healthcheck_output" "  4) ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
+assert_contains "$alb_healthcheck_output" "確認対象           : frontend"
+assert_contains "$alb_healthcheck_output" "偽装サービス       : alb-healthcheck"
+# 偽装サービス自身の状態 (判定元が生きているか) を先に出す。
+assert_contains "$alb_healthcheck_output" "コンテナ           : alb-healthcheck"
+assert_contains "$alb_healthcheck_output" "起動状態           : running"
+assert_contains "$alb_healthcheck_output" "自身の healthcheck : healthy (連続失敗 0)"
+assert_contains "$alb_healthcheck_output" "再起動回数         : 0"
+assert_contains "$alb_healthcheck_output" "状態参照 API       : http://127.0.0.1:18580/targets"
+# 偽装サービスのコンテナ内 CLI が出したレポート本文。
+assert_contains "$alb_healthcheck_output" "User-Agent         : ELB-HealthChecker/2.0"
+assert_contains "$alb_healthcheck_output" "status=200  matcher=一致     判定=成功  戻り値(exit)=0"
+assert_contains "$alb_healthcheck_output" "ALB ヘルスチェック判定 : OK (healthy かつその場のチェックも成功)"
+assert_before "$alb_healthcheck_output" "起動状態           : running" "ALB ヘルスチェック判定 : OK"
+# ターゲットに登録されていないサービスでは従来どおり 0 から 3 のまま。
+assert_contains "$alb_healthcheck_output" "Compose サービス 'app' で実行する操作を選択してください:"
+assert_not_contains "$alb_healthcheck_output" "0 から 4 の番号を入力してください。"
+assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli has-service frontend"
+assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli report frontend"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-alb-healthcheck /bin/sh -c"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 偽装サービス自身を選ぶと、全ターゲットグループをまとめて確認する。
+alb_healthcheck_all_output="$TEST_TMP/keep-mode-alb-healthcheck-all.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="alb-healthcheck"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service alb-healthcheck \
+    --startup-service alb-healthcheck \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_all_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$alb_healthcheck_all_output" >&2
+  fail "ALB health check helper for the emulator service returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$alb_healthcheck_all_output" "確認対象           : alb-healthcheck"
+assert_contains "$alb_healthcheck_all_output" "ALB ヘルスチェック判定 : OK"
+assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli report --all"
+# 偽装サービス自身は has-service を問い合わせずに対象と判定する。
+assert_not_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli has-service alb-healthcheck"
+
+# unhealthy 判定は「診断結果」であり、ヘルパー自体の失敗としては扱わない。
+alb_healthcheck_ng_output="$TEST_TMP/keep-mode-alb-healthcheck-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="backend alb-healthcheck"
+export FAKE_ALB_HEALTHCHECK_RESULT="ng"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service backend,alb-healthcheck \
+    --startup-service backend \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_HEALTHCHECK_RESULT
+  cat "$alb_healthcheck_ng_output" >&2
+  fail "NG ALB health check did not return to the service action menu"
+fi
+unset FAKE_ALB_HEALTHCHECK_RESULT
+
+assert_contains "$alb_healthcheck_ng_output" "確認対象           : backend"
+assert_contains "$alb_healthcheck_ng_output" "status=404  matcher=不一致    判定=失敗  戻り値(exit)=22"
+assert_contains "$alb_healthcheck_ng_output" "ALB ヘルスチェック判定 : NG (unhealthy、またはその場のチェックが失敗)"
+assert_contains "$alb_healthcheck_ng_output" "Target.FailedHealthChecks) を上のレポートで確認してください。"
+assert_not_contains "$alb_healthcheck_ng_output" "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$alb_healthcheck_ng_output" "Compose サービス 'backend' で実行する操作を選択してください:" 2
+
+# initial (登録直後) は判定保留として扱い、失敗にはしない。
+alb_healthcheck_initial_output="$TEST_TMP/keep-mode-alb-healthcheck-initial.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_ALB_HEALTHCHECK_RESULT="initial"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service backend,alb-healthcheck \
+    --startup-service backend \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_initial_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_HEALTHCHECK_RESULT
+  cat "$alb_healthcheck_initial_output" >&2
+  fail "initial ALB health check did not return to the service action menu"
+fi
+unset FAKE_ALB_HEALTHCHECK_RESULT
+
+assert_contains "$alb_healthcheck_initial_output" "ALB ヘルスチェック判定 : 判定保留 (initial。healthy の連続成功回数に未到達)"
+assert_not_contains "$alb_healthcheck_initial_output" "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
+
+# 偽装サービスの状態を取得できない場合はヘルパーの失敗として扱い、メニューへ戻る。
+alb_healthcheck_unavailable_output="$TEST_TMP/keep-mode-alb-healthcheck-unavailable.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_ALB_HEALTHCHECK_RESULT="unavailable"
+export FAKE_ALB_HEALTHCHECK_SERVICE_DOWN="true"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service backend,alb-healthcheck \
+    --startup-service backend \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_unavailable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_HEALTHCHECK_RESULT FAKE_ALB_HEALTHCHECK_SERVICE_DOWN
+  cat "$alb_healthcheck_unavailable_output" >&2
+  fail "unavailable ALB health check did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_HEALTHCHECK_RESULT FAKE_ALB_HEALTHCHECK_SERVICE_DOWN
+
+assert_contains "$alb_healthcheck_unavailable_output" "起動状態           : restarting"
+assert_contains "$alb_healthcheck_unavailable_output" "自身の healthcheck : unhealthy (連続失敗 4)"
+assert_contains "$alb_healthcheck_unavailable_output" "ALB ヘルスチェック偽装サービスが健全ではありません。"
+assert_contains "$alb_healthcheck_unavailable_output" "ALB ヘルスチェック偽装サービスから状態を取得できませんでした。"
+assert_contains "$alb_healthcheck_unavailable_output" "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$alb_healthcheck_unavailable_output" "Compose サービスの対話操作を終了しました。"
+
+# 偽装サービスが起動していない構成では操作が増えない (従来どおり 0 から 3)。
+alb_healthcheck_absent_output="$TEST_TMP/keep-mode-alb-healthcheck-absent.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="frontend"
+if ! printf '1\n3\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service frontend \
+    --startup-service frontend \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$alb_healthcheck_absent_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$alb_healthcheck_absent_output" >&2
+  fail "service actions without the ALB health check emulator returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_not_contains "$alb_healthcheck_absent_output" "ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
+assert_not_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli"
+
 cwagent_helper_output="$TEST_TMP/keep-mode-cwagent-helper.out"
 : > "$FAKE_DOCKER_CALLS"
 : > "$FAKE_CURL_CALLS"
