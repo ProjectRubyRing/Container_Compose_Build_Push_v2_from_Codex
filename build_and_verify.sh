@@ -723,6 +723,132 @@ READONLY_PROBE_BASE_DIRS=(
   /usr/local/tomcat/logs
 )
 
+# ---- JBoss EAP Undertow バーチャルホスト (default-host) の分析 ---------------
+# Undertow は受け取ったリクエストの Host ヘッダーを見て、どのバーチャルホスト
+# (undertow subsystem の <host>) が処理するかを決める。判定は
+# NameVirtualHostHandler が行い、次の順で探す。
+#   (1) Host ヘッダーからポートを除いたホスト名で完全一致を探す
+#       ("app.example.jp:8080" なら "app.example.jp"。IPv6 は "[::1]" のまま扱う)
+#   (2) 見つからなければホスト名を小文字化して、もう一度だけ探す
+#   (3) それでも見つからなければ server の default-host が指すホストへ渡す
+# 探索表へ登録されるのは <host> の name と alias で、両者は同じ重みで扱われる。
+#
+# ここで混同しやすいのが、名前の似た 2 つの「既定」である。
+#   server の default-host            … Host ヘッダーがどの名前とも一致しなかった
+#                                       リクエストの受け皿 (振り分けの既定)
+#   subsystem の default-virtual-host … jboss-web.xml に <virtual-host> を書いて
+#                                       いない WAR が載るホスト (デプロイ先の既定)
+# 既定の standalone.xml では両方とも "default-host" を指すため同一に見えるが、
+# 片方だけ変えると「WAR が載ったホストと受け皿が食い違い、特定の Host ヘッダーの
+# ときだけ 404 になる」状態が起きる。分析ではこの 2 つを必ず分けて出力する。
+#
+# 分析は既定で毎回行い、画面と (--report-dir 指定時は) テキストの両方へ出す。
+# --no-undertow-analysis で分析ごと、--no-undertow-analysis-display / -text で
+# 出力先ごとに抑制できる。
+UNDERTOW_ANALYSIS="true"              # false (--no-undertow-analysis): 分析を行わない
+UNDERTOW_ANALYSIS_DISPLAY="true"      # false (--no-undertow-analysis-display): 画面へ出さない
+UNDERTOW_ANALYSIS_TEXT_ENABLED="true" # false (--no-undertow-analysis-text): テキストへ出さない
+UNDERTOW_ANALYSIS_TEXT=""             # テキストの出力先。空なら --report-dir 配下へ自動命名
+UNDERTOW_ANALYSIS_TEXT_SET="false"    # 出力先が明示指定されたか
+UNDERTOW_ANALYSIS_TEXT_OUTPUT=""      # 実際に出力したテキストのパス
+UNDERTOW_ANALYSIS_DONE="false"        # 分析済みか (成功経路と EXIT 経路の二重実行防止)
+UNDERTOW_ANALYSIS_DIGEST_FILE=""      # 画面表示・テキスト・全量レポートで共用する本文
+UNDERTOW_ANALYSIS_SKIP_REASON=""      # 分析しなかった理由 (全量レポートへ記載する)
+UNDERTOW_ANALYSIS_COLLECT_STATUS=""   # 情報の取得状況 (設定ファイルのみ / 実リクエストまで)
+UNDERTOW_PROBE="true"                 # false (--no-undertow-probe): 実リクエストを送らない
+UNDERTOW_PROBE_PATH=""                # 実リクエストのパス (空なら検出したコンテキストルート)
+UNDERTOW_PROBE_PATH_SET="false"       # パスが明示指定されたか
+UNDERTOW_HOST_HEADERS=()              # --undertow-host-header で追加する検査対象ホスト名
+UNDERTOW_ANALYSIS_SERVICES="0"        # 分析できたサービス数
+UNDERTOW_ANALYSIS_HOSTS="0"           # 検出したバーチャルホストの総数
+UNDERTOW_ANALYSIS_NAMES="0"           # 振り分けを判定した Host ヘッダー名の総数
+UNDERTOW_ANALYSIS_FALLBACK="0"        # うち default-host へ落ちる (一致しない) 数
+UNDERTOW_ANALYSIS_WARN="0"            # 要確認として挙げた指摘の件数
+UNDERTOW_ANALYSIS_VERDICT=""          # 総合判定
+UNDERTOW_SEPARATOR=$'\037'            # 解析結果の区切り (XML 本文には現れない制御文字)
+UNDERTOW_PROBE_MAX="12"               # 実リクエストを送る Host ヘッダー名の上限
+UNDERTOW_PROBE_TIMEOUT="5"            # 実リクエスト 1 回あたりのタイムアウト秒
+# 設定に現れなくても実際に使われるため、検査対象へ必ず含めるホスト名。
+UNDERTOW_BASE_HOST_NAMES=(
+  localhost
+  127.0.0.1
+)
+# どのホスト名・別名とも一致しないことが確実な名前。これで応答が返れば
+# 「default-host が受け皿として使われている」ことを実測で示せる。
+UNDERTOW_FALLBACK_PROBE_NAME="undertow-default-host-check.invalid"
+# undertow subsystem の要素と属性を取り出す awk。出力は次の 2 種類。
+#   E<SEP><要素の通し番号><SEP><親の通し番号><SEP><階層><SEP><要素名>
+#   A<SEP><要素の通し番号><SEP><属性名><SEP><属性値>
+# 属性値は XML エスケープされたままの「ファイル上の表記」で返し、実体参照の
+# 復元は呼び出し側 (jboss_xml_unescape) で行う。
+# 属性値に含まれる改行・タブは空白へ潰す。alias を複数行に折り返して書いた
+# 設定でも 1 行 1 レコードを保つためで、alias は空白区切りとしても解釈するため
+# 意味は変わらない。
+UNDERTOW_XML_AWK="$(cat <<'UNDERTOW_XML_AWK_END'
+function emit_attrs(tag, elem_id,   rest, token, key, quote, pos, value) {
+  rest = tag
+  sub(/^[^ \t\r\n\/>]*/, "", rest)
+  while (match(rest, /[A-Za-z_:][-A-Za-z0-9_:.]*[ \t\r\n]*=[ \t\r\n]*["']/)) {
+    token = substr(rest, RSTART, RLENGTH)
+    rest = substr(rest, RSTART + RLENGTH)
+    quote = substr(token, length(token), 1)
+    key = token
+    sub(/[ \t\r\n]*=[ \t\r\n]*["']$/, "", key)
+    pos = index(rest, quote)
+    if (pos == 0) return
+    value = substr(rest, 1, pos - 1)
+    rest = substr(rest, pos + 1)
+    gsub(/[\r\n\t]+/, " ", value)
+    printf "A%s%s%s%s%s%s\n", SEP, elem_id, SEP, key, SEP, value
+  }
+}
+BEGIN {
+  RS = "<"
+  depth = 0
+  elem_id = 0
+  in_undertow = 0
+  undertow_depth = 0
+}
+{
+  record = $0
+  if (record == "") next
+  close_pos = index(record, ">")
+  if (close_pos == 0) next
+  tag = substr(record, 1, close_pos - 1)
+  if (tag == "") next
+  first = substr(tag, 1, 1)
+  if (first == "/") {
+    if (in_undertow && depth == undertow_depth) in_undertow = 0
+    if (depth > 0) depth--
+    next
+  }
+  if (first == "?" || first == "!") next
+  ename = tag
+  sub(/[ \t\r\n\/].*$/, "", ename)
+  if (ename == "") next
+  self_closing = (substr(tag, length(tag), 1) == "/")
+  depth++
+  # undertow subsystem の開始判定。名前空間の版 (urn:jboss:domain:undertow:14.0
+  # など) は EAP のバージョンごとに変わるため、版の部分は問わない。
+  if (!in_undertow && ename == "subsystem" && tag ~ /urn:jboss:domain:undertow:/) {
+    in_undertow = 1
+    undertow_depth = depth
+  }
+  if (in_undertow) {
+    elem_id++
+    id_at[depth] = elem_id
+    parent = (depth > undertow_depth) ? id_at[depth - 1] : 0
+    printf "E%s%s%s%s%s%s%s%s\n", SEP, elem_id, SEP, parent, SEP, depth, SEP, ename
+    emit_attrs(tag, elem_id)
+  }
+  if (self_closing) {
+    if (in_undertow && depth == undertow_depth) in_undertow = 0
+    depth--
+  }
+}
+UNDERTOW_XML_AWK_END
+)"
+
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
 now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
@@ -1143,14 +1269,17 @@ JBoss マスターパスワードの伝搬検証:
   --report-dir DIR         ビルド結果、環境変数一覧、コンテナ内ツリー、JBoss EAP
                            デプロイ構造、JVM パラメータ、OpenTelemetry 設定、
                            WAR デプロイ時 Java 例外解析、読み取り専用ファイル
-                           システム分析を DIR/build_and_verify_<日時>.txt へ保存する。
+                           システム分析、Undertow バーチャルホスト分析を
+                           DIR/build_and_verify_<日時>.txt へ保存する。
                            保存内容は画面の制限にかかわらず全深度・全ファイル名となる。
                            あわせて Java 例外解析を
                            DIR/build_and_verify_<日時>_java_exceptions.xlsx と
                            DIR/build_and_verify_<日時>_java_exceptions.txt へ、
                            読み取り専用ファイルシステム分析を
                            DIR/build_and_verify_<日時>_readonly_filesystem.xlsx と
-                           DIR/build_and_verify_<日時>_readonly_filesystem.txt へ
+                           DIR/build_and_verify_<日時>_readonly_filesystem.txt へ、
+                           Undertow バーチャルホスト分析を
+                           DIR/build_and_verify_<日時>_undertow_virtual_host.txt へ
                            追加出力する (Excel とテキストは同じ内容)
 
 WAR デプロイ時の Java 例外解析:
@@ -1251,6 +1380,71 @@ WAR デプロイ時の Java 例外解析:
                          DIR/build_and_verify_<日時>_readonly_filesystem.txt へ
                          自動出力する
   --no-readonly-analysis 読み取り専用ファイルシステムの分析とファイル出力を行わない
+
+JBoss EAP Undertow バーチャルホスト (default-host) の分析:
+  (オプション指定不要。既定で毎回分析し、画面とテキストの両方へ出力する)
+  分析内容               起動したコンテナの standalone.xml から undertow subsystem を
+                         読み取り、呼び出し元が Host ヘッダーにホスト名を指定して
+                         きたとき、どのバーチャルホストが処理するのかを判定する。
+                         Undertow の振り分けは NameVirtualHostHandler が行い、
+                           (1) Host ヘッダーからポートを除いたホスト名で完全一致
+                               ("app.example.jp:8080" なら "app.example.jp"。
+                                IPv6 は "[::1]" と括弧付きのまま扱う)
+                           (2) 一致しなければ小文字化して、もう一度だけ探す
+                           (3) それでも一致しなければ server の default-host へ渡す
+                         の順で決まる。探索表へ載るのは <host> の name と alias で、
+                         両者は同じ重みで扱われる。
+                         出力する内容:
+                         - subsystem の既定値 (default-server /
+                           default-virtual-host / default-servlet-container /
+                           default-security-domain)。XML に書かれていない場合は
+                           スキーマ既定値を「(既定値)」付きで示す
+                         - server ごとの default-host・servlet-container と、
+                           http/https/ajp リスナーの待受 (socket-binding)
+                         - バーチャルホストごとの name・alias 一覧・
+                           default-web-module・location
+                         - Host ヘッダー名ごとの振り分け表。設定に現れる名前に
+                           加えて localhost / 127.0.0.1 / コンテナ名 /
+                           Compose サービス名 / コンテナ IP / --verify-url の
+                           ホスト名を対象とし、「別名に一致」なのか
+                           「一致せず default-host を使用」なのかを 1 行ずつ示す
+                         - default-host 設定の利用状況 (受け皿として使われる
+                           ホスト名の件数と、その中身)
+                         - 要確認の指摘。default-virtual-host と default-host の
+                           食い違い、大文字を含む name / alias (Undertow は
+                           完全一致か小文字化の 2 回しか探さないため、大文字を
+                           含む名前は表記が違う Host ヘッダーと一致しない)、
+                           重複した別名、別名を持たないホストなど
+  --undertow-host-header NAME
+                         振り分けを判定する Host ヘッダー名を追加する。
+                         繰り返し指定またはカンマ区切りで複数指定できる。
+                         "app.example.jp:8443" のようにポートを付けて渡すと、
+                         Undertow と同じ規則でポートを落として判定する
+  --undertow-probe-path PATH
+                         実リクエストの送信先パス (既定: WFLYUT0021 ログから
+                         検出したコンテキストルート。検出できなければ "/")
+  --no-undertow-probe    実リクエストによる確認を行わず、設定ファイルの解析だけで
+                         判定する。既定では Host ヘッダーを差し替えた GET を
+                         コンテナ内 (curl/wget が無ければホスト側) から送り、
+                         応答ステータスを突き合わせて、設定どおりに振り分けられて
+                         いるかを実測する。どの名前とも一致しない
+                         "undertow-default-host-check.invalid" も必ず送り、
+                         default-host が受け皿として働いているかを確かめる
+  --undertow-analysis-text FILE
+                         分析結果をテキストファイルとして FILE へ出力する。
+                         --report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_undertow_virtual_host.txt へ
+                         自動出力する。内容は画面表示と同一
+  --no-undertow-analysis-display
+                         画面への出力だけを抑制する (テキストと全量レポートへは出す)
+  --no-undertow-analysis-text
+                         テキストファイルへの出力だけを抑制する (画面と全量レポート
+                         へは出す)
+                         ※ --no-undertow-analysis-display との同時指定は、出力先が
+                           無くなるため受け付けない
+  --no-undertow-analysis Undertow バーチャルホストの分析と出力を一切行わない
+                         (画面・テキスト・全量レポートの [12] のすべてを止める。
+                          全量レポートには止めた理由だけを残す)
 
 CloudWatch Agent (cwagent) のログ送信検証:
   (compose.yml に cwagent サービスが定義されていれば自動で実行する)
@@ -1437,6 +1631,13 @@ while [ $# -gt 0 ]; do
     --readonly-analysis-excel) need_value "$1" $#; READONLY_ANALYSIS_EXCEL="$2"; READONLY_ANALYSIS_EXCEL_SET="true"; shift 2 ;;
     --readonly-analysis-text)  need_value "$1" $#; READONLY_ANALYSIS_TEXT="$2"; READONLY_ANALYSIS_TEXT_SET="true"; shift 2 ;;
     --no-readonly-analysis)    READONLY_ANALYSIS="false"; shift ;;
+    --undertow-host-header) need_value "$1" $#; append_services UNDERTOW_HOST_HEADERS "$2"; shift 2 ;;
+    --undertow-probe-path)  need_value "$1" $#; UNDERTOW_PROBE_PATH="$2"; UNDERTOW_PROBE_PATH_SET="true"; shift 2 ;;
+    --no-undertow-probe)    UNDERTOW_PROBE="false"; shift ;;
+    --undertow-analysis-text) need_value "$1" $#; UNDERTOW_ANALYSIS_TEXT="$2"; UNDERTOW_ANALYSIS_TEXT_SET="true"; shift 2 ;;
+    --no-undertow-analysis-display) UNDERTOW_ANALYSIS_DISPLAY="false"; shift ;;
+    --no-undertow-analysis-text)    UNDERTOW_ANALYSIS_TEXT_ENABLED="false"; shift ;;
+    --no-undertow-analysis)         UNDERTOW_ANALYSIS="false"; shift ;;
     --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
     --no-verify-cwagent)   VERIFY_CWAGENT="false"; shift ;;
     --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
@@ -1593,6 +1794,59 @@ if [ "$READONLY_ANALYSIS_EXCEL_SET" = "true" ] && [ "$READONLY_ANALYSIS_TEXT_SET
   err "--readonly-analysis-excel と --readonly-analysis-text に同じパスは指定できません: $READONLY_ANALYSIS_EXCEL"
   exit 2
 fi
+
+# ---- Undertow バーチャルホスト分析オプションの検証 ---------------------------
+# 分析ごと止める指定と、出力先・検査内容を細かく決める指定は意味が矛盾するため、
+# 併用された時点で止める (指定したつもりの出力が出ない事故を防ぐ)。
+if [ "$UNDERTOW_ANALYSIS_TEXT_SET" = "true" ]; then
+  if [ -z "$UNDERTOW_ANALYSIS_TEXT" ] || [ "$UNDERTOW_ANALYSIS_TEXT" = "-" ]; then
+    err "--undertow-analysis-text にはファイルパスを指定してください: $UNDERTOW_ANALYSIS_TEXT"
+    exit 2
+  fi
+  if [ "$UNDERTOW_ANALYSIS" != "true" ]; then
+    err "--undertow-analysis-text と --no-undertow-analysis は同時に指定できません。"
+    exit 2
+  fi
+  if [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+    err "--undertow-analysis-text と --no-undertow-analysis-text は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$UNDERTOW_ANALYSIS" != "true" ]; then
+  if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ] || [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+    err "--no-undertow-analysis と --no-undertow-analysis-display / --no-undertow-analysis-text は同時に指定できません。"
+    err "  分析ごと行わない場合は --no-undertow-analysis だけを指定してください。"
+    exit 2
+  fi
+  if [ ${#UNDERTOW_HOST_HEADERS[@]} -gt 0 ] || [ "$UNDERTOW_PROBE_PATH_SET" = "true" ]; then
+    err "--no-undertow-analysis と --undertow-host-header / --undertow-probe-path は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ] && [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+  err "--no-undertow-analysis-display と --no-undertow-analysis-text を同時に指定すると出力先が無くなります。"
+  err "  分析ごと行わない場合は --no-undertow-analysis を指定してください。"
+  exit 2
+fi
+if [ "$UNDERTOW_PROBE_PATH_SET" = "true" ]; then
+  case "$UNDERTOW_PROBE_PATH" in
+    /*) ;;
+    *)
+      err "--undertow-probe-path には / で始まるパスを指定してください: $UNDERTOW_PROBE_PATH"
+      exit 2
+      ;;
+  esac
+fi
+# Host ヘッダーへ改行や空白を混ぜるとリクエストそのものが壊れるため、ここで弾く。
+for _undertow_host_header in "${UNDERTOW_HOST_HEADERS[@]}"; do
+  case "$_undertow_host_header" in
+    *[[:space:]]*)
+      err "--undertow-host-header に空白を含む値は指定できません: $_undertow_host_header"
+      exit 2
+      ;;
+  esac
+done
+unset _undertow_host_header
 
 # ---- cwagent 検証オプションの検証 -------------------------------------------
 validate_positive_integer "$CWAGENT_DELIVERY_TIMEOUT" "--cwagent-delivery-timeout" || exit 2
@@ -18969,6 +19223,1058 @@ append_readonly_analysis_report() {
   return 0
 }
 
+# ---- JBoss EAP Undertow バーチャルホスト (default-host) の分析 ---------------
+# 収集は standalone.xml と compose ログ、判定はこのスクリプト内で完結させる。
+# Excel を出す他の分析と違い Python は使わない (振り分けの再現に要るのは
+# 文字列比較だけで、外部ヘルパーへ渡す利点が無いため)。
+
+# 解析中の standalone.xml を保持する配列。サービスごとに作り直す。
+UT_ELEM_NAME=()        # 要素の通し番号 -> 要素名
+UT_ELEM_PARENT=()      # 要素の通し番号 -> 親要素の通し番号
+declare -A UT_ATTR=()  # "<通し番号>/<属性名>" -> 属性値 (実体参照は復元済み)
+UT_MAX_ELEM=0
+UT_SUBSYSTEM_INDEX=0
+UT_SERVER_INDEXES=()
+declare -A UT_IS_SERVER=()
+declare -A UT_SERVER_HOSTS=()     # server の通し番号 -> host の通し番号 (空白区切り)
+declare -A UT_SERVER_LISTENERS=() # server の通し番号 -> listener の通し番号 (空白区切り)
+declare -A UT_HOST_ALIASES=()     # host の通し番号 -> 別名 (改行区切り)
+declare -A UT_ROUTE=()            # "<server>/<登録名>" -> host の通し番号
+declare -A UT_ROUTE_DUP=()        # 同じ名前を複数の host が登録している場合の記録
+# 検査対象の Host ヘッダー名と、その判定結果。
+UT_CANDIDATES=()
+declare -A UT_CANDIDATE_ORIGIN=() # 名前 -> 由来 (設定・一般的な呼び出し・利用者指定)
+declare -A UT_CANDIDATE_KIND=()   # 名前 -> exact / lowercase / default
+declare -A UT_CANDIDATE_TARGET=() # 名前 -> 振り分け先の host 名
+declare -A UT_CANDIDATE_VERDICT=() # 名前 -> 判定の説明
+
+# XML コメントを取り除く。<!-- --> の中に書かれた <host> や alias を
+# 生きている設定として読まないために要る。
+undertow_strip_xml_comments() {
+  awk '
+    BEGIN { RS = "-->"; ORS = "" }
+    {
+      text = $0
+      start = 1
+      last = 0
+      while ((found = index(substr(text, start), "<!--")) > 0) {
+        last = start + found - 1
+        start = last + 4
+      }
+      if (last > 0) text = substr(text, 1, last - 1)
+      print text
+    }
+  ' "$1"
+}
+
+# standalone.xml の undertow subsystem を UT_ELEM_* / UT_ATTR へ展開する。
+undertow_parse_config() {
+  # 復元後の値を受ける変数名は jboss_xml_unescape 側の local と重ならないものに
+  # する。同じ名前だと呼び出し先の local に隠れ、printf -v の結果が戻らない。
+  local xml_file="$1" line kind index parent depth name key value attr_decoded
+
+  UT_ELEM_NAME=()
+  UT_ELEM_PARENT=()
+  UT_ATTR=()
+  UT_MAX_ELEM=0
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      E*)
+        IFS="$UNDERTOW_SEPARATOR" read -r kind index parent depth name <<< "$line"
+        [ -n "$index" ] && [ -n "$name" ] || continue
+        UT_ELEM_NAME[$index]="$name"
+        UT_ELEM_PARENT[$index]="${parent:-0}"
+        [ "$index" -gt "$UT_MAX_ELEM" ] && UT_MAX_ELEM="$index"
+        ;;
+      A*)
+        IFS="$UNDERTOW_SEPARATOR" read -r kind index key value <<< "$line"
+        [ -n "$index" ] && [ -n "$key" ] || continue
+        # 属性値は XML エスケープされた表記で届くため、比較・表示の前に戻す。
+        jboss_xml_unescape attr_decoded "$value"
+        UT_ATTR["${index}/${key}"]="$attr_decoded"
+        ;;
+    esac
+  done < <(undertow_strip_xml_comments "$xml_file" \
+             | awk -v SEP="$UNDERTOW_SEPARATOR" "$UNDERTOW_XML_AWK")
+
+  [ "$UT_MAX_ELEM" -gt 0 ]
+}
+
+undertow_attr() {
+  printf '%s' "${UT_ATTR["${1}/${2}"]-}"
+}
+
+undertow_attr_present() {
+  [ -n "${UT_ATTR["${1}/${2}"]+_}" ]
+}
+
+# 属性が書かれていればその値を、書かれていなければスキーマ既定値を返す。
+# 併せて「(既定値)」の注記を別の変数へ入れ、XML に明記された値と区別できる
+# ようにする (既定値のままなのか明示したのかで、変更時の影響範囲が変わるため)。
+undertow_attr_with_default() {
+  local _value_var="$1" _suffix_var="$2" index="$3" key="$4" fallback="$5"
+  if undertow_attr_present "$index" "$key"; then
+    printf -v "$_value_var" '%s' "$(undertow_attr "$index" "$key")"
+    printf -v "$_suffix_var" '%s' ""
+  else
+    printf -v "$_value_var" '%s' "$fallback"
+    printf -v "$_suffix_var" '%s' " (既定値)"
+  fi
+}
+
+# alias 属性は "localhost,example.com" のカンマ区切りで書かれるが、空白区切りで
+# 書かれた設定も読めるよう、両方を区切りとして分解する。
+undertow_split_aliases() {
+  local raw="$1" token
+  raw="${raw//,/ }"
+  for token in $raw; do
+    [ -n "$token" ] && printf '%s\n' "$token"
+  done
+}
+
+# host が受け付ける名前 (name + 別名) を 1 行 1 件で返す。
+undertow_host_names() {
+  local host_index="$1" host_name
+  host_name="$(undertow_attr "$host_index" "name")"
+  [ -n "$host_name" ] && printf '%s\n' "$host_name"
+  printf '%s' "${UT_HOST_ALIASES[$host_index]-}"
+}
+
+# server / host / listener を索引付けし、Host ヘッダーの探索表を組み立てる。
+undertow_build_model() {
+  local index parent name server_index host_index alias_raw alias route_key
+
+  UT_SUBSYSTEM_INDEX=0
+  UT_SERVER_INDEXES=()
+  UT_IS_SERVER=()
+  UT_SERVER_HOSTS=()
+  UT_SERVER_LISTENERS=()
+  UT_HOST_ALIASES=()
+  UT_ROUTE=()
+  UT_ROUTE_DUP=()
+
+  # 要素は出現順 (親が子より先) に採番されているため、1 回の走査で親子を辿れる。
+  for ((index = 1; index <= UT_MAX_ELEM; index++)); do
+    name="${UT_ELEM_NAME[$index]-}"
+    [ -n "$name" ] || continue
+    parent="${UT_ELEM_PARENT[$index]-0}"
+    case "$name" in
+      subsystem)
+        [ "$parent" = "0" ] && [ "$UT_SUBSYSTEM_INDEX" = "0" ] && UT_SUBSYSTEM_INDEX="$index"
+        ;;
+      server)
+        [ "$parent" = "$UT_SUBSYSTEM_INDEX" ] || continue
+        UT_SERVER_INDEXES+=("$index")
+        UT_IS_SERVER["$index"]=1
+        UT_SERVER_HOSTS["$index"]=""
+        UT_SERVER_LISTENERS["$index"]=""
+        ;;
+      host)
+        [ -n "${UT_IS_SERVER[$parent]+_}" ] || continue
+        UT_SERVER_HOSTS["$parent"]="${UT_SERVER_HOSTS[$parent]} $index"
+        UT_HOST_ALIASES["$index"]=""
+        ;;
+      http-listener|https-listener|ajp-listener)
+        [ -n "${UT_IS_SERVER[$parent]+_}" ] || continue
+        UT_SERVER_LISTENERS["$parent"]="${UT_SERVER_LISTENERS[$parent]} $index"
+        ;;
+      alias)
+        # undertow は alias を属性で書くが、EAP 6 の web subsystem のように
+        # <alias name="..."/> と子要素で書かれた設定も拾えるようにしておく。
+        [ -n "${UT_HOST_ALIASES[$parent]+_}" ] || continue
+        alias="$(undertow_attr "$index" "name")"
+        [ -n "$alias" ] || continue
+        UT_HOST_ALIASES["$parent"]="${UT_HOST_ALIASES[$parent]}${alias}"$'\n'
+        ;;
+    esac
+  done
+
+  [ "$UT_SUBSYSTEM_INDEX" != "0" ] || return 1
+
+  # alias 属性を分解し、子要素由来の別名と 1 つにまとめてから探索表を作る。
+  for server_index in "${UT_SERVER_INDEXES[@]}"; do
+    for host_index in ${UT_SERVER_HOSTS[$server_index]}; do
+      alias_raw="$(undertow_attr "$host_index" "alias")"
+      if [ -n "$alias_raw" ]; then
+        while IFS= read -r alias; do
+          [ -n "$alias" ] || continue
+          UT_HOST_ALIASES["$host_index"]="${UT_HOST_ALIASES[$host_index]}${alias}"$'\n'
+        done < <(undertow_split_aliases "$alias_raw")
+      fi
+      # 探索表へは host の name と別名を同じ重みで登録する
+      # (Undertow の NameVirtualHostHandler が両者を区別しないため)。
+      while IFS= read -r alias; do
+        [ -n "$alias" ] || continue
+        route_key="${server_index}/${alias}"
+        if [ -n "${UT_ROUTE[$route_key]+_}" ] && [ "${UT_ROUTE[$route_key]}" != "$host_index" ]; then
+          UT_ROUTE_DUP["$route_key"]=1
+        else
+          UT_ROUTE["$route_key"]="$host_index"
+        fi
+      done < <(undertow_host_names "$host_index")
+    done
+  done
+  return 0
+}
+
+# Host ヘッダーの値を、Undertow が探索キーとして使う形へ整える。
+#   "app.example.jp:8080" -> "app.example.jp"   (最初の : より前)
+#   "[::1]:8080"          -> "[::1]"            (最後の ] まで。括弧は残る)
+undertow_normalize_host_header() {
+  local value="$1" rest
+  case "$value" in
+    '['*)
+      rest="${value%]*}"
+      if [ "$rest" != "$value" ]; then
+        printf '%s]' "$rest"
+        return 0
+      fi
+      printf '%s' "$value"
+      ;;
+    *:*) printf '%s' "${value%%:*}" ;;
+    *)   printf '%s' "$value" ;;
+  esac
+}
+
+# 探索キーがどの host へ渡るかを判定する。
+# 出力: "<種別><SEP><一致した名前><SEP><host の通し番号>"
+#   exact     … 表記どおりに一致
+#   lowercase … 小文字化して一致 (設定側が小文字で書かれている)
+#   default   … 一致せず、server の default-host が受け皿になる
+undertow_lookup_host() {
+  local server_index="$1" lookup_key="$2" lowered
+  if [ -n "${UT_ROUTE["${server_index}/${lookup_key}"]+_}" ]; then
+    printf 'exact%s%s%s%s' "$UNDERTOW_SEPARATOR" "$lookup_key" \
+        "$UNDERTOW_SEPARATOR" "${UT_ROUTE["${server_index}/${lookup_key}"]}"
+    return 0
+  fi
+  lowered="$(printf '%s' "$lookup_key" | tr '[:upper:]' '[:lower:]')"
+  if [ "$lowered" != "$lookup_key" ] \
+      && [ -n "${UT_ROUTE["${server_index}/${lowered}"]+_}" ]; then
+    printf 'lowercase%s%s%s%s' "$UNDERTOW_SEPARATOR" "$lowered" \
+        "$UNDERTOW_SEPARATOR" "${UT_ROUTE["${server_index}/${lowered}"]}"
+    return 0
+  fi
+  printf 'default%s%s' "$UNDERTOW_SEPARATOR" "$UNDERTOW_SEPARATOR"
+  return 0
+}
+
+# 実リクエストの送信先パスを決める。WFLYUT0021 の 1 件目を既定とする。
+undertow_detect_probe_path() {
+  local logs="$1" context_root=""
+  if [ "$UNDERTOW_PROBE_PATH_SET" = "true" ]; then
+    printf '%s\n' "$UNDERTOW_PROBE_PATH"
+    return 0
+  fi
+  context_root="$(
+    printf '%s\n' "$logs" \
+      | strip_ansi_codes \
+      | sed -nE "s/.*WFLYUT0021:[[:space:]]*Registered web context:[[:space:]]*'?([^'[:space:]]+)'?.*/\1/p" \
+      | sed -n '1p'
+  )"
+  if [ -n "$context_root" ]; then
+    normalize_context_root "$context_root"
+  else
+    printf '/\n'
+  fi
+}
+
+# コンテナ側 HTTP リスナーポートを WFLYUT0006 から検出する。
+# discover_jboss_http_port と違い、対話操作用のグローバルへは触れない。
+undertow_detect_listener_port() {
+  local logs="$1" detected_port=""
+  if [ -n "$JBOSS_HTTP_PORT" ]; then
+    printf '%s\n' "$JBOSS_HTTP_PORT"
+    return 0
+  fi
+  detected_port="$(
+    printf '%s\n' "$logs" \
+      | strip_ansi_codes \
+      | sed -nE 's/.*WFLYUT0006:.*Undertow HTTP listener .* listening on .*:([0-9]+).*/\1/p' \
+      | tail -n 1
+  )"
+  if [ -n "$detected_port" ]; then
+    printf '%s\n' "$detected_port"
+  else
+    printf '8080\n'
+  fi
+}
+
+# コンテナ内から Host ヘッダーを差し替えた GET を 1 回送り、HTTP ステータスを返す。
+# 取得できなければ空を返す。コンテナ内スクリプトの目印 "undertow-host-probe" は、
+# テストの偽 docker がこの呼び出しを見分けるためにも使う
+# (変更するときは tests/helpers/docker も合わせる)。
+undertow_probe_via_container() {
+  local cid="$1" url="$2" host_header="$3"
+  docker exec "$cid" /bin/sh -c '
+# undertow-host-probe
+set -u
+probe_url=$1
+probe_host=$2
+probe_timeout=$3
+if command -v curl >/dev/null 2>&1; then
+  curl --silent --output /dev/null --noproxy "*" \
+       --max-time "$probe_timeout" \
+       --write-out "%{http_code}" \
+       --header "Host: ${probe_host}" \
+       "$probe_url"
+  exit $?
+fi
+if command -v wget >/dev/null 2>&1; then
+  wget --quiet --server-response --output-document=/dev/null \
+       --timeout="$probe_timeout" --tries=1 \
+       --header="Host: ${probe_host}" "$probe_url" 2>&1 \
+    | sed -n "s#^[[:space:]]*HTTP/[0-9.]*[[:space:]]\{1,\}\([0-9]\{3\}\).*#\1#p" \
+    | tail -n 1
+  exit 0
+fi
+exit 127
+' _ "$url" "$host_header" "$UNDERTOW_PROBE_TIMEOUT" 2>/dev/null
+}
+
+# ホスト側から Host ヘッダーを差し替えた GET を 1 回送る。
+# コンテナに curl も wget も無い (distroless 等) 場合のフォールバック。
+undertow_probe_via_host() {
+  local tool="$1" url="$2" host_header="$3"
+  case "$tool" in
+    curl)
+      curl --silent --output /dev/null --noproxy '*' \
+           --max-time "$UNDERTOW_PROBE_TIMEOUT" \
+           --write-out '%{http_code}' \
+           --header "Host: ${host_header}" \
+           "$url" 2>/dev/null
+      ;;
+    wget)
+      wget --quiet --server-response --output-document=/dev/null \
+           --timeout="$UNDERTOW_PROBE_TIMEOUT" --tries=1 \
+           --header="Host: ${host_header}" "$url" 2>&1 \
+        | sed -n 's#^[[:space:]]*HTTP/[0-9.]*[[:space:]]\{1,\}\([0-9]\{3\}\).*#\1#p' \
+        | tail -n 1
+      ;;
+    *) return 125 ;;
+  esac
+}
+
+# ホスト側から届く URL を組み立てる。公開ポートを優先し、無ければコンテナ IP。
+undertow_resolve_host_side_url() {
+  local cid="$1" container_port="$2" path="$3"
+  local mapping mapped_host mapped_port container_ip
+  mapping="$(docker port "$cid" "${container_port}/tcp" 2>/dev/null | sed -n '1p' || true)"
+  if [ -n "$mapping" ]; then
+    mapped_port="${mapping##*:}"
+    mapped_host="${mapping%:*}"
+    mapped_host="${mapped_host#[}"
+    mapped_host="${mapped_host%]}"
+    case "$mapped_host" in
+      ""|0.0.0.0|::) mapped_host="127.0.0.1" ;;
+    esac
+    if printf '%s' "$mapped_port" | grep -qE '^[0-9]+$'; then
+      printf 'http://%s:%s%s\n' "$mapped_host" "$mapped_port" "$path"
+      return 0
+    fi
+  fi
+  container_ip="$(
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+      "$cid" 2>/dev/null | sed -n '/./{p;q;}' || true
+  )"
+  [ -n "$container_ip" ] || return 1
+  printf 'http://%s:%s%s\n' "$container_ip" "$container_port" "$path"
+  return 0
+}
+
+# 検査対象の Host ヘッダー名を、重複を除いて順番に積む。
+# 由来 (どこから来た名前か) を併記し、設定由来の行と実際の呼び出しで使われる
+# 名前の行を、読み手が区別できるようにする。
+undertow_add_candidate() {
+  local value="$1" origin="$2" key
+  [ -n "$value" ] || return 0
+  key="$(undertow_normalize_host_header "$value")"
+  [ -n "$key" ] || return 0
+  if [ -n "${UT_CANDIDATE_ORIGIN[$key]+_}" ]; then
+    # 同じ名前が別の由来でも出てきた場合は、由来だけを足す。
+    case "${UT_CANDIDATE_ORIGIN[$key]}" in
+      *"$origin"*) ;;
+      *) UT_CANDIDATE_ORIGIN["$key"]="${UT_CANDIDATE_ORIGIN[$key]}, ${origin}" ;;
+    esac
+    return 0
+  fi
+  UT_CANDIDATE_ORIGIN["$key"]="$origin"
+  UT_CANDIDATES+=("$key")
+}
+
+# 検査対象の Host ヘッダー名を集める。
+undertow_collect_candidates() {
+  local cid="$1" service_name="$2" container_name="$3" primary_server="$4"
+  local host_index name host_own_name base extra container_ip verify_host
+
+  UT_CANDIDATES=()
+  UT_CANDIDATE_ORIGIN=()
+  UT_CANDIDATE_KIND=()
+  UT_CANDIDATE_TARGET=()
+  UT_CANDIDATE_VERDICT=()
+
+  # (1) 設定に書かれている名前。ここに載っている限り default-host は使われない。
+  for host_index in ${UT_SERVER_HOSTS[$primary_server]}; do
+    host_own_name="$(undertow_attr "$host_index" "name")"
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if [ "$name" = "$host_own_name" ]; then
+        undertow_add_candidate "$name" "host の name"
+      else
+        undertow_add_candidate "$name" "alias"
+      fi
+    done < <(undertow_host_names "$host_index")
+  done
+
+  # (2) 設定に現れなくても実際に使われる名前。
+  for base in "${UNDERTOW_BASE_HOST_NAMES[@]}"; do
+    undertow_add_candidate "$base" "一般的な呼び出し"
+  done
+  # 同じ Compose ネットワーク上の別サービスは、サービス名や container_name を
+  # そのまま Host ヘッダーに載せて呼ぶ。設定側に別名が無ければ default-host 行き。
+  undertow_add_candidate "$service_name" "Compose サービス名"
+  undertow_add_candidate "$container_name" "コンテナ名"
+  container_ip="$(
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+      "$cid" 2>/dev/null | sed -n '/./{p;q;}' || true
+  )"
+  undertow_add_candidate "$container_ip" "コンテナ IP"
+  if [ -n "$VERIFY_URL" ]; then
+    verify_host="${VERIFY_URL#*://}"
+    verify_host="${verify_host%%/*}"
+    undertow_add_candidate "$verify_host" "--verify-url のホスト"
+  fi
+
+  # (3) 利用者が明示した名前 (本番の FQDN や ALB のホスト名を渡す想定)。
+  for extra in "${UNDERTOW_HOST_HEADERS[@]}"; do
+    undertow_add_candidate "$extra" "--undertow-host-header"
+  done
+
+  # (4) どの名前とも一致しないことが確実な名前。default-host が受け皿として
+  #     働いているかを、設定の読み取りではなく実測で示すために使う。
+  undertow_add_candidate "$UNDERTOW_FALLBACK_PROBE_NAME" "受け皿の確認用 (意図的に一致させない)"
+}
+
+# 集めた名前それぞれの振り分け先を決め、以降の節で使い回せるよう控える。
+undertow_resolve_candidates() {
+  local primary_server="$1" default_host_name="$2"
+  local candidate lookup kind matched_name matched_index
+
+  for candidate in "${UT_CANDIDATES[@]}"; do
+    lookup="$(undertow_lookup_host "$primary_server" "$candidate")"
+    IFS="$UNDERTOW_SEPARATOR" read -r kind matched_name matched_index <<< "$lookup"
+    UT_CANDIDATE_KIND["$candidate"]="$kind"
+    case "$kind" in
+      exact)
+        UT_CANDIDATE_TARGET["$candidate"]="$(undertow_attr "$matched_index" "name")"
+        if [ "$matched_name" = "${UT_CANDIDATE_TARGET[$candidate]}" ]; then
+          UT_CANDIDATE_VERDICT["$candidate"]="name に一致 (default-host は不使用)"
+        else
+          UT_CANDIDATE_VERDICT["$candidate"]="別名に一致 (default-host は不使用)"
+        fi
+        ;;
+      lowercase)
+        UT_CANDIDATE_TARGET["$candidate"]="$(undertow_attr "$matched_index" "name")"
+        UT_CANDIDATE_VERDICT["$candidate"]="小文字化して一致 (default-host は不使用)"
+        ;;
+      *)
+        UT_CANDIDATE_TARGET["$candidate"]="$default_host_name"
+        UT_CANDIDATE_VERDICT["$candidate"]="一致なし → default-host を使用"
+        ;;
+    esac
+  done
+}
+
+# 表を桁揃えして出力する。1 行 = "<列1><SEP><列2><SEP><列3>" を標準入力から渡す。
+#
+# bash の ${#var} と printf の %-Ns が文字数を数えるかバイト数を数えるかは
+# ロケール依存で (UTF-8 ロケールなら文字数、C ロケールならバイト数)、日本語の
+# 見出しと半角のホスト名が混ざる表ではどちらでも桁がずれる。そこで UTF-8 の
+# バイト列として直接数え、実行環境のロケールに左右されずに揃える。
+#   先頭バイト 0-127   : 1 バイト文字      → 半角 1 桁
+#   先頭バイト 194-223 : 2 バイト文字      → 半角 1 桁
+#   先頭バイト 224-239 : 3 バイト文字      → 全角 2 桁 (日本語)
+#   先頭バイト 240-247 : 4 バイト文字      → 全角 2 桁
+undertow_render_table() {
+  LC_ALL=C awk -v SEP="$UNDERTOW_SEPARATOR" -v w1=37 -v w2=19 '
+    function dwidth(s,   n, i, v, w, step) {
+      n = length(s); w = 0; i = 1
+      while (i <= n) {
+        v = ord[substr(s, i, 1)]
+        if (v < 128)      { step = 1; w += 1 }
+        else if (v < 192) { step = 1; w += 1 }
+        else if (v < 224) { step = 2; w += 1 }
+        else if (v < 240) { step = 3; w += 2 }
+        else              { step = 4; w += 2 }
+        i += step
+      }
+      return w
+    }
+    function pad(s, target,   rest) {
+      rest = target - dwidth(s)
+      if (rest < 1) rest = 1
+      return s sprintf("%" rest "s", "")
+    }
+    BEGIN {
+      FS = SEP
+      for (n = 1; n < 256; n++) ord[sprintf("%c", n)] = n
+    }
+    { printf "  %s%s%s\n", pad($1, w1), pad($2, w2), $3 }
+  '
+}
+
+# 表の 1 行分を、undertow_render_table へ渡す形へ組み立てる。
+undertow_table_row() {
+  printf '%s%s%s%s%s\n' "$1" "$UNDERTOW_SEPARATOR" "$2" "$UNDERTOW_SEPARATOR" "$3"
+}
+
+undertow_route_table_rule() {
+  printf '  %s %s %s\n' \
+      "------------------------------------" \
+      "------------------" \
+      "------------------------------------------"
+}
+
+# 1 サービス分の分析結果を書き出す。UT_* のモデルは構築済みであること。
+undertow_write_service_section() {
+  local cid="$1" service_name="$2" container_name="$3" config_file="$4" out="$5"
+  local logs="$6"
+  local subsystem_ns default_server default_vhost default_container default_security
+  local value suffix server_index server_name server_default_host servlet_container
+  local host_index host_name listener_index listener_kind listener_name socket_binding
+  local primary_server=0 primary_default_host="" primary_default_host_index=0
+  local candidate target_label alias_count host_total=0 name_total=0 fallback_total=0
+  local probe_path probe_port probe_origin="" probe_url="" host_tool="" probe_count=0
+  local status_code default_host_defined="false" dup_key lowered
+  local probe_truncated="false"
+  local -a notices=() probe_rows=()
+
+  subsystem_ns="$(undertow_attr "$UT_SUBSYSTEM_INDEX" "xmlns")"
+
+  {
+    printf '\n'
+    printf '===================================================================\n'
+    printf 'Undertow バーチャルホスト分析 (サービス: %s / コンテナ: %s)\n' \
+        "$service_name" "$container_name"
+    printf '===================================================================\n'
+    printf '設定ファイル  : %s\n' "$config_file"
+    printf '名前空間      : %s\n' "${subsystem_ns:-(不明)}"
+  } >> "$out"
+
+  # ---- [1] subsystem の既定値 ------------------------------------------------
+  undertow_attr_with_default default_server suffix "$UT_SUBSYSTEM_INDEX" \
+      "default-server" "default-server"
+  {
+    printf '\n[1] subsystem の既定値 (WAR がどのホストへ載るかを決める)\n'
+    printf '  default-server           : %s%s\n' "$default_server" "$suffix"
+  } >> "$out"
+  undertow_attr_with_default default_vhost suffix "$UT_SUBSYSTEM_INDEX" \
+      "default-virtual-host" "default-host"
+  {
+    printf '  default-virtual-host     : %s%s\n' "$default_vhost" "$suffix"
+    printf '      └ jboss-web.xml に <virtual-host> を書いていない WAR が載るホスト\n'
+  } >> "$out"
+  undertow_attr_with_default default_container suffix "$UT_SUBSYSTEM_INDEX" \
+      "default-servlet-container" "default"
+  printf '  default-servlet-container: %s%s\n' "$default_container" "$suffix" >> "$out"
+  undertow_attr_with_default default_security suffix "$UT_SUBSYSTEM_INDEX" \
+      "default-security-domain" "other"
+  printf '  default-security-domain  : %s%s\n' "$default_security" "$suffix" >> "$out"
+
+  # ---- [2] server とリスナー -------------------------------------------------
+  printf '\n[2] server 定義とリスナー\n' >> "$out"
+  if [ ${#UT_SERVER_INDEXES[@]} -eq 0 ]; then
+    printf '  server が定義されていません。\n' >> "$out"
+  fi
+  for server_index in "${UT_SERVER_INDEXES[@]}"; do
+    server_name="$(undertow_attr "$server_index" "name")"
+    undertow_attr_with_default server_default_host suffix "$server_index" \
+        "default-host" "default-host"
+    {
+      printf "  server '%s'\n" "${server_name:-(名前なし)}"
+      printf '    default-host      : %s%s\n' "$server_default_host" "$suffix"
+      printf '        └ Host ヘッダーがどの名前とも一致しなかったリクエストの受け皿\n'
+    } >> "$out"
+    undertow_attr_with_default servlet_container suffix "$server_index" \
+        "servlet-container" "default"
+    printf '    servlet-container : %s%s\n' "$servlet_container" "$suffix" >> "$out"
+    if [ -z "${UT_SERVER_LISTENERS[$server_index]}" ]; then
+      printf '    リスナー          : (なし)\n' >> "$out"
+    else
+      printf '    リスナー:\n' >> "$out"
+      for listener_index in ${UT_SERVER_LISTENERS[$server_index]}; do
+        listener_kind="${UT_ELEM_NAME[$listener_index]}"
+        listener_name="$(undertow_attr "$listener_index" "name")"
+        socket_binding="$(undertow_attr "$listener_index" "socket-binding")"
+        printf "      %-15s '%s' socket-binding=%s\n" \
+            "$listener_kind" "${listener_name:-(名前なし)}" "${socket_binding:-(未指定)}" >> "$out"
+      done
+    fi
+    # 実リクエストの宛先になる server を決める。HTTP リスナーを持つ最初の
+    # server を主対象とし、無ければ最初の server を使う。
+    if [ "$primary_server" = "0" ]; then
+      for listener_index in ${UT_SERVER_LISTENERS[$server_index]}; do
+        [ "${UT_ELEM_NAME[$listener_index]}" = "http-listener" ] || continue
+        primary_server="$server_index"
+        primary_default_host="$server_default_host"
+        break
+      done
+    fi
+  done
+  if [ "$primary_server" = "0" ] && [ ${#UT_SERVER_INDEXES[@]} -gt 0 ]; then
+    primary_server="${UT_SERVER_INDEXES[0]}"
+    undertow_attr_with_default primary_default_host suffix "$primary_server" \
+        "default-host" "default-host"
+    printf '  ※ HTTP リスナーを持つ server が無いため、最初の server を対象に判定します。\n' >> "$out"
+  fi
+  if [ "$primary_server" = "0" ]; then
+    printf '\nserver が 1 つも無いため、Host ヘッダーの振り分けは判定できません。\n' >> "$out"
+    return 1
+  fi
+
+  # ---- [3] バーチャルホスト --------------------------------------------------
+  printf '\n[3] バーチャルホストと受け付けるホスト名\n' >> "$out"
+  for server_index in "${UT_SERVER_INDEXES[@]}"; do
+    server_name="$(undertow_attr "$server_index" "name")"
+    undertow_attr_with_default server_default_host suffix "$server_index" \
+        "default-host" "default-host"
+    for host_index in ${UT_SERVER_HOSTS[$server_index]}; do
+      host_total=$((host_total + 1))
+      host_name="$(undertow_attr "$host_index" "name")"
+      target_label=""
+      [ "$host_name" = "$default_vhost" ] && target_label="${target_label} [subsystem の default-virtual-host]"
+      if [ "$host_name" = "$server_default_host" ]; then
+        target_label="${target_label} [server の default-host]"
+        if [ "$server_index" = "$primary_server" ]; then
+          default_host_defined="true"
+          primary_default_host_index="$host_index"
+        fi
+      fi
+      printf "  host '%s' (server: %s)%s\n" \
+          "${host_name:-(名前なし)}" "${server_name:-(名前なし)}" "$target_label" >> "$out"
+      alias_count=0
+      while IFS= read -r value; do
+        [ -n "$value" ] || continue
+        alias_count=$((alias_count + 1))
+        if [ "$alias_count" -eq 1 ]; then
+          printf '    別名              : %s\n' "$value" >> "$out"
+        else
+          printf '                        %s\n' "$value" >> "$out"
+        fi
+      done <<< "${UT_HOST_ALIASES[$host_index]-}"
+      [ "$alias_count" -eq 0 ] && printf '    別名              : (なし)\n' >> "$out"
+      undertow_attr_with_default value suffix "$host_index" "default-web-module" "ROOT.war"
+      printf '    default-web-module: %s%s\n' "$value" "$suffix" >> "$out"
+      value="$(undertow_attr "$host_index" "default-response-code")"
+      [ -n "$value" ] && printf '    default-response-code: %s\n' "$value" >> "$out"
+    done
+  done
+  [ "$host_total" -eq 0 ] && printf '  バーチャルホストが定義されていません。\n' >> "$out"
+
+  # ---- [4] Host ヘッダーの振り分け表 -----------------------------------------
+  undertow_collect_candidates "$cid" "$service_name" "$container_name" "$primary_server"
+  undertow_resolve_candidates "$primary_server" "$primary_default_host"
+  {
+    printf '\n[4] Host ヘッダーごとの振り分け (server: %s)\n' \
+        "$(undertow_attr "$primary_server" "name")"
+    printf '  Undertow は Host ヘッダーからポートを除いたホスト名で完全一致を探し、\n'
+    printf '  見つからなければ小文字化して 1 度だけ探し直し、それでも見つからなければ\n'
+    printf "  server の default-host ('%s') へ渡す。\n" "$primary_default_host"
+    printf '\n'
+  } >> "$out"
+
+  {
+    undertow_table_row "Host ヘッダー" "振り分け先" "判定 / 由来"
+    for candidate in "${UT_CANDIDATES[@]}"; do
+      undertow_table_row "$candidate" "${UT_CANDIDATE_TARGET[$candidate]}" \
+          "${UT_CANDIDATE_VERDICT[$candidate]} / ${UT_CANDIDATE_ORIGIN[$candidate]}"
+    done
+  } | undertow_render_table | {
+    # 見出しの直後へ罫線を挟む (表全体を 1 回の整形で組んでから割り込ませる)。
+    IFS= read -r value && printf '%s\n' "$value" && undertow_route_table_rule
+    cat
+  } >> "$out"
+
+  for candidate in "${UT_CANDIDATES[@]}"; do
+    name_total=$((name_total + 1))
+    [ "${UT_CANDIDATE_KIND[$candidate]}" = "default" ] && fallback_total=$((fallback_total + 1))
+  done
+
+  # ---- [5] default-host 設定の利用状況 ---------------------------------------
+  {
+    printf '\n[5] default-host 設定の利用状況\n'
+    printf '  受け皿となる default-host : %s\n' "$primary_default_host"
+    if [ "$default_host_defined" = "true" ]; then
+      printf '  同名の host 定義          : あり\n'
+      undertow_attr_with_default value suffix "$primary_default_host_index" \
+          "default-web-module" "ROOT.war"
+      printf '  受け皿のデプロイ既定      : default-web-module=%s%s\n' "$value" "$suffix"
+    else
+      printf '  同名の host 定義          : 見つかりません\n'
+    fi
+    printf '  判定した Host ヘッダー    : %s 件\n' "$name_total"
+    printf '  うち default-host を使用  : %s 件\n' "$fallback_total"
+    printf '  うち name / 別名に一致    : %s 件\n' "$((name_total - fallback_total))"
+    if [ "$fallback_total" -eq 0 ]; then
+      printf '  → 判定した範囲では、すべての Host ヘッダーが name か別名に一致するため\n'
+      printf '    default-host は受け皿として使われていません。\n'
+    else
+      printf "  → 次の Host ヘッダーで呼ばれた場合、default-host ('%s') が処理します:\n" \
+          "$primary_default_host"
+      for candidate in "${UT_CANDIDATES[@]}"; do
+        [ "${UT_CANDIDATE_KIND[$candidate]}" = "default" ] || continue
+        printf '      - %s (%s)\n' "$candidate" "${UT_CANDIDATE_ORIGIN[$candidate]}"
+      done
+    fi
+  } >> "$out"
+
+  # ---- [6] 実リクエストによる確認 --------------------------------------------
+  printf '\n[6] 実リクエストによる確認\n' >> "$out"
+  if [ "$UNDERTOW_PROBE" != "true" ]; then
+    printf '  --no-undertow-probe が指定されたため送信していません。\n' >> "$out"
+  else
+    probe_path="$(undertow_detect_probe_path "$logs")"
+    probe_port="$(undertow_detect_listener_port "$logs")"
+    {
+      printf '  送信内容      : GET %s (Host ヘッダーだけを差し替えた読み取りリクエスト)\n' "$probe_path"
+      printf '  タイムアウト  : %s 秒 / 1 回、最大 %s 件\n' "$UNDERTOW_PROBE_TIMEOUT" "$UNDERTOW_PROBE_MAX"
+    } >> "$out"
+    # まずコンテナ内から送る。コンテナ内なら公開ポートの有無に左右されない。
+    probe_url="http://127.0.0.1:${probe_port}${probe_path}"
+    status_code="$(undertow_probe_via_container "$cid" "$probe_url" "$UNDERTOW_FALLBACK_PROBE_NAME")"
+    if [ -n "$status_code" ]; then
+      probe_origin="コンテナ内 (${probe_url})"
+    elif host_tool="$(detect_host_http_tool)" \
+        && probe_url="$(undertow_resolve_host_side_url "$cid" "$probe_port" "$probe_path")"; then
+      # コンテナに curl / wget が無い場合はホスト側から公開ポートへ送り直す。
+      probe_origin="ホスト側 ${host_tool} (${probe_url})"
+    else
+      host_tool=""
+      probe_origin=""
+    fi
+    if [ -z "$probe_origin" ]; then
+      {
+        printf '  送信元        : (確保できず)\n'
+        printf '  コンテナ内に curl / wget が無く、ホスト側からも到達できるアドレスを\n'
+        printf '  組み立てられなかったため、実リクエストによる確認は行えませんでした。\n'
+        printf '  設定ファイルからの判定 ([4]) は上記のとおりです。\n'
+      } >> "$out"
+    else
+      {
+        printf '  送信元        : %s\n' "$probe_origin"
+        printf '\n'
+      } >> "$out"
+      # 1 件ごとに docker exec / curl を回すため、先に全行を集めてから
+      # まとめて桁揃えする (整形をパイプの中で回すと結果を持ち帰れない)。
+      probe_rows=("$(undertow_table_row "Host ヘッダー" "応答" "設定からの判定")")
+      for candidate in "${UT_CANDIDATES[@]}"; do
+        if [ "$probe_count" -ge "$UNDERTOW_PROBE_MAX" ]; then
+          probe_truncated="true"
+          break
+        fi
+        probe_count=$((probe_count + 1))
+        if [ -n "$host_tool" ]; then
+          status_code="$(undertow_probe_via_host "$host_tool" "$probe_url" "$candidate")"
+        else
+          status_code="$(undertow_probe_via_container "$cid" "$probe_url" "$candidate")"
+        fi
+        case "$status_code" in
+          ''|000) status_code="(応答なし)" ;;
+        esac
+        if [ "${UT_CANDIDATE_KIND[$candidate]}" = "default" ]; then
+          value="default-host ('${primary_default_host}') が処理"
+        else
+          value="'${UT_CANDIDATE_TARGET[$candidate]}' が処理"
+        fi
+        probe_rows+=("$(undertow_table_row "$candidate" "HTTP ${status_code}" "$value")")
+      done
+      printf '%s\n' "${probe_rows[@]}" | undertow_render_table | {
+        IFS= read -r value && printf '%s\n' "$value" && undertow_route_table_rule
+        cat
+      } >> "$out"
+      if [ "$probe_truncated" = "true" ]; then
+        printf '  (上限 %s 件に達したため、以降は送信していません)\n' "$UNDERTOW_PROBE_MAX" >> "$out"
+      fi
+      {
+        printf '  ※ 応答が同じでも、処理したバーチャルホストが同じとは限らない。\n'
+        printf '     どのホストが処理したかは [4] の判定を参照する。\n'
+      } >> "$out"
+    fi
+  fi
+
+  # ---- [7] 要確認 ------------------------------------------------------------
+  # default-virtual-host (デプロイ先の既定) と default-host (振り分けの受け皿) が
+  # 食い違うと、どの名前とも一致しない Host ヘッダーで呼ばれたときだけ WAR の
+  # 無いホストへ渡り 404 になる。名前が似ていて取り違えやすいため最初に挙げる。
+  if [ "$default_vhost" != "$primary_default_host" ]; then
+    notices+=("subsystem の default-virtual-host ('${default_vhost}') と server の default-host ('${primary_default_host}') が異なります。<virtual-host> を書いていない WAR は '${default_vhost}' へ載る一方、どの名前とも一致しない Host ヘッダーは '${primary_default_host}' が受けるため、その組み合わせでは 404 になります。")
+  fi
+  if [ "$default_host_defined" != "true" ]; then
+    notices+=("server の default-host が指す '${primary_default_host}' に対応する host 定義が見つかりません。どの名前とも一致しない Host ヘッダーの行き先がありません。")
+  fi
+  for server_index in "${UT_SERVER_INDEXES[@]}"; do
+    # 受け皿は server ごとに違うため、その server の default-host を取り直す。
+    undertow_attr_with_default server_default_host suffix "$server_index" \
+        "default-host" "default-host"
+    for host_index in ${UT_SERVER_HOSTS[$server_index]}; do
+      host_name="$(undertow_attr "$host_index" "name")"
+      while IFS= read -r value; do
+        [ -n "$value" ] || continue
+        # Undertow は「完全一致」と「小文字化して一致」の 2 回しか探さない。
+        # 設定側に大文字が入っていると、小文字で送られてきた Host ヘッダーは
+        # どちらの探索でも一致せず、気付かないうちに default-host へ流れる。
+        case "$value" in
+          *[A-Z]*)
+            lowered="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+            notices+=("host '${host_name}' の名前 '${value}' に大文字が含まれます。Undertow は完全一致と小文字化の 2 回しか探さないため、'${lowered}' のように表記の違う Host ヘッダーでは一致せず default-host へ渡ります。")
+            ;;
+        esac
+      done < <(undertow_host_names "$host_index")
+      # 別名が無い host は、自分の name と一致した Host ヘッダーしか受け取れない。
+      # ただし受け皿 (default-host) 自身は一致しなかった分を全部引き受けるため、
+      # 別名が無くても届かなくなるものは無い。挙げても対処のしようがないので除く。
+      if [ -z "${UT_HOST_ALIASES[$host_index]-}" ] \
+          && [ "$host_name" != "$server_default_host" ]; then
+        notices+=("host '${host_name}' に別名がありません。'${host_name}' 以外の Host ヘッダーはこのホストへ届きません。")
+      fi
+    done
+  done
+  for dup_key in "${!UT_ROUTE_DUP[@]}"; do
+    notices+=("名前 '${dup_key#*/}' を複数の host が登録しています。Undertow の探索表は名前ごとに 1 つしか持てないため、どちらが処理するかは設定の書き順に依存します。")
+  done
+
+  printf '\n[7] 要確認\n' >> "$out"
+  if [ ${#notices[@]} -eq 0 ]; then
+    printf '  指摘はありません。\n' >> "$out"
+  else
+    for value in "${notices[@]}"; do
+      printf '  - %s\n' "$value" >> "$out"
+    done
+  fi
+
+  UNDERTOW_ANALYSIS_HOSTS=$((UNDERTOW_ANALYSIS_HOSTS + host_total))
+  UNDERTOW_ANALYSIS_NAMES=$((UNDERTOW_ANALYSIS_NAMES + name_total))
+  UNDERTOW_ANALYSIS_FALLBACK=$((UNDERTOW_ANALYSIS_FALLBACK + fallback_total))
+  UNDERTOW_ANALYSIS_WARN=$((UNDERTOW_ANALYSIS_WARN + ${#notices[@]}))
+  return 0
+}
+# 分析結果をテキストファイルへ書き出す。内容は画面表示と同一で、どの実行の
+# 結果なのかを後から突き合わせられるようヘッダーだけを足す。
+undertow_write_analysis_text() {
+  local text_path="$1"
+  {
+    printf '===================================================================\n'
+    printf 'build_and_verify.sh Undertow バーチャルホスト (default-host) 分析\n'
+    printf '===================================================================\n'
+    printf '処理開始日時 : %s\n' "$RUN_STARTED_AT"
+    printf '出力日時     : %s\n' "$(now_display_time)"
+    printf 'Compose 定義 : %s\n' "$COMPOSE_FILE"
+    printf '情報の取得   : %s\n' "${UNDERTOW_ANALYSIS_COLLECT_STATUS:-(不明)}"
+    printf '総合判定     : %s\n' "${UNDERTOW_ANALYSIS_VERDICT:-(なし)}"
+    cat -- "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+  } > "$text_path"
+}
+
+# standalone.xml の undertow subsystem から、Host ヘッダーの振り分けを再現する。
+# 成功経路 (主処理の末尾) と失敗経路 (EXIT トラップ) の双方から呼ばれるため、
+# 二重に実行しないよう UNDERTOW_ANALYSIS_DONE で守る。docker exec と compose logs
+# を使うため、コンテナを停止・削除する前に呼ぶ必要がある。
+analyze_undertow_virtual_hosts() {
+  local exit_status="${1:-0}"
+  local cid service_name container_name home config_file xml_b64 xml_file logs
+  local analyzed=0 skipped=0 text_path=""
+
+  local -a target_container_ids=()
+
+  [ "$UNDERTOW_ANALYSIS_DONE" = "true" ] && return 0
+
+  if [ "$UNDERTOW_ANALYSIS" != "true" ]; then
+    UNDERTOW_ANALYSIS_DONE="true"
+    UNDERTOW_ANALYSIS_SKIP_REASON="--no-undertow-analysis が指定されたため分析していません。"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    UNDERTOW_ANALYSIS_DONE="true"
+    UNDERTOW_ANALYSIS_SKIP_REASON="DRY-RUN のため分析していません。"
+    log "[DRY-RUN] Undertow バーチャルホストの分析をスキップします。"
+    return 0
+  fi
+  UNDERTOW_ANALYSIS_DONE="true"
+
+  mapfile -t target_container_ids < <(verification_target_container_ids)
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    UNDERTOW_ANALYSIS_SKIP_REASON="対象コンテナが起動していないため分析できません (--verify-startup または --verify-url を併用してください)。"
+    UNDERTOW_ANALYSIS_VERDICT="未評価 (対象コンテナが起動していないため)"
+    log "Undertow バーチャルホスト分析: ${UNDERTOW_ANALYSIS_SKIP_REASON}"
+    return 0
+  fi
+
+  if ! UNDERTOW_ANALYSIS_DIGEST_FILE="$(mktemp 2>/dev/null)"; then
+    UNDERTOW_ANALYSIS_DIGEST_FILE=""
+    UNDERTOW_ANALYSIS_SKIP_REASON="分析用の一時ファイルを作成できませんでした。"
+    warn "Undertow バーチャルホスト分析用の一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  : > "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+    container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+
+    home="$(jboss_detect_home "$cid")"
+    if [ -z "$home" ] && [ -z "$JBOSS_CONFIG_FILE" ]; then
+      # JBoss EAP ではないサービス (db や cwagent 等) は対象外。
+      continue
+    fi
+    if ! config_file="$(jboss_detect_config_file "$cid" "$home")" || [ -z "$config_file" ]; then
+      skipped=$((skipped + 1))
+      printf '\nサービス %s: standalone.xml を特定できませんでした (--jboss-config-file で指定できます)。\n' \
+          "$service_name" >> "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+      continue
+    fi
+    xml_b64="$(jboss_container_read_file "$cid" "$config_file")"
+    if [ -z "$xml_b64" ]; then
+      skipped=$((skipped + 1))
+      printf '\nサービス %s: 設定ファイルを読み出せませんでした: %s\n' \
+          "$service_name" "$config_file" >> "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+      continue
+    fi
+    if ! xml_file="$(mktemp 2>/dev/null)"; then
+      warn "Undertow 分析用の一時ファイルを作成できませんでした (サービス: ${service_name})。"
+      continue
+    fi
+    if ! printf '%s' "$xml_b64" | base64 -d > "$xml_file" 2>/dev/null; then
+      rm -f -- "$xml_file"
+      skipped=$((skipped + 1))
+      printf '\nサービス %s: 設定ファイルを復号できませんでした: %s\n' \
+          "$service_name" "$config_file" >> "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+      continue
+    fi
+
+    if ! undertow_parse_config "$xml_file" || ! undertow_build_model; then
+      rm -f -- "$xml_file"
+      skipped=$((skipped + 1))
+      {
+        printf '\nサービス %s: undertow subsystem を検出できませんでした: %s\n' \
+            "$service_name" "$config_file"
+        printf '  JBoss EAP 6 以前の web subsystem や、undertow を外した構成の可能性があります。\n'
+      } >> "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+      continue
+    fi
+    rm -f -- "$xml_file"
+
+    log "Undertow のバーチャルホスト設定を確認します (サービス: ${service_name}, ファイル: ${config_file}) ..."
+    logs="$(compose_logs "$service_name" 2>/dev/null || true)"
+    undertow_write_service_section "$cid" "$service_name" "$container_name" \
+        "$config_file" "$UNDERTOW_ANALYSIS_DIGEST_FILE" "$logs" || true
+    analyzed=$((analyzed + 1))
+  done
+
+  UNDERTOW_ANALYSIS_SERVICES="$analyzed"
+  if [ "$analyzed" -eq 0 ]; then
+    if [ "$skipped" -eq 0 ]; then
+      UNDERTOW_ANALYSIS_SKIP_REASON="起動したコンテナに JBoss EAP が見つからなかったため分析していません。"
+      UNDERTOW_ANALYSIS_VERDICT="未評価 (JBoss EAP のコンテナなし)"
+      rm -f -- "$UNDERTOW_ANALYSIS_DIGEST_FILE"
+      UNDERTOW_ANALYSIS_DIGEST_FILE=""
+      return 0
+    fi
+    UNDERTOW_ANALYSIS_VERDICT="未評価 (undertow subsystem を読み取れませんでした)"
+  elif [ "$UNDERTOW_ANALYSIS_NAMES" -eq 0 ]; then
+    # server や host が 1 つも無い構成。振り分けようがないため件数では語らない。
+    UNDERTOW_ANALYSIS_VERDICT="未評価 (振り分け先となる server / host が定義されていません)"
+  elif [ "$UNDERTOW_ANALYSIS_FALLBACK" -gt 0 ]; then
+    UNDERTOW_ANALYSIS_VERDICT="バーチャルホスト ${UNDERTOW_ANALYSIS_HOSTS} 件、判定した Host ヘッダー ${UNDERTOW_ANALYSIS_NAMES} 件のうち ${UNDERTOW_ANALYSIS_FALLBACK} 件が default-host へ渡ります (要確認 ${UNDERTOW_ANALYSIS_WARN} 件)"
+  else
+    UNDERTOW_ANALYSIS_VERDICT="バーチャルホスト ${UNDERTOW_ANALYSIS_HOSTS} 件、判定した Host ヘッダー ${UNDERTOW_ANALYSIS_NAMES} 件はすべて name / 別名に一致し、default-host は使われません (要確認 ${UNDERTOW_ANALYSIS_WARN} 件)"
+  fi
+
+  if [ "$UNDERTOW_PROBE" = "true" ]; then
+    UNDERTOW_ANALYSIS_COLLECT_STATUS="standalone.xml の undertow subsystem を解析し、Host ヘッダーを差し替えた実リクエストで振り分けを確認しました。"
+  else
+    UNDERTOW_ANALYSIS_COLLECT_STATUS="standalone.xml の undertow subsystem の解析のみで判定しました (--no-undertow-probe)。"
+  fi
+
+  # テキストへの出力。--report-dir が無く出力先も指定されていない場合は出さない。
+  if [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" = "true" ] \
+      && [ -s "$UNDERTOW_ANALYSIS_DIGEST_FILE" ]; then
+    text_path="$(prepare_analysis_output \
+        "$UNDERTOW_ANALYSIS_TEXT" "$UNDERTOW_ANALYSIS_TEXT_SET" "txt" "テキスト" \
+        "_undertow_virtual_host" "Undertow バーチャルホスト分析")"
+    if [ -n "$text_path" ]; then
+      if undertow_write_analysis_text "$text_path" && [ -s "$text_path" ]; then
+        UNDERTOW_ANALYSIS_TEXT_OUTPUT="$text_path"
+      else
+        warn "Undertow バーチャルホスト分析のテキストを出力できませんでした: $text_path"
+      fi
+    fi
+  fi
+
+  show_undertow_virtual_host_analysis
+  return 0
+}
+
+# 分析結果を画面へ出す。--no-undertow-analysis-display 指定時は、テキストと
+# 全量レポートへの出力だけを残して画面表示を省く。
+show_undertow_virtual_host_analysis() {
+  if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ]; then
+    if [ -n "$UNDERTOW_ANALYSIS_TEXT_OUTPUT" ]; then
+      log "Undertow バーチャルホスト分析のテキストを出力しました (画面表示は --no-undertow-analysis-display により省略): $UNDERTOW_ANALYSIS_TEXT_OUTPUT"
+    fi
+    return 0
+  fi
+  if [ -n "$UNDERTOW_ANALYSIS_DIGEST_FILE" ] && [ -s "$UNDERTOW_ANALYSIS_DIGEST_FILE" ]; then
+    diag ""
+    diag "==================================================================="
+    diag "JBoss EAP Undertow バーチャルホスト (default-host) 分析"
+    diag "==================================================================="
+    cat -- "$UNDERTOW_ANALYSIS_DIGEST_FILE" >&2
+  elif [ -n "$UNDERTOW_ANALYSIS_SKIP_REASON" ]; then
+    log "Undertow バーチャルホスト分析: ${UNDERTOW_ANALYSIS_SKIP_REASON}"
+    return 0
+  fi
+
+  if [ "${UNDERTOW_ANALYSIS_WARN:-0}" -gt 0 ] 2>/dev/null; then
+    warn "Undertow バーチャルホスト分析: 要確認の指摘が ${UNDERTOW_ANALYSIS_WARN} 件あります。"
+    warn "  判定: ${UNDERTOW_ANALYSIS_VERDICT}"
+  else
+    log "Undertow バーチャルホスト分析: ${UNDERTOW_ANALYSIS_VERDICT}"
+  fi
+  log "  対象 ${UNDERTOW_ANALYSIS_SERVICES} サービス、バーチャルホスト ${UNDERTOW_ANALYSIS_HOSTS} 件、判定した Host ヘッダー ${UNDERTOW_ANALYSIS_NAMES} 件 (うち default-host 経由 ${UNDERTOW_ANALYSIS_FALLBACK} 件)"
+  if [ -n "$UNDERTOW_ANALYSIS_TEXT_OUTPUT" ]; then
+    log "Undertow バーチャルホスト分析のテキストを出力しました: $UNDERTOW_ANALYSIS_TEXT_OUTPUT"
+  elif [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+    log "Undertow バーチャルホスト分析のテキスト出力は --no-undertow-analysis-text により行いません。"
+  elif [ -z "$BUILD_REPORT_DIR" ]; then
+    log "Undertow バーチャルホスト分析のファイル出力は、--report-dir または --undertow-analysis-text の指定時に行います。"
+  fi
+  return 0
+}
+
+# 全量レポートへ Undertow バーチャルホスト分析の結果を追記する。
+append_undertow_analysis_report() {
+  local report_file="$1"
+
+  if [ -z "$UNDERTOW_ANALYSIS_DIGEST_FILE" ] || [ ! -s "$UNDERTOW_ANALYSIS_DIGEST_FILE" ]; then
+    printf '%s\n' "${UNDERTOW_ANALYSIS_SKIP_REASON:-分析結果を取得できなかったため記載できません。}" \
+        >> "$report_file"
+    return 0
+  fi
+  if [ -n "$UNDERTOW_ANALYSIS_TEXT_OUTPUT" ]; then
+    printf 'テキスト      : %s (この節と同じ内容)\n' "$UNDERTOW_ANALYSIS_TEXT_OUTPUT" >> "$report_file"
+  else
+    printf 'テキスト      : (未出力)\n' >> "$report_file"
+  fi
+  printf '情報の取得状況: %s\n' "${UNDERTOW_ANALYSIS_COLLECT_STATUS:-(不明)}" >> "$report_file"
+  printf '総合判定      : %s\n' "${UNDERTOW_ANALYSIS_VERDICT:-(なし)}" >> "$report_file"
+  cat -- "$UNDERTOW_ANALYSIS_DIGEST_FILE" >> "$report_file"
+  return 0
+}
+
 append_compose_service_logs_report() {
   local report_file="$1"
   local service_name index=0 normalized_logs line_count containers log_scope
@@ -19183,6 +20489,8 @@ write_build_report() {
     printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
     printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
     printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
+    printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
+    printf '                (テキストも併せて出力。Host ヘッダーごとの振り分けと実測結果を含む)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートのヘッダーを書き込めませんでした: $candidate"
@@ -19288,6 +20596,11 @@ write_build_report() {
   printf '\n[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析\n' >> "$report_tmp"
   append_readonly_analysis_report "$report_tmp"
 
+  # Undertow のバーチャルホスト分析。これもコンテナを停止する前に済ませてあり、
+  # ここではその結果を書き出すだけとする。
+  printf '\n[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析\n' >> "$report_tmp"
+  append_undertow_analysis_report "$report_tmp"
+
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートを確定できませんでした: $candidate"
@@ -19316,6 +20629,9 @@ cleanup_all() {
   # 済ませる必要がある (docker diff / docker exec / compose logs を使うため)。
   # ビルドのみの実行や失敗した実行でも、compose.yml の定義から分かる範囲は出力する。
   analyze_readonly_filesystem "$original_status"
+  # Undertow のバーチャルホスト分析も、standalone.xml の読み出しと実リクエストに
+  # 起動中のコンテナが要るため、停止・削除より前に済ませる。
+  analyze_undertow_virtual_hosts "$original_status"
   if ! write_build_report "$original_status"; then
     cleanup_status=1
   fi
@@ -19342,6 +20658,7 @@ cleanup_all() {
   # 解析結果の一時ファイルは、全量レポートへ転記し終えたここで削除する。
   [ -n "$DEPLOY_EXCEPTION_TEXT_FILE" ] && rm -f "$DEPLOY_EXCEPTION_TEXT_FILE"
   [ -n "$READONLY_ANALYSIS_DIGEST_FILE" ] && rm -f "$READONLY_ANALYSIS_DIGEST_FILE"
+  [ -n "$UNDERTOW_ANALYSIS_DIGEST_FILE" ] && rm -f "$UNDERTOW_ANALYSIS_DIGEST_FILE"
   [ -n "$URL_BODY_FILE" ] && rm -f "$URL_BODY_FILE"
   [ -n "$INTERACTIVE_HTTP_BODY_FILE" ] && rm -f "$INTERACTIVE_HTTP_BODY_FILE"
   [ -n "$HEALTHCHECK_DIAGNOSTIC_FILE" ] && rm -f "$HEALTHCHECK_DIAGNOSTIC_FILE"
@@ -19650,6 +20967,12 @@ analyze_war_deploy_exceptions 0
 # べきディレクトリを分析する。起動に成功した実行でこそ「どこへ書いたか」が
 # 分かるため、成功経路でもコンテナを片付ける前に実行する。
 analyze_readonly_filesystem 0
+
+# 呼び出し元が Host ヘッダーにホスト名を指定してきたとき、どのバーチャルホストが
+# 処理するのか (default-host が受け皿として使われるのか) を分析する。
+# standalone.xml の読み出しと実リクエストに起動中のコンテナが要るため、
+# 成功経路でもコンテナを片付ける前のここで実行する。
+analyze_undertow_virtual_hosts 0
 
 # jboss-cli が生成した standalone.xml と Elytron CredentialStore まで確認し、
 # ビルド前の段と合わせて伝搬検証の結果をまとめて出力する。

@@ -1,0 +1,40 @@
+<?xml version="1.0" ?>
+<!--
+  Undertow バーチャルホスト分析のテスト用 standalone.xml (抜粋)。
+  - undertow の前後に別の subsystem を置き、名前空間で絞り込めているかを見る
+  - コメント内にも <host> を書き、コメント除去が効いているかを見る
+  - alias はカンマ区切り。default-host / admin-host の 2 ホスト構成
+-->
+<server xmlns="urn:jboss:domain:20.0">
+  <profile>
+    <subsystem xmlns="urn:wildfly:elytron:18.0">
+      <credential-stores/>
+    </subsystem>
+    <!-- <host name="commented-out-host" alias="ghost.example.com"/> は解析対象外 -->
+    <subsystem xmlns="urn:jboss:domain:undertow:14.0"
+               default-server="default-server"
+               default-virtual-host="default-host"
+               default-servlet-container="default"
+               default-security-domain="other"
+               statistics-enabled="false">
+      <buffer-cache name="default"/>
+      <server name="default-server">
+        <ajp-listener name="ajp" socket-binding="ajp"/>
+        <http-listener name="default" socket-binding="http" redirect-socket="https" enable-http2="true"/>
+        <https-listener name="https" socket-binding="https" ssl-context="applicationSSC" enable-http2="true"/>
+        <host name="default-host" alias="localhost,orders.example.jp">
+          <location name="/" handler="welcome-content"/>
+          <http-invoker http-authentication-factory="application-http-authentication"/>
+        </host>
+        <host name="admin-host" default-web-module="admin.war"/>
+      </server>
+      <servlet-container name="default">
+        <jsp-config/>
+        <websockets/>
+      </servlet-container>
+    </subsystem>
+    <subsystem xmlns="urn:jboss:domain:datasources:7.0">
+      <datasources/>
+    </subsystem>
+  </profile>
+</server>

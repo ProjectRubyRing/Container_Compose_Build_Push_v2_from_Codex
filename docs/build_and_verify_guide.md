@@ -57,6 +57,7 @@
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
 | 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
 | 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
+| 16 | JBoss EAP Undertow バーチャルホスト (`default-host`) の分析 (`Host` ヘッダーごとの振り分け判定、`default-host` の利用状況、`Host` ヘッダーを差し替えた実リクエストによる確認) | (起動確認時に既定で自動。無効化は `--no-undertow-analysis`。テキスト出力は `--report-dir` / `--undertow-analysis-text` 指定時) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -486,6 +487,13 @@ compose down (削除)
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 不可 | 読み取り専用ファイルシステム分析の Excel 出力先。`--no-readonly-analysis` とは排他 |
 | `--readonly-analysis-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他。Excel と同じパスは不可 |
 | `--no-readonly-analysis` | フラグ | `false` | 不可 | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |
+| `--undertow-host-header NAME` | ホスト名 (カンマ区切りも可) | (なし) | **可** | Undertow バーチャルホスト分析で振り分けを判定する `Host` ヘッダー名を追加する。ポート付きでも可 (Undertow と同じ規則で落とす)。`--no-undertow-analysis` とは排他 |
+| `--undertow-probe-path PATH` | `/` で始まるパス | (`WFLYUT0021` から検出) | 不可 | `Host` ヘッダーを差し替えた実リクエストの送信先パス。`--no-undertow-analysis` とは排他 |
+| `--no-undertow-probe` | フラグ | `false` | 不可 | 実リクエストを送らず、`standalone.xml` の解析だけで判定する |
+| `--undertow-analysis-text FILE` | ファイルパス | (なし) | 不可 | Undertow バーチャルホスト分析のテキスト出力先 (内容は画面表示と同一)。`--no-undertow-analysis` / `--no-undertow-analysis-text` とは排他 |
+| `--no-undertow-analysis-display` | フラグ | `false` | 不可 | 画面出力だけを抑制する。`--no-undertow-analysis-text` との同時指定は出力先が無くなるため不可 |
+| `--no-undertow-analysis-text` | フラグ | `false` | 不可 | テキスト出力だけを抑制する。`--no-undertow-analysis-display` との同時指定は不可 |
+| `--no-undertow-analysis` | フラグ | `false` | 不可 | Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない |
 
 ### 4.8 終了時のクリーンアップ
 

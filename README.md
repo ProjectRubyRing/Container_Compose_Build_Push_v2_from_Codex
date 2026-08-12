@@ -203,6 +203,13 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--readonly-analysis-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) 分析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
 | `--readonly-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--no-readonly-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない | `false` |
+| `--undertow-host-header NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析で振り分けを判定する `Host` ヘッダー名を追加する (カンマ区切り / 繰り返し可。ポート付きでも可) | (なし) |
+| `--undertow-probe-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。`Host` ヘッダーを差し替えた実リクエストの送信先パス | (`WFLYUT0021` から検出したコンテキストルート) |
+| `--no-undertow-probe` | **`build_and_verify.sh` / `--build-only` 委譲時**。実リクエストを送らず、`standalone.xml` の解析だけで判定する | `false` |
+| `--undertow-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析のテキスト出力先を明示する (内容は画面表示と同一) | (`--report-dir` 配下へ自動命名) |
+| `--no-undertow-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析の画面出力だけを抑制する (テキストと全量レポートへは出力する) | `false` |
+| `--no-undertow-analysis-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析のテキスト出力だけを抑制する (画面へは出力する) | `false` |
+| `--no-undertow-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -1295,6 +1302,91 @@ services:
 - **`要対応` を検出しても終了コードは変わりません**。終了コードは従来どおり、
   起動確認や URL 応答確認の結果で決まります。
 - `--dry-run` では分析しません (全量レポートの `[11]` へ理由を記録します)。
+
+### JBoss EAP Undertow バーチャルホスト (`default-host`) の分析
+
+呼び出し元が `Host` ヘッダーにホスト名を指定してきたとき、**どのバーチャルホストが
+そのリクエストを処理するのか**を、コンテナ内の `standalone.xml` から判定します。
+オプション指定は不要で、**既定で毎回実行し、画面とテキストの両方へ出力**します。
+
+Undertow の振り分けは `NameVirtualHostHandler` が次の順で決めます。
+
+1. `Host` ヘッダーからポートを除いたホスト名で**完全一致**を探す
+   (`app.example.jp:8080` なら `app.example.jp`。IPv6 は `[::1]` と括弧付きのまま扱う)
+2. 見つからなければ**小文字化して 1 度だけ**探し直す
+3. それでも見つからなければ **`server` の `default-host`** が指すホストへ渡す
+
+探索表に載るのは `<host>` の `name` と `alias` で、両者は同じ重みで扱われます。
+
+#### 名前の似た 2 つの「既定」を分けて出力する
+
+この分析がいちばん役に立つのは、次の 2 つを取り違えている場合です。
+
+| 設定 | 意味 |
+| --- | --- |
+| `server` の `default-host` | `Host` ヘッダーがどの名前とも一致しなかったリクエストの**受け皿** (振り分けの既定) |
+| `subsystem` の `default-virtual-host` | `jboss-web.xml` に `<virtual-host>` を書いていない WAR が**載るホスト** (デプロイ先の既定) |
+
+既定の `standalone.xml` ではどちらも `default-host` を指すため同一に見えますが、
+片方だけ変えると「WAR が載ったホストと受け皿が食い違い、**特定の `Host` ヘッダーの
+ときだけ 404 になる**」状態が起きます。分析はこの 2 つを必ず分けて出力し、
+食い違っていれば `要確認` として理由付きで指摘します。
+
+#### 出力内容
+
+| 節 | 内容 |
+| --- | --- |
+| `[1]` | `subsystem` の既定値 (`default-server` / `default-virtual-host` / `default-servlet-container` / `default-security-domain`)。XML に書かれていない項目はスキーマ既定値を `(既定値)` 付きで示す |
+| `[2]` | `server` ごとの `default-host`・`servlet-container` と、`http` / `https` / `ajp` リスナーの `socket-binding` |
+| `[3]` | バーチャルホストごとの `name`・別名一覧・`default-web-module`。`default-virtual-host` と `default-host` に該当するホストには印を付ける |
+| `[4]` | **`Host` ヘッダーごとの振り分け表**。設定に現れる名前に加えて `localhost` / `127.0.0.1` / Compose サービス名 / コンテナ名 / コンテナ IP / `--verify-url` のホスト名を対象に、「別名に一致」なのか「一致せず `default-host` を使用」なのかを 1 行ずつ示す |
+| `[5]` | **`default-host` 設定の利用状況**。受け皿として使われる `Host` ヘッダーの件数と、その中身を一覧する |
+| `[6]` | **実リクエストによる確認**。`Host` ヘッダーだけを差し替えた `GET` をコンテナ内 (`curl` / `wget` が無ければホスト側) から送り、応答ステータスを設定からの判定と並べる |
+| `[7]` | 要確認。`default-virtual-host` と `default-host` の食い違い、大文字を含む `name` / `alias`、複数ホストが登録した重複別名、別名を持たないホスト |
+
+`[6]` では、どの名前とも一致しない `undertow-default-host-check.invalid` を必ず送ります。
+これに応答が返れば、`default-host` が受け皿として実際に働いていることを、設定の
+読み取りではなく実測で示せます。
+
+#### 出力先と抑制
+
+画面と全量レポート `[12]` に加えて、`--report-dir DIR` を指定していれば
+`build_and_verify_<日時>_undertow_virtual_host.txt` (画面と同じ内容) を出力します。
+
+```bash
+# 既定。分析は毎回実行され、画面とテキストの両方へ出力される
+./build_and_verify.sh --verify-startup     --compose-service app --startup-service app     --report-dir ./reports
+
+# 本番の FQDN や ALB のホスト名を渡して、default-host へ落ちないかを確かめる
+./build_and_verify.sh --verify-startup     --undertow-host-header orders.example.jp,alb-internal.ap-northeast-1.elb.amazonaws.com
+
+# 実リクエストを送らず、設定ファイルの解析だけで判定する
+./build_and_verify.sh --verify-startup --no-undertow-probe
+
+# 出力先ごとに抑制する (両方を同時に抑制するとエラー)
+./build_and_verify.sh --verify-startup --no-undertow-analysis-display
+./build_and_verify.sh --verify-startup --no-undertow-analysis-text
+
+# 分析ごと行わない
+./build_and_verify.sh --verify-startup --no-undertow-analysis
+```
+
+#### 前提と影響範囲
+
+- 分析に **Python 3 は不要**です (振り分けの再現に必要なのは文字列比較だけのため、
+  `awk` と bash だけで完結します)。
+- **起動中のコンテナが必要**です。`standalone.xml` をコンテナから読み出すため、
+  `--verify-startup` / `--verify-url` を併用しない実行では「対象コンテナが起動して
+  いないため分析できません」と記録して読み飛ばします。
+- `undertow` subsystem が無い構成 (JBoss EAP 6 以前の `web` subsystem など) では、
+  その旨を記録して読み飛ばします。JBoss EAP 以外のサービスは対象外です。
+- 実リクエストは **`GET` のみ**で、`Host` ヘッダー以外は変更しません。1 回あたり
+  5 秒でタイムアウトし、最大 12 件までに制限します。`--no-undertow-probe` で
+  完全に止められます。
+- 分析は成功時は主処理の末尾、失敗時は `EXIT` の後始末で実行します。いずれも
+  **コンテナを削除する前**です。
+- **`要確認` を検出しても終了コードは変わりません**。
+- `--dry-run` では分析しません (全量レポートの `[12]` へ理由を記録します)。
 
 ### CloudWatch Logs 送信検証 (cwagent)
 

@@ -1,0 +1,22 @@
+<?xml version="1.0" ?>
+<!--
+  Undertow バーチャルホスト分析の異常系テスト用 standalone.xml (抜粋)。
+  次の 3 つを同時に踏ませる。
+  - subsystem の default-virtual-host (app-host) と server の default-host
+    (fallback-host) が食い違う
+  - alias に大文字が混ざる (Orders.Example.JP)
+  - 同じ別名 (localhost) を 2 つの host が登録している
+-->
+<server>
+  <profile>
+    <subsystem xmlns="urn:jboss:domain:undertow:14.0"
+               default-server="default-server"
+               default-virtual-host="app-host">
+      <server name="default-server" default-host="fallback-host" servlet-container="app-container">
+        <http-listener name="default" socket-binding="http"/>
+        <host name="app-host" alias="Orders.Example.JP,localhost"/>
+        <host name="fallback-host" alias="localhost"/>
+      </server>
+    </subsystem>
+  </profile>
+</server>

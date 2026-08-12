@@ -58,7 +58,7 @@ collect_report_files() {
   REPORT_FILES=()
   for path in "$dir"/build_and_verify_*.txt; do
     case "$path" in
-      *_java_exceptions.txt|*_readonly_filesystem.txt) continue ;;
+      *_java_exceptions.txt|*_readonly_filesystem.txt|*_undertow_virtual_host.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -2179,6 +2179,256 @@ assert_contains "$jboss_no_password_output" "--verify-jboss-password には検�
 
 unset FAKE_JBOSS_STANDALONE_XML
 
+# ---- JBoss EAP Undertow バーチャルホスト (default-host) の分析 ---------------
+# standalone.xml の undertow subsystem を読み、Host ヘッダーごとにどのバーチャル
+# ホストが処理するのか (default-host が受け皿として使われるのか) を判定する機能。
+# 既定で画面とテキストの両方へ出力し、パラメータで抑制できることまで確認する。
+#
+# ここまでのシナリオが export した fixture 切り替え用の変数を引き継ぐと、
+# 起動確認やコンテナ一覧の挙動が変わってしまうため、先にすべて解除する。
+unset FAKE_DOCKER_CLEANED FAKE_COMPOSE_SHUTDOWN_MARKER FAKE_COMPOSE_NO_CONTAINERS \
+      FAKE_COMPOSE_UP_FAIL FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES \
+      FAKE_COMPOSE_PS_SERVICES FAKE_DOCKER_FIND_FAIL FAKE_DOCKER_NO_JAVA_PROCESS \
+      FAKE_JBOSS_SECRET_VALUE FAKE_JBOSS_SECRET_MISSING FAKE_JBOSS_PROBE_BUILD_FAIL \
+      FAKE_JBOSS_HOME FAKE_JBOSS_CS_PASSWORD FAKE_JBOSS_ELYTRON_TOOL_MISSING \
+      FAKE_JBOSS_CS_FILE_MISSING
+
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_JBOSS_STANDALONE_XML="$TEST_DIR/fixtures/standalone-undertow.xml"
+# default-host へ落ちたリクエストだけ 404 を返し、振り分けの違いを応答で示す。
+export FAKE_UNDERTOW_404_HOSTS="app test-app-1 172.20.0.2 undertow-default-host-check.invalid extra.example.jp"
+
+# --- 既定 (オプション指定なし) で画面とテキストの両方へ出力する ---
+undertow_output="$TEST_TMP/undertow-default.out"
+undertow_reports="$TEST_TMP/undertow-reports"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$undertow_reports" \
+    --undertow-host-header extra.example.jp,orders.example.jp:8443 \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_output" 2>&1; then
+  cat "$undertow_output" >&2
+  fail "undertow virtual host analysis returned a non-zero status"
+fi
+
+# 見出しと設定ファイルの特定
+assert_contains "$undertow_output" "JBoss EAP Undertow バーチャルホスト (default-host) 分析"
+assert_contains "$undertow_output" "Undertow バーチャルホスト分析 (サービス: app / コンテナ: test-app-1)"
+assert_contains "$undertow_output" "名前空間      : urn:jboss:domain:undertow:14.0"
+
+# [1] subsystem の既定値。XML に書かれた値と、書かれていないスキーマ既定値を区別する
+assert_contains "$undertow_output" "default-virtual-host     : default-host"
+assert_contains "$undertow_output" "default-security-domain  : other"
+
+# [2] server とリスナー。default-host は XML に無いためスキーマ既定値と示す
+assert_contains "$undertow_output" "default-host      : default-host (既定値)"
+assert_contains "$undertow_output" "servlet-container : default (既定値)"
+assert_contains "$undertow_output" "http-listener   'default' socket-binding=http"
+assert_contains "$undertow_output" "https-listener  'https' socket-binding=https"
+assert_contains "$undertow_output" "ajp-listener    'ajp' socket-binding=ajp"
+
+# [3] バーチャルホストと別名。コメント内の host は拾わないこと
+assert_contains "$undertow_output" "host 'default-host' (server: default-server) [subsystem の default-virtual-host] [server の default-host]"
+assert_contains "$undertow_output" "host 'admin-host' (server: default-server)"
+assert_contains "$undertow_output" "default-web-module: admin.war"
+assert_not_contains "$undertow_output" "commented-out-host"
+assert_not_contains "$undertow_output" "ghost.example.com"
+
+# [4] Host ヘッダーごとの振り分け。設定由来・呼び出し由来・利用者指定を区別する
+assert_matches "$undertow_output" 'localhost +default-host +別名に一致 \(default-host は不使用\)'
+assert_matches "$undertow_output" 'orders\.example\.jp +default-host +別名に一致'
+assert_matches "$undertow_output" 'admin-host +admin-host +name に一致'
+assert_matches "$undertow_output" 'app +default-host +一致なし → default-host を使用 / Compose サービス名'
+assert_matches "$undertow_output" 'test-app-1 +default-host +一致なし → default-host を使用 / コンテナ名'
+assert_matches "$undertow_output" '172\.20\.0\.2 +default-host +一致なし → default-host を使用 / コンテナ IP'
+assert_matches "$undertow_output" 'extra\.example\.jp +default-host +一致なし → default-host を使用 / --undertow-host-header'
+# ポート付きで渡した名前は Undertow と同じ規則でポートを落として判定する
+assert_not_contains "$undertow_output" "orders.example.jp:8443"
+
+# [5] default-host 設定の利用状況
+assert_contains "$undertow_output" "[5] default-host 設定の利用状況"
+assert_contains "$undertow_output" "受け皿となる default-host : default-host"
+assert_contains "$undertow_output" "同名の host 定義          : あり"
+assert_contains "$undertow_output" "→ 次の Host ヘッダーで呼ばれた場合、default-host ('default-host') が処理します:"
+assert_contains "$undertow_output" "      - app (Compose サービス名)"
+assert_contains "$undertow_output" "      - extra.example.jp (--undertow-host-header)"
+
+# [6] 実リクエスト。default-host へ落ちた名前だけ 404 になる fixture
+assert_contains "$undertow_output" "[6] 実リクエストによる確認"
+assert_contains "$undertow_output" "送信内容      : GET /orders (Host ヘッダーだけを差し替えた読み取りリクエスト)"
+assert_contains "$undertow_output" "送信元        : コンテナ内 (http://127.0.0.1:8080/orders)"
+assert_matches "$undertow_output" 'localhost +HTTP 200 +.default-host. が処理'
+assert_matches "$undertow_output" 'app +HTTP 404 +default-host \(.default-host.\) が処理'
+assert_matches "$undertow_output" 'undertow-default-host-check\.invalid +HTTP 404 +default-host'
+
+# [7] 別名を持たない host は指摘する
+assert_contains "$undertow_output" "[7] 要確認"
+assert_contains "$undertow_output" "host 'admin-host' に別名がありません。"
+
+# 総合判定の行。この fixture は要確認が 1 件出るため、判定は WARN 側の
+# 「判定: ...」行へ載る (指摘が無い場合は「Undertow バーチャルホスト分析: ...」)。
+assert_matches "$undertow_output" '判定: バーチャルホスト 2 件、判定した Host ヘッダー [0-9]+ 件のうち [0-9]+ 件が default-host へ渡ります \(要確認 1 件\)'
+assert_matches "$undertow_output" '対象 1 サービス、バーチャルホスト 2 件、判定した Host ヘッダー 10 件 \(うち default-host 経由 6 件\)'
+
+# テキストファイルが --report-dir 配下へ自動出力され、画面と同じ内容を持つこと
+undertow_text="$(ls "$undertow_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null | head -n 1)"
+[ -n "$undertow_text" ] && [ -f "$undertow_text" ] \
+  || fail "expected an undertow virtual host analysis text file under $undertow_reports"
+assert_contains "$undertow_text" "build_and_verify.sh Undertow バーチャルホスト (default-host) 分析"
+assert_contains "$undertow_text" "[5] default-host 設定の利用状況"
+assert_contains "$undertow_text" "受け皿となる default-host : default-host"
+assert_contains "$undertow_output" "Undertow バーチャルホスト分析のテキストを出力しました: $undertow_text"
+
+# 全量レポートの [12] にも同じ結果が載ること
+collect_report_files "$undertow_reports"
+[ ${#REPORT_FILES[@]} -eq 1 ] || fail "expected one full build report for the undertow scenario"
+assert_contains "${REPORT_FILES[0]}" "[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析"
+assert_contains "${REPORT_FILES[0]}" "[5] default-host 設定の利用状況"
+assert_contains "${REPORT_FILES[0]}" "テキスト      : $undertow_text (この節と同じ内容)"
+
+# --- 設定の食い違いを指摘するケース ---
+undertow_mismatch_output="$TEST_TMP/undertow-mismatch.out"
+export FAKE_JBOSS_STANDALONE_XML="$TEST_DIR/fixtures/standalone-undertow-mismatch.xml"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --no-undertow-probe \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_mismatch_output" 2>&1; then
+  cat "$undertow_mismatch_output" >&2
+  fail "undertow mismatch scenario returned a non-zero status"
+fi
+
+# 受け皿は server の default-host であって、subsystem の default-virtual-host ではない
+assert_contains "$undertow_mismatch_output" "default-host      : fallback-host"
+assert_contains "$undertow_mismatch_output" "default-virtual-host     : app-host"
+assert_contains "$undertow_mismatch_output" "受け皿となる default-host : fallback-host"
+assert_contains "$undertow_mismatch_output" "subsystem の default-virtual-host ('app-host') と server の default-host ('fallback-host') が異なります。"
+# 大文字を含む別名は、小文字の Host ヘッダーと一致しないことを指摘する
+assert_contains "$undertow_mismatch_output" "の名前 'Orders.Example.JP' に大文字が含まれます。"
+assert_contains "$undertow_mismatch_output" "'orders.example.jp' のように表記の違う Host ヘッダーでは一致せず default-host へ渡ります。"
+# 同じ別名を複数の host が登録している場合も指摘する
+assert_contains "$undertow_mismatch_output" "名前 'localhost' を複数の host が登録しています。"
+# --no-undertow-probe を指定したので実リクエストは送らない
+assert_contains "$undertow_mismatch_output" "--no-undertow-probe が指定されたため送信していません。"
+assert_not_contains "$undertow_mismatch_output" "送信元        : コンテナ内"
+assert_not_contains "$FAKE_DOCKER_CALLS" "undertow-host-probe"
+
+# --- --no-undertow-analysis で分析ごと抑制する ---
+undertow_off_output="$TEST_TMP/undertow-off.out"
+undertow_off_reports="$TEST_TMP/undertow-off-reports"
+export FAKE_JBOSS_STANDALONE_XML="$TEST_DIR/fixtures/standalone-undertow.xml"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$undertow_off_reports" \
+    --no-undertow-analysis \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_off_output" 2>&1; then
+  cat "$undertow_off_output" >&2
+  fail "--no-undertow-analysis returned a non-zero status"
+fi
+assert_not_contains "$undertow_off_output" "JBoss EAP Undertow バーチャルホスト (default-host) 分析"
+assert_not_contains "$undertow_off_output" "[5] default-host 設定の利用状況"
+[ -z "$(ls "$undertow_off_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null)" ] \
+  || fail "--no-undertow-analysis unexpectedly wrote an undertow analysis text file"
+collect_report_files "$undertow_off_reports"
+assert_contains "${REPORT_FILES[0]}" "--no-undertow-analysis が指定されたため分析していません。"
+
+# --- --no-undertow-analysis-display は画面だけを抑制し、テキストは残す ---
+undertow_nodisp_output="$TEST_TMP/undertow-nodisplay.out"
+undertow_nodisp_reports="$TEST_TMP/undertow-nodisplay-reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$undertow_nodisp_reports" \
+    --no-undertow-analysis-display \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_nodisp_output" 2>&1; then
+  cat "$undertow_nodisp_output" >&2
+  fail "--no-undertow-analysis-display returned a non-zero status"
+fi
+assert_not_contains "$undertow_nodisp_output" "[5] default-host 設定の利用状況"
+assert_contains "$undertow_nodisp_output" "画面表示は --no-undertow-analysis-display により省略"
+undertow_nodisp_text="$(ls "$undertow_nodisp_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null | head -n 1)"
+[ -n "$undertow_nodisp_text" ] \
+  || fail "--no-undertow-analysis-display should still write the analysis text file"
+assert_contains "$undertow_nodisp_text" "[5] default-host 設定の利用状況"
+
+# --- --no-undertow-analysis-text はテキストだけを抑制し、画面へは出す ---
+undertow_notext_output="$TEST_TMP/undertow-notext.out"
+undertow_notext_reports="$TEST_TMP/undertow-notext-reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$undertow_notext_reports" \
+    --no-undertow-analysis-text \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_notext_output" 2>&1; then
+  cat "$undertow_notext_output" >&2
+  fail "--no-undertow-analysis-text returned a non-zero status"
+fi
+assert_contains "$undertow_notext_output" "[5] default-host 設定の利用状況"
+assert_contains "$undertow_notext_output" "テキスト出力は --no-undertow-analysis-text により行いません。"
+[ -z "$(ls "$undertow_notext_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null)" ] \
+  || fail "--no-undertow-analysis-text unexpectedly wrote an undertow analysis text file"
+
+# --- 矛盾するオプションの組み合わせは起動前に弾く ---
+undertow_conflict_output="$TEST_TMP/undertow-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-undertow-analysis --undertow-analysis-text "$TEST_TMP/x.txt"
+) >"$undertow_conflict_output" 2>&1; then
+  cat "$undertow_conflict_output" >&2
+  fail "--no-undertow-analysis with --undertow-analysis-text unexpectedly returned zero"
+fi
+assert_contains "$undertow_conflict_output" "--undertow-analysis-text と --no-undertow-analysis は同時に指定できません。"
+
+undertow_conflict2_output="$TEST_TMP/undertow-conflict2.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-undertow-analysis-display --no-undertow-analysis-text
+) >"$undertow_conflict2_output" 2>&1; then
+  cat "$undertow_conflict2_output" >&2
+  fail "suppressing both undertow outputs unexpectedly returned zero"
+fi
+assert_contains "$undertow_conflict2_output" "--no-undertow-analysis-display と --no-undertow-analysis-text を同時に指定すると出力先が無くなります。"
+
+undertow_conflict3_output="$TEST_TMP/undertow-conflict3.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --undertow-probe-path "orders"
+) >"$undertow_conflict3_output" 2>&1; then
+  cat "$undertow_conflict3_output" >&2
+  fail "a relative --undertow-probe-path unexpectedly returned zero"
+fi
+assert_contains "$undertow_conflict3_output" "--undertow-probe-path には / で始まるパスを指定してください: orders"
+
+unset FAKE_JBOSS_STANDALONE_XML FAKE_UNDERTOW_404_HOSTS
+
 # ---- CloudWatch Agent (cwagent) のログ送信検証 -------------------------------
 # compose.yml の cwagent 定義と設定 JSON の静的チェック (ビルド前) と、起動後の
 # 送達チェックを、正常系・異常系の双方で確認する。
@@ -3846,4 +4096,4 @@ CERT_CHECK_FAKE_GETENT
   unset MSYS2_ARG_CONV_EXCL
 fi
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check chain diagnosis, and Docker cleanup scenarios\n'
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check chain diagnosis, and Docker cleanup scenarios\n'

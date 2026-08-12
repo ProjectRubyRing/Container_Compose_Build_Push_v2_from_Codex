@@ -793,6 +793,22 @@ if [ "${1:-}" = "exec" ]; then
 
   case "$fake_exec_script" in
     '') ;;
+    *'undertow-host-probe'*)
+      # Undertow バーチャルホスト分析の実リクエスト。
+      #   docker exec <cid> /bin/sh -c '<script>' _ <URL> <Host ヘッダー> <秒>
+      # Host ヘッダーが FAKE_UNDERTOW_404_HOSTS に含まれていれば 404 を返し、
+      # default-host へ落ちたリクエストだけが 404 になる構成を再現する。
+      [ "${FAKE_UNDERTOW_PROBE_MISSING:-false}" = "true" ] && exit 127
+      fake_undertow_host="${8:-}"
+      for fake_undertow_404 in ${FAKE_UNDERTOW_404_HOSTS:-}; do
+        if [ "$fake_undertow_host" = "$fake_undertow_404" ]; then
+          printf '404'
+          exit 0
+        fi
+      done
+      printf '200'
+      exit 0
+      ;;
     *'$candidate/bin'*)
       # JBoss インストール先の検出
       fake_home="$(fake_jboss_home)"
