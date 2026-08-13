@@ -968,7 +968,7 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
       exit 2
       ;;
     ng)
-      printf '\n=== 1-1. トラストストア /opt/app/security/truststore.p12 ===\n'
+      printf '\n=== 2-1. トラストストア /opt/app/security/truststore.p12 ===\n'
       printf '[FAIL] cacert.crt はこのストアに登録されていない\n'
       printf '\n=== 結果 ===\n'
       printf '  PASS=1  FAIL=1  WARN=0  SKIP=0\n'
@@ -982,11 +982,27 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
       printf '       - /opt/app/security/truststore.p12  (起動中 JVM の -Djavax.net.ssl.trustStore)\n'
       printf '     接続先          : 1 件\n'
       printf '       - SECURE_API_URL = https://secure-api:8443/api/v1/ping\n'
-      printf '\n=== 2-1. HTTPS 接続 SECURE_API_URL ===\n'
+      printf '     自己証明書      : 1 ファイル (詳細は 1. / フィンガープリント照合にも使用)\n'
+      printf '       - /etc/pki/ca-trust/source/anchors/cacert.crt\n'
+      printf '\n=== 1. 受領した自己証明書 (cacert.crt) の詳細 ===\n'
+      printf '     この後の接続確認 (3-N.) は、ここに出す証明書を信頼した状態での結果です。\n'
+      printf '     [1] /etc/pki/ca-trust/source/anchors/cacert.crt  (1302 bytes)\n'
+      printf '         X.509 バージョン: v3 (拡張を持てる。CA かどうかを basicConstraints で明示できる)\n'
+      printf '         基本制約        : CA:TRUE, pathlen:0 (critical)\n'
+      printf '         自己署名        : YES (subject = issuer。自分の公開鍵で署名を検証できた)\n'
+      printf '         種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)\n'
+      printf '         トラストアンカー: できる。この CA が発行した証明書を検証できるようになる\n'
+      printf '[PASS] cacert.crt は自己署名のルート CA 証明書 (X.509 v3) で、トラストアンカーにできる\n'
+      printf '\n=== 3-1. HTTPS 接続 SECURE_API_URL ===\n'
       printf '[PASS] /opt/app/security/truststore.p12 由来の PEM で接続成功 (HTTP 200)\n'
       printf '[PASS] 対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)\n'
+      printf '\n=== 5. 受領した自己証明書の全項目 (openssl x509 -text) ===\n'
+      printf '     /etc/pki/ca-trust/source/anchors/cacert.crt\n'
+      printf '      Certificate:\n'
+      printf '          Data:\n'
+      printf '              Version: 3 (0x2)\n'
       printf '\n=== 結果 ===\n'
-      printf '  PASS=4  FAIL=0  WARN=0  SKIP=0\n'
+      printf '  PASS=6  FAIL=0  WARN=0  SKIP=0\n'
       printf '判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。\n'
       exit 0
       ;;

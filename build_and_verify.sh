@@ -627,6 +627,17 @@ BUILD_RESULT_STATUS="未実行"
 BUILD_RESULT_DETAIL=""
 BUILD_IMAGE_INFO=""
 
+# ---- 証明書チェック結果のテキスト出力 ----------------------------------------
+# 証明書チェック (logs モードの操作) は、受領した自己証明書の素性 (ルート CA /
+# 中間 CA / 自己署名リーフ、X.509 のバージョン、トラストアンカーにできるか) と、
+# それを信頼した状態での HTTPS 接続結果を続けて出す。画面は流れてしまい、
+# 証明書の内容は後から突き合わせたくなるため、同じ内容をテキストへも残す。
+# 出力先は --cert-check-text > --report-dir 配下 > 一時ディレクトリ の順に決める。
+CERT_CHECK_TEXT=""                # テキストの出力先。空なら自動命名する
+CERT_CHECK_TEXT_SET="false"       # 出力先が明示指定されたか
+CERT_CHECK_TEXT_ENABLED="true"    # false (--no-cert-check-text): テキストを出力しない
+CERT_CHECK_TEXT_OUTPUT=""         # 直近に出力したテキストのパス
+
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
 # 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
@@ -1239,6 +1250,12 @@ JBoss マスターパスワードの伝搬検証:
                                     証明書チェックも選択でき、コンテナ内の
                                     設定だけで自己証明書による HTTPS 接続を
                                     確認する (パラメータ入力なし)。
+                                    接続結果の前提として、受領した cacert.crt が
+                                    ルート CA / 中間 CA / 自己署名リーフの
+                                    どれか、X.509 v1/v2/v3 のどれか、そのまま
+                                    トラストアンカーにできるかまで表示し、
+                                    同じ内容をテキストファイルへも出力する
+                                    (--cert-check-text / --no-cert-check-text)。
                                     ALB ヘルスチェック偽装サービス
                                     (alb-healthcheck) が起動していれば、その
                                     ターゲット (frontend / backend 等) と偽装
@@ -1305,6 +1322,17 @@ JBoss マスターパスワードの伝搬検証:
                            Undertow バーチャルホスト分析を
                            DIR/build_and_verify_<日時>_undertow_virtual_host.txt へ
                            追加出力する (Excel とテキストは同じ内容)
+  --cert-check-text FILE   証明書チェック (--keep-container-mode logs の操作) の
+                           結果を FILE へ出力する。受領した自己証明書の詳細
+                           (種別・X.509 バージョン・トラストアンカー可否・全項目) と
+                           HTTPS 接続の結果を、画面と同じ内容で残す。
+                           未指定時は --report-dir 配下の
+                           DIR/build_and_verify_<日時>_cert_check_<サービス名>.txt、
+                           --report-dir も無い場合は一時ディレクトリへ出力し、
+                           そのパスを画面へ表示する。同じサービスを繰り返し
+                           確認したときは連番を足し、前回の結果を上書きしない
+  --no-cert-check-text     証明書チェック結果のテキスト出力を行わない
+                           (画面表示だけにする)
 
 WAR デプロイ時の Java 例外解析:
   (オプション指定不要。デプロイ処理のログに Java 例外があれば自動で解析する)
@@ -1648,6 +1676,8 @@ while [ $# -gt 0 ]; do
     --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
     --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
+    --cert-check-text)     need_value "$1" $#; CERT_CHECK_TEXT="$2"; CERT_CHECK_TEXT_SET="true"; shift 2 ;;
+    --no-cert-check-text)  CERT_CHECK_TEXT_ENABLED="false"; shift ;;
     --deploy-exception-excel) need_value "$1" $#; DEPLOY_EXCEPTION_EXCEL="$2"; DEPLOY_EXCEPTION_EXCEL_SET="true"; shift 2 ;;
     --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
     --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
@@ -1748,6 +1778,16 @@ done
 if [ "$BUILD_REPORT_DIR_SET" = "true" ] && { [ -z "$BUILD_REPORT_DIR" ] || [ "$BUILD_REPORT_DIR" = "-" ]; }; then
   err "--report-dir にはディレクトリパスを指定してください: $BUILD_REPORT_DIR"
   exit 2
+fi
+if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
+  if [ -z "$CERT_CHECK_TEXT" ] || [ "$CERT_CHECK_TEXT" = "-" ]; then
+    err "--cert-check-text にはファイルパスを指定してください: $CERT_CHECK_TEXT"
+    exit 2
+  fi
+  if [ "$CERT_CHECK_TEXT_ENABLED" != "true" ]; then
+    err "--cert-check-text と --no-cert-check-text は同時に指定できません。"
+    exit 2
+  fi
 fi
 validate_positive_integer "$DEPLOY_EXCEPTION_MAX" "--deploy-exception-limit" || exit 2
 if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ]; then
@@ -7564,14 +7604,87 @@ compose_service_supports_cert_check() {
   ' >/dev/null 2>&1
 }
 
+# 証明書チェックの結果テキストの出力先を決める。
+#   --cert-check-text の明示指定 > --report-dir 配下 > 一時ディレクトリ
+# 対話中は同じサービスを何度でも確認できるため、既存ファイルがあれば連番を足し、
+# 直前の結果を上書きしない (証明書を入れ替えながらの比較ができるようにする)。
+resolve_cert_check_text_path() {
+  local service_name="$1"
+  local safe_name base dir_part base_name prefix extension candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
+    base="$CERT_CHECK_TEXT"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_cert_check_${safe_name}.txt"
+  else
+    # 出力先の指定が無くても、証明書の詳細は後から突き合わせたくなる情報なので
+    # 一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_cert_check_${safe_name}.txt"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  base_name="$(basename -- "$base")"
+  case "$base_name" in
+    ?*.*) prefix="${base_name%.*}"; extension=".${base_name##*.}" ;;
+    *)    prefix="$base_name";      extension="" ;;
+  esac
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 画面へ出したものと同じ内容を、どの構成に対する結果かが分かる見出しを付けて残す。
+# 証明書・トラストストア・接続先のパスを含むため、他ユーザーからは読めない権限で作る。
+write_cert_check_text() {
+  local path="$1" service_name="$2" container_name="$3" capture_file="$4" verdict="$5"
+  local dir_path
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "証明書チェック結果の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "証明書チェック結果のテキストを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf '証明書チェック結果 (build_and_verify.sh)\n'
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf 'Compose サービス : %s\n' "$service_name"
+    printf 'コンテナ         : %s\n' "$container_name"
+    printf 'compose ファイル : %s\n' "$COMPOSE_FILE"
+    printf '判定             : %s\n' "$verdict"
+    printf '記載内容         : 0. 検出した設定 / 1. 受領した自己証明書の詳細 /\n'
+    printf '                   2-N. トラストストア / 3-N. HTTPS 接続 /\n'
+    printf '                   4. 次の一手 / 5. 自己証明書の全項目\n'
+    printf '取り扱い         : 接続先・トラストストア・証明書の情報を含みます。\n'
+    printf '                   共有・保存の際は取り扱いに注意してください。\n'
+    printf '===================================================================\n'
+    redact_healthcheck_text < "$capture_file"
+  } >> "$path" 2>/dev/null || {
+    warn "証明書チェック結果のテキストを出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
 # front / back のように自己証明書を取り込んだコンテナで、そのコンテナ自身の curl から
 # HTTPS の REST API (別 Compose サービスの secure-api / ALB 等) へ接続できるかを確認する。
 # トラストストア・パスワード・接続先・CA 証明書はすべてコンテナ内の JVM 引数と環境変数から
 # 検出するため、選択後の入力は不要。パスワードはコンテナ内でだけ解決し、
 # docker exec のコマンドライン (ホストのプロセス引数) には一切載せない。
+# 接続結果の前提として、受領した自己証明書そのものの詳細 (種別・X.509 バージョン・
+# トラストアンカー可否・全項目) を先に表示し、同じ内容をテキストファイルへも残す。
 run_interactive_compose_cert_check() {
   local service_name="$1" container_id container_name cert_check_script
-  local capture_file="" exec_status=0
+  local capture_file="" exec_status=0 verdict_text="" text_path=""
   local -a container_ids=()
 
   mapfile -t container_ids < <(compose_container_ids "$service_name")
@@ -7594,7 +7707,18 @@ set -u
 #   パスワード     : 同 -Djavax.net.ssl.trustStorePassword → *TRUSTSTORE*PASSWORD 環境変数
 #                    → changeit → パスワード無し (整合性チェック省略)
 #   接続先         : https:// で始まる値を持つ環境変数 (SECURE_API_URL 等)
-#   CA 証明書      : ${PKI_TRUST_DIR}/*.crt → *CACERT* / *CA_BUNDLE* 環境変数
+#   自己証明書     : ${PKI_TRUST_DIR}/*.crt → *CACERT* / *CA_BUNDLE* 環境変数
+# 出力するセクションは次のとおり。接続の合否 (3-N.) を読むための前提として、
+# 受け取った証明書そのものの素性 (1.) を先に確定させる。
+#   0.   コンテナ内から検出した設定
+#   1.   受領した自己証明書 (cacert.crt) の詳細
+#        種別 (ルート CA / 中間 CA / 自己署名リーフ / end-entity)、X.509 の
+#        バージョン (v1 / v2 / v3)、トラストアンカーにできるか、有効期間、
+#        基本制約・鍵用途・SKI/AKI・署名アルゴリズム・鍵長・SHA-256 / SHA-1
+#   2-N. トラストストアの内容 (JDK 標準 cacerts との差分と SHA-256 照合)
+#   3-N. HTTPS 接続の結果と、失敗時のチェーン解析による原因特定
+#   4.   次の一手 (検出した原因ごとの対処)
+#   5.   受領した自己証明書の全項目 (openssl x509 -text をそのまま掲載)
 # 終了コード: 0 = 判定 OK / 1 = 判定 NG / 2 = 検出できず実行不能
 
 CC_PASS=0
@@ -7949,6 +8073,336 @@ else
   cc_info 'JVM             : トラストストアを指定した起動中プロセスは見つからなかった'
 fi
 
+# トラストストアや接続先を検出できなくても、受領した自己証明書の詳細 (1.) は
+# 前提情報として必ず出す。実行できるかどうかの判定はその後に行う。
+if [ "$CC_STORE_TOTAL" -gt 0 ]; then
+  cc_info "トラストストア  : ${CC_STORE_TOTAL} 件"
+  while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
+    [ -n "$cc_store" ] || continue
+    cc_info "  - ${cc_store}  (${cc_source})"
+  done < "$CC_STORES_FILE"
+else
+  cc_info 'トラストストア  : 検出なし'
+fi
+if [ "$CC_TARGET_TOTAL" -gt 0 ]; then
+  cc_info "接続先          : ${CC_TARGET_TOTAL} 件"
+  while IFS= read -r cc_line; do
+    [ -n "$cc_line" ] || continue
+    cc_info "  - ${cc_line%%=*} = ${cc_line#*=}"
+  done < "$CC_TARGETS_FILE"
+else
+  cc_info '接続先          : 検出なし'
+fi
+if [ "$CC_CACERT_TOTAL" -gt 0 ]; then
+  cc_info "自己証明書      : ${CC_CACERT_TOTAL} ファイル (詳細は 1. / フィンガープリント照合にも使用)"
+  while IFS= read -r cc_line; do
+    [ -n "$cc_line" ] || continue
+    cc_info "  - ${cc_line}"
+  done < "$CC_CACERTS_FILE"
+else
+  cc_info '自己証明書      : 検出なし (詳細表示とフィンガープリント照合は行わない)'
+fi
+if [ "$CC_STORE_TOTAL" -gt "$CC_MAX_STORES" ] || [ "$CC_TARGET_TOTAL" -gt "$CC_MAX_TARGETS" ]; then
+  cc_info "確認件数の上限  : トラストストア ${CC_MAX_STORES} 件 / 接続先 ${CC_MAX_TARGETS} 件まで"
+fi
+
+# =====================================================================
+# 1. 受領した自己証明書 (cacert.crt) の詳細
+#    接続の合否より前に「受け取った証明書が何なのか」を確定させる。
+#    同じ「接続できない」でも、ルート CA を受領しているのか、中間 CA なのか、
+#    そもそも CA ではないリーフなのかで、次にやることがまったく変わるため。
+#    判定に使う項目 (種別 / バージョン / 基本制約 / 鍵用途 / 有効期間) を
+#    整形して出し、全項目は 5. へそのまま載せる。
+# =====================================================================
+
+# 受領した証明書は PEM とは限らず、DER (バイナリ) で配布されることもある。
+# どちらでも同じ解析ができるよう、1 枚ずつの PEM へ正規化してから扱う。
+# 結果は CC_NC_FORMAT (形式) と CC_NC_COUNT (枚数) へ入れる。
+cc_normalize_certs() {  # $1=証明書ファイル $2=出力ディレクトリ
+  cc_nc_src="$1"
+  cc_nc_dir="$2"
+  CC_NC_FORMAT='不明'
+  CC_NC_COUNT=0
+  mkdir -p "$cc_nc_dir" 2>/dev/null || return 1
+  if grep -q -- '-----BEGIN CERTIFICATE-----' "$cc_nc_src" 2>/dev/null; then
+    # 1 ファイルにルートと中間が連結されていることがあるため 1 枚ずつに割る。
+    awk -v dir="$cc_nc_dir" '
+      /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%03d.pem", dir, n); w = 1 }
+      w { print > out }
+      /-----END CERTIFICATE-----/   { w = 0 }
+    ' "$cc_nc_src"
+    CC_NC_FORMAT='PEM'
+  elif [ -n "$CC_OPENSSL" ] \
+      && "$CC_OPENSSL" x509 -inform DER -in "$cc_nc_src" \
+           -out "$cc_nc_dir/cert-001.pem" >/dev/null 2>&1; then
+    CC_NC_FORMAT='DER'
+  fi
+  for cc_nc_pem in "$cc_nc_dir"/cert-*.pem; do
+    [ -r "$cc_nc_pem" ] || continue
+    CC_NC_COUNT=$((CC_NC_COUNT + 1))
+  done
+  [ "$CC_NC_COUNT" -gt 0 ]
+}
+
+# openssl x509 -text の拡張は、見出し行の次の行に値が入る。
+cc_ext_value_of() {  # $1=PEM $2=拡張の見出し
+  cc_x509 "$1" -text \
+    | sed -n "/$2/{n;s/^[[:space:]]*//;s/[[:space:]]*$//;p;}" | head -n 1
+}
+# 見出し行そのものに付く critical の有無。
+cc_ext_flag_of() {  # $1=PEM $2=拡張の見出し
+  cc_x509 "$1" -text | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -n 1
+}
+# X.509 のバージョン番号 (1 / 2 / 3)。v3 でなければ拡張を持てない。
+cc_version_of() {
+  cc_x509 "$1" -text \
+    | sed -n 's/^[[:space:]]*Version:[[:space:]]*\([0-9]\).*/\1/p' | head -n 1
+}
+cc_serial_of() { cc_x509 "$1" -serial | sed 's/^serial=//'; }
+cc_sigalg_of() {
+  cc_x509 "$1" -text \
+    | sed -n 's/^[[:space:]]*Signature Algorithm:[[:space:]]*//p' | head -n 1
+}
+cc_fp1_of()    { cc_x509 "$1" -fingerprint -sha1 | sed 's/^.*=//' | tr -d '\r'; }
+cc_keyalg_of() {
+  cc_x509 "$1" -text \
+    | sed -n 's/^[[:space:]]*Public Key Algorithm:[[:space:]]*//p' | head -n 1
+}
+cc_keybits_of() {
+  cc_x509 "$1" -text \
+    | sed -n 's/.*Public-Key:[[:space:]]*(\([0-9][0-9]*\) bit).*/\1/p' | head -n 1
+}
+# subject と issuer が同じ (自己発行)。署名まで検証できるかは下の判定で見る。
+# 自己発行なのに署名を検証できない場合は、ファイルの破損か差し替えを疑う。
+cc_is_self_issued() {
+  [ -n "$CC_OPENSSL" ] || return 1
+  [ "$(cc_subject_hash_of "$1")" = "$(cc_issuer_hash_of "$1")" ]
+}
+# 自己署名かどうかを、有効期限とは切り離して判定する。
+# cc_is_selfsigned は openssl verify がそのまま通ることを条件にするため、
+# 期限切れのルート CA を「署名を検証できない」と誤って扱ってしまう。
+# 期限切れ (と有効期間前) は別項目で判定するので、ここでは署名だけを見る。
+cc_is_selfsigned_ignoring_time() {
+  [ -n "$CC_OPENSSL" ] || return 1
+  [ "$(cc_subject_hash_of "$1")" = "$(cc_issuer_hash_of "$1")" ] || return 1
+  "$CC_OPENSSL" verify -CAfile "$1" "$1" >/dev/null 2>&1 && return 0
+  "$CC_OPENSSL" verify -CAfile "$1" "$1" 2>&1 \
+    | grep -qE 'certificate has expired|certificate is not yet valid'
+}
+
+# 証明書 1 枚分の詳細と判定を出す。
+cc_report_cert_detail() {  # $1=PEM $2=元ファイル $3=通番 $4=総数
+  cc_cd_pem="$1"; cc_cd_src="$2"; cc_cd_i="$3"; cc_cd_n="$4"
+  cc_cd_label="$(basename -- "$cc_cd_src")"
+  if [ "$cc_cd_n" -gt 1 ]; then
+    cc_cd_label="${cc_cd_label} [${cc_cd_i}/${cc_cd_n}]"
+    cc_info "    --- 証明書 ${cc_cd_i}/${cc_cd_n} ---"
+  fi
+
+  cc_cd_ver="$(cc_version_of "$cc_cd_pem")"
+  cc_cd_bc="$(cc_ext_value_of "$cc_cd_pem" 'X509v3 Basic Constraints')"
+  cc_cd_bc_flag="$(cc_ext_flag_of "$cc_cd_pem" 'X509v3 Basic Constraints')"
+  cc_cd_ku="$(cc_ext_value_of "$cc_cd_pem" 'X509v3 Key Usage')"
+  cc_cd_eku="$(cc_ext_value_of "$cc_cd_pem" 'X509v3 Extended Key Usage')"
+  cc_cd_skid="$(cc_ext_value_of "$cc_cd_pem" 'X509v3 Subject Key Identifier')"
+  cc_cd_akid="$(cc_ext_value_of "$cc_cd_pem" 'X509v3 Authority Key Identifier' \
+    | sed 's/^keyid://')"
+  cc_cd_san="$(cc_san_of "$cc_cd_pem")"
+  cc_cd_sigalg="$(cc_sigalg_of "$cc_cd_pem")"
+  cc_cd_bits="$(cc_keybits_of "$cc_cd_pem")"
+  cc_cd_notafter="$(cc_notafter_of "$cc_cd_pem")"
+
+  cc_info "    subject         : $(cc_subject_of "$cc_cd_pem")"
+  cc_info "    issuer          : $(cc_issuer_of "$cc_cd_pem")"
+  cc_info "    シリアル番号    : $(cc_serial_of "$cc_cd_pem")"
+  cc_info "    有効期間        : $(cc_notbefore_of "$cc_cd_pem") 〜 ${cc_cd_notafter}"
+  cc_info "    署名アルゴリズム: ${cc_cd_sigalg:-取得できず}"
+  cc_info "    公開鍵          : $(cc_keyalg_of "$cc_cd_pem")${cc_cd_bits:+ ${cc_cd_bits} bit}"
+  cc_info "    SHA-256         : $(cc_fp_of "$cc_cd_pem")"
+  cc_info "    SHA-1           : $(cc_fp1_of "$cc_cd_pem")"
+  case "$cc_cd_ver" in
+    3) cc_info '    X.509 バージョン: v3 (拡張を持てる。CA かどうかを basicConstraints で明示できる)' ;;
+    2) cc_info '    X.509 バージョン: v2 (拡張を持てない。CA かどうかを証明書自身では示せない)' ;;
+    1) cc_info '    X.509 バージョン: v1 (拡張を持てない。CA かどうかを証明書自身では示せない)' ;;
+    *) cc_info '    X.509 バージョン: 判定できず' ;;
+  esac
+  if [ -n "$cc_cd_bc" ]; then
+    cc_info "    基本制約        : ${cc_cd_bc}${cc_cd_bc_flag:+ (${cc_cd_bc_flag})}"
+  else
+    cc_info '    基本制約        : (なし)'
+  fi
+  cc_info "    鍵用途          : ${cc_cd_ku:-(なし)}"
+  cc_info "    拡張鍵用途      : ${cc_cd_eku:-(なし)}"
+  cc_info "    SKI             : ${cc_cd_skid:-(なし)}"
+  cc_info "    AKI             : ${cc_cd_akid:-(なし。自己署名のルート CA では省略されることがある)}"
+  if [ -n "$cc_cd_san" ]; then
+    cc_info "    SAN             : ${cc_cd_san}"
+  fi
+
+  cc_cd_self_issued='no'
+  cc_cd_selfsigned='no'
+  cc_cd_ca='no'
+  cc_is_self_issued "$cc_cd_pem" && cc_cd_self_issued='yes'
+  cc_is_selfsigned_ignoring_time "$cc_cd_pem" && cc_cd_selfsigned='yes'
+  cc_is_ca "$cc_cd_pem" && cc_cd_ca='yes'
+
+  if [ "$cc_cd_selfsigned" = 'yes' ]; then
+    cc_info '    自己署名        : YES (subject = issuer。自分の公開鍵で署名を検証できた)'
+  elif [ "$cc_cd_self_issued" = 'yes' ]; then
+    cc_info '    自己署名        : NO (subject = issuer だが、自分の公開鍵では署名を検証できない)'
+    cc_warn "${cc_cd_label} は subject と issuer が同じなのに署名を検証できない (ファイルの破損 / 差し替えを疑う)"
+  else
+    cc_info '    自己署名        : NO (別の CA が発行した証明書)'
+  fi
+
+  # 種別とトラストアンカー可否。ここが「受領物が何なのか」の結論になる。
+  if [ "$cc_cd_ca" = 'yes' ] && [ "$cc_cd_selfsigned" = 'yes' ]; then
+    cc_info '    種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)'
+    cc_info '    トラストアンカー: できる。この CA が発行した証明書を検証できるようになる'
+    cc_pass "${cc_cd_label} は自己署名のルート CA 証明書 (X.509 v${cc_cd_ver:-?}) で、トラストアンカーにできる"
+  elif [ "$cc_cd_ca" = 'yes' ]; then
+    cc_info '    種別            : 中間 CA 証明書 (別の CA が発行した CA)'
+    cc_info '    トラストアンカー: できる (取り込むとこの CA 配下だけを信頼する形になる)。'
+    cc_info '                      ルート CA から検証させたい場合は上位の CA も取り込む'
+    cc_warn "${cc_cd_label} は中間 CA 証明書 (X.509 v${cc_cd_ver:-?})。ルート CA まで信頼するかを決めて取り込む"
+    cc_hint 'intermediate-anchor'
+  elif [ "$cc_cd_selfsigned" = 'yes' ] && [ "${cc_cd_ver:-3}" != '3' ]; then
+    cc_info '    種別            : 自己署名証明書 (X.509 v1 / v2 のため CA かどうかを拡張で示せない)'
+    cc_info '    トラストアンカー: できる。トラストストアへ入れた自己署名証明書はアンカーとして扱われる。'
+    cc_info '                      ただし用途の制限を証明書自身で表現できないため v3 での再発行が望ましい'
+    cc_warn "${cc_cd_label} は X.509 v${cc_cd_ver:-?} で basicConstraints を持たない (CA かどうかを判定できない)"
+    cc_hint 'v1-anchor'
+  elif [ "$cc_cd_selfsigned" = 'yes' ] && [ -z "$cc_cd_bc" ]; then
+    cc_info '    種別            : 自己署名証明書 (v3 だが basicConstraints が無く、CA としては扱われない)'
+    cc_info '    トラストアンカー: この 1 枚だけを信頼する形になる。'
+    cc_info '                      basicConstraints が無いため、この証明書が発行した証明書は検証できない'
+    cc_warn "${cc_cd_label} は basicConstraints を持たない (CA:TRUE が無いため CA として扱われない)"
+    cc_hint 'no-basic-constraints'
+  elif [ "$cc_cd_selfsigned" = 'yes' ]; then
+    cc_info '    種別            : 自己署名のサーバ / クライアント証明書 (CA:FALSE のリーフ)'
+    cc_info '    トラストアンカー: この 1 枚だけを信頼する形になる。'
+    cc_info '                      同じ主体でも再発行された別の証明書は検証できない'
+    cc_warn "${cc_cd_label} は CA 証明書ではない (自己署名リーフ。この 1 枚だけを信頼する形になる)"
+    cc_hint 'leaf-anchor'
+  else
+    cc_info '    種別            : end-entity 証明書 (CA ではないリーフ。別の CA が発行)'
+    cc_info '    トラストアンカー: 向かない。発行元の CA 証明書を配布元から入手する'
+    cc_warn "${cc_cd_label} は CA 証明書ではない (別の CA が発行したリーフ)。cacert.crt の取り違えを疑う"
+    cc_hint 'cacert-not-ca'
+  fi
+
+  # 有効期間。期限切れは構成が正しくても接続を必ず失敗させる。
+  if cc_is_expired "$cc_cd_pem"; then
+    cc_fail "${cc_cd_label} は有効期限が切れている (${cc_cd_notafter})"
+    cc_hint 'expired-anchor'
+  elif ! "$CC_OPENSSL" x509 -in "$cc_cd_pem" -noout -checkend 2592000 >/dev/null 2>&1; then
+    cc_warn "${cc_cd_label} は 30 日以内に有効期限を迎える (${cc_cd_notafter})"
+    cc_hint 'expiring-anchor'
+  else
+    cc_pass "${cc_cd_label} は有効期間内 (〜 ${cc_cd_notafter})"
+  fi
+
+  # keyUsage を持つ CA は、その用途に従って検証される。
+  if [ "$cc_cd_ca" = 'yes' ] && [ -n "$cc_cd_ku" ]; then
+    case "$cc_cd_ku" in
+      *'Certificate Sign'*) ;;
+      *)
+        cc_warn "${cc_cd_label} は CA:TRUE だが鍵用途に Certificate Sign が無い (CA として扱われないことがある)"
+        cc_hint 'ca-keyusage'
+        ;;
+    esac
+  fi
+  case "$cc_cd_sigalg" in
+    *md5*|*MD5*|*sha1*|*SHA1*|*SHA-1*)
+      cc_warn "${cc_cd_label} の署名アルゴリズムは ${cc_cd_sigalg} (最近の JDK / OpenSSL は既定で拒否する)"
+      cc_hint 'weak-sigalg'
+      ;;
+  esac
+  case "${cc_cd_bits:-}" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$cc_cd_bits" -lt 2048 ]; then
+        case "$(cc_keyalg_of "$cc_cd_pem")" in
+          *rsa*|*RSA*)
+            cc_warn "${cc_cd_label} の鍵長は ${cc_cd_bits} bit (RSA 2048 bit 未満は拒否されることがある)"
+            cc_hint 'weak-key'
+            ;;
+        esac
+      fi
+      ;;
+  esac
+}
+
+# 5. で全項目を出すために、正規化した PEM と元ファイルの対応を残す。
+CC_CACERT_PEM_INDEX="$CC_DIR/cacert-pems.tsv"
+: > "$CC_CACERT_PEM_INDEX"
+
+cc_section '1. 受領した自己証明書 (cacert.crt) の詳細'
+if [ "$CC_CACERT_TOTAL" -eq 0 ]; then
+  cc_info '受領した自己証明書を検出できませんでした。'
+  cc_info '  ${PKI_TRUST_DIR}/*.crt か、証明書のパスを値に持つ *CACERT* / *CA_CERT* /'
+  cc_info '  *CA_BUNDLE* 環境変数があると、ここへ証明書の詳細を出します。'
+else
+  cc_info 'この後の接続確認 (3-N.) は、ここに出す証明書を信頼した状態での結果です。'
+  if [ "$CC_STORE_TOTAL" -gt 0 ]; then
+    cc_info 'トラストストアへ実際に入っているかは 2-N. で SHA-256 により照合します。'
+  fi
+  cc_cacert_index=0
+  while IFS= read -r cc_cacert; do
+    [ -n "$cc_cacert" ] || continue
+    cc_cacert_index=$((cc_cacert_index + 1))
+    cc_ca_bytes="$(wc -c < "$cc_cacert" 2>/dev/null | tr -d '[:space:]')"
+    case "${cc_ca_bytes:-}" in
+      ''|*[!0-9]*) cc_ca_bytes=0 ;;
+    esac
+    printf '\n'
+    cc_info "[${cc_cacert_index}] ${cc_cacert}  (${cc_ca_bytes} bytes)"
+
+    if [ -z "$CC_OPENSSL" ]; then
+      # openssl が無くても keytool -printcert なら中身を出せる。判定の粒度は落ちる。
+      cc_info '    openssl が無いため keytool -printcert の出力を掲載します'
+      "$CC_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+        -printcert -file "$cc_cacert" > "$CC_DIR/printcert.out" 2>&1 < /dev/null || :
+      sed 's/^/      /' "$CC_DIR/printcert.out" 2>/dev/null | head -n 80
+      cc_kt_owner="$(sed -n 's/^Owner:[[:space:]]*//p' "$CC_DIR/printcert.out" | head -n 1)"
+      cc_kt_issuer="$(sed -n 's/^Issuer:[[:space:]]*//p' "$CC_DIR/printcert.out" | head -n 1)"
+      cc_kt_ver="$(sed -n 's/^Version:[[:space:]]*\([0-9]\).*/\1/p' "$CC_DIR/printcert.out" | head -n 1)"
+      cc_info "    X.509 バージョン: v${cc_kt_ver:-?}"
+      if [ -n "$cc_kt_owner" ] && [ "$cc_kt_owner" = "$cc_kt_issuer" ]; then
+        cc_info '    自己発行        : YES (Owner = Issuer。署名の検証は openssl が無いため未実施)'
+      else
+        cc_info '    自己発行        : NO (Owner と Issuer が異なる)'
+      fi
+      if grep -qi 'CA:true' "$CC_DIR/printcert.out" 2>/dev/null; then
+        cc_info '    種別            : CA 証明書 (BasicConstraints CA:true)'
+        cc_info '    トラストアンカー: できる'
+        cc_pass "$(basename -- "$cc_cacert") は CA 証明書で、トラストアンカーにできる (keytool の出力による判定)"
+      else
+        cc_warn "$(basename -- "$cc_cacert") は BasicConstraints CA:true を確認できない (openssl があると種別まで判定できる)"
+      fi
+      cc_hint 'no-openssl'
+      continue
+    fi
+
+    cc_ca_dir="$CC_DIR/cacert-${cc_cacert_index}"
+    if ! cc_normalize_certs "$cc_cacert" "$cc_ca_dir"; then
+      cc_warn "証明書として読み取れない: ${cc_cacert} (PEM / DER のどちらとしても解析できない)"
+      continue
+    fi
+    cc_info "    ファイル形式    : ${CC_NC_FORMAT} (証明書 ${CC_NC_COUNT} 枚)"
+    cc_ca_sub=0
+    for cc_ca_pem in "$cc_ca_dir"/cert-*.pem; do
+      [ -r "$cc_ca_pem" ] || continue
+      cc_ca_sub=$((cc_ca_sub + 1))
+      printf '%s\t%s\t%s\t%s\n' \
+        "$cc_ca_pem" "$cc_cacert" "$cc_ca_sub" "$CC_NC_COUNT" >> "$CC_CACERT_PEM_INDEX"
+      cc_report_cert_detail "$cc_ca_pem" "$cc_cacert" "$cc_ca_sub" "$CC_NC_COUNT"
+    done
+  done < "$CC_CACERTS_FILE"
+fi
+
+# ここから先は接続確認。トラストストアか接続先が無ければ実行できないため、
+# 前提情報 (0. と 1.) を出し切ってから終了する。
 if [ "$CC_STORE_TOTAL" -eq 0 ]; then
   printf '\nトラストストアを検出できませんでした。\n'
   printf '  -Djavax.net.ssl.trustStore を付けて JVM を起動しているか、\n'
@@ -7961,31 +8415,8 @@ if [ "$CC_TARGET_TOTAL" -eq 0 ]; then
   exit 2
 fi
 
-cc_info "トラストストア  : ${CC_STORE_TOTAL} 件"
-while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
-  [ -n "$cc_store" ] || continue
-  cc_info "  - ${cc_store}  (${cc_source})"
-done < "$CC_STORES_FILE"
-cc_info "接続先          : ${CC_TARGET_TOTAL} 件"
-while IFS= read -r cc_line; do
-  [ -n "$cc_line" ] || continue
-  cc_info "  - ${cc_line%%=*} = ${cc_line#*=}"
-done < "$CC_TARGETS_FILE"
-if [ "$CC_CACERT_TOTAL" -gt 0 ]; then
-  cc_info "CA 証明書       : ${CC_CACERT_TOTAL} 件 (フィンガープリント照合に使用)"
-  while IFS= read -r cc_line; do
-    [ -n "$cc_line" ] || continue
-    cc_info "  - ${cc_line}"
-  done < "$CC_CACERTS_FILE"
-else
-  cc_info 'CA 証明書       : 検出なし (フィンガープリント照合は行わない)'
-fi
-if [ "$CC_STORE_TOTAL" -gt "$CC_MAX_STORES" ] || [ "$CC_TARGET_TOTAL" -gt "$CC_MAX_TARGETS" ]; then
-  cc_info "確認件数の上限  : トラストストア ${CC_MAX_STORES} 件 / 接続先 ${CC_MAX_TARGETS} 件まで"
-fi
-
 # =====================================================================
-# 1. トラストストアから PEM バンドルを書き出す
+# 2. トラストストアから PEM バンドルを書き出す
 #    curl は JKS / PKCS12 を直接読めないため keytool -rfc で PEM へ変換する。
 # =====================================================================
 CC_READY_FILE="$CC_DIR/ready.tsv"
@@ -7996,7 +8427,7 @@ while IFS="$CC_TAB" read -r cc_store cc_source cc_pwtoken; do
   cc_store_index=$((cc_store_index + 1))
   [ "$cc_store_index" -le "$CC_MAX_STORES" ] || break
 
-  cc_section "1-${cc_store_index}. トラストストア ${cc_store}"
+  cc_section "2-${cc_store_index}. トラストストア ${cc_store}"
   cc_info "検出元: ${cc_source}"
   if [ ! -r "$cc_store" ]; then
     cc_fail "トラストストアを読み取れない: ${cc_store}"
@@ -8172,7 +8603,7 @@ if [ "$CC_READY_TOTAL" -eq 0 ]; then
 fi
 
 # =====================================================================
-# 2. 検出した接続先へ、各トラストストア由来の PEM で HTTPS 接続する
+# 3. 検出した接続先へ、各トラストストア由来の PEM で HTTPS 接続する
 #    失敗したときは curl の終了コードで止めず、サーバが実際に提示した
 #    証明書チェーンとトラストストアの中身を突き合わせ、
 #    「どの CA が足りないのか」「取り込みは成功しているのか」まで出す。
@@ -8324,7 +8755,7 @@ while IFS= read -r cc_target_line <&3; do
   cc_host="$(cc_url_hostport "$cc_target_url" | cut -f1)"
   cc_port="$(cc_url_hostport "$cc_target_url" | cut -f2)"
 
-  cc_section "2-${cc_target_index}. HTTPS 接続 ${cc_target_name}"
+  cc_section "3-${cc_target_index}. HTTPS 接続 ${cc_target_name}"
   cc_info "接続先: ${cc_target_url}"
   cc_info "ホスト: ${cc_host}   ポート: ${cc_port}"
 
@@ -8476,11 +8907,58 @@ while IFS= read -r cc_target_line <&3; do
 done 3< "$CC_TARGETS_FILE"
 
 # =====================================================================
-# 3. 次の一手 (検出した原因ごとの対処)
+# 4. 次の一手 (検出した原因ごとの対処)
 #    上のログを読み直さなくても、そのまま実行できる形で対処を出す。
 # =====================================================================
 if [ -s "$CC_HINTS_FILE" ]; then
-  cc_section '3. 次の一手'
+  cc_section '4. 次の一手'
+  if cc_has_hint 'cacert-not-ca'; then
+    printf '  ● 受領した証明書が CA 証明書ではない (別の CA が発行したリーフ)\n'
+    printf '     basicConstraints で CA:TRUE が示されていないため、この証明書では\n'
+    printf '     他の証明書を検証できません。\n'
+    printf '     トラストアンカーにしても、その 1 枚を提示するサーバしか検証できません。\n'
+    printf '     発行元の CA 証明書 (ルート / 中間) を配布元から入手して取り込んでください。\n'
+  fi
+  if cc_has_hint 'leaf-anchor'; then
+    printf '  ● 受領した証明書が自己署名のリーフ証明書 (CA:FALSE)\n'
+    printf '     この 1 枚だけを信頼する形になり、サーバ証明書を再発行するたびに\n'
+    printf '     配り直しが必要になります。恒常的に使うなら CA 証明書 (CA:TRUE) を\n'
+    printf '     発行してもらい、その CA が署名したサーバ証明書へ差し替えてください。\n'
+  fi
+  if cc_has_hint 'intermediate-anchor'; then
+    printf '  ● 受領した証明書が中間 CA 証明書\n'
+    printf '     この中間 CA をアンカーにすると、その配下だけを信頼する形になります。\n'
+    printf '     ルート CA から検証させたい場合は、上位のルート CA も取り込んでください。\n'
+    printf '     サーバ側が中間 CA をチェーンに同梱しているかも併せて確認します。\n'
+  fi
+  if cc_has_hint 'v1-anchor'; then
+    printf '  ● 受領した証明書が X.509 v1 / v2 (拡張を持たない)\n'
+    printf '     basicConstraints が無いため、証明書自身では CA かどうかを示せません。\n'
+    printf '     トラストストアへ入れればアンカーとしては扱われますが、用途の制限が効かず、\n'
+    printf '     検証を厳しくした環境では拒否されることがあります。v3 での再発行を推奨します。\n'
+  fi
+  if cc_has_hint 'no-basic-constraints'; then
+    printf '  ● 受領した証明書 (v3) に basicConstraints が無い\n'
+    printf '     CA:TRUE が示されていないため、この証明書が発行した証明書は検証できません。\n'
+    printf '     CA として使うつもりなら basicConstraints=critical,CA:TRUE と\n'
+    printf '     keyUsage=keyCertSign を付けて発行し直してもらってください。\n'
+  fi
+  if cc_has_hint 'ca-keyusage'; then
+    printf '  ● CA 証明書なのに鍵用途に Certificate Sign が無い\n'
+    printf '     keyUsage を持つ証明書は、その用途の範囲でしか使われません。\n'
+    printf '     Certificate Sign を含めて発行し直さないと、CA として扱われないことがあります。\n'
+  fi
+  if cc_has_hint 'weak-sigalg' || cc_has_hint 'weak-key'; then
+    printf '  ● 署名アルゴリズム / 鍵長が古い\n'
+    printf '     MD5・SHA-1 署名や RSA 2048 bit 未満の鍵は、最近の JDK / OpenSSL が\n'
+    printf '     既定で拒否します (java.security の jdk.certpath.disabledAlgorithms)。\n'
+    printf '     アンカーとして直接信頼する場合は通ることもありますが、更新を推奨します。\n'
+  fi
+  if cc_has_hint 'expiring-anchor'; then
+    printf '  ● 30 日以内に有効期限を迎える証明書がある\n'
+    printf '     期限が切れると、構成をまったく変えなくても接続は必ず失敗します。\n'
+    printf '     更新された証明書の入手と入れ替えを先に済ませてください。\n'
+  fi
   if cc_has_hint 'cacert-present-other-issuer'; then
     printf '  ● 受領した自己証明書はストアに入っているのに接続できない\n'
     printf '     サーバ証明書の発行元が、その受領 CA ではありません。典型的には\n'
@@ -8550,6 +9028,26 @@ if [ -s "$CC_HINTS_FILE" ]; then
   fi
 fi
 
+# =====================================================================
+# 5. 受領した自己証明書の全項目
+#    1. は判定に必要な項目だけを整形して出す。ここでは openssl の出力を
+#    そのまま載せ、拡張・鍵・署名を含む全項目を残す。テキストへ保存したとき、
+#    この 1 ファイルだけで受領物の内容を追えるようにするため。
+# =====================================================================
+if [ -s "$CC_CACERT_PEM_INDEX" ]; then
+  cc_section '5. 受領した自己証明書の全項目 (openssl x509 -text)'
+  while IFS="$CC_TAB" read -r cc_ap_pem cc_ap_src cc_ap_i cc_ap_n; do
+    [ -r "$cc_ap_pem" ] || continue
+    if [ "${cc_ap_n:-1}" -gt 1 ]; then
+      cc_info "${cc_ap_src}  (証明書 ${cc_ap_i}/${cc_ap_n})"
+    else
+      cc_info "${cc_ap_src}"
+    fi
+    "$CC_OPENSSL" x509 -in "$cc_ap_pem" -noout -text 2>/dev/null \
+      | sed 's/^/      /' | head -n 200
+  done < "$CC_CACERT_PEM_INDEX"
+fi
+
 cc_section '結果'
 printf '  PASS=%d  FAIL=%d  WARN=%d  SKIP=%d\n' "$CC_PASS" "$CC_FAIL" "$CC_WARN" "$CC_SKIP"
 cc_truncation_note
@@ -8568,6 +9066,9 @@ CERT_CHECK_SCRIPT
   diag "コンテナ         : ${container_name}"
   diag "コンテナ内の JVM 引数と環境変数からトラストストアと HTTPS 接続先を検出し、"
   diag "そのコンテナ自身の curl で接続できるかを確認します (追加の入力は不要)。"
+  diag "接続結果の前提として、受領した自己証明書 (cacert.crt) がルート CA / 中間 CA /"
+  diag "自己署名リーフのどれか、X.509 v1/v2/v3 のどれか、そのままトラストアンカーに"
+  diag "できるかを先に表示します (1. と 5.)。"
   diag "接続待ちが入るため、完了まで数十秒かかることがあります。"
 
   if ! capture_file="$(mktemp 2>/dev/null)"; then
@@ -8577,6 +9078,28 @@ CERT_CHECK_SCRIPT
   docker exec "$container_id" /bin/sh -c "$cert_check_script" \
     > "$capture_file" 2>&1 || exec_status=$?
   print_healthcheck_capture "$capture_file" "(証明書チェックの出力がありません)"
+
+  case "$exec_status" in
+    0) verdict_text="OK (検出したトラストストアの証明書で HTTPS 接続できています)" ;;
+    1) verdict_text="NG ([FAIL] の内容を確認してください)" ;;
+    2) verdict_text="実行不能 (必要な設定をコンテナ内から検出できませんでした)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 実行不能・エラーで終わった場合も、そこまでに出た証明書の詳細は残す。
+  if [ "$CERT_CHECK_TEXT_ENABLED" = "true" ]; then
+    text_path="$(resolve_cert_check_text_path "$service_name")"
+    if [ -n "$text_path" ] \
+        && write_cert_check_text "$text_path" "$service_name" "$container_name" \
+             "$capture_file" "$verdict_text"; then
+      CERT_CHECK_TEXT_OUTPUT="$text_path"
+      diag "証明書チェック結果のテキスト : ${text_path}"
+      if [ "$CERT_CHECK_TEXT_SET" != "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+        diag "  (--report-dir または --cert-check-text を指定すると出力先を変えられます)"
+      fi
+    fi
+  else
+    diag "証明書チェック結果のテキスト : 出力しません (--no-cert-check-text)"
+  fi
   rm -f -- "$capture_file"
 
   case "$exec_status" in

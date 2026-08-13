@@ -49,8 +49,9 @@ assert_matches() {
 
 # 全量レポート (build_and_verify_<日時>.txt) だけを DIR から取り出し、REPORT_FILES へ入れる。
 # 同じディレクトリには Java 例外解析のテキスト
-# (build_and_verify_<日時>_java_exceptions.txt) と、読み取り専用ファイルシステム
-# 分析のテキスト (build_and_verify_<日時>_readonly_filesystem.txt) も出力される
+# (build_and_verify_<日時>_java_exceptions.txt)、読み取り専用ファイルシステム
+# 分析のテキスト (build_and_verify_<日時>_readonly_filesystem.txt)、証明書チェックの
+# テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
 # この関数を使う。
 collect_report_files() {
@@ -59,6 +60,7 @@ collect_report_files() {
   for path in "$dir"/build_and_verify_*.txt; do
     case "$path" in
       *_java_exceptions.txt|*_readonly_filesystem.txt|*_undertow_virtual_host.txt) continue ;;
+      *_cert_check_*.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -1221,6 +1223,7 @@ assert_contains "$mysql_failure_output" "Compose サービスの対話操作を�
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 cert_check_output="$TEST_TMP/keep-mode-cert-check.out"
+cert_check_reports="$TEST_TMP/cert-check-reports"
 : > "$FAKE_DOCKER_CALLS"
 # トラストストアと HTTPS 接続先を設定したコンテナ (front / back 相当) でだけ
 # 証明書チェックが追加され、既存操作の番号は変わらないこと。
@@ -1234,6 +1237,7 @@ if ! printf '2\n4\n\n0\n1\n0\n0\n' | (
     --suppress-startup-logs \
     --env-list-limit 1 \
     --directory-tree-depth 1 \
+    --report-dir "$cert_check_reports" \
     --suppress-removed-logs
 ) >"$cert_check_output" 2>&1; then
   unset FAKE_COMPOSE_PS_SERVICES
@@ -1246,8 +1250,32 @@ assert_contains "$cert_check_output" "  4) 証明書チェック (トラスト�
 assert_contains "$cert_check_output" "Compose サービス : tlsapp"
 assert_contains "$cert_check_output" "コンテナ         : app-front"
 assert_contains "$cert_check_output" "そのコンテナ自身の curl で接続できるかを確認します (追加の入力は不要)。"
+assert_contains "$cert_check_output" "できるかを先に表示します (1. と 5.)。"
 assert_contains "$cert_check_output" "判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。"
 assert_contains "$cert_check_output" "証明書チェック結果 : OK"
+# 接続結果の前に、受領した自己証明書の素性が前提情報として出ていること。
+assert_contains "$cert_check_output" "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ==="
+assert_contains "$cert_check_output" "種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)"
+assert_before "$cert_check_output" \
+  "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ===" "=== 3-1. HTTPS 接続 SECURE_API_URL ==="
+# 画面と同じ内容がテキストファイルへ残ること (--report-dir 配下へサービス名付きで自動命名)。
+cert_check_text="${cert_check_reports}"/build_and_verify_*_cert_check_tlsapp.txt
+cert_check_text="$(ls -1 ${cert_check_text} 2>/dev/null | head -n 1)"
+[ -n "$cert_check_text" ] && [ -s "$cert_check_text" ] \
+  || fail "cert check text was not written under the report directory"
+assert_contains "$cert_check_output" "証明書チェック結果のテキスト : ${cert_check_text}"
+assert_contains "$cert_check_text" "証明書チェック結果 (build_and_verify.sh)"
+assert_contains "$cert_check_text" "Compose サービス : tlsapp"
+assert_contains "$cert_check_text" "コンテナ         : app-front"
+assert_contains "$cert_check_text" "判定             : OK (検出したトラストストアの証明書で HTTPS 接続できています)"
+assert_contains "$cert_check_text" "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ==="
+assert_contains "$cert_check_text" "種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)"
+assert_contains "$cert_check_text" "=== 5. 受領した自己証明書の全項目 (openssl x509 -text) ==="
+assert_contains "$cert_check_text" "判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。"
+# 全量レポートの数え上げに、証明書チェックのテキストが混ざらないこと。
+collect_report_files "$cert_check_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected exactly one full report next to the cert check text (got ${#REPORT_FILES[@]})"
 # 証明書チェックを持たないサービスでは従来どおり 0 から 3 のまま。
 assert_contains "$cert_check_output" "Compose サービス 'app' で実行する操作を選択してください:"
 assert_not_contains "$cert_check_output" "0 から 4 の番号を入力してください。"
@@ -1262,7 +1290,7 @@ export FAKE_COMPOSE_PS_SERVICES="tlsapp"
 export FAKE_CERT_CHECK_RESULT="ng"
 if ! printf '1\n4\n\n0\n0\n' | (
   cd "$REPO_ROOT"
-  bash ./build_and_verify.sh \
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
     --compose-service tlsapp \
     --startup-service tlsapp \
     --keep-container-mode logs \
@@ -1288,7 +1316,7 @@ cert_check_undetectable_output="$TEST_TMP/keep-mode-cert-check-undetectable.out"
 export FAKE_CERT_CHECK_RESULT="undetectable"
 if ! printf '1\n4\n\n0\n0\n' | (
   cd "$REPO_ROOT"
-  bash ./build_and_verify.sh \
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
     --compose-service tlsapp \
     --startup-service tlsapp \
     --keep-container-mode logs \
@@ -1306,6 +1334,86 @@ unset FAKE_COMPOSE_PS_SERVICES FAKE_CERT_CHECK_RESULT
 assert_contains "$cert_check_undetectable_output" "証明書チェックに必要な設定をコンテナ内から検出できませんでした。"
 assert_contains "$cert_check_undetectable_output" "証明書チェックに失敗しました。サービス操作の選択へ戻ります。"
 assert_contains "$cert_check_undetectable_output" "Compose サービスの対話操作を終了しました。"
+# 実行不能で終わっても、そこまでに出た内容はテキストへ残す (出力先の指定が無ければ
+# 一時ディレクトリへ出し、パスを画面へ示す)。
+assert_contains "$cert_check_undetectable_output" "証明書チェック結果のテキスト : "
+assert_contains "$cert_check_undetectable_output" \
+  "  (--report-dir または --cert-check-text を指定すると出力先を変えられます)"
+cert_check_fallback_text="$(sed -n 's/^証明書チェック結果のテキスト : //p' \
+  "$cert_check_undetectable_output" | head -n 1)"
+[ -n "$cert_check_fallback_text" ] && [ -s "$cert_check_fallback_text" ] \
+  || fail "cert check text was not written to the temporary directory fallback"
+case "$cert_check_fallback_text" in
+  "$TEST_TMP"/*) ;;
+  *) fail "cert check text fallback ignored TMPDIR: $cert_check_fallback_text" ;;
+esac
+assert_contains "$cert_check_fallback_text" \
+  "判定             : 実行不能 (必要な設定をコンテナ内から検出できませんでした)"
+
+# --cert-check-text で出力先を明示でき、--no-cert-check-text で出力を止められること。
+cert_check_text_opt_output="$TEST_TMP/keep-mode-cert-check-text-opt.out"
+cert_check_text_opt="$TEST_TMP/cert-check-explicit/result.txt"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --cert-check-text "$cert_check_text_opt" \
+    --suppress-removed-logs
+) >"$cert_check_text_opt_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$cert_check_text_opt_output" >&2
+  fail "explicit --cert-check-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$cert_check_text_opt_output" "証明書チェック結果のテキスト : ${cert_check_text_opt}"
+[ -s "$cert_check_text_opt" ] || fail "--cert-check-text did not create $cert_check_text_opt"
+assert_contains "$cert_check_text_opt" "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ==="
+
+cert_check_no_text_output="$TEST_TMP/keep-mode-cert-check-no-text.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --no-cert-check-text \
+    --suppress-removed-logs
+) >"$cert_check_no_text_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$cert_check_no_text_output" >&2
+  fail "--no-cert-check-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$cert_check_no_text_output" "証明書チェック結果のテキスト : 出力しません (--no-cert-check-text)"
+# 画面表示そのものは従来どおり行う。
+assert_contains "$cert_check_no_text_output" "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ==="
+
+# 出力先を指定しつつ出力を止める指定は、意味が矛盾するため受け付けない。
+cert_check_conflict_output="$TEST_TMP/cert-check-option-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --cert-check-text "$TEST_TMP/never-written.txt" \
+    --no-cert-check-text \
+    --dry-run
+) >"$cert_check_conflict_output" 2>&1; then
+  cat "$cert_check_conflict_output" >&2
+  fail "--cert-check-text with --no-cert-check-text should be rejected"
+fi
+assert_contains "$cert_check_conflict_output" \
+  "--cert-check-text と --no-cert-check-text は同時に指定できません。"
 
 # --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された
@@ -4204,7 +4312,7 @@ CERT_CHECK_FAKE_GETENT
       export JAVA_HOME="$CC_T/java"
       export EXTRASLB_TRUSTSTORE_PATH="$CC_T/store/extraslb-truststore.p12"
       export EXTRASLB_TRUSTSTORE_PASSWORD='changeit'
-      export PKI_TRUST_DIR="$CC_T/trust"
+      export PKI_TRUST_DIR="${PKI_TRUST_DIR_OVERRIDE:-$CC_T/trust}"
       export SECURE_API_URL='https://secure-api:8443/api/v1/ping'
       sh "$CC_T/cert-check.sh"
     ) > "$1" 2>&1
@@ -4218,6 +4326,30 @@ CERT_CHECK_FAKE_GETENT
   [ "$cc_rc" -eq 1 ] \
     || { cat "$cc_missing_output" >&2; fail "cert check should exit 1 for a missing trust anchor (got $cc_rc)"; }
 
+  # 接続の合否より前に、受領した自己証明書の素性を確定させている
+  assert_contains "$cc_missing_output" "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ==="
+  assert_contains "$cc_missing_output" "ファイル形式    : PEM (証明書 1 枚)"
+  assert_contains "$cc_missing_output" \
+    "X.509 バージョン: v3 (拡張を持てる。CA かどうかを basicConstraints で明示できる)"
+  assert_contains "$cc_missing_output" "基本制約        : CA:TRUE, pathlen:0 (critical)"
+  assert_contains "$cc_missing_output" "鍵用途          : Certificate Sign, CRL Sign"
+  assert_contains "$cc_missing_output" \
+    "自己署名        : YES (subject = issuer。自分の公開鍵で署名を検証できた)"
+  assert_contains "$cc_missing_output" \
+    "種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)"
+  assert_contains "$cc_missing_output" \
+    "トラストアンカー: できる。この CA が発行した証明書を検証できるようになる"
+  assert_contains "$cc_missing_output" \
+    "[PASS] cacert.crt は自己署名のルート CA 証明書 (X.509 v3) で、トラストアンカーにできる"
+  assert_contains "$cc_missing_output" "[PASS] cacert.crt は有効期間内 ("
+  # 判定の材料 (詳細) は、接続結果より前に出ている
+  assert_before "$cc_missing_output" \
+    "=== 1. 受領した自己証明書 (cacert.crt) の詳細 ===" "=== 3-1. HTTPS 接続 SECURE_API_URL ==="
+  # 全項目 (openssl x509 -text) を末尾へ添付し、テキスト 1 枚で追えるようにする
+  assert_contains "$cc_missing_output" "=== 5. 受領した自己証明書の全項目 (openssl x509 -text) ==="
+  assert_contains "$cc_missing_output" "X509v3 Basic Constraints: critical"
+  assert_before "$cc_missing_output" \
+    "=== 4. 次の一手 ===" "=== 5. 受領した自己証明書の全項目 (openssl x509 -text) ==="
   # 取り込み自体は成功していることを示す (0 件なら取り込み漏れと区別できない)
   assert_contains "$cc_missing_output" "独自に追加された CA: 1 件 (JDK 標準 cacerts に無い証明書)"
   assert_contains "$cc_missing_output" "alias=extraslb-ca-1"
@@ -4255,7 +4387,7 @@ CERT_CHECK_FAKE_GETENT
   # 本命が成功しているときだけ対照テストは PASS になる
   assert_contains "$cc_ok_output" "[PASS] 対照テスト: --cacert 無しでは検証に失敗した (curl exit 60)"
   assert_contains "$cc_ok_output" "判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。"
-  assert_not_contains "$cc_ok_output" "=== 3. 次の一手 ==="
+  assert_not_contains "$cc_ok_output" "=== 4. 次の一手 ==="
 
   # --- (3) 取り込み自体が漏れている (JDK 標準そのまま) ------------------------
   cc_not_imported_output="$TEST_TMP/cert-check-not-imported.out"
@@ -4271,7 +4403,96 @@ CERT_CHECK_FAKE_GETENT
   # 取り込み済みではないので、発行元違いの案内は出さない
   assert_not_contains "$cc_not_imported_output" "★取り込み自体は成功している"
 
+  # --- (4) 受領物が CA ではないリーフ証明書だった ------------------------------
+  # 「cacert.crt を置いたのに接続できない」の原因が、そもそも CA 証明書ではない
+  # ことである場合を、接続の合否より前に指摘できることを確かめる。
+  cc_leaf_output="$TEST_TMP/cert-check-leaf-cacert.out"
+  mkdir -p "$CC_T/trust-leaf"
+  cp "$CC_T/pki/leaf.crt" "$CC_T/trust-leaf/cacert.crt"
+  cc_write_store "cacert:extraslb-ca-1"
+  cc_rc=0
+  PKI_TRUST_DIR_OVERRIDE="$CC_T/trust-leaf"
+  cc_run_check "$cc_leaf_output" || cc_rc=$?
+  unset PKI_TRUST_DIR_OVERRIDE
+  [ "$cc_rc" -eq 1 ] \
+    || { cat "$cc_leaf_output" >&2; fail "cert check should exit 1 for a leaf cacert.crt (got $cc_rc)"; }
+  assert_contains "$cc_leaf_output" "基本制約        : CA:FALSE (critical)"
+  assert_contains "$cc_leaf_output" "自己署名        : NO (別の CA が発行した証明書)"
+  assert_contains "$cc_leaf_output" \
+    "種別            : end-entity 証明書 (CA ではないリーフ。別の CA が発行)"
+  assert_contains "$cc_leaf_output" \
+    "トラストアンカー: 向かない。発行元の CA 証明書を配布元から入手する"
+  assert_contains "$cc_leaf_output" \
+    "[WARN] cacert.crt は CA 証明書ではない (別の CA が発行したリーフ)。cacert.crt の取り違えを疑う"
+  assert_contains "$cc_leaf_output" "● 受領した証明書が CA 証明書ではない (別の CA が発行したリーフ)"
+
+  # --- (5) 受領物が X.509 v1 の自己署名証明書だった ---------------------------
+  # v1 には basicConstraints が無く、CA かどうかを証明書自身では示せない。
+  # アンカーにはできるが用途を制限できないことを指摘する。
+  # v1 を作れない openssl (拡張が既定で付く) の場合はこの確認だけ省く。
+  printf '[req]\ndistinguished_name=cc_dn\n[cc_dn]\n' > "$CC_T/pki/v1.cnf"
+  openssl req -x509 -x509v1 -config "$CC_T/pki/v1.cnf" \
+    -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout "$CC_T/pki/legacy-v1.key" -out "$CC_T/pki/legacy-v1.crt" \
+    -subj "/C=JP/O=Local Test Org/CN=Legacy V1 CA" >/dev/null 2>&1 || :
+  cc_v1_version="$(openssl x509 -in "$CC_T/pki/legacy-v1.crt" -noout -text 2>/dev/null \
+    | sed -n 's/^[[:space:]]*Version:[[:space:]]*\([0-9]\).*/\1/p' | head -n 1)"
+  if [ "${cc_v1_version:-}" != "1" ]; then
+    printf 'SKIP: この openssl では X.509 v1 の証明書を生成できないため v1 判定の確認を省略します\n'
+  else
+    cc_v1_output="$TEST_TMP/cert-check-v1-cacert.out"
+    mkdir -p "$CC_T/trust-v1"
+    cp "$CC_T/pki/legacy-v1.crt" "$CC_T/trust-v1/cacert.crt"
+    cc_rc=0
+    PKI_TRUST_DIR_OVERRIDE="$CC_T/trust-v1"
+    cc_run_check "$cc_v1_output" || cc_rc=$?
+    unset PKI_TRUST_DIR_OVERRIDE
+    [ "$cc_rc" -eq 1 ] \
+      || { cat "$cc_v1_output" >&2; fail "cert check should exit 1 for a v1 cacert.crt (got $cc_rc)"; }
+    assert_contains "$cc_v1_output" \
+      "X.509 バージョン: v1 (拡張を持てない。CA かどうかを証明書自身では示せない)"
+    assert_contains "$cc_v1_output" "基本制約        : (なし)"
+    assert_contains "$cc_v1_output" \
+      "種別            : 自己署名証明書 (X.509 v1 / v2 のため CA かどうかを拡張で示せない)"
+    assert_contains "$cc_v1_output" \
+      "[WARN] cacert.crt は X.509 v1 で basicConstraints を持たない (CA かどうかを判定できない)"
+    assert_contains "$cc_v1_output" "● 受領した証明書が X.509 v1 / v2 (拡張を持たない)"
+  fi
+
+  # --- (6) 受領物が期限切れのルート CA だった -------------------------------
+  # openssl verify は期限切れを理由に失敗するため、素朴に判定すると
+  # 「自己署名を検証できない」と読めてしまう。種別はルート CA のまま示し、
+  # 期限切れは期限切れとして [FAIL] にすることを確かめる。
+  # 過去日付の証明書を作れない openssl の場合はこの確認だけ省く。
+  openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+    -keyout "$CC_T/pki/expired-ca.key" -out "$CC_T/pki/expired-ca.crt" \
+    -subj "/C=JP/O=Local Test Org/CN=Expired Root CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -not_before 20200101000000Z -not_after 20210101000000Z >/dev/null 2>&1 || :
+  if [ ! -s "$CC_T/pki/expired-ca.crt" ] \
+      || openssl x509 -in "$CC_T/pki/expired-ca.crt" -noout -checkend 0 >/dev/null 2>&1; then
+    printf 'SKIP: この openssl では期限切れの証明書を生成できないため期限切れ判定の確認を省略します\n'
+  else
+    cc_expired_output="$TEST_TMP/cert-check-expired-cacert.out"
+    mkdir -p "$CC_T/trust-expired"
+    cp "$CC_T/pki/expired-ca.crt" "$CC_T/trust-expired/cacert.crt"
+    cc_rc=0
+    PKI_TRUST_DIR_OVERRIDE="$CC_T/trust-expired"
+    cc_run_check "$cc_expired_output" || cc_rc=$?
+    unset PKI_TRUST_DIR_OVERRIDE
+    [ "$cc_rc" -eq 1 ] \
+      || { cat "$cc_expired_output" >&2; fail "cert check should exit 1 for an expired cacert.crt (got $cc_rc)"; }
+    # 期限切れでも「自己署名のルート CA」であることは変わらない
+    assert_contains "$cc_expired_output" \
+      "自己署名        : YES (subject = issuer。自分の公開鍵で署名を検証できた)"
+    assert_contains "$cc_expired_output" \
+      "種別            : ルート CA 証明書 (自己署名の CA。信頼の連鎖の最上位)"
+    assert_contains "$cc_expired_output" "[FAIL] cacert.crt は有効期限が切れている ("
+    assert_contains "$cc_expired_output" "● 有効期限切れの証明書がある"
+  fi
+
   unset MSYS2_ARG_CONV_EXCL
 fi
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check chain diagnosis, and Docker cleanup scenarios\n'
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, and Docker cleanup scenarios\n'

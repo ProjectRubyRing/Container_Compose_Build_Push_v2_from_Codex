@@ -341,7 +341,8 @@ flowchart TD
   `--cwagent-required`、WAR デプロイ時 Java 例外解析の
   `--deploy-exception-excel` / `--deploy-exception-text` / `--deploy-exception-limit` /
   `--no-deploy-exception-analysis`、読み取り専用ファイルシステム分析の
-  `--readonly-analysis-excel` / `--readonly-analysis-text` / `--no-readonly-analysis` など)
+  `--readonly-analysis-excel` / `--readonly-analysis-text` / `--no-readonly-analysis`、
+  証明書チェック結果のテキスト出力の `--cert-check-text` / `--no-cert-check-text` など)
 - 委譲**されない**もの:
   - `--log-dir` — 委譲元で処理済み (委譲先の出力もログファイルに記録されます)
   - ECR 専用オプション — `--account-id` / `--registry` / `--repository` /
