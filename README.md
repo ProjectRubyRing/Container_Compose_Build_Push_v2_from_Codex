@@ -73,7 +73,8 @@ xlsx は標準ライブラリだけで組み立てます)。
 さらに、**ビルドのみを行う** (ECR へはプッシュしない) 専用スクリプトとして
 `build_and_verify.sh` を提供します。ビルドに加えて、コンテナを起動して
 **jbosseap (WildFly/JBoss EAP) サーバーの起動確認**や、**指定 URL への HTTP 応答確認**、
-**同時に起動した Compose サービスのログ表示**、**コンテナ内ディレクトリツリーの表示**、
+**同時に起動した Compose サービスのログ表示**、
+**コンテナ内ディレクトリツリーの表示** (既定は非表示。`--directory-tree` で有効化)、
 **デプロイ済み Web アプリケーションの各ルート表示**、
 **Java の JVM パラメータ一覧表示**、**OpenTelemetry 環境変数・JVM パラメータ一覧表示**、
 **全量テキストレポートの保存**、
@@ -194,10 +195,14 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--copy-file-no-overwrite` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` のコピー先に同名ファイルがある場合、強制上書きせずに処理を中止する (`exit 1`) | `false` |
 | `--env-list-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後に表示する環境変数一覧の件数。各対象コンテナごとに先頭 `N` 件を表示し、既定は `all` | `all` |
 | `--env-list-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後の環境変数一覧を `FILE` にも出力する。画面表示も継続 | (なし) |
-| `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする | `all` (最下層まで) |
-| `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する | 未指定時はファイル非表示 |
-| `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、コンテナ内ツリー、JBoss EAP デプロイ構造、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全深度・全ファイル名で日時付きテキストへ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (いずれも Excel とテキストは同じ内容) として同じディレクトリへ追加出力する | (なし) |
+| `--directory-tree` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造を画面へ表示する。`--directory-tree-depth` / `--directory-file-limit` / `--deployment-dir-env` を指定した場合は、この指定が無くても表示を有効にする | `false` (画面表示しない) |
+| `--no-directory-tree` | **`build_and_verify.sh` / `--build-only` 委譲時**。上記の画面表示を行わない。深さ等の指定による自動有効化も打ち消す | `false` |
+| `--directory-tree-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[3]` `[4]` へ、コンテナ内ツリーと JBoss EAP デプロイ構造を出力する。画面表示 (`--directory-tree`) とは独立して指定する | `false` (レポートへ出力しない) |
+| `--no-directory-tree-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。全量レポートへツリーとデプロイ構造を出力しない | `true` (既定) |
+| `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
+| `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
+| `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (いずれも Excel とテキストは同じ内容) として同じディレクトリへ追加出力する | (なし) |
 | `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
 | `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
@@ -842,8 +847,15 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   OpenTelemetry 一覧 (`-Djboss.password=...`、`OTEL_EXPORTER_OTLP_HEADERS` など) にも
   同じ規則で適用します。
 - 環境変数一覧の後に、同じ対象コンテナの `/` を起点とした**ディレクトリツリー**を
-  `├──`、`└──`、`│` の罫線記号を使ったツリー表記で表示します。画面の既定表示は
-  ディレクトリのみで、通常ファイルは表示しません。
+  `├──`、`└──`、`│` の罫線記号を使ったツリー表記で表示します。
+  **この表示は既定では行いません。** ツリーは巨大になりやすいため、
+  `--directory-tree` を指定したときだけ表示します (後述の JBoss EAP デプロイ構造も
+  同じ指定でまとめて切り替わります)。`--directory-tree-depth` /
+  `--directory-file-limit` / `--deployment-dir-env` を指定した場合は、
+  `--directory-tree` が無くても表示を有効にします。逆に `--no-directory-tree` を
+  付けると、それらを指定しても表示しません。表示しない実行では、コンテナ内の
+  `find` 自体を実行しないため待ち時間も増えません。
+  表示を有効にした場合の既定はディレクトリのみで、通常ファイルは表示しません。
   ファイル表示を有効にする場合は `--directory-file-limit N` を指定すると、各ディレクトリ
   直下が `N` 件以下なら全ファイル名、超過時は最終拡張子ごとの件数へ切り替えます
   (`archive.tar.gz` は `.gz`、`.env` と末尾がドットの名前は `(拡張子なし)`)。
@@ -858,6 +870,8 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   `WEB-INF/classes` を検出し、**JBoss EAP デプロイ構造**として表示します。
   `--deployment-dir-env NAME` で、絶対ディレクトリパスを値に持つ環境変数も
   同じ表示へ追加できます。複数の Web アプリケーションや環境変数指定にも対応します。
+  この表示もディレクトリツリーと同じく既定では行わず、`--directory-tree`
+  (または `--directory-tree-depth` などの自動有効化) が必要です。
 - `--directory-tree-depth N` では各表示ルート直下を深さ `1` として最大深度を
   制限できます。既定の `all` は末端まで探索します。空ディレクトリも表示しますが、
   ファイル表示を有効にした場合も通常ファイル以外の特殊ファイルは集計せず、
@@ -874,9 +888,13 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
 - `--report-dir DIR` を指定すると、
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>.txt` へ全量レポートを保存します。
   ビルドまたは動作確認が失敗した場合も、コンテナ停止前に取得できた情報を保存します。
-  レポートだけは画面用の件数・深度制限を適用せず、環境変数全件、除外対象を除く
-  全ディレクトリ深度、全ファイル名、および検出した JVM パラメータ・OpenTelemetry 設定の
-  全件を出力します。起動確認を伴わないビルドのみの場合、コンテナ由来の 5 セクションは
+  レポートだけは画面用の件数・深度制限を適用せず、環境変数全件、および検出した
+  JVM パラメータ・OpenTelemetry 設定の全件を出力します。
+  **コンテナ内ディレクトリツリー (`[3]`) と JBoss EAP デプロイ構造 (`[4]`) は、
+  既定では見出しだけを残して内容を保存しません。** 保存する場合は
+  `--directory-tree-report` を併用してください (画面表示の有無とは独立した指定です)。
+  併用したときは、除外対象を除く全ディレクトリ深度・全ファイル名で保存します。
+  起動確認を伴わないビルドのみの場合、コンテナ由来の 5 セクションは
   「未取得」と記録します。`--dry-run` ではファイルを作成せず、出力予定だけを表示します。
   レポートの構成は `[1] ビルド結果` / `[2] 環境変数一覧` / `[3] コンテナ内ディレクトリツリー` /
   `[4] JBoss EAP デプロイ構造` / `[5] Java JVM パラメータ` /
@@ -974,7 +992,11 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
     --env-list-limit 10 \
     --env-list-file ./logs/container_envs.txt
 
+# コンテナ内ディレクトリツリーを表示する (既定は非表示。深さは最下層まで)
+./build_and_verify.sh --verify-startup --directory-tree
+
 # コンテナ内ディレクトリツリーをディレクトリだけ / 直下から 3 階層まで表示
+# (深さを指定すると --directory-tree が無くても表示が有効になる)
 ./build_and_verify.sh --verify-startup \
     --directory-tree-depth 3
 
@@ -984,9 +1006,14 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
     --directory-tree-depth 4 --directory-file-limit 5
 
 # 画面は深さ 2・5 件で制限し、レポートは ./build-reports へ全量保存
+# (レポートへツリーを残すには --directory-tree-report を併用する)
 ./build_and_verify.sh --verify-startup \
     --directory-tree-depth 2 --directory-file-limit 5 \
-    --report-dir ./build-reports
+    --directory-tree-report --report-dir ./build-reports
+
+# 画面にはツリーを出さず、レポートにだけツリーを残す
+./build_and_verify.sh --verify-startup \
+    --directory-tree-report --report-dir ./build-reports
 
 # app / batch / db をまとめてビルド・起動し、JBoss EAP の app だけを確認
 ./build_and_verify.sh --compose-service app,batch,db \
@@ -1014,8 +1041,9 @@ bash tests/build_and_verify_test.sh
 
 ### JVM パラメータと OpenTelemetry 設定の表示
 
-起動確認 (`--verify-startup` / `--verify-url`) を伴う実行では、環境変数一覧・
-ディレクトリツリー・JBoss EAP デプロイ構造に続けて、**Java の JVM パラメータ**と
+起動確認 (`--verify-startup` / `--verify-url`) を伴う実行では、環境変数一覧
+(および `--directory-tree` 指定時はディレクトリツリー・JBoss EAP デプロイ構造)
+に続けて、**Java の JVM パラメータ**と
 **OpenTelemetry 関連設定**を自動で表示します。専用のオプション指定は不要です。
 `--report-dir` を指定した場合は、同じ内容が全量レポートの
 `[5] Java JVM パラメータ` / `[6] OpenTelemetry 環境変数・JVM パラメータ` へ保存されます。

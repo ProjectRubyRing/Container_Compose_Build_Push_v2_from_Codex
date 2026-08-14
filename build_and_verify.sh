@@ -18,17 +18,20 @@
 #   (3) Compose サービスログ: 起動確認対象と同時に起動した他サービスのログを、
 #                          起動ログの直後へサービス単位で順次表示する。
 #   (4) ディレクトリツリー表示: 動作確認したコンテナのディレクトリを階層表示する。
+#                          既定は非表示で、--directory-tree 指定時に表示する。
 #                          通常ファイルはオプション指定時のみ出力する。
 #   (5) デプロイ構造表示    : JBoss デプロイ先、Web ルート、Java クラスパスルート、
 #                          指定環境変数のディレクトリを検出して階層表示する。
+#                          表示可否は (4) と同じ指定で切り替える。
 #   (6) JVM パラメータ表示  : コンテナ内の Java プロセスを検出し、起動時の JVM
 #                          パラメータをヒープ・GC・エージェント・システム
 #                          プロパティ等へ分類して表示する。
 #   (7) OpenTelemetry 表示  : OTEL_* をはじめとする OpenTelemetry 関連の環境変数と
 #                          JVM パラメータを 1 つの一覧にまとめて表示する。
-#   (8) 全量レポート        : ビルド結果と全量の環境変数・ツリー・デプロイ構造・
-#                          JVM パラメータ・OpenTelemetry 設定を日時付きテキスト
-#                          ファイルへ保存する。
+#   (8) 全量レポート        : ビルド結果と全量の環境変数・JVM パラメータ・
+#                          OpenTelemetry 設定を日時付きテキストファイルへ保存する。
+#                          ツリーとデプロイ構造は --directory-tree-report 指定時
+#                          のみ保存する。
 #   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
 #                          bash 接続するか、対話式の HTTP リクエスト、または
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
@@ -550,6 +553,11 @@ BUILD_ARG_ENV_NAMES_LOADED="false"
 declare -A BUILD_ARG_ENV_NAME_SET=()
 
 # ---- コンテナ内ディレクトリツリー出力 -----------------------------------------
+# 画面表示・全量レポートへの出力とも既定は行わない。ツリーは巨大になりやすく、
+# 通常の確認では読み飛ばされるため、必要なときだけ明示的に有効化する。
+DIRECTORY_TREE_DISPLAY="false"    # true: 画面へツリーと JBoss EAP デプロイ構造を表示
+DIRECTORY_TREE_DISPLAY_SET="false" # --directory-tree / --no-directory-tree の明示指定があったか
+DIRECTORY_TREE_REPORT="false"     # true: 全量レポートへツリーと JBoss EAP デプロイ構造を出力
 DIRECTORY_TREE_DEPTH="all"        # all: 最下層まで / 数値: / 直下を 1 とする最大ディレクトリ深さ
 DIRECTORY_TREE_DEPTH_SET="false"  # 深さが明示指定されたか (ビルドのみ実行時の警告用)
 DIRECTORY_FILE_LIMIT="none"       # none: ファイル非表示 / all・数値: ファイル表示を有効化
@@ -1335,26 +1343,44 @@ JBoss マスターパスワードの伝搬検証:
                            既定: all (全件表示)
   --env-list-file FILE     動作確認成功時の環境変数一覧を FILE にも出力する。
                            画面表示は従来どおり継続する
+  --directory-tree         環境変数一覧の後に、コンテナ内ディレクトリツリーと
+                           JBoss EAP デプロイ構造を画面へ表示する。
+                           既定は非表示。--directory-tree-depth /
+                           --directory-file-limit / --deployment-dir-env を
+                           指定した場合は、この指定が無くても表示を有効にする
+  --no-directory-tree      上記の画面表示を行わない。--directory-tree-depth などを
+                           指定した場合の自動有効化も打ち消す
+  --directory-tree-report  --report-dir の全量レポートへ、コンテナ内ディレクトリ
+                           ツリーと JBoss EAP デプロイ構造を出力する。
+                           既定は見出しだけを残し、内容は出力しない。
+                           画面表示の有無 (--directory-tree) とは独立して指定する
+  --no-directory-tree-report
+                           全量レポートへツリーとデプロイ構造を出力しない (既定)
   --directory-tree-depth N|all
-                           環境変数一覧の後に表示するコンテナ内ディレクトリツリーの
-                           最大深さ。/ 直下を深さ 1 とし、既定の all は最下層まで表示する。
-                           JBoss EAP のデプロイ構造にも同じ深さを適用する
+                           表示するコンテナ内ディレクトリツリーの最大深さ。
+                           / 直下を深さ 1 とし、既定の all は最下層まで表示する。
+                           JBoss EAP のデプロイ構造にも同じ深さを適用する。
+                           指定すると画面表示を自動で有効にする
   --directory-file-limit N|all
                            通常ファイルの画面表示を有効にする。各ディレクトリ直下が
                            N 件以下なら全ファイル名、超過時は拡張子別件数を表示する。
                            all は件数にかかわらず全ファイル名を表示する。
-                           未指定時はディレクトリのみを表示する
+                           未指定時はディレクトリのみを表示する。
+                           指定すると画面表示を自動で有効にする
   --deployment-dir-env NAME
                            ディレクトリパスを値に持つコンテナ環境変数名。
                            JBoss デプロイ先、Web アプリケーションルート、
                            WEB-INF/classes と併せて、そのディレクトリ構造を表示する。
-                           繰り返し指定またはカンマ区切りで複数指定できる
-  --report-dir DIR         ビルド結果、環境変数一覧、コンテナ内ツリー、JBoss EAP
-                           デプロイ構造、JVM パラメータ、OpenTelemetry 設定、
-                           WAR デプロイ時 Java 例外解析、読み取り専用ファイル
-                           システム分析、Undertow バーチャルホスト分析を
+                           繰り返し指定またはカンマ区切りで複数指定できる。
+                           指定すると画面表示を自動で有効にする
+  --report-dir DIR         ビルド結果、環境変数一覧、JVM パラメータ、
+                           OpenTelemetry 設定、WAR デプロイ時 Java 例外解析、
+                           読み取り専用ファイルシステム分析、Undertow
+                           バーチャルホスト分析を
                            DIR/build_and_verify_<日時>.txt へ保存する。
-                           保存内容は画面の制限にかかわらず全深度・全ファイル名となる。
+                           コンテナ内ツリーと JBoss EAP デプロイ構造は既定では
+                           保存せず、--directory-tree-report を併用したときだけ
+                           画面の制限にかかわらず全深度・全ファイル名で保存する。
                            あわせて Java 例外解析を
                            DIR/build_and_verify_<日時>_java_exceptions.xlsx と
                            DIR/build_and_verify_<日時>_java_exceptions.txt へ、
@@ -1716,6 +1742,10 @@ while [ $# -gt 0 ]; do
     --suppress-removed-logs) SUPPRESS_REMOVED_LOGS="true"; shift ;;
     --env-list-limit)      need_value "$1" $#; ENV_LIST_LIMIT="$2"; shift 2 ;;
     --env-list-file)       need_value "$1" $#; ENV_LIST_FILE="$2"; shift 2 ;;
+    --directory-tree)      DIRECTORY_TREE_DISPLAY="true"; DIRECTORY_TREE_DISPLAY_SET="true"; shift ;;
+    --no-directory-tree)   DIRECTORY_TREE_DISPLAY="false"; DIRECTORY_TREE_DISPLAY_SET="true"; shift ;;
+    --directory-tree-report) DIRECTORY_TREE_REPORT="true"; shift ;;
+    --no-directory-tree-report) DIRECTORY_TREE_REPORT="false"; shift ;;
     --directory-tree-depth) need_value "$1" $#; DIRECTORY_TREE_DEPTH="$2"; DIRECTORY_TREE_DEPTH_SET="true"; shift 2 ;;
     --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
     --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
@@ -1819,9 +1849,22 @@ for _deployment_env in "${DEPLOYMENT_DIR_ENVS[@]}"; do
     exit 2
   fi
 done
+# 深さ・ファイル表示・環境変数の指定は「ツリーを見たい」という意思表示のため、
+# --directory-tree が無くても画面表示を有効にする。--no-directory-tree を
+# 明示した場合はそちらを優先し、自動有効化は行わない。
+if [ "$DIRECTORY_TREE_DISPLAY_SET" != "true" ] \
+    && { [ "$DIRECTORY_TREE_DEPTH_SET" = "true" ] \
+      || [ "$DIRECTORY_FILE_LIMIT_SET" = "true" ] \
+      || [ ${#DEPLOYMENT_DIR_ENVS[@]} -gt 0 ]; }; then
+  DIRECTORY_TREE_DISPLAY="true"
+fi
 if [ "$BUILD_REPORT_DIR_SET" = "true" ] && { [ -z "$BUILD_REPORT_DIR" ] || [ "$BUILD_REPORT_DIR" = "-" ]; }; then
   err "--report-dir にはディレクトリパスを指定してください: $BUILD_REPORT_DIR"
   exit 2
+fi
+# 全量レポート自体を作らない実行では、ツリーの出力指定は書き出す先が無い。
+if [ "$DIRECTORY_TREE_REPORT" = "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+  warn "--directory-tree-report は --report-dir と併用してください (全量レポートを出力しないため無視します)。"
 fi
 if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
   if [ -z "$CERT_CHECK_TEXT" ] || [ "$CERT_CHECK_TEXT" = "-" ]; then
@@ -4819,6 +4862,13 @@ append_container_directory_tree_report() {
 }
 
 show_verified_container_directory_trees() {
+  # 既定では表示しない。JBoss EAP デプロイ構造も同じ指定でまとめて切り替えるため、
+  # 案内はここで 1 度だけ出す。
+  if [ "$DIRECTORY_TREE_DISPLAY" != "true" ]; then
+    log "コンテナ内ディレクトリツリーと JBoss EAP デプロイ構造は表示しません (--directory-tree で表示します)。"
+    return 0
+  fi
+
   [ "$DRY_RUN" = "true" ] && {
     if [ "$DIRECTORY_FILE_LIMIT" = "none" ]; then
       log "[DRY-RUN] 環境変数一覧後のコンテナ内ディレクトリツリー出力をプレビューします (最大深さ: ${DIRECTORY_TREE_DEPTH}, 通常ファイル: 表示しない)。"
@@ -4968,6 +5018,9 @@ append_container_deployment_structure_report() {
 }
 
 show_verified_container_deployment_structures() {
+  # 表示可否はコンテナ内ツリーと同じ指定で切り替える (案内はツリー側で出す)。
+  [ "$DIRECTORY_TREE_DISPLAY" = "true" ] || return 0
+
   [ "$DRY_RUN" = "true" ] && {
     if [ "$DIRECTORY_FILE_LIMIT" = "none" ]; then
       log "[DRY-RUN] コンテナ内ツリー後の JBoss EAP デプロイ構造出力をプレビューします (最大深さ: ${DIRECTORY_TREE_DEPTH}, 通常ファイル: 表示しない)。"
@@ -21566,11 +21619,17 @@ append_jboss_password_report() {
 }
 
 # EXIT トラップからコンテナ停止前に呼び、画面表示の制限にかかわらず環境変数は
-# 全件、各ディレクトリは全深度・全ファイル名で保存する。
+# 全件保存する。ディレクトリツリーと JBoss EAP デプロイ構造は
+# --directory-tree-report を指定したときだけ、全深度・全ファイル名で保存する。
 write_build_report() {
   local exit_status="$1" overall_status build_status report_dir report_base candidate
   local counter=1 report_tmp report_finished_at cid service_name container_name
+  local tree_report_note="対象コンテナが起動していないため取得していません。"
   local -a target_container_ids=()
+
+  if [ "$DIRECTORY_TREE_REPORT" != "true" ]; then
+    tree_report_note="--directory-tree-report を指定していないため出力していません。"
+  fi
 
   [ -n "$BUILD_REPORT_DIR" ] || return 0
   if [ "$DRY_RUN" = "true" ]; then
@@ -21640,7 +21699,12 @@ write_build_report() {
     # 前回の実行が残したコンテナを再利用したのか作り直したのかで、同じ compose.yml
     # でも起動確認の結果が変わる。あとから突き合わせられるよう点検結果も残す。
     printf '既存コンテナ  : %s\n' "${STALE_CONTAINER_SUMMARY:-(未点検)}"
-    printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
+    if [ "$DIRECTORY_TREE_REPORT" = "true" ]; then
+      printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
+    else
+      printf '保存ポリシー  : 環境変数は全件、ツリーと JBoss EAP デプロイ構造は保存しない\n'
+      printf '                (--directory-tree-report を併用すると全深度・全ファイル名で保存)\n'
+    fi
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
@@ -21664,9 +21728,9 @@ write_build_report() {
       printf '\n[2] 環境変数一覧 (全件)\n'
       printf '対象コンテナが起動していないため取得していません。\n'
       printf '\n[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)\n'
-      printf '対象コンテナが起動していないため取得していません。\n'
+      printf '%s\n' "$tree_report_note"
       printf '\n[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)\n'
-      printf '対象コンテナが起動していないため取得していません。\n'
+      printf '%s\n' "$tree_report_note"
       printf '\n[5] Java JVM パラメータ (全件)\n'
       printf '対象コンテナが起動していないため取得していません。\n'
       printf '\n[6] OpenTelemetry 環境変数・JVM パラメータ (全件)\n'
@@ -21683,25 +21747,35 @@ write_build_report() {
       append_container_env_report "$cid" "$service_name" "$container_name" "$report_tmp" "all"
     done
 
+    # ツリーとデプロイ構造は巨大になりやすいため、見出しだけ残して既定では
+    # 中身を書かない。収集自体 (コンテナ内 find) も行わない。
     printf '\n[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)\n' >> "$report_tmp"
-    for cid in "${target_container_ids[@]}"; do
-      [ -n "$cid" ] || continue
-      service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
-      [ -n "$service_name" ] || service_name="(unknown)"
-      container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
-      append_container_directory_tree_report "$cid" "$service_name" "$container_name" \
-          "$report_tmp" "/" "コンテナ内ディレクトリツリー" "all" "all"
-    done
+    if [ "$DIRECTORY_TREE_REPORT" != "true" ]; then
+      printf '%s\n' "$tree_report_note" >> "$report_tmp"
+    else
+      for cid in "${target_container_ids[@]}"; do
+        [ -n "$cid" ] || continue
+        service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+        [ -n "$service_name" ] || service_name="(unknown)"
+        container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+        append_container_directory_tree_report "$cid" "$service_name" "$container_name" \
+            "$report_tmp" "/" "コンテナ内ディレクトリツリー" "all" "all"
+      done
+    fi
 
     printf '\n[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)\n' >> "$report_tmp"
-    for cid in "${target_container_ids[@]}"; do
-      [ -n "$cid" ] || continue
-      service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
-      [ -n "$service_name" ] || service_name="(unknown)"
-      container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
-      append_container_deployment_structure_report "$cid" "$service_name" "$container_name" \
-          "$report_tmp" "all" "all"
-    done
+    if [ "$DIRECTORY_TREE_REPORT" != "true" ]; then
+      printf '%s\n' "$tree_report_note" >> "$report_tmp"
+    else
+      for cid in "${target_container_ids[@]}"; do
+        [ -n "$cid" ] || continue
+        service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+        [ -n "$service_name" ] || service_name="(unknown)"
+        container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+        append_container_deployment_structure_report "$cid" "$service_name" "$container_name" \
+            "$report_tmp" "all" "all"
+      done
+    fi
 
     printf '\n[5] Java JVM パラメータ (全件)\n' >> "$report_tmp"
     for cid in "${target_container_ids[@]}"; do
@@ -22042,7 +22116,7 @@ if [ "$NEED_CONTAINER" != "true" ]; then
   if [ "$ENV_LIST_LIMIT" != "all" ] || [ -n "$ENV_LIST_FILE" ]; then
     warn "環境変数一覧はコンテナ起動を伴う動作確認時のみ出力されます。--verify-startup または --verify-url を併用してください。"
   fi
-  if [ "$DIRECTORY_TREE_DEPTH_SET" = "true" ]; then
+  if [ "$DIRECTORY_TREE_DISPLAY" = "true" ] || [ "$DIRECTORY_TREE_REPORT" = "true" ]; then
     warn "コンテナ内ディレクトリツリーはコンテナ起動を伴う動作確認時のみ出力されます。--verify-startup または --verify-url を併用してください。"
   fi
   if [ "$DIRECTORY_FILE_LIMIT_SET" = "true" ] || [ ${#DEPLOYMENT_DIR_ENVS[@]} -gt 0 ]; then

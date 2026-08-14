@@ -100,6 +100,7 @@ if ! (
     --directory-tree-depth 2 \
     --directory-file-limit 10 \
     --deployment-dir-env APP_CONFIG_DIR \
+    --directory-tree-report \
     --report-dir "$TEST_TMP/reports" \
     --suppress-removed-logs
 ) >"$success_output" 2>&1; then
@@ -402,6 +403,125 @@ assert_not_contains "$tree_depth_output" "[ファイル]"
 assert_matches "$FAKE_DOCKER_CALLS" 'exec cid-app find / -maxdepth 1 .* -prune -print0 -o -type d -print0'
 assert_not_contains "$FAKE_DOCKER_CALLS" "-type f -print0"
 
+# 既定ではツリーもデプロイ構造も画面へ出さず、全量レポートにも書かない。
+# 表示しない分、コンテナ内 find も呼ばない。
+tree_default_output="$TEST_TMP/tree-default.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/tree-default-reports" \
+    --suppress-removed-logs
+) >"$tree_default_output" 2>&1; then
+  cat "$tree_default_output" >&2
+  fail "default directory tree scenario returned a non-zero status"
+fi
+
+assert_contains "$tree_default_output" "コンテナ内ディレクトリツリーと JBoss EAP デプロイ構造は表示しません (--directory-tree で表示します)。"
+assert_not_contains "$tree_default_output" "コンテナ内ディレクトリツリー (サービス: app"
+assert_not_contains "$tree_default_output" "JBoss EAP デプロイ済み Web アプリケーションのディレクトリ構造"
+assert_not_contains "$FAKE_DOCKER_CALLS" "exec cid-app find /"
+collect_report_files "$TEST_TMP/tree-default-reports"
+tree_default_report="${REPORT_FILES[0]:-}"
+[ -n "$tree_default_report" ] || fail "expected a full build report for the default directory tree scenario"
+assert_contains "$tree_default_report" "[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)"
+assert_contains "$tree_default_report" "[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)"
+assert_occurrences "$tree_default_report" "--directory-tree-report を指定していないため出力していません。" 2
+assert_contains "$tree_default_report" "保存ポリシー  : 環境変数は全件、ツリーと JBoss EAP デプロイ構造は保存しない"
+assert_contains "$tree_default_report" "[2] 環境変数一覧 (全件)"
+assert_contains "$tree_default_report" "[5] Java JVM パラメータ (全件)"
+
+# --directory-tree は画面表示だけを有効にし、レポートへは書き出さない。
+tree_display_only_output="$TEST_TMP/tree-display-only.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree \
+    --report-dir "$TEST_TMP/tree-display-reports" \
+    --suppress-removed-logs
+) >"$tree_display_only_output" 2>&1; then
+  cat "$tree_display_only_output" >&2
+  fail "--directory-tree scenario returned a non-zero status"
+fi
+
+assert_contains "$tree_display_only_output" "コンテナ内ディレクトリツリー (サービス: app, コンテナ: test-app-1, 最大深さ: all)"
+assert_contains "$tree_display_only_output" "JBoss EAP デプロイ済み Web アプリケーションのディレクトリ構造"
+assert_not_contains "$tree_display_only_output" "--directory-tree で表示します"
+collect_report_files "$TEST_TMP/tree-display-reports"
+tree_display_report="${REPORT_FILES[0]:-}"
+[ -n "$tree_display_report" ] || fail "expected a full build report for the --directory-tree scenario"
+assert_occurrences "$tree_display_report" "--directory-tree-report を指定していないため出力していません。" 2
+
+# --directory-tree-report はレポートへの出力だけを有効にし、画面表示は増やさない。
+tree_report_only_output="$TEST_TMP/tree-report-only.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-report \
+    --report-dir "$TEST_TMP/tree-report-reports" \
+    --suppress-removed-logs
+) >"$tree_report_only_output" 2>&1; then
+  cat "$tree_report_only_output" >&2
+  fail "--directory-tree-report scenario returned a non-zero status"
+fi
+
+assert_contains "$tree_report_only_output" "コンテナ内ディレクトリツリーと JBoss EAP デプロイ構造は表示しません (--directory-tree で表示します)。"
+assert_not_contains "$tree_report_only_output" "コンテナ内ディレクトリツリー (サービス: app"
+collect_report_files "$TEST_TMP/tree-report-reports"
+tree_report_only_report="${REPORT_FILES[0]:-}"
+[ -n "$tree_report_only_report" ] || fail "expected a full build report for the --directory-tree-report scenario"
+assert_not_contains "$tree_report_only_report" "--directory-tree-report を指定していないため出力していません。"
+assert_contains "$tree_report_only_report" "保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名"
+assert_contains "$tree_report_only_report" "コンテナ内ディレクトリツリー (サービス: app, コンテナ: test-app-1, 最大深さ: all"
+assert_contains "$tree_report_only_report" "JBoss EAP デプロイ済み Web アプリケーションのディレクトリ構造"
+
+# 深さ指定は画面表示を自動で有効にするが、--no-directory-tree を併記すれば表示しない。
+tree_no_display_output="$TEST_TMP/tree-no-display.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --no-directory-tree \
+    --suppress-removed-logs
+) >"$tree_no_display_output" 2>&1; then
+  cat "$tree_no_display_output" >&2
+  fail "--no-directory-tree scenario returned a non-zero status"
+fi
+
+assert_contains "$tree_no_display_output" "コンテナ内ディレクトリツリーと JBoss EAP デプロイ構造は表示しません (--directory-tree で表示します)。"
+assert_not_contains "$tree_no_display_output" "コンテナ内ディレクトリツリー (サービス: app"
+assert_not_contains "$FAKE_DOCKER_CALLS" "exec cid-app find /"
+
+# --report-dir が無い実行で --directory-tree-report を指定したら、書き出す先が無いと警告する。
+tree_report_without_dir_output="$TEST_TMP/tree-report-without-dir.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --directory-tree-report
+) >"$tree_report_without_dir_output" 2>&1; then
+  cat "$tree_report_without_dir_output" >&2
+  fail "--directory-tree-report without --report-dir unexpectedly returned a non-zero status"
+fi
+assert_contains "$tree_report_without_dir_output" "--directory-tree-report は --report-dir と併用してください"
+
 invalid_startup_log_lines_output="$TEST_TMP/startup-log-lines-invalid.out"
 if (
   cd "$REPO_ROOT"
@@ -452,6 +572,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --env-list-limit 1 \
+    --directory-tree \
     --suppress-removed-logs
 ) >"$tree_find_failure_output" 2>&1; then
   cat "$tree_find_failure_output" >&2
