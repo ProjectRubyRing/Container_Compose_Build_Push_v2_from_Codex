@@ -1,0 +1,8 @@
+app-1  | 10:00:00,001 INFO  [org.jboss.modules] (main) JBoss Modules version 2.1.5.Final
+app-1  | 10:00:01,110 INFO  [org.jboss.as] (MSC service thread 1-2) WFLYSRV0049: JBoss EAP 8.1.0.GA (WildFly Core 27.0.0.Final) starting
+app-1  | 10:00:05,200 ERROR [org.jboss.as.controller.management-operation] (ServerService Thread Pool -- 40) WFLYCTL0013: Operation ("add") failed
+app-1  | 10:00:05,201 ERROR [org.jboss.as.connector.deployers.jdbc] (MSC service thread 1-4) IJ031084: Unable to create connection
+app-1  | Caused by: com.mysql.cj.exceptions.CJCommunicationsException: Communications link failure
+app-1  | Caused by: java.net.UnknownHostException: mysql
+app-1  | 10:00:05,400 ERROR [org.jboss.as.controller] (Controller Boot Thread) WFLYCTL0186: Services which failed to start: service jboss.data-source.AppXADS
+app-1  | 10:00:06,000 ERROR [org.jboss.as.server] (Controller Boot Thread) WFLYSRV0026: JBoss EAP 8.1.0.GA (WildFly Core 27.0.0.Final) started (with errors) in 6000ms

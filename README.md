@@ -179,6 +179,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--up-retry N` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` が一過性のエラー、または依存サービスが期限内に healthy にならずに失敗したときの再試行回数。再試行の前に必ず原因の診断を表示する | `1` |
 | `--no-up-retry` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` の再試行を行わない (`--up-retry 0` と同じ) | `false` |
 | `--up-retry-interval SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` の再試行間隔・秒 | `15` |
+| `--recreate-containers` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`docker compose up` へ `--force-recreate` を付け、前回の実行が残したコンテナを状態にかかわらず必ず作り直す | `false` |
+| `--no-recreate-containers` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。前回の実行が残したコンテナを状態にかかわらずそのまま再利用する (点検を行わない従来の動作)。既定 (`auto`) は `compose up` の前に既存コンテナを点検し、「停止したまま」「unhealthy のまま」「消えた / 作り直されたネットワークへ繋がったまま」のいずれかが見つかったときだけ `--force-recreate` を付ける | `false` |
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
@@ -708,6 +710,94 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   (MySQL のコールド初期化は数分かかることがあります)
 - `--wait-healthy` を使っている場合は `--wait-timeout SEC` を広げる
 - 起動確認そのものが遅い場合は `--startup-timeout SEC` を広げる
+
+### 前回のコンテナを残したまま再実行したとき (ウォーム再実行)
+
+`--keep-container` / `--keep-container-mode` を付けると、確認後もコンテナが起動した
+まま残ります。その状態で `build_and_verify.sh` をもう一度実行すると、`docker compose up`
+は**設定とイメージが変わっていないコンテナを作り直さずに再利用する**ため、
+
+- 今回のビルドで作り直されるコンテナ (front / back などビルド対象)
+- 前回の実行が作ったまま残るコンテナ (mysql / valkey などビルド対象外)
+
+が 1 つのスタックに混在します。この混在は、次の形で起動確認を壊します。
+
+| 残っているコンテナの状態 | 起きること | 見え方 |
+| --- | --- | --- |
+| `exited` / `restarting` のまま | 依存している側が `depends_on` の `condition: service_healthy` を満たせない | `dependency failed to start: container mysql is unhealthy` |
+| `unhealthy` のまま | 同上 | 同上 |
+| 消えた / 作り直されたネットワークへ接続したまま | 今回作り直されたコンテナから名前解決できない | 接続側だけに `java.net.UnknownHostException: mysql` / `Unknown MySQL server host` |
+| タグが指すイメージが更新済みなのに前回のイメージのまま | 今回ビルドした成果物を検証できていない | 変更したはずの修正が反映されない |
+
+3 番目が特にたちの悪い形です。**DB の `healthcheck` は `127.0.0.1` を見ていることが
+多いため、ネットワークから切れていてもコンテナ自身は `healthy` のまま**で、
+接続側に「ホストが見つからない」だけが出ます。
+
+そこで `compose up` の前に既存コンテナを点検し、上の 1〜3 番目に該当するものが
+あれば `--force-recreate` を付けて作り直します (既定 `auto`)。
+
+```
+[WARN] 前回の実行が残したコンテナに、起動確認を壊す状態のものがあります:
+[WARN]   - mysql (mysql): 前回の状態 'exited' のまま残っています
+[INFO]   該当コンテナを compose up で作り直します (--force-recreate)。
+[INFO]   そのまま再利用する場合は --no-recreate-containers を指定してください。
+```
+
+4 番目は compose 自身が作り直すため警告のみです。全量レポート (`--report-dir`) には
+点検結果が残るので、あとから「再利用したのか作り直したのか」を突き合わせられます。
+
+```
+既存コンテナ  : 問題 1 件を検出したため --force-recreate で作り直し
+```
+
+- 常に作り直す: `--recreate-containers`
+- 点検も作り直しもしない (従来の動作): `--no-recreate-containers`
+- `--allow-service-exit NAME` で除外したサービスは、停止していても問題として扱いません
+  (初期化専用の短命サービス向け)
+
+**作り直しても直らない場合 — 残っているボリュームを疑う**
+
+コンテナを作り直しても同じ場所で失敗する場合は、**データ用のボリュームが前回の
+中断で壊れたまま残っている**可能性があります。DB コンテナは、初期化 (initdb) の
+途中で停止するとデータディレクトリが中途半端な状態で残り、次回以降は
+「初期化済み」と判断されて初期化がやり直されません。そのため
+`docker compose down -v` でボリュームを消すまで、毎回同じ場所で起動に失敗し続けます。
+
+このとき、コンテナが起動しないので Docker の DNS はそのサービス名を解決できず、
+接続側には `java.net.UnknownHostException` だけが出ます。**「ホストが見つからない」
+という症状の本当の原因が DB 側にある**、という追いにくい形になります。
+
+`compose up` の失敗診断では、各サービスのログから初期化エラーの兆候を探して
+そのまま表示します。
+
+```
+  残っているデータ用ボリュームが壊れている可能性があります:
+    [mysql]
+      [ERROR] [MY-010457] [Server] --initialize specified but the data directory has files in it. Aborting.
+
+    DB コンテナは、前回の実行が初期化の途中で停止するとデータディレクトリが
+    中途半端な状態で残ります。(中略)
+    対処 (ボリュームのデータは消えます):
+      docker compose -f compose.yml down -v
+```
+
+起動確認の失敗時 (`UnknownHostException` などがログに出た場合) は、
+**引けなかったホスト名ごとに切り分け**も表示します。compose の定義にあるか、
+そのサービスのコンテナが running か、実際にコンテナ内から引けるか、
+接続元と接続先がどのネットワークにいるかを突き合わせるため、
+「接続先名の設定ミス」「依存サービスの起動失敗」「コンテナの混在」を区別できます。
+
+```
+ 名前解決の失敗の切り分け
+  解決できなかったホスト名: mysql
+    compose の定義  : サービス 'mysql' として定義されています
+    コンテナの状態  : mysql (状態: exited, 終了コード: 1)
+    今の名前解決    : 解決できません (getent hosts mysql)
+```
+
+なお、後始末の `docker compose down` には `--shutdown-timeout` (既定 30 秒) を
+停止猶予として渡します。compose の既定 (10 秒) では、DB の初期化中や InnoDB の
+書き出し中に SIGKILL となり、上記の「壊れたボリューム」を自分で作ってしまうためです。
 
 ### 起動確認 (`--verify-startup`)
 

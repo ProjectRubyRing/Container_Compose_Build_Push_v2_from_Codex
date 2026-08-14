@@ -354,6 +354,38 @@ COMPOSE_UP_SUMMARY=""             # compose up の試行結果 (全量レポー�
 COMPOSE_PULL_HELP_CACHE=""        # compose pull が受け付けるオプションの判定結果
 COMPOSE_CAPTURE_FILE=""           # 実行中の compose 出力の記録先 (EXIT で削除)
 DIAGNOSTIC_HEALTH_LOG_LINES="40"  # 起動失敗の診断で表示する healthcheck 履歴の行数
+# ---- 前回の実行が残したコンテナ (ウォーム再実行) の扱い ----------------------
+# compose up は「設定とイメージが変わっていないコンテナ」を作り直さず再利用する。
+# --keep-container / --keep-container-mode でコンテナを残したまま再実行すると、
+#   ・今回のビルドで作り直されるコンテナ (front / back など build 対象)
+#   ・前回の実行が作ったまま残るコンテナ (mysql / valkey などビルド対象外)
+# が 1 つのスタックに混在する。この混在は次の形で起動確認を壊す。
+#   (1) 前回のコンテナが exited / unhealthy のまま残っていると、依存している側は
+#       depends_on の condition: service_healthy を満たせず compose up が中断する
+#       ("dependency failed to start: container mysql is unhealthy")
+#   (2) 前回のコンテナが「消えた / 作り直された」ネットワークへ繋がったままだと、
+#       今回作り直されたコンテナから名前解決できない。DB の healthcheck は
+#       127.0.0.1 を見ていることが多く、その場合コンテナ自身は healthy のままなので
+#       接続側の "java.net.UnknownHostException: mysql" だけが見えて原因が分かりにくい
+#   (3) タグが指すイメージが更新済みなのに前回のイメージのまま動いていると、
+#       今回ビルドした成果物を検証できていない
+# そこで compose up の前に既存コンテナを点検し、(1)(2) に該当するものがあれば
+# --force-recreate で作り直す。(3) は compose 自身が作り直すため警告に留める。
+# 作り直しても直らない場合はデータ用ボリュームが壊れている可能性が高いため、
+# 診断でその旨と docker compose down -v を案内する。
+RECREATE_CONTAINERS="auto"        # auto: 問題のある残存コンテナがあるときだけ作り直す
+                                  # always (--recreate-containers): 常に作り直す
+                                  # never  (--no-recreate-containers): 常に再利用する
+FORCE_RECREATE="false"            # compose up へ --force-recreate を付けるか (点検結果)
+STALE_CONTAINER_SUMMARY=""        # 既存コンテナ点検の結果 (全量レポート用)
+STALE_CONTAINER_ISSUES=()         # 点検で見つかった問題 (診断・レポート用)
+# 残っているデータ用ボリュームが壊れているときに、コンテナのログへ現れる文字列。
+# 前回の実行が DB の初期化中に停止すると、データディレクトリが中途半端な状態で
+# 残る。次回以降は「初期化済み」と判断されて初期化がやり直されないため、
+# ボリュームを消すまで毎回同じ場所で起動に失敗し続ける。
+BROKEN_DATA_VOLUME_LOG_PATTERN='data directory has files in it|Data directory .* is not empty|Can.t open and lock privilege tables|MY-010457|Table .mysql\.[a-z_]+. doesn.t exist|InnoDB: Unable to lock|InnoDB: Cannot open datafile|InnoDB: Corrupted|database files are incompatible with server|incorrect checksum in control file|could not open directory'
+# 名前解決に失敗したことを示すログ。どのホスト名を引けなかったのかまで取り出す。
+UNRESOLVED_HOST_LOG_PATTERN='UnknownHostException|Unknown MySQL server host|Name or service not known|Temporary failure in name resolution|Could not resolve host|nodename nor servname provided'
 # 実行開始時点の Docker の状態。コールド実行かどうかは失敗時の診断材料になる。
 DOCKER_STATE_SUMMARY=""           # ローカルイメージ件数 / ビルドキャッシュ量
 DOCKER_STATE_COLD="unknown"       # true: コールド実行 / false: ウォーム / unknown: 未判定
@@ -1216,6 +1248,16 @@ JBoss マスターパスワードの伝搬検証:
                            間に合わないことがあり、同じ操作をやり直すと成功する。
   --no-up-retry            compose up の再試行を行わない (--up-retry 0 と同じ)
   --up-retry-interval SEC  compose up の再試行間隔・秒 (既定: 15)
+  --recreate-containers    compose up へ --force-recreate を付け、前回の実行が
+                           残したコンテナを状態にかかわらず必ず作り直す
+  --no-recreate-containers 前回の実行が残したコンテナを、状態にかかわらずそのまま
+                           再利用する (この点検を行わない従来の動作)
+                           ※既定は auto。compose up の前に既存コンテナを点検し、
+                             「停止したまま」「unhealthy のまま」「消えた / 作り直された
+                             ネットワークへ繋がったまま」のいずれかが見つかったときだけ
+                             --force-recreate を付ける。--keep-container 系で
+                             コンテナを残したまま再実行したときに、前回のコンテナと
+                             今回のコンテナが混在して依存待ちや名前解決が壊れるのを防ぐ
   --allow-service-exit NAME
                            起動確認中に停止していても失敗扱いにしないサービス名。
                            繰り返し指定またはカンマ区切りで複数指定できる。
@@ -1660,6 +1702,8 @@ while [ $# -gt 0 ]; do
     --up-retry)            need_value "$1" $#; UP_RETRY="$2"; shift 2 ;;
     --no-up-retry)         UP_RETRY="0"; shift ;;
     --up-retry-interval)   need_value "$1" $#; UP_RETRY_INTERVAL="$2"; shift 2 ;;
+    --recreate-containers) RECREATE_CONTAINERS="always"; shift ;;
+    --no-recreate-containers) RECREATE_CONTAINERS="never"; shift ;;
     --allow-service-exit)  need_value "$1" $#; append_services ALLOW_SERVICE_EXIT "$2"; shift 2 ;;
     --suppress-startup-logs) SUPPRESS_STARTUP_LOGS="true"; shift ;;
     --shutdown-timeout)    need_value "$1" $#; SHUTDOWN_LOG_TIMEOUT="$2"; shift 2 ;;
@@ -5722,6 +5766,355 @@ pull_required_images() {
   return 0
 }
 
+# =============================================================================
+# 前回の実行が残したコンテナ (ウォーム再実行) の点検と、失敗時の切り分け
+# -----------------------------------------------------------------------------
+# --keep-container 系でコンテナを残したまま再実行すると、compose up は変化の無い
+# コンテナを作り直さずに再利用するため、前回のコンテナと今回のコンテナが混在する。
+# 混在したまま起動確認へ進むと、依存待ち (service_healthy) や名前解決が壊れた状態を
+# 「アプリの不具合」として見てしまう。compose up の前に点検して切り分ける。
+# =============================================================================
+
+# プロジェクトが作った全コンテナ ID (依存サービス分と停止済みを含む)。
+# compose_container_ids_all は起動対象サービスに絞るため、依存サービスまで
+# まとめて点検したいこの用途では使えない。
+compose_project_container_ids_all() {
+  "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -aq 2>/dev/null
+}
+
+# docker inspect が返した状態行が、想定した書式かどうか (区切りの数で判定する)。
+# 想定外 (取得失敗・版差) の行は点検対象から外し、誤検知で作り直さない。
+stale_inspect_line_is_valid() {
+  local line="$1" pipes
+  [ -n "$line" ] || return 1
+  pipes="$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')"
+  case "$pipes" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$pipes" -ge 6 ]
+}
+
+# ネットワーク名から現在の ID を引く。
+#   0: 取得できた (ID を標準出力へ)
+#   1: そのネットワークは存在しない
+#   2: 判定できなかった (docker が使えない等)。この場合は何も報告しない。
+stale_network_current_id() {
+  local network_name="$1" out status
+  out="$(docker network inspect -f '{{.Id}}' "$network_name" 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  case "$out" in
+    *"not found"*|*"No such network"*) return 1 ;;
+  esac
+  return 2
+}
+
+# compose up の前に、前回の実行が残したコンテナを点検する。
+# 判定材料はすべて docker inspect から取るため、compose の版差に依存しない。
+# 問題が見つかった場合は FORCE_RECREATE=true とし、compose up へ
+# --force-recreate を渡して作り直す (--no-recreate-containers で無効化できる)。
+inspect_stale_containers() {
+  STALE_CONTAINER_ISSUES=()
+  FORCE_RECREATE="false"
+
+  if [ "$RECREATE_CONTAINERS" = "always" ]; then
+    FORCE_RECREATE="true"
+    STALE_CONTAINER_SUMMARY="常に作り直す (--recreate-containers)"
+    log "  前回の実行が残したコンテナは --force-recreate で必ず作り直します。"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    STALE_CONTAINER_SUMMARY="DRY-RUN のため未実施"
+    return 0
+  fi
+
+  local -a container_ids=()
+  mapfile -t container_ids < <(compose_project_container_ids_all)
+
+  local cid info svc name status health image_id image_ref networks issue
+  local current_image net net_name net_id current_net net_status
+  local allowed allowed_service cache_hit cache_index
+  local checked=0 image_stale=0
+
+  local -a inspect_targets=()
+  for cid in ${container_ids[@]+"${container_ids[@]}"}; do
+    [ -n "$cid" ] && inspect_targets+=("$cid")
+  done
+  if [ ${#inspect_targets[@]} -eq 0 ]; then
+    STALE_CONTAINER_SUMMARY="前回の実行が残したコンテナはありません"
+    return 0
+  fi
+
+  # docker inspect は複数の ID をまとめて受け取り、1 コンテナ 1 行で返す。
+  # コンテナごとに docker を起動すると、Windows の Docker Desktop では
+  # 1 呼び出し数百 ms かかり、起動前に十数秒待たされるため 1 回にまとめる。
+  local -a inspect_lines=()
+  mapfile -t inspect_lines < <(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}|{{.State.Status}}|{{with .State.Health}}{{.Status}}{{end}}|{{.Image}}|{{.Config.Image}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}} {{end}}' "${inspect_targets[@]}" 2>/dev/null)
+
+  # 同じネットワーク名 / イメージ参照を何度も問い合わせないよう結果を控える。
+  # 値は "<状態>:<ID>" (状態は stale_network_current_id の戻り値と同じ意味)。
+  local -a net_cache_key=() net_cache_val=()
+  local -a img_cache_key=() img_cache_val=()
+
+  for info in ${inspect_lines[@]+"${inspect_lines[@]}"}; do
+    stale_inspect_line_is_valid "$info" || continue
+    IFS='|' read -r svc name status health image_id image_ref networks <<< "$info"
+    name="$(normalize_container_name "$name")"
+    case "$svc" in
+      ""|"<no value>") svc="$name" ;;
+    esac
+    checked=$(( checked + 1 ))
+
+    # (1) 起動していないコンテナ。依存している側は depends_on の
+    #     condition: service_healthy を満たせず "dependency failed to start" で止まる。
+    #     正常に終了しうるサービスは --allow-service-exit で除外できる。
+    allowed="false"
+    for allowed_service in ${ALLOW_SERVICE_EXIT[@]+"${ALLOW_SERVICE_EXIT[@]}"}; do
+      if [ "$allowed_service" = "$svc" ]; then
+        allowed="true"
+        break
+      fi
+    done
+    if [ "$allowed" != "true" ] && [ -n "$status" ] && [ "$status" != "running" ]; then
+      STALE_CONTAINER_ISSUES+=("${svc} (${name}): 前回の状態 '${status}' のまま残っています")
+    fi
+
+    # (2) healthcheck が unhealthy のまま残っているコンテナ。
+    if [ "$health" = "unhealthy" ]; then
+      STALE_CONTAINER_ISSUES+=("${svc} (${name}): healthcheck が unhealthy のまま残っています")
+    fi
+
+    # (3) 既に無い / 作り直されたネットワークへ繋がったままのコンテナ。
+    #     この状態では他のコンテナから名前解決できず、接続側にだけ
+    #     UnknownHostException が出る (自分の healthcheck は 127.0.0.1 を見るので通る)。
+    for net in $networks; do
+      [ -n "$net" ] || continue
+      net_name="${net%%=*}"
+      net_id="${net#*=}"
+      [ -n "$net_name" ] || continue
+      cache_hit=""
+      cache_index=0
+      while [ "$cache_index" -lt ${#net_cache_key[@]} ]; do
+        if [ "${net_cache_key[$cache_index]}" = "$net_name" ]; then
+          cache_hit="${net_cache_val[$cache_index]}"
+          break
+        fi
+        cache_index=$(( cache_index + 1 ))
+      done
+      if [ -z "$cache_hit" ]; then
+        current_net=""
+        net_status=0
+        current_net="$(stale_network_current_id "$net_name")" || net_status=$?
+        cache_hit="${net_status}:${current_net}"
+        net_cache_key+=("$net_name")
+        net_cache_val+=("$cache_hit")
+      fi
+      net_status="${cache_hit%%:*}"
+      current_net="${cache_hit#*:}"
+      if [ "$net_status" -eq 1 ]; then
+        STALE_CONTAINER_ISSUES+=("${svc} (${name}): 既に存在しないネットワーク '${net_name}' へ接続されたままです (他コンテナから名前解決できません)")
+      elif [ "$net_status" -eq 0 ] && [ -n "$net_id" ] && [ -n "$current_net" ] \
+          && [ "$net_id" != "$current_net" ]; then
+        STALE_CONTAINER_ISSUES+=("${svc} (${name}): ネットワーク '${net_name}' が作り直されており、古い方へ接続されたままです (他コンテナから名前解決できません)")
+      fi
+    done
+
+    # (4) タグが指すイメージが更新済みなのに、前回のイメージのまま動いている。
+    #     compose 自身が作り直すため作り直しの条件には入れないが、作り直されなかった
+    #     場合に「今回ビルドした成果物を検証できていない」ことへ気付けるようにする。
+    if [ -n "$image_ref" ] && [ -n "$image_id" ]; then
+      cache_hit=""
+      cache_index=0
+      while [ "$cache_index" -lt ${#img_cache_key[@]} ]; do
+        if [ "${img_cache_key[$cache_index]}" = "$image_ref" ]; then
+          cache_hit="${img_cache_val[$cache_index]}"
+          break
+        fi
+        cache_index=$(( cache_index + 1 ))
+      done
+      if [ -z "$cache_hit" ]; then
+        current_image="$(docker image inspect -f '{{.Id}}' "$image_ref" 2>/dev/null)" || current_image=""
+        cache_hit="id:${current_image}"
+        img_cache_key+=("$image_ref")
+        img_cache_val+=("$cache_hit")
+      fi
+      current_image="${cache_hit#id:}"
+      if [ -n "$current_image" ] && [ "$current_image" != "$image_id" ]; then
+        image_stale=$(( image_stale + 1 ))
+        warn "前回のコンテナが古いイメージのまま動いています: ${svc} (${name}, image=${image_ref})"
+      fi
+    fi
+  done
+
+  if [ "$checked" -eq 0 ]; then
+    STALE_CONTAINER_SUMMARY="前回の実行が残したコンテナはありません"
+    return 0
+  fi
+
+  if [ ${#STALE_CONTAINER_ISSUES[@]} -eq 0 ]; then
+    if [ "$image_stale" -gt 0 ]; then
+      STALE_CONTAINER_SUMMARY="既存コンテナ ${checked} 件を点検 (古いイメージのまま ${image_stale} 件 / 作り直しは不要)"
+    else
+      STALE_CONTAINER_SUMMARY="既存コンテナ ${checked} 件を点検 (作り直しが必要なものはありません)"
+    fi
+    return 0
+  fi
+
+  warn "前回の実行が残したコンテナに、起動確認を壊す状態のものがあります:"
+  for issue in "${STALE_CONTAINER_ISSUES[@]}"; do
+    warn "  - ${issue}"
+  done
+  if [ "$RECREATE_CONTAINERS" = "never" ]; then
+    STALE_CONTAINER_SUMMARY="問題 ${#STALE_CONTAINER_ISSUES[@]} 件を検出 (--no-recreate-containers のため再利用)"
+    warn "  --no-recreate-containers が指定されているため、そのまま再利用します。"
+  else
+    FORCE_RECREATE="true"
+    STALE_CONTAINER_SUMMARY="問題 ${#STALE_CONTAINER_ISSUES[@]} 件を検出したため --force-recreate で作り直し"
+    log "  該当コンテナを compose up で作り直します (--force-recreate)。"
+    log "  そのまま再利用する場合は --no-recreate-containers を指定してください。"
+  fi
+  return 0
+}
+
+# 起動できなかったサービスのログから「残っているデータ用ボリュームが壊れている」
+# 兆候を探す。DB コンテナは、前回の実行が初期化 (initdb) の途中で停止すると
+# データディレクトリが中途半端な状態で残る。次回以降は「初期化済み」と判断されて
+# 初期化がやり直されないため、ボリュームを消すまで毎回同じ場所で失敗し続ける。
+# コンテナが起動しないと Docker の DNS はそのサービス名を解決できないので、
+# 接続側には UnknownHostException だけが出て、原因が DB 側にあることが見えにくい。
+diagnose_broken_data_volume() {
+  [ "$DRY_RUN" = "true" ] && return 0
+  local -a services=()
+  mapfile -t services < <(compose_all_service_names)
+  [ ${#services[@]} -gt 0 ] || return 0
+
+  local svc logs hits line found="false"
+  for svc in "${services[@]}"; do
+    [ -n "$svc" ] || continue
+    logs="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" logs --no-color --tail 200 "$svc" 2>/dev/null | strip_ansi_codes)"
+    [ -n "$logs" ] || continue
+    hits="$(printf '%s\n' "$logs" | grep -Ei -- "$BROKEN_DATA_VOLUME_LOG_PATTERN" | tail -n 3)"
+    [ -n "$hits" ] || continue
+    if [ "$found" != "true" ]; then
+      found="true"
+      diag ""
+      diag "  残っているデータ用ボリュームが壊れている可能性があります:"
+    fi
+    diag "    [${svc}]"
+    while IFS= read -r line; do
+      [ -n "$line" ] && diag "      ${line}"
+    done <<< "$hits"
+  done
+  [ "$found" = "true" ] || return 0
+
+  diag ""
+  diag "    DB コンテナは、前回の実行が初期化の途中で停止するとデータディレクトリが"
+  diag "    中途半端な状態で残ります。次回以降は「初期化済み」と判断されて初期化が"
+  diag "    やり直されないため、ボリュームを消すまで毎回同じ場所で失敗し続けます。"
+  diag "    コンテナが起動しないと Docker の DNS はそのサービス名を解決できないため、"
+  diag "    接続側には java.net.UnknownHostException / Unknown MySQL server host だけが"
+  diag "    出て、原因が DB 側にあることが見えにくくなります。"
+  diag "    対処 (ボリュームのデータは消えます):"
+  diag "      ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v"
+  return 0
+}
+
+# 起動ログから「引けなかったホスト名」を取り出し、その正体を実測で切り分ける。
+# UnknownHostException は「接続先の綴り間違い」に見えるが、Compose 構成では
+#   ・そのサービスのコンテナが起動していない (依存サービスの起動失敗が本当の原因)
+#   ・前回の実行が残したコンテナが古いネットワークに繋がっている
+# のどちらかであることが多い。ログだけでは区別できないため、compose の定義・
+# コンテナの状態・コンテナ内からの名前解決を突き合わせて示す。
+diagnose_name_resolution_failure() {
+  local logs="$1"
+  [ "$DRY_RUN" = "true" ] && return 0
+  [ -n "$logs" ] || return 0
+  printf '%s\n' "$logs" | grep -qEi -- "$UNRESOLVED_HOST_LOG_PATTERN" || return 0
+
+  local -a hosts=()
+  mapfile -t hosts < <(
+    printf '%s\n' "$logs" \
+      | grep -Eo "UnknownHostException: [A-Za-z0-9_.-]+|Unknown MySQL server host .[A-Za-z0-9_.-]+|Could not resolve host: [A-Za-z0-9_.-]+" \
+      | sed -E "s/^UnknownHostException: //; s/^Unknown MySQL server host .//; s/^Could not resolve host: //" \
+      | awk 'NF && !seen[$0]++'
+  )
+
+  diag ""
+  diag "────────────────────────────────────────────────────────────────────"
+  diag " 名前解決の失敗の切り分け"
+  diag "────────────────────────────────────────────────────────────────────"
+  if [ ${#hosts[@]} -eq 0 ]; then
+    diag "  ログに名前解決の失敗が出ていますが、ホスト名を取り出せませんでした。"
+    diag "  上のログ本文で、解決できなかった宛先を確認してください。"
+    diag "────────────────────────────────────────────────────────────────────"
+    diag ""
+    return 0
+  fi
+
+  local -a defined_services=()
+  mapfile -t defined_services < <(compose_all_service_names)
+
+  local host svc defined probe_cid probe_out probe_networks target_networks
+  for host in "${hosts[@]}"; do
+    diag ""
+    diag "  解決できなかったホスト名: ${host}"
+    defined="false"
+    for svc in ${defined_services[@]+"${defined_services[@]}"}; do
+      if [ "$svc" = "$host" ]; then
+        defined="true"
+        break
+      fi
+    done
+    if [ "$defined" = "true" ]; then
+      diag "    compose の定義  : サービス '${host}' として定義されています"
+      diag "    コンテナの状態  : $(compose_service_container_summary "$host")"
+    else
+      diag "    compose の定義  : 同名のサービスは compose.yml にありません"
+      diag "      → 接続先名の綴り、または外部ホスト (DNS / プロキシ) を確認してください。"
+      continue
+    fi
+
+    # 実際に引けるかを、起動確認対象のコンテナの中から確かめる。
+    probe_cid="$(verification_target_container_ids 2>/dev/null | head -n 1)"
+    if [ -n "$probe_cid" ]; then
+      probe_out="$(docker exec "$probe_cid" sh -c "getent hosts ${host} 2>/dev/null || true" 2>/dev/null | head -n 1)"
+      case "$probe_out" in
+        [0-9]*|[0-9a-fA-F]*:*)
+          diag "    今の名前解決    : 解決できます (${probe_out})" ;;
+        "")
+          diag "    今の名前解決    : 解決できません (getent hosts ${host})" ;;
+        *)
+          diag "    今の名前解決    : 判定できませんでした (コンテナ内で getent を実行できません)" ;;
+      esac
+      probe_networks="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$probe_cid" 2>/dev/null)"
+      [ -n "$probe_networks" ] && diag "    接続元の network: ${probe_networks}"
+    fi
+    target_networks=""
+    while IFS= read -r svc; do
+      [ -n "$svc" ] || continue
+      target_networks="${target_networks}$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$svc" 2>/dev/null)"
+    done < <(compose_container_ids_all "$host")
+    [ -n "$target_networks" ] && diag "    接続先の network: ${target_networks}"
+  done
+
+  diag ""
+  diag "  見方:"
+  diag "    - サービスは定義されているのにコンテナが running でない"
+  diag "      → そのサービスの起動失敗が本当の原因。上のサービス別ログを確認する"
+  diag "        (DB なら、残ったボリュームが壊れていないかも併せて確認する)"
+  diag "    - コンテナは running なのに解決できない / network が食い違う"
+  diag "      → 前回の実行が残したコンテナが古いネットワークに繋がっている。"
+  diag "        --recreate-containers を付けて作り直すか、compose down で作り直す"
+  diag "    - compose.yml に同名のサービスが無い"
+  diag "      → 接続先名の設定ミス、または外部ホストの DNS / プロキシ設定"
+  diag "────────────────────────────────────────────────────────────────────"
+  diag ""
+  return 0
+}
+
 # compose up が失敗した理由を、コンテナを削除する前に採取して表示する。
 # どのサービスが停止・unhealthy なのかと、その healthcheck の実行結果まで出す。
 diagnose_compose_up_failure() {
@@ -5779,6 +6172,18 @@ diagnose_compose_up_failure() {
     done < <(compose_container_ids_all "$svc")
   done
 
+  # compose up の前に採取した「前回の実行が残したコンテナ」の点検結果。
+  # 依存待ちが通らない原因が、アプリ側ではなく残存コンテナにあることが分かる。
+  if [ ${#STALE_CONTAINER_ISSUES[@]} -gt 0 ]; then
+    diag ""
+    diag "  前回の実行が残したコンテナの点検結果:"
+    for line in "${STALE_CONTAINER_ISSUES[@]}"; do
+      diag "    - ${line}"
+    done
+  fi
+  # 作り直しても直らない場合に備え、データ用ボリュームの破損も併せて確認する。
+  diagnose_broken_data_volume
+
   diag ""
   case "$kind" in
     transient)
@@ -5797,6 +6202,10 @@ diagnose_compose_up_failure() {
       diag "   2. ボリュームも削除した場合、DB は初期化からやり直しになる。"
       diag "      → 上の状態表示で、どのサービスが unhealthy のままかを確認する。"
       diag "   3. --wait-healthy を使っている場合は --wait-timeout SEC を広げる。"
+      diag "   4. 逆に、ボリュームを残したまま再実行している場合は、前回の中断で"
+      diag "      DB のデータディレクトリが壊れたまま残っている可能性がある。"
+      diag "      → 上のログに初期化エラーが出ていないかを確認し、出ていれば"
+      diag "        ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v で作り直す。"
       ;;
     *)
       diag "  一過性のエラーとして判断できませんでした。上の状態と healthcheck の"
@@ -5818,6 +6227,12 @@ start_container() {
   else
     log "コンテナを起動します (compose up -d, 全サービス) ..."
   fi
+  # 前回の実行が残したコンテナを点検し、起動確認を壊す状態のもの (停止したまま /
+  # unhealthy のまま / 消えたネットワークへ接続したまま) があれば作り直す。
+  # 混在したまま起動すると、依存待ちが通らない・名前解決できないという形で
+  # 「アプリの不具合」に見える失敗になるため、compose up の前に片付ける。
+  inspect_stale_containers
+
   # 既存コンテナを再利用した場合に前回起動の WFLYSRV0025 を誤検出しないよう、
   # compose up の直前を今回のログ取得開始時刻として記録する。
   # docker compose logs --since は RFC3339 を受け取る。表示・記録を JST に揃える
@@ -5828,6 +6243,9 @@ start_container() {
     *) CONTAINER_LOG_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ;;
   esac
   local up_args=(-f "$COMPOSE_FILE" up -d --no-build)
+  if [ "$FORCE_RECREATE" = "true" ]; then
+    up_args+=(--force-recreate)
+  fi
   # --wait を付けると、compose が depends_on の条件に加えて対象サービス自身が
   # healthy (healthcheck 未定義なら running) になるまで待ってから戻る。
   # 依存先の healthcheck が未整備だと待てないため、compose.yml 側の整備が前提。
@@ -5898,12 +6316,16 @@ teardown_container() {
     log "コンテナを残します (--keep-container)。手動で停止する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
     return 0
   fi
-  log "コンテナを停止・削除します (compose down) ..."
+  # 停止猶予を明示する。既定の 10 秒では、DB の初期化中や InnoDB の書き出し中に
+  # SIGKILL となり、データ用ボリュームが中途半端な状態で残ることがある。そうなると
+  # 次回以降は down -v するまで DB が起動できず、接続側には「ホストが見つからない」
+  # (UnknownHostException) だけが出る、という追いにくい壊れ方をする。
+  log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT}) ..."
   local down_ok=0
   if [ "$SUPPRESS_REMOVED_LOGS" = "true" ] && [ "$DRY_RUN" != "true" ]; then
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down > /dev/null 2>&1 || down_ok=$?
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT" > /dev/null 2>&1 || down_ok=$?
   else
-    run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down || down_ok=$?
+    run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT" || down_ok=$?
   fi
   if [ "$down_ok" -ne 0 ]; then
     warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
@@ -6104,6 +6526,9 @@ dump_startup_logs_from_snapshot() {
   local logs="$1" target_desc="$2"
   show_startup_logs "$logs" "$target_desc" "false"
   show_companion_service_logs "false"
+  # 名前解決の失敗は接続先名の間違いに見えるが、Compose 構成では依存サービスの
+  # 起動失敗やコンテナの混在が原因であることが多い。ログを出したここで切り分ける。
+  diagnose_name_resolution_failure "$logs"
 }
 
 # 失敗時に設定行数分のコンテナ起動ログを出力する (原因調査用)。
@@ -21212,6 +21637,9 @@ write_build_report() {
     printf '開始時の Docker: %s\n' "${DOCKER_STATE_SUMMARY:-(未取得)}"
     printf 'イメージ取得  : %s\n' "${COMPOSE_PULL_SUMMARY:-(未実行)}"
     printf 'コンテナ起動  : %s\n' "${COMPOSE_UP_SUMMARY:-(未実行)}"
+    # 前回の実行が残したコンテナを再利用したのか作り直したのかで、同じ compose.yml
+    # でも起動確認の結果が変わる。あとから突き合わせられるよう点検結果も残す。
+    printf '既存コンテナ  : %s\n' "${STALE_CONTAINER_SUMMARY:-(未点検)}"
     printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'

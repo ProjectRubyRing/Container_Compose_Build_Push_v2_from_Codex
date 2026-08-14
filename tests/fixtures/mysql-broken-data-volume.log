@@ -1,0 +1,4 @@
+mysql  | 2026-08-14T10:00:00.100000Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+mysql  | 2026-08-14T10:00:00.500000Z 0 [ERROR] [MY-010457] [Server] --initialize specified but the data directory has files in it. Aborting.
+mysql  | 2026-08-14T10:00:00.600000Z 0 [ERROR] [MY-013236] [Server] The designated data directory is unusable.
+mysql  | 2026-08-14T10:00:00.700000Z 0 [ERROR] [MY-010119] [Server] Aborting

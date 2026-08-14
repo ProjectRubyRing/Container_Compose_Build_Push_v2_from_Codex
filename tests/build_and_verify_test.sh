@@ -863,6 +863,152 @@ if (
 fi
 assert_contains "$invalid_up_retry_output" "--up-retry には 0 以上の整数を指定してください: -1"
 
+# --- 前回の実行が残したコンテナの点検 (ウォーム再実行) -----------------------
+# --keep-container 系でコンテナを残したまま再実行すると、前回のコンテナと
+# 今回のコンテナが混在して依存待ち・名前解決が壊れる。compose up の前に点検し、
+# 壊れた状態のものだけを --force-recreate で作り直すこと。
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_STALE_NETWORKS="net_default=net-aaa"
+export FAKE_STALE_IMAGES="app-image=sha256:img-app mysql:8.4.7=sha256:img-mysql"
+
+# 停止したまま残っているコンテナは作り直す。
+stale_exited_output="$TEST_TMP/stale-exited.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_STALE_CONTAINERS='cid-app|app|/app|running|healthy|sha256:img-app|app-image|net_default=net-aaa
+cid-mysql|mysql|/mysql|exited||sha256:img-mysql|mysql:8.4.7|net_default=net-aaa '
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$TEST_TMP/stale-exited-reports" \
+    --suppress-removed-logs
+) >"$stale_exited_output" 2>&1; then
+  unset FAKE_STALE_CONTAINERS FAKE_STALE_NETWORKS FAKE_STALE_IMAGES
+  cat "$stale_exited_output" >&2
+  fail "stale container scenario returned a non-zero status"
+fi
+assert_contains "$stale_exited_output" "前回の実行が残したコンテナに、起動確認を壊す状態のものがあります:"
+assert_contains "$stale_exited_output" "mysql (mysql): 前回の状態 'exited' のまま残っています"
+assert_contains "$stale_exited_output" "該当コンテナを compose up で作り直します (--force-recreate)。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build --force-recreate app"
+collect_report_files "$TEST_TMP/stale-exited-reports"
+stale_exited_reports=("${REPORT_FILES[@]}")
+[ ${#stale_exited_reports[@]} -eq 1 ] || fail "expected one report for the stale container scenario"
+assert_contains "${stale_exited_reports[0]}" "既存コンテナ  : 問題 1 件を検出したため --force-recreate で作り直し"
+
+# 消えたネットワークへ繋がったまま (running / healthy でも名前解決できない) も作り直す。
+stale_network_output="$TEST_TMP/stale-network.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_STALE_CONTAINERS='cid-mysql|mysql|/mysql|running|healthy|sha256:img-mysql|mysql:8.4.7|net_removed=net-old '
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-removed-logs
+) >"$stale_network_output" 2>&1; then
+  unset FAKE_STALE_CONTAINERS FAKE_STALE_NETWORKS FAKE_STALE_IMAGES
+  cat "$stale_network_output" >&2
+  fail "stale network scenario returned a non-zero status"
+fi
+assert_contains "$stale_network_output" "既に存在しないネットワーク 'net_removed' へ接続されたままです"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build --force-recreate app"
+
+# --no-recreate-containers では検出だけ行い、作り直さないこと。
+stale_keep_output="$TEST_TMP/stale-keep.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --no-recreate-containers \
+    --suppress-removed-logs
+) >"$stale_keep_output" 2>&1; then
+  unset FAKE_STALE_CONTAINERS FAKE_STALE_NETWORKS FAKE_STALE_IMAGES
+  cat "$stale_keep_output" >&2
+  fail "--no-recreate-containers scenario returned a non-zero status"
+fi
+assert_contains "$stale_keep_output" "--no-recreate-containers が指定されているため、そのまま再利用します。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build app"
+assert_not_contains "$FAKE_DOCKER_CALLS" "--force-recreate"
+unset FAKE_STALE_CONTAINERS FAKE_STALE_NETWORKS FAKE_STALE_IMAGES
+
+# --recreate-containers は点検の結果によらず必ず作り直すこと。
+stale_always_output="$TEST_TMP/stale-always.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --recreate-containers \
+    --suppress-removed-logs
+) >"$stale_always_output" 2>&1; then
+  cat "$stale_always_output" >&2
+  fail "--recreate-containers scenario returned a non-zero status"
+fi
+assert_contains "$stale_always_output" "前回の実行が残したコンテナは --force-recreate で必ず作り直します。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build --force-recreate app"
+
+# --- 名前解決の失敗 (UnknownHostException) の切り分け ------------------------
+# 「ホストが見つからない」は接続先名の誤りに見えるが、Compose 構成では依存
+# サービスのコンテナが存在しないことが原因であることが多い。ログを出すだけでなく、
+# compose の定義とコンテナの状態を突き合わせて示すこと。
+unknown_host_output="$TEST_TMP/unknown-host.out"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-unknown-host.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app mysql"
+export FAKE_COMPOSE_PS_SERVICES="app mysql"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --no-shutdown-logs \
+    --suppress-removed-logs
+) >"$unknown_host_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$unknown_host_output" >&2
+  fail "unknown host fixture unexpectedly returned zero"
+fi
+assert_contains "$unknown_host_output" "名前解決の失敗の切り分け"
+assert_contains "$unknown_host_output" "解決できなかったホスト名: mysql"
+assert_contains "$unknown_host_output" "compose の定義  : サービス 'mysql' として定義されています"
+
+# --- 残っているデータ用ボリュームが壊れている場合の診断 ----------------------
+# 前回の実行が DB の初期化中に停止すると、以後は down -v するまで毎回失敗する。
+# compose up の失敗診断で、その兆候と down -v の案内まで出すこと。
+broken_volume_output="$TEST_TMP/broken-volume.out"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/mysql-broken-data-volume.log"
+export FAKE_COMPOSE_UP_FAIL=true
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --no-up-retry \
+    --no-shutdown-logs \
+    --suppress-removed-logs
+) >"$broken_volume_output" 2>&1; then
+  unset FAKE_COMPOSE_UP_FAIL FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$broken_volume_output" >&2
+  fail "broken data volume fixture unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_UP_FAIL
+assert_contains "$broken_volume_output" "残っているデータ用ボリュームが壊れている可能性があります:"
+assert_contains "$broken_volume_output" "data directory has files in it"
+assert_contains "$broken_volume_output" "対処 (ボリュームのデータは消えます):"
+assert_contains "$broken_volume_output" "docker compose -f compose.yml down -v"
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+
 unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 
 invalid_shutdown_timeout_output="$TEST_TMP/shutdown-timeout-invalid.out"

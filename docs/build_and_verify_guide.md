@@ -441,6 +441,8 @@ compose down (削除)
 | `--up-retry N` | 0 以上の整数 | `1` | 不可 | `compose up` が一過性の理由で失敗したときの再試行回数 |
 | `--no-up-retry` | フラグ | `false` | — | `compose up` の再試行を行わない (`--up-retry 0` と同じ) |
 | `--up-retry-interval SEC` | 0 以上の整数 | `15` | 不可 | `compose up` の再試行間隔 |
+| `--recreate-containers` | フラグ | `false` | — | 前回の実行が残したコンテナを、状態にかかわらず `--force-recreate` で作り直す |
+| `--no-recreate-containers` | フラグ | `false` | — | 前回の実行が残したコンテナの点検と作り直しを行わない (従来の動作) |
 | `--suppress-startup-logs` | フラグ | `false` | — | 起動ログの表示を抑制 (判定は継続。失敗時は表示される) |
 | `--shutdown-timeout SEC` | 1 以上の整数 | `30` | 不可 | エラー終了時の SIGTERM から SIGKILL までの猶予秒数 (ECS の StopTimeout 既定と同じ) |
 | `--no-shutdown-logs` | フラグ | `false` | — | エラー終了時の SIGTERM 停止と終了ログ取得を行わない |
@@ -727,6 +729,49 @@ services:
 コールド実行で毎回 `dependency failed to start` になる場合は、再試行ではなく
 `compose.yml` の `healthcheck` の `start_period` / `retries`、`--wait-timeout`、
 `--startup-timeout` を広げてください。
+
+**ウォーム再実行 — 前回のコンテナが残っている場合**
+
+`--keep-container` / `--keep-container-mode` を付けると、確認後もコンテナが起動した
+まま残ります。その状態で再実行すると、`compose up` は**設定とイメージが変わっていない
+コンテナを作り直さずに再利用する**ため、今回のビルドで作り直されたコンテナ
+(front / back など) と、前回の実行が作ったまま残るコンテナ (mysql / valkey など
+ビルド対象外) が 1 つのスタックに混在します。
+
+| 残っているコンテナの状態 | 起きること | 見え方 |
+| --- | --- | --- |
+| `exited` / `restarting` のまま | 依存側が `condition: service_healthy` を満たせない | `dependency failed to start: container ... is unhealthy` |
+| `unhealthy` のまま | 同上 | 同上 |
+| 消えた / 作り直されたネットワークへ接続したまま | 今回作り直されたコンテナから名前解決できない | 接続側だけに `java.net.UnknownHostException` |
+| タグが指すイメージが更新済みなのに前回のイメージのまま | 今回ビルドした成果物を検証できていない | 修正が反映されない |
+
+3 番目は特に分かりにくい形です。DB の `healthcheck` は `127.0.0.1` を見ていることが
+多いため、**ネットワークから切れていてもコンテナ自身は `healthy` のまま**で、
+接続側に「ホストが見つからない」だけが出ます。
+
+そこで `compose up` の前に既存コンテナを点検し、1〜3 番目に該当するものがあれば
+`--force-recreate` を付けて作り直します (既定 `auto`)。4 番目は `compose` 自身が
+作り直すため警告のみです。点検結果は全量レポートの `既存コンテナ` 行に残ります。
+
+- 常に作り直す … `--recreate-containers`
+- 点検も作り直しもしない (従来の動作) … `--no-recreate-containers`
+- `--allow-service-exit NAME` で除外したサービスは、停止していても問題として扱いません
+
+作り直しても同じ場所で失敗する場合は、**データ用ボリュームが前回の中断で壊れたまま
+残っている**可能性があります。DB は初期化 (initdb) の途中で停止するとデータ
+ディレクトリが中途半端な状態で残り、次回以降は「初期化済み」と判断されて初期化が
+やり直されないため、`compose down -v` でボリュームを消すまで毎回失敗し続けます。
+`compose up` の失敗診断は、各サービスのログから初期化エラーの兆候を探して表示し、
+`compose down -v` を案内します。
+
+起動確認が失敗したときは、`UnknownHostException` などから**引けなかったホスト名**を
+取り出し、compose の定義にあるか / そのコンテナが running か / 実際にコンテナ内から
+引けるか / 接続元と接続先がどのネットワークにいるかを突き合わせて表示します。
+「接続先名の設定ミス」「依存サービスの起動失敗」「コンテナの混在」を区別できます。
+
+なお後始末の `compose down` には `--shutdown-timeout` (既定 30 秒) を停止猶予として
+渡します。`compose` の既定 (10 秒) では、DB の初期化中や InnoDB の書き出し中に
+SIGKILL となり、上記の「壊れたボリューム」を自分で作ってしまうためです。
 
 ### 5.4 `--keep-container-mode` の 3 モード
 

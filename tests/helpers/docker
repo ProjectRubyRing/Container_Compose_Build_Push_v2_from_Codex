@@ -28,6 +28,54 @@ is_compose_stopped() {
   [ -n "${FAKE_COMPOSE_SHUTDOWN_MARKER:-}" ] && [ -f "$FAKE_COMPOSE_SHUTDOWN_MARKER" ]
 }
 
+# ---- 前回の実行が残したコンテナ (inspect_stale_containers) の再現 -----------
+# FAKE_STALE_CONTAINERS を指定したときだけ有効。未指定なら従来どおりの動作。
+# 1 行 1 コンテナで、次の順に | 区切りで書く:
+#   ID|サービス名|/コンテナ名|状態|health|イメージ ID|イメージ参照|ネットワーク名=ID
+# ネットワークの現在の ID は FAKE_STALE_NETWORKS ("名前=ID" を空白区切り)、
+# イメージ参照が今指しているイメージ ID は FAKE_STALE_IMAGES ("参照=ID") で与える。
+if [ -n "${FAKE_STALE_CONTAINERS:-}" ]; then
+  if [ "${1:-}" = "compose" ] && [[ " $* " == *" ps "* ]] && [[ " $* " == *" -aq "* ]]; then
+    while IFS='|' read -r stale_id stale_rest; do
+      [ -n "$stale_id" ] && printf '%s\n' "$stale_id"
+    done <<< "$FAKE_STALE_CONTAINERS"
+    exit 0
+  fi
+  if [ "${1:-}" = "inspect" ] && [[ " $* " == *"NetworkID"* ]]; then
+    # 実装側は複数の ID をまとめて渡し、1 コンテナ 1 行で受け取る。
+    shift
+    [ "${1:-}" = "-f" ] && shift 2
+    for stale_target in "$@"; do
+      while IFS='|' read -r stale_id stale_rest; do
+        [ "$stale_id" = "$stale_target" ] || continue
+        printf '%s\n' "$stale_rest"
+        break
+      done <<< "$FAKE_STALE_CONTAINERS"
+    done
+    exit 0
+  fi
+  if [ "${1:-}" = "network" ] && [ "${2:-}" = "inspect" ]; then
+    stale_target="${!#}"
+    for stale_entry in ${FAKE_STALE_NETWORKS:-}; do
+      if [ "${stale_entry%%=*}" = "$stale_target" ]; then
+        printf '%s\n' "${stale_entry#*=}"
+        exit 0
+      fi
+    done
+    printf 'Error response from daemon: network %s not found\n' "$stale_target" >&2
+    exit 1
+  fi
+  if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ] && [[ " $* " == *"{{.Id}} "* ]]; then
+    stale_target="${!#}"
+    for stale_entry in ${FAKE_STALE_IMAGES:-}; do
+      if [ "${stale_entry%%=*}" = "$stale_target" ]; then
+        printf '%s\n' "${stale_entry#*=}"
+        exit 0
+      fi
+    done
+  fi
+fi
+
 if [ "${1:-}" = "compose" ]; then
   shift
   subcommand=""
