@@ -55,7 +55,7 @@
 | 11-3 | 終了時のビルドキャッシュ削除・使用量の計測 | `--prune-build-cache` / `--prune-build-cache-keep` / `--disk-usage-report` |
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
-| 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。ファイル出力は `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` 指定時) |
+| 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。結果は全量レポート `[10]` と Excel へ。**画面表示は `--deploy-exception-display` 指定時のみ**、**テキスト出力は `--deploy-exception-text` 指定時のみ**) |
 | 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
 | 16 | JBoss EAP Undertow バーチャルホスト (`default-host`) の分析 (`Host` ヘッダーごとの振り分け判定、`default-host` の利用状況、`Host` ヘッダーを差し替えた実リクエストによる確認) | (起動確認時に既定で自動。無効化は `--no-undertow-analysis`。テキスト出力は `--report-dir` / `--undertow-analysis-text` 指定時) |
 
@@ -123,7 +123,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | ビルド監視 | `run_build_with_watchdog` / `build_watchdog_reader` / `build_watchdog_monitor` / `diagnose_build_stall` / `build_phase_from_line` / `check_build_disk_space` | `exporting layers` などで出力が途切れたときの進捗表示・停滞診断・上限時間での中断 |
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
-| Java 例外解析 | `analyze_war_deploy_exceptions` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、画面表示と Excel 出力 |
+| Java 例外解析 | `analyze_war_deploy_exceptions` / `deploy_exception_output_requested` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `show_war_deploy_exception_outputs` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、出力先の要否判定、画面表示 (`--deploy-exception-display` 指定時) と Excel / テキスト出力 |
 | 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_dockerfile_facts` / `readonly_parse_dockerfile` / `readonly_shell_write_targets` / `readonly_scan_context_script` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `readonly_collect_container_scripts` / `show_readonly_filesystem_analysis` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、`Dockerfile` からのビルド時の書き込み先の収集、起動スクリプトからの実行時の書き込み先の収集、コンテナの書き込み状況の収集、判定結果の表示と Excel / テキスト出力 |
 | レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` / `append_readonly_analysis_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
@@ -202,7 +202,7 @@ flowchart TD
     AA --> AA2[JVM パラメータ一覧を表示<br/>/proc から Java プロセスを検出]
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
-    AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → Excel 出力]
+    AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → レポート/Excel 出力<br/>画面表示は --deploy-exception-display 指定時のみ]
     AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + Dockerfile ビルド時 + 起動スクリプト/実行状況 実行時<br/>→ tmpfs / マウントの要否判定 → Excel 出力]
     AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
     AB --> Z2[完了 exit 0]
@@ -485,9 +485,11 @@ compose down (削除)
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。ツリーとデプロイ構造は `--directory-tree-report` 併用時のみ保存 |
-| `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。`--no-deploy-exception-analysis` とは排他 |
-| `--deploy-exception-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析の Excel と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析のテキストは `--deploy-exception-text` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report` 併用時のみ保存 |
+| `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない (結果は全量レポート `[10]` と Excel に残る)。`--no-deploy-exception-analysis` とは排他 |
+| `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
+| `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。`--report-dir` 指定時は未指定でも自動出力。`--no-deploy-exception-analysis` とは排他 |
+| `--deploy-exception-text FILE` | ファイルパス | (なし。**指定時のみ出力**) | 不可 | 同じ内容のテキスト出力先。`--report-dir` を指定しただけでは出力しない。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 不可 | 詳細分析を行う例外の最大件数 |
 | `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析と Excel 出力を行わない |
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 不可 | 読み取り専用ファイルシステム分析の Excel 出力先。`--no-readonly-analysis` とは排他 |
@@ -940,14 +942,14 @@ AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイ
 | 対象 | 起動失敗ログ (`WFLYSRV0026` / `WFLYSRV0056`) を検出したデプロイエラー |
 | 対象外 | 起動確認のタイムアウト、コンテナの途中停止、`compose up` の失敗 (いずれも従来どおり終了) |
 | 開始する操作 | `--keep-container-mode` 指定時はそのモード。未指定時は `logs` (→ 5.4) |
-| 対話の前 | 失敗した起動ログと、WAR デプロイ時 Java 例外解析の結果を先に表示する |
+| 対話の前 | 失敗した起動ログを表示し、WAR デプロイ時 Java 例外解析を先に済ませる (画面へ出すのは `--deploy-exception-display` 指定時。既定では全量レポート `[10]` と Excel へ残すだけ) |
 | 対話の後 | コンテナは起動状態のまま残る。不要になったら `docker compose -f compose.yml down` |
 | 終了コード | デプロイエラーは失敗のままなので `1` |
 
 ```
 起動確認 → WFLYSRV0026 検出
   → 起動ログを表示
-  → WAR デプロイ時 Java 例外解析を表示
+  → WAR デプロイ時 Java 例外解析 (--deploy-exception-display 指定時のみ表示)
   → 対話操作 (logs) を開始  ← 各 Compose サービスへ bash 接続 / ログ確認
   → 対話操作を終了してもコンテナは残したまま exit 1
 ```
@@ -1247,6 +1249,7 @@ RUN --mount=type=secret,id=cacerts \
  → JVM パラメータ → OpenTelemetry 環境変数・JVM パラメータ)
 (ディレクトリツリーと JBoss デプロイ構造は --directory-tree 指定時のみ)
 (WAR デプロイ時 Java 例外解析 → 読み取り専用ファイルシステムの書き込み先分析)
+(Java 例外解析の画面表示は --deploy-exception-display 指定時のみ)
 ```
 
 エラー終了時は、後始末の中で SIGTERM 送出後の終了ログも続けて表示します。
@@ -1267,8 +1270,8 @@ RUN --mount=type=secret,id=cacerts \
 | `--env-list-file` のパス | 指定時 | 環境変数一覧 |
 | `--report-dir/build_and_verify_<日時>.txt` | 指定時 | 全量レポート (デプロイ結果ファイル) |
 | `--report-dir/build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | WAR デプロイ時 Java 例外エラー解析の Excel ブック |
-| `--report-dir/build_and_verify_<日時>_java_exceptions.txt` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | 同じ内容のテキスト版 (全スタックフレーム + 区分付きデプロイログ) |
-| `--deploy-exception-excel` / `--deploy-exception-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--deploy-exception-excel` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--deploy-exception-text` のパス | **指定時のみ** (`--report-dir` だけでは出力しない) | Excel と同じ内容のテキスト版 (全スタックフレーム + 区分付きデプロイログ) |
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.xlsx` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 読み取り専用ファイルシステム分析の Excel ブック |
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.txt` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 同じ内容のテキスト版 (全ディレクトリの判定・根拠・参考知識) |
 | `--readonly-analysis-excel` / `--readonly-analysis-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
@@ -1286,7 +1289,7 @@ RUN --mount=type=secret,id=cacerts \
 | `[7] JBoss マスターパスワードの伝搬検証` | `--verify-jboss-password` 指定時、段ごとの判定・パスワード文字列・16 進ダンプ | 段 1〜3 のみ記録し、残りは「未確認」 |
 | `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送信状況チェックの段ごとの判定 (送達の段は `--cwagent-delivery-report` 未指定なら「情報」) | 設定ファイルチェックのみ記録し、送達は「未確認」 |
 | `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
-| `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (画面と同じ全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
+| `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス。**画面表示 (`--deploy-exception-display`) の有無にかかわらず記録する** | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
 | `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
@@ -1575,6 +1578,17 @@ NG を検出しても**既定では終了コードを変えません** (`--verif
 
 専用オプションなしで自動実行されます (`--no-deploy-exception-analysis` / `--dry-run`
 のときだけ行いません)。
+
+> **既定では画面へ表示しません。** 解析結果は 1 例外あたり数十行になり、ビルドの成否や
+> 動作確認の結果を画面から押し流してしまうため、画面表示は `--deploy-exception-display`
+> を指定したときだけ行います。テキストファイルも同じ考え方で、`--report-dir` を
+> 指定しただけでは出力せず、`--deploy-exception-text FILE` で出力先を指定したときだけ
+> 書き出します。既定でも解析そのものは動き、結果は**全量レポートの `[10]`** と
+> **Excel ブック**に残ります。
+> なお、画面表示・テキスト・Excel・全量レポートのいずれも要求されていない実行
+> (`--report-dir` も `--deploy-exception-*` も無い) では、結果を出す先が無いため
+> 解析自体を行いません。
+
 JBoss EAP のデプロイ処理 (WAR の展開 → 記述子の解析 → モジュール依存の解決 →
 CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そのデプロイユニットは
 `failed` となり `WFLYCTL0080` / `WFLYSRV0021` でロールバックされます。
@@ -1598,7 +1612,7 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | 例外クラスの分類 | 完全修飾クラス名 → 単純名 → `Error` / `Exception` の順に照合し、分類・深刻度・分析文・対処手順を決める |
 | メッセージ本文の追加解析 | `Metaspace` / `Connection refused` / `Access denied` / `class file version` / `WELD-001408` など、本文から具体策が言えるパターンを追加所見として付ける |
 | デプロイ関連の判定 | `jboss.deployment.unit."<アーカイブ>"` の有無、`WFLYSRV0027` 以降かどうか、ロガーがデプロイヤかどうかで判定し、**判定の根拠も併記**する |
-| 出力 | 画面 (例外を検出したときのみ全文) / 全量レポート `[10]` / Excel ブック / 同じ内容のテキストファイル |
+| 出力 | 全量レポート `[10]` / Excel ブック / 画面 (`--deploy-exception-display` 指定時のみ。例外を検出したときだけ全文) / テキストファイル (`--deploy-exception-text FILE` 指定時のみ) |
 
 #### 分類する例外クラス
 
@@ -1628,6 +1642,9 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 
 #### 例外 1 件あたりの出力
 
+次の内容が全量レポート `[10]` に記録され、`--deploy-exception-display` を指定した
+ときは同じものを画面へも出します。
+
 ```
 -------------------------------------------------------------------
 [例外 1/2] org.jboss.msc.service.StartException
@@ -1651,7 +1668,7 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 ■ 例外の連鎖とスタックトレース     … 各段の先頭 12 フレーム
 ```
 
-例外が 1 件も無い場合、画面へは
+例外が 1 件も無い場合、`--deploy-exception-display` を指定していても画面へは
 `WAR デプロイ時の Java 例外は検出されませんでした。` の 1 行だけを出します。
 
 #### 解析対象ログの状況 (`ログ取得状況`)
@@ -1671,15 +1688,15 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 
 #### 出力ファイル (Excel とテキスト)
 
-`--report-dir` を指定していれば、デプロイ結果ファイル
-(`build_and_verify_<日時>.txt`) と**同じディレクトリへ追加で**次の 2 つを出力します。
-出力先は `--deploy-exception-excel FILE` / `--deploy-exception-text FILE` で
-個別に明示することもできます。
+| ファイル | 出力条件 | 内容 |
+| --- | --- | --- |
+| `build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時に自動命名。`--deploy-exception-excel FILE` で明示も可 | 後述の 6 シート構成の Excel ブック |
+| `--deploy-exception-text FILE` のパス | **`--deploy-exception-text FILE` を指定したときだけ** (`--report-dir` だけでは出力しない) | Excel と同じ内容のテキスト版。Excel を開けない環境や、`grep` / `diff` で追いたい場合に使う |
 
-| ファイル | 内容 |
-| --- | --- |
-| `build_and_verify_<日時>_java_exceptions.xlsx` | 後述の 6 シート構成の Excel ブック |
-| `build_and_verify_<日時>_java_exceptions.txt` | 同じ内容のテキスト版。Excel を開けない環境や、`grep` / `diff` で追いたい場合に使う |
+Excel は `--report-dir` を指定していれば、デプロイ結果ファイル
+(`build_and_verify_<日時>.txt`) と**同じディレクトリへ追加で**出力します。
+テキストは自動命名を行わないため、必要なときに出力先を明示してください
+(同じ内容が全量レポート `[10]` にも載るため、既定では同じファイルを 2 つ作りません)。
 
 テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
 含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
@@ -1703,9 +1720,9 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 | 長文の扱い | 「原因分析」「対処方法」は 1 項目 = 1 行の縦持ち、「スタックトレース」は 1 フレーム = 1 行に展開する。1 セルへ長文を詰めて Excel の行高上限 (409.5pt) を超え、末尾が読めなくなるのを避けるため |
 | その他 | 見出し行の固定、オートフィルタ、列幅、折り返し、深刻度の色分けを設定済み |
 
-例外が 0 件でも Excel とテキストは出力し、「概要」に
+例外が 0 件でも (出力条件を満たしていれば) Excel とテキストは出力し、「概要」に
 `OK (Java 例外は検出されませんでした)` と記録します。コンテナの起動に失敗した
-場合や解析対象のログが無い場合も同じ 2 ファイルを出力し、「概要」の
+場合や解析対象のログが無い場合も同じファイルを出力し、「概要」の
 `ログ取得状況` と `未評価 (解析対象のログが無いため判定できません)` で
 理由が分かるようにします。
 
@@ -2051,24 +2068,31 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 # 16) build_and_push.sh 経由での呼び出し (同じ処理)
 ./build_and_push.sh --build-only --verify-startup --log-dir ./logs
 
-# 17) デプロイ結果ファイルと Java 例外解析 (Excel + テキスト) をまとめて保存
-#     (reports/build_and_verify_<日時>.txt、
-#      reports/build_and_verify_<日時>_java_exceptions.xlsx、
-#      reports/build_and_verify_<日時>_java_exceptions.txt が出力される)
+# 17) デプロイ結果ファイルと Java 例外解析の Excel をまとめて保存
+#     (reports/build_and_verify_<日時>.txt … [10] に例外解析の全文、
+#      reports/build_and_verify_<日時>_java_exceptions.xlsx が出力される。
+#      画面には解析結果を出さない ← 既定)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
 
-# 17-2) Java 例外解析の Excel / テキストを任意のパスへ出力する
+# 17-2) 解析結果を画面でも読む (既定は非表示)
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports \
+    --deploy-exception-display
+
+# 17-3) Java 例外解析の Excel / テキストを任意のパスへ出力する
+#       (テキストは --deploy-exception-text を指定したときだけ出力される)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --deploy-exception-excel ./reports/deploy-errors.xlsx \
     --deploy-exception-text ./reports/deploy-errors.txt
 
-# 17-3) Java 例外解析を行わない (ログ量を抑えたい場合)
+# 17-4) Java 例外解析を行わない (解析処理ごと省く)
 ./build_and_verify.sh --verify-startup --no-deploy-exception-analysis
 
-# 17-4) 読み取り専用ファイルシステム (read_only) の書き込み先分析
+# 17-5) 読み取り専用ファイルシステム (read_only) の書き込み先分析
 #       既定で毎回実行される。--report-dir があれば
 #       reports/build_and_verify_<日時>_readonly_filesystem.xlsx / .txt も出力される
 #       Dockerfile のビルド時に書くだけのディレクトリは「ビルド時のみ」として
@@ -2077,13 +2101,13 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
     --compose-service app --startup-service app \
     --report-dir ./reports
 
-# 17-5) 読み取り専用ファイルシステム分析の Excel / テキストを任意のパスへ出力する
+# 17-6) 読み取り専用ファイルシステム分析の Excel / テキストを任意のパスへ出力する
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --readonly-analysis-excel ./reports/readonly.xlsx \
     --readonly-analysis-text ./reports/readonly.txt
 
-# 17-6) 読み取り専用ファイルシステムの分析を行わない
+# 17-7) 読み取り専用ファイルシステムの分析を行わない
 ./build_and_verify.sh --verify-startup --no-readonly-analysis
 
 # 18) ビルドが exporting layers から進まないときの調査
@@ -2119,7 +2143,7 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `コピー先に同名ファイルが既に存在します: … (--copy-file-no-overwrite が指定されているため中止します)` | 上書き禁止指定でコピー先に同名ファイルがある | 既存ファイルを退避する、コピー先を変える、または `--copy-file-no-overwrite` を外して強制上書き (終了時に復元) させる |
 | `コピー先が通常ファイルではありません` | コピー先が既存のディレクトリ・シンボリックリンク等 | 上書きも自動削除も行わないため、コピー先を変えるか対象を手動で片付ける |
 | `上書き前のファイルを復元できませんでした: … -> …` | 退避先からの `mv` に失敗 (権限・容量など) | 表示された退避先パスから手動で戻す。退避先ディレクトリは削除されずに残る |
-| `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 (デプロイエラー) | 既定ではコンテナを残したまま調査用の対話操作へ入る (→ 5.4-2)。表示された失敗行と Java 例外解析を確認 |
+| `JBoss EAP 8.1 が正常起動しませんでした` | `WFLYSRV0026` / `WFLYSRV0056` を検出 (デプロイエラー) | 既定ではコンテナを残したまま調査用の対話操作へ入る (→ 5.4-2)。表示された失敗行と、全量レポート `[10]` の Java 例外解析 (画面で読むなら `--deploy-exception-display`) を確認 |
 | `対話操作を開始できなかったため、通常のエラー終了として後始末します` | デプロイエラーを検出したが、端末から入力できず調査モードへ入れなかった (CI 等) | 対話実行するか、`--keep-container` を併用してコンテナを残す |
 | `起動中のコンテナが無いため、デプロイエラーの調査用対話操作へは入りません` | デプロイエラー検出後にコンテナが残っていない | コンテナが落ちた原因を起動ログで確認する |
 | `コンテナの起動に失敗しました (compose up)` | 依存サービスの healthcheck 失敗で `condition: service_healthy` を満たせない等 | 直前に表示される「コンテナ起動失敗の診断 (compose up)」の失敗の分類・サービス状態・healthcheck 実行履歴と、続けて表示される `終了 (SIGTERM) 時のコンテナログ` を確認 |
@@ -2151,7 +2175,7 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `[NG] 収集対象パスが cwagent にマウントされていません` | `collect_list` の `file_path` が `cwagent` の `volumes` に無く、tail 対象が存在しない | ログ出力元と同じボリュームを `cwagent` へマウントする (読み取り専用で可) |
 | `[NG] log_group_name が CloudWatch Logs の命名規則に反します` | 空白など使用できない文字が含まれる | `[A-Za-z0-9_./#-]` の範囲・512 文字以内へ直す |
 | `[NG] リージョンが設定ファイルにも cwagent の environment にもありません` | `agent.region` も `AWS_REGION` も無く、送信先エンドポイントを決められない | 設定 JSON の `agent.region` か `cwagent` の `environment.AWS_REGION` を設定する |
-| `WAR デプロイ時に Java の例外を N 件検出しました` | デプロイ処理で例外が投げられた | 直前に出力された例外ごとの `■ 対処方法` を上から実施する。Excel の「対処方法」シートにも同じ内容がある |
+| `WAR デプロイ時に Java の例外を N 件検出しました` (`--deploy-exception-display` 指定時のみ) | デプロイ処理で例外が投げられた | 直前に出力された例外ごとの `■ 対処方法` を上から実施する。全量レポート `[10]` と Excel の「対処方法」シートにも同じ内容がある |
 | `Java 例外解析をスキップしました: Python 3 が見つかりません` | `python3` / `python` / `/usr/libexec/platform-python` のいずれも無い | Python 3 を導入する (Excel 生成に標準ライブラリだけを使うため追加パッケージは不要) |
 | `WAR デプロイ時 Java 例外解析に失敗しました (exit=…)` | 解析ヘルパーが異常終了した | 続けて表示されるヘルパーのメッセージを確認。ビルドの成否には影響しない |
 | `Java 例外解析 Excel / テキストの出力先を作成できませんでした` | 出力先ディレクトリを作れない (権限不足) | 書き込み可能なパスを `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` に指定する |
@@ -2159,6 +2183,7 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
 | `--deploy-exception-text と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
 | `--deploy-exception-excel と --deploy-exception-text に同じパスは指定できません` | 両方へ同じパスを指定した (exit 2) | 別々のパスにする |
+| `--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません` | 排他違反 (exit 2)。解析しないのに表示はできない | どちらか一方にする |
 | `読み取り専用ファイルシステムの書き込み先分析をスキップしました: Python 3 が見つかりません` | 分析ヘルパーに必要な Python 3 が無い | Python 3 を入れる。分析以外の処理には影響しない |
 | `--readonly-analysis-excel には .xlsx で終わるパスを指定してください` | 拡張子が `.xlsx` でない (exit 2) | `.xlsx` で終わるパスにする |
 | `--readonly-analysis-excel と --no-readonly-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |

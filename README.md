@@ -79,7 +79,8 @@ xlsx は標準ライブラリだけで組み立てます)。
 **Java の JVM パラメータ一覧表示**、**OpenTelemetry 環境変数・JVM パラメータ一覧表示**、
 **全量テキストレポートの保存**、
 **WAR デプロイ時 Java 例外エラー解析** (スタックトレースと例外クラスから原因分析と
-対処提案を生成し、Excel ブックとテキストファイルにも出力)、
+対処提案を生成し、全量レポートと Excel ブックへ出力。画面表示は
+`--deploy-exception-display`、テキスト出力は `--deploy-exception-text` の指定時のみ)、
 **読み取り専用ファイルシステム (`read_only`) の書き込み先分析** (Dockerfile の
 ビルド時の書き込みと `entrypoint.sh` などの実行時の書き込みを分けて集計し、
 tmpfs やバインドマウントを割り当てるべきディレクトリを判定して、Excel ブックと
@@ -202,9 +203,11 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx` と `..._java_exceptions.txt`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (いずれも Excel とテキストは同じ内容) として同じディレクトリへ追加出力する | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析のテキストは `--deploy-exception-text` を指定したときだけ出力する | (なし) |
+| `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示せず、全量レポート `[10]` と Excel にだけ残す | `false` (非表示) |
+| `--no-deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--deploy-exception-display` を打ち消す) | `true` (既定) |
 | `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
-| `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
+| `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を指定する。**指定したときだけ出力**し、`--report-dir` だけでは出力しない | (出力しない) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
 | `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
 | `--readonly-analysis-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) 分析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
@@ -903,12 +906,13 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   `[10] WAR デプロイ時 Java 例外解析` /
   `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` です。
 - `--report-dir DIR` を指定すると、デプロイ結果ファイルとは**別に**
-  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` と、同じ内容の
-  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.txt` を追加出力します。
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` を追加出力します。
   WAR のデプロイ処理で発生した Java 例外の解析結果をまとめたもので、
   **コンテナの起動に失敗した場合でも必ず出力します** (デプロイ結果ファイルだけが
   残る状態にはなりません)。解析対象のログを取得できなかった場合は、その理由と
-  `未評価` の判定を記録したうえで同じ 2 ファイルを出力します。詳細は後述の
+  `未評価` の判定を記録したうえで出力します。同じ内容のテキストは
+  `--deploy-exception-text FILE` を指定したときだけ出力します (`--report-dir` の
+  指定だけでは出力しません)。詳細は後述の
   [WAR デプロイ時の Java 例外エラー解析](#war-デプロイ時の-java-例外エラー解析) を参照してください。
 - 同じく `--report-dir DIR` の指定で、
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>_readonly_filesystem.xlsx` と、同じ内容の
@@ -951,8 +955,9 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
 - 開始する対話操作は、`--keep-container-mode` を指定していればそのモード、
   未指定なら `logs` です。`logs` では起動中の各 Compose サービスを番号で選び、
   ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断を繰り返し行えます。
-- 対話操作に入る前に、失敗した起動ログと **WAR デプロイ時 Java 例外解析**の結果を
-  表示するため、原因を見てから調査に入れます。
+- 対話操作に入る前に、失敗した起動ログを表示し、**WAR デプロイ時 Java 例外解析**も
+  先に済ませます (結果は全量レポート `[10]` と Excel へ。画面でも読みたい場合は
+  `--deploy-exception-display` を指定します)。
 - 対話操作を終えてもコンテナは起動状態のまま残ります。不要になったら
   `docker compose -f compose.yml down` で削除してください。
 - デプロイエラーは失敗のままなので、終了コードは `1` です。
@@ -1135,15 +1140,28 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 巻き戻されます。ログにはスタックトレースがそのまま出ますが、**どの例外が根本原因で、
 なぜそうなり、何を直せばよいのか**はログを読む側の知識に依存していました。
 
-`build_and_verify.sh` は**専用オプションなしに**この解析を自動実行します。
-例外を検出した場合は画面へ詳細な分析と対処提案を出力し、
-全量レポートの `[10]` へ同じ内容を残し、さらに**デプロイ結果ファイルとは別に
-Excel ブックと、同じ内容のテキストファイルを追加出力**します。
+`build_and_verify.sh` は**専用オプションなしに**この解析を自動実行し、
+検出した例外の詳細な分析と対処提案を**全量レポートの `[10]`** と
+**Excel ブック**へ残します。
+
+> **画面への表示とテキストファイルへの出力は、既定では行いません。**
+> 解析結果は 1 例外あたり数十行になり、ビルドの成否や動作確認の結果を画面から
+> 押し流してしまうためです。必要なときだけ次のオプションで有効にします。
+>
+> | 出力 | 既定 | 有効にするオプション |
+> | --- | --- | --- |
+> | 画面表示 | 出さない | `--deploy-exception-display` |
+> | テキストファイル | 出さない (`--report-dir` だけでは出力しない) | `--deploy-exception-text FILE` |
+> | 全量レポート `[10]` | 出す | (`--report-dir` 指定時) |
+> | Excel ブック | 出す | (`--report-dir` 指定時。`--deploy-exception-excel FILE` で明示も可) |
+>
+> 上記のいずれも要求されていない実行 (`--report-dir` も `--deploy-exception-*` も
+> 無い) では、結果を出す先が無いため解析自体を行いません。
 
 **コンテナの起動 (`compose up`) に失敗した実行でも解析は必ず行います。**
 起動できない原因そのものがデプロイ処理中の Java 例外であることが多いため、
 失敗するまでに出力されたログを対象に、成功時と同じ内容の解析結果
-(画面 / `[10]` / Excel / テキスト) を出力します。デプロイ結果ファイル
+(`[10]` / Excel、指定時は画面 / テキスト) を出力します。デプロイ結果ファイル
 (`build_and_verify_<日時>.txt`) だけが残る状態にはなりません。
 
 #### 解析の内容
@@ -1175,13 +1193,14 @@ Excel ブックと、同じ内容のテキストファイルを追加出力**し
 ■ 例外の連鎖とスタックトレース
 ```
 
-例外が 1 件も無い場合、画面へは
+例外が 1 件も無い場合、`--deploy-exception-display` を指定していても画面へは
 `WAR デプロイ時の Java 例外は検出されませんでした。` の 1 行だけを出します。
 
 #### 解析対象ログの状況 (`ログ取得状況`)
 
 解析はどの経路でも実行するため、「どこまでのログを解析できたのか」を
-画面・全量レポート `[10]`・Excel の「概要」シートへ同じ文言で残します。
+全量レポート `[10]`・Excel の「概要」シート (画面表示時は画面へも) へ
+同じ文言で残します。
 
 | 状況 | `ログ取得状況` | 総合判定 |
 | --- | --- | --- |
@@ -1197,15 +1216,13 @@ Excel ブックと、同じ内容のテキストファイルを追加出力**し
 
 #### 出力ファイル (Excel とテキスト)
 
-`--report-dir DIR` を指定していれば、デプロイ結果ファイル
-`DIR/build_and_verify_<日時>.txt` と**同じディレクトリへ追加で**次の 2 つを出力します。
-出力先は `--deploy-exception-excel FILE` / `--deploy-exception-text FILE` で
-個別に明示することもできます。
+| ファイル | 出力条件 | 内容 |
+| --- | --- | --- |
+| `build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir DIR` 指定時に、デプロイ結果ファイル `DIR/build_and_verify_<日時>.txt` と**同じディレクトリへ追加で**出力する。`--deploy-exception-excel FILE` で出力先の明示も可 | 下表の 6 シート構成の Excel ブック |
+| `--deploy-exception-text FILE` のパス | **`--deploy-exception-text FILE` を指定したときだけ**出力する (`--report-dir` を指定しただけでは出力しない) | **Excel と同じ内容のテキスト版**。Excel を開けない環境や、`grep` / `diff` で追跡したい場合に使う |
 
-| ファイル | 内容 |
-| --- | --- |
-| `build_and_verify_<日時>_java_exceptions.xlsx` | 下表の 6 シート構成の Excel ブック |
-| `build_and_verify_<日時>_java_exceptions.txt` | **同じ内容のテキスト版**。Excel を開けない環境や、`grep` / `diff` で追跡したい場合に使う |
+テキストは自動命名を行いません。同じ内容が全量レポート `[10]` にも載るため、
+既定で同じファイルを 2 つ作らないようにしています。
 
 テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
 含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
@@ -1230,18 +1247,26 @@ Excel ブックと、同じ内容のテキストファイルを追加出力**し
   行高上限 (409.5pt) を超えて末尾が読めなくなるのを避けるためです。
 - 見出し行の固定・オートフィルタ・列幅・折り返し・深刻度の色分けを設定済みです。
 
-例外が 0 件でも Excel とテキストは出力し、「概要」へ
+例外が 0 件でも (出力条件を満たしていれば) Excel とテキストは出力し、「概要」へ
 `OK (Java 例外は検出されませんでした)` と記録します。コンテナの起動に失敗した場合や
-解析対象のログが無い場合も同じ 2 ファイルを出力し、「概要」の `ログ取得状況` と
+解析対象のログが無い場合も同じファイルを出力し、「概要」の `ログ取得状況` と
 `未評価 (解析対象のログが無いため判定できません)` で理由が分かるようにします。
 
 ```bash
-# デプロイ結果ファイルと Java 例外解析 (Excel + テキスト) をまとめて保存
+# デプロイ結果ファイルと Java 例外解析の Excel をまとめて保存
+# (画面には解析結果を出さない ← 既定。結果は [10] と Excel に残る)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
 
+# 解析結果を画面でも読む (既定は非表示)
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports \
+    --deploy-exception-display
+
 # Excel / テキストの出力先を明示する
+# (テキストは --deploy-exception-text を指定したときだけ出力される)
 ./build_and_verify.sh --verify-startup \
     --deploy-exception-excel ./reports/deploy-errors.xlsx \
     --deploy-exception-text ./reports/deploy-errors.txt

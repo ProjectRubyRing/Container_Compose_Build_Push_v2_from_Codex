@@ -55,11 +55,15 @@
 #  (12) Java 例外解析      : WAR のデプロイ処理で Java の例外が投げられた場合、
 #                          スタックトレースと Caused by の連鎖から根本原因の
 #                          例外クラスを特定し、発生の仕組み・想定される原因・
-#                          確認手順・対処方法・再発防止を生成して表示する。
+#                          確認手順・対処方法・再発防止を生成する。
+#                          画面表示とテキスト出力は既定では行わず、それぞれ
+#                          --deploy-exception-display / --deploy-exception-text
+#                          を指定したときだけ出す (ビルド結果を埋もれさせない)。
 #                          解析結果は全量レポートへ保存するほか、Excel ブック
-#                          (build_and_verify_<日時>_java_exceptions.xlsx) と、
-#                          同じ内容のテキスト (同 _java_exceptions.txt) として
-#                          も出力する。ブックは 概要 / 例外一覧 / 原因分析 /
+#                          (build_and_verify_<日時>_java_exceptions.xlsx) として
+#                          も出力する。同じ内容のテキストは
+#                          --deploy-exception-text FILE で指定した先へ出す。
+#                          ブックは 概要 / 例外一覧 / 原因分析 /
 #                          対処方法 / スタックトレース / デプロイログ の 6 シート
 #                          構成で、フォントは Meiryo UI、行高は内容と列幅から
 #                          計算して明示するため、折り返した本文が切れない。
@@ -686,12 +690,19 @@ CERT_CHECK_TEXT_OUTPUT=""         # 直近に出力したテキストのパス
 # 「どの例外クラスが根本原因か」「なぜそうなるのか」「どう直すのか」はログを読む側の
 # 知識に依存していた。そこで、デプロイ処理のログから例外ブロック (Caused by の連鎖と
 # スタックフレーム) を切り出し、例外クラスごとの知識をもとに原因分析と対処提案を
-# 生成し、画面・全量レポート・Excel ブックの 3 か所へ出力する。
+# 生成し、全量レポート・Excel ブックへ出力する。
+#
+# 解析結果は 1 例外あたり数十行になり、ビルドの成否や動作確認の結果を画面から
+# 押し流してしまう。そのため画面表示は既定で行わず、--deploy-exception-display を
+# 指定したときだけ出す。テキストファイルも同じ考え方で、--report-dir を指定した
+# だけでは書き出さず、--deploy-exception-text FILE で出力先を指定したときだけ
+# 出力する (Excel と全量レポートへの記載は従来どおり)。
 DEPLOY_EXCEPTION_ANALYSIS="true"   # false: Java 例外の解析を行わない
+DEPLOY_EXCEPTION_DISPLAY="false"   # true (--deploy-exception-display): 解析結果を画面へ表示する
 DEPLOY_EXCEPTION_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名する
 DEPLOY_EXCEPTION_EXCEL_SET="false" # 出力先が明示指定されたか (未指定時の警告条件)
-DEPLOY_EXCEPTION_TEXT=""           # テキストの出力先。空なら --report-dir 配下へ自動命名する
-DEPLOY_EXCEPTION_TEXT_SET="false"  # 出力先が明示指定されたか
+DEPLOY_EXCEPTION_TEXT=""           # テキストの出力先 (--deploy-exception-text の指定時のみ出力)
+DEPLOY_EXCEPTION_TEXT_SET="false"  # 出力先が明示指定されたか (テキスト出力の有無そのもの)
 DEPLOY_EXCEPTION_MAX="50"          # 詳細分析を行う例外の最大件数
 DEPLOY_EXCEPTION_LOG_ROWS="3000"   # デプロイログの出力上限 (Excel シート・テキスト共通)
 DEPLOY_EXCEPTION_ANALYZED="false"  # 解析を実行済みか (成功経路と EXIT 経路の二重実行防止)
@@ -1403,17 +1414,26 @@ JBoss マスターパスワードの伝搬検証:
                            (画面表示だけにする)
 
 WAR デプロイ時の Java 例外解析:
-  (オプション指定不要。デプロイ処理のログに Java 例外があれば自動で解析する)
+  (デプロイ処理のログに Java 例外があれば自動で解析する。ただし画面表示と
+   テキスト出力は既定では行わず、下のオプションを指定したときだけ出力する)
   解析内容               コンテナ起動後のログから Java の例外ブロックを切り出し、
                          Caused by の連鎖をたどって根本原因の例外クラスを特定する。
                          例外クラスごとに「何が起きたか」「発生の仕組み」
                          「想定される原因」「確認手順」「対処方法」「再発防止」を
-                         生成し、画面と全量レポートへ出力する。
+                         生成し、全量レポート ([10]) へ出力する。
                          クラスロード / データソース / JNDI / CDI (Weld) /
                          JPA / TLS / メモリなど、EAP のデプロイで起きやすい
                          例外クラスを分類し、WFLYSRV0021・WFLYCTL0080 といった
                          EAP のメッセージコードと突き合わせて、デプロイ失敗の
                          直接原因かどうかまで判定する
+  --deploy-exception-display
+                         解析結果を画面へ表示する。既定では表示しない
+                         (1 例外あたり数十行になり、ビルドの成否や動作確認の
+                         結果が画面から流れてしまうため)。指定すると、検出した
+                         例外ごとの原因分析と対処方法、総合判定を画面へ出す
+  --no-deploy-exception-display
+                         画面表示を行わない (既定と同じ。
+                         --deploy-exception-display を打ち消す)
   --deploy-exception-excel FILE
                          Java 例外解析の結果を Excel ブック (.xlsx) として
                          FILE へ出力する。--report-dir 指定時は未指定でも
@@ -1425,9 +1445,9 @@ WAR デプロイ時の Java 例外解析:
                          出力には Python 3 が必要
   --deploy-exception-text FILE
                          Excel と同じ内容を、テキストファイルとして FILE へ
-                         出力する。--report-dir 指定時は未指定でも
-                         DIR/build_and_verify_<日時>_java_exceptions.txt へ
-                         自動出力する。全スタックフレームと区分付きデプロイログ
+                         出力する。既定では出力せず、このオプションを指定した
+                         ときだけ書き出す (--report-dir を指定しただけでは
+                         出力しない)。全スタックフレームと区分付きデプロイログ
                          まで含むため、Excel を開けない環境でも同じ情報を追える
   --deploy-exception-limit N
                          詳細分析を行う例外の最大件数 (既定: 50)
@@ -1752,6 +1772,8 @@ while [ $# -gt 0 ]; do
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
     --cert-check-text)     need_value "$1" $#; CERT_CHECK_TEXT="$2"; CERT_CHECK_TEXT_SET="true"; shift 2 ;;
     --no-cert-check-text)  CERT_CHECK_TEXT_ENABLED="false"; shift ;;
+    --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
+    --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
     --deploy-exception-excel) need_value "$1" $#; DEPLOY_EXCEPTION_EXCEL="$2"; DEPLOY_EXCEPTION_EXCEL_SET="true"; shift 2 ;;
     --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
     --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
@@ -1877,6 +1899,10 @@ if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
   fi
 fi
 validate_positive_integer "$DEPLOY_EXCEPTION_MAX" "--deploy-exception-limit" || exit 2
+if [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
+  err "--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません。"
+  exit 2
+fi
 if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ]; then
   if [ -z "$DEPLOY_EXCEPTION_EXCEL" ] || [ "$DEPLOY_EXCEPTION_EXCEL" = "-" ]; then
     err "--deploy-exception-excel にはファイルパスを指定してください: $DEPLOY_EXCEPTION_EXCEL"
@@ -12245,8 +12271,10 @@ handle_deploy_error_investigation() {
     return 0
   fi
 
-  # デプロイ失敗の原因そのものである Java 例外の解析を、調査へ入る前に見せる。
+  # デプロイ失敗の原因そのものである Java 例外の解析を、調査へ入る前に済ませる。
   # (後始末からも呼ばれるが、二重実行は関数側で防いでいる)
+  # 画面へ出るのは --deploy-exception-display を指定したときだけで、既定では
+  # 解析結果を全量レポート・Excel へ回すに留める。
   analyze_war_deploy_exceptions 1
 
   local previous_keep_container="$KEEP_CONTAINER"
@@ -16315,7 +16343,19 @@ read_deploy_exception_summary() {
   done < "$summary_file"
 }
 
-# デプロイ処理のログから Java 例外を解析し、画面表示・Excel 出力を行う。
+# 解析結果を受け取る先が 1 つでもあるかを返す。画面表示 (既定は無効)、
+# テキスト (--deploy-exception-text)、Excel (--deploy-exception-excel /
+# --report-dir)、全量レポート (--report-dir) のいずれも要求されていない実行では、
+# 解析しても結果を出す場所が無いため、ログ収集とヘルパー起動ごと省く。
+deploy_exception_output_requested() {
+  [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && return 0
+  [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] && return 0
+  [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] && return 0
+  [ -n "$BUILD_REPORT_DIR" ] && return 0
+  return 1
+}
+
+# デプロイ処理のログから Java 例外を解析し、画面表示・ファイル出力を行う。
 # 成功経路 (主処理の末尾) と失敗経路 (EXIT トラップ) の双方から呼ばれるため、
 # 二重に実行しないよう DEPLOY_EXCEPTION_ANALYZED で守る。コンテナを削除する前に
 # 呼ぶ必要がある (compose logs が取得できなくなるため)。
@@ -16336,6 +16376,13 @@ analyze_war_deploy_exceptions() {
   if [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
     DEPLOY_EXCEPTION_ANALYZED="true"
     DEPLOY_EXCEPTION_SKIP_REASON="--no-deploy-exception-analysis が指定されたため解析していません。"
+    return 0
+  fi
+  # 出力先がどこにも無い実行は、解析そのものを行わない (既定の実行で全サービスの
+  # ログ収集と Python ヘルパーの起動を無駄に走らせないため)。
+  if ! deploy_exception_output_requested; then
+    DEPLOY_EXCEPTION_ANALYZED="true"
+    DEPLOY_EXCEPTION_SKIP_REASON="画面表示・ファイル出力・全量レポートのいずれも要求されていないため解析していません (--deploy-exception-display / --deploy-exception-text / --deploy-exception-excel / --report-dir)。"
     return 0
   fi
   if [ "$DRY_RUN" = "true" ]; then
@@ -16389,9 +16436,14 @@ analyze_war_deploy_exceptions() {
   excel_path="$(prepare_analysis_output \
       "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel" \
       "_java_exceptions" "Java 例外解析")"
-  text_path="$(prepare_analysis_output \
-      "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト" \
-      "_java_exceptions" "Java 例外解析")"
+  # テキストは --deploy-exception-text で出力先を指定したときだけ書き出す。
+  # (--report-dir 配下への自動命名は行わない。全量レポートの [10] へ同じ内容が
+  #  載るため、既定でもう 1 つ同じファイルを増やさない)
+  if [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
+    text_path="$(prepare_analysis_output \
+        "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト" \
+        "_java_exceptions" "Java 例外解析")"
+  fi
 
   analyzer_args=(
     --log-file "$log_file"
@@ -16434,7 +16486,15 @@ analyze_war_deploy_exceptions() {
 
 # 解析結果を画面へ出す。例外を検出した場合のみ全文を表示し、
 # 0 件のときは 1 行の結果表示に留める (成功時のログを埋もれさせないため)。
+#
+# 既定 (--deploy-exception-display なし) では画面表示を行わない。解析結果は
+# 全量レポートの [10] と Excel へ残るため、ビルド結果の画面は素のままにする。
+# ただしファイルを実際に書き出した場合は、その置き場所だけ 1 行で知らせる。
 show_war_deploy_exception_analysis() {
+  if [ "$DEPLOY_EXCEPTION_DISPLAY" != "true" ]; then
+    show_war_deploy_exception_outputs
+    return 0
+  fi
   # 検出件数は解析ヘルパーの集計をそのまま伝える。本文が空でも件数は隠さない。
   if [ "${DEPLOY_EXCEPTION_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
     if [ -s "$DEPLOY_EXCEPTION_TEXT_FILE" ]; then
@@ -16459,6 +16519,13 @@ show_war_deploy_exception_analysis() {
   if [ "$DEPLOY_EXCEPTION_LOG_COLLECTED" = "true" ] && [ "$STARTED_CONTAINER" != "true" ]; then
     log "  解析範囲: ${DEPLOY_EXCEPTION_LOG_STATUS}"
   fi
+  show_war_deploy_exception_outputs
+  return 0
+}
+
+# 出力したファイルの置き場所だけを知らせる。画面表示を抑止していても、実際に
+# 書き出したファイルは伝える (出力したのに場所が分からない状態を作らないため)。
+show_war_deploy_exception_outputs() {
   if [ -n "$DEPLOY_EXCEPTION_EXCEL_FILE" ]; then
     log "Java 例外解析の Excel ブックを出力しました: $DEPLOY_EXCEPTION_EXCEL_FILE"
   fi
@@ -16467,7 +16534,7 @@ show_war_deploy_exception_analysis() {
   fi
   if [ -z "$DEPLOY_EXCEPTION_EXCEL_FILE" ] && [ -z "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ] \
       && [ -z "$BUILD_REPORT_DIR" ]; then
-    log "Java 例外解析のファイル出力は、--report-dir または --deploy-exception-excel / --deploy-exception-text の指定時に行います。"
+    log "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text の指定時 (Excel は --report-dir でも) に行います。"
   fi
   return 0
 }
@@ -16490,7 +16557,7 @@ append_deploy_exception_report() {
     printf 'テキスト      : %s (Excel と同じ内容。全スタックフレームとデプロイログを含む)\n' \
         "$DEPLOY_EXCEPTION_TEXT_OUTPUT" >> "$report_file"
   else
-    printf 'テキスト      : (未出力)\n' >> "$report_file"
+    printf 'テキスト      : (未出力。--deploy-exception-text FILE を指定すると出力します)\n' >> "$report_file"
   fi
   printf 'ログ取得状況  : %s\n' "${DEPLOY_EXCEPTION_LOG_STATUS:-(不明)}" >> "$report_file"
   printf '取得範囲      : 終了ログ (SIGTERM 後) を取得する前のデプロイ処理ログ\n' >> "$report_file"
@@ -21709,6 +21776,8 @@ write_build_report() {
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
     printf '                デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)\n'
+    printf '                (画面表示は --deploy-exception-display、テキストは\n'
+    printf '                 --deploy-exception-text FILE を指定したときだけ出力する)\n'
     printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
     printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
     printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
@@ -22125,7 +22194,8 @@ if [ "$NEED_CONTAINER" != "true" ]; then
   if [ "$BUILD_REPORT_DIR_SET" = "true" ]; then
     warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
-  if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
+  if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
+      || [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ]; then
     warn "WAR デプロイ時 Java 例外解析は、コンテナを起動していないため解析対象のログがありません (結果は「未評価」として出力します)。--verify-startup または --verify-url を併用してください。"
   fi
   if [ "$CWAGENT_VERIFY_ACTIVE" = "true" ]; then

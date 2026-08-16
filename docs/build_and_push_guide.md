@@ -339,6 +339,7 @@ flowchart TD
   `--cwagent-config-dir` / `--cwagent-delivery-target` / `--cwagent-delivery-timeout` /
   `--cwagent-delivery-interval` / `--cwagent-mock-service` / `--cwagent-mock-port` /
   `--cwagent-required`、WAR デプロイ時 Java 例外解析の
+  `--deploy-exception-display` / `--no-deploy-exception-display` /
   `--deploy-exception-excel` / `--deploy-exception-text` / `--deploy-exception-limit` /
   `--no-deploy-exception-analysis`、読み取り専用ファイルシステム分析の
   `--readonly-analysis-excel` / `--readonly-analysis-text` / `--no-readonly-analysis`、

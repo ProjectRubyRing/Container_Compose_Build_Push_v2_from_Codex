@@ -48,12 +48,12 @@ assert_matches() {
 }
 
 # 全量レポート (build_and_verify_<日時>.txt) だけを DIR から取り出し、REPORT_FILES へ入れる。
-# 同じディレクトリには Java 例外解析のテキスト
-# (build_and_verify_<日時>_java_exceptions.txt)、読み取り専用ファイルシステム
-# 分析のテキスト (build_and_verify_<日時>_readonly_filesystem.txt)、証明書チェックの
+# 同じディレクトリには読み取り専用ファイルシステム分析のテキスト
+# (build_and_verify_<日時>_readonly_filesystem.txt)、証明書チェックの
 # テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
-# この関数を使う。
+# この関数を使う。Java 例外解析のテキスト (_java_exceptions.txt) は
+# --deploy-exception-text 指定時にしか作られないが、除外は残しておく。
 collect_report_files() {
   local dir="$1" path
   REPORT_FILES=()
@@ -1175,21 +1175,23 @@ assert_occurrences "${build_failure_reports[0]}" "コンテナ      : (コンテ
 assert_occurrences "${build_failure_reports[0]}" "(このサービスのログはありません)" 3
 # ビルド失敗で compose up まで到達しなかった場合も Java 例外解析は必ず実行し、
 # 「0 件検出」ではなく「未評価」として理由まで残す。
+# 画面表示は既定で行わないため (--deploy-exception-display 未指定)、結果が残るのは
+# 全量レポートの [10] と Excel だけになる。テキストも既定では出力しない。
 if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$build_failure_output"; then
-  assert_contains "$build_failure_output" \
+  assert_not_contains "$build_failure_output" \
     "WAR デプロイ時 Java 例外解析: コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
   assert_contains "${build_failure_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
   assert_contains "${build_failure_reports[0]}" \
     "ログ取得状況  : コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
   assert_contains "${build_failure_reports[0]}" "総合判定      : 未評価 (解析対象のログが無いため判定できません)"
   assert_not_contains "${build_failure_reports[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
+  assert_contains "${build_failure_reports[0]}" "解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。"
   build_failure_books=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.xlsx)
   [ ${#build_failure_books[@]} -eq 1 ] && [ -s "${build_failure_books[0]}" ] \
     || fail "expected a java exception workbook even when the build failed"
   build_failure_texts=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.txt)
-  [ ${#build_failure_texts[@]} -eq 1 ] && [ -s "${build_failure_texts[0]}" ] \
-    || fail "expected a java exception text file even when the build failed"
-  assert_contains "${build_failure_texts[0]}" "解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。"
+  [ ! -e "${build_failure_texts[0]}" ] \
+    || fail "did not expect a java exception text file without --deploy-exception-text"
 fi
 
 # JVM を実行しないコンテナ (OTel Collector / DB など) でも、Java プロセス無しを
@@ -3394,11 +3396,15 @@ assert_contains "$cwagent_option_error_output" "--cwagent-delivery-target には
 # =============================================================================
 # デプロイ処理で Java の例外が投げられたログを与え、
 #   - 例外の連鎖 (Caused by) をたどって根本原因の例外クラスを特定すること
-#   - 例外クラスに応じた原因分析と対処提案を画面へ出すこと
+#   - 例外クラスに応じた原因分析と対処提案を --deploy-exception-display で画面へ出すこと
 #   - 全量レポートの [10] へ同じ内容を残すこと
 #   - デプロイ結果ファイルとは別に Excel ブックを追加出力すること
+#   - --deploy-exception-text の指定時にテキストを出力すること
 # を確認する。base はビルド専用でコンテナを持たないため、解析対象は app だけにする。
+# 画面表示とテキスト出力はいずれも既定では行わないため、この実行では明示的に
+# 有効化する (既定の挙動そのものは後段の deploy-exception-quiet で確認する)。
 deploy_exception_output="$TEST_TMP/deploy-exception.out"
+deploy_exception_text_path="$TEST_TMP/deploy-exception-reports/java_exceptions.txt"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3411,6 +3417,8 @@ if (
     --startup-service app \
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-reports" \
+    --deploy-exception-display \
+    --deploy-exception-text "$deploy_exception_text_path" \
     --exit-on-deploy-error \
     --suppress-removed-logs
 ) >"$deploy_exception_output" 2>&1; then
@@ -3472,13 +3480,17 @@ else
     "Java 例外解析の Excel ブックを出力しました: ${deploy_exception_books[0]}"
   assert_contains "${deploy_exception_reports[0]}" "Excel ブック  : ${deploy_exception_books[0]}"
 
-  # --- Excel と同じ内容をテキストファイルでも追加出力すること ---
-  deploy_exception_texts=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.txt)
-  [ ${#deploy_exception_texts[@]} -eq 1 ] && [ -s "${deploy_exception_texts[0]}" ] \
-    || fail "expected one java exception text file next to the deploy report"
+  # --- Excel と同じ内容を、--deploy-exception-text で指定した先へ出力すること ---
+  deploy_exception_texts=("$deploy_exception_text_path")
+  [ -s "${deploy_exception_texts[0]}" ] \
+    || fail "expected the java exception text file at --deploy-exception-text"
   assert_contains "$deploy_exception_output" \
     "Java 例外解析のテキストを出力しました: ${deploy_exception_texts[0]}"
   assert_contains "${deploy_exception_reports[0]}" "テキスト      : ${deploy_exception_texts[0]}"
+  # 自動命名 (build_and_verify_<日時>_java_exceptions.txt) は行わない。
+  deploy_exception_auto_texts=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ! -e "${deploy_exception_auto_texts[0]}" ] \
+    || fail "did not expect an auto-named java exception text file"
   # テキストは画面表示と同じ分析に加えて、全スタックフレームと区分付きデプロイログを含む。
   assert_contains "${deploy_exception_texts[0]}" "総合判定      : NG (デプロイ処理中に致命的な例外が発生しています)"
   assert_contains "${deploy_exception_texts[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
@@ -3540,8 +3552,121 @@ else
   fi
 fi
 
+# --- 既定では画面表示もテキスト出力も行わないこと ---
+# 同じ例外ログを与えても、--deploy-exception-display / --deploy-exception-text を
+# 指定しなければ、解析結果はビルド結果の画面に現れず、テキストも作らない。
+# 解析そのものは動いており、結果は全量レポートの [10] と Excel に残る。
+deploy_exception_quiet_output="$TEST_TMP/deploy-exception-quiet.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-quiet-reports" \
+    --exit-on-deploy-error \
+    --suppress-removed-logs
+) >"$deploy_exception_quiet_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_quiet_output" >&2
+  fail "java exception fixture unexpectedly returned zero without display options"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_quiet_output"; then
+  # 画面には解析本文も検出サマリも出さない。
+  assert_not_contains "$deploy_exception_quiet_output" "■ 発生の仕組み (なぜこの例外になるのか)"
+  assert_not_contains "$deploy_exception_quiet_output" "■ 対処方法"
+  assert_not_contains "$deploy_exception_quiet_output" \
+    "WAR デプロイ時に Java の例外を 2 件検出しました (デプロイ処理中: 2 件)。"
+  assert_not_contains "$deploy_exception_quiet_output" "[例外 1/2] org.jboss.msc.service.StartException"
+  # テキストは自動命名でも作らない。
+  quiet_texts=("$TEST_TMP/deploy-exception-quiet-reports"/build_and_verify_*_java_exceptions.txt)
+  [ ! -e "${quiet_texts[0]}" ] \
+    || fail "did not expect a java exception text file without --deploy-exception-text"
+  # Excel と全量レポートへは従来どおり残す (出力先だけは画面へ 1 行で知らせる)。
+  quiet_books=("$TEST_TMP/deploy-exception-quiet-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ${#quiet_books[@]} -eq 1 ] && [ -s "${quiet_books[0]}" ] \
+    || fail "expected a java exception workbook even without --deploy-exception-display"
+  assert_contains "$deploy_exception_quiet_output" \
+    "Java 例外解析の Excel ブックを出力しました: ${quiet_books[0]}"
+  collect_report_files "$TEST_TMP/deploy-exception-quiet-reports"
+  quiet_reports=("${REPORT_FILES[@]}")
+  [ ${#quiet_reports[@]} -eq 1 ] && [ -f "${quiet_reports[0]}" ] \
+    || fail "expected one report for the quiet java exception scenario"
+  assert_contains "${quiet_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
+  assert_contains "${quiet_reports[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  assert_contains "${quiet_reports[0]}" \
+    "テキスト      : (未出力。--deploy-exception-text FILE を指定すると出力します)"
+fi
+
+# --- 出力先が 1 つも無い実行では、解析そのものを行わないこと ---
+# --report-dir も --deploy-exception-* も無い場合、結果を出す場所が無いため、
+# ログ収集と解析ヘルパーの起動ごと省く (画面には何も現れない)。
+deploy_exception_nosink_output="$TEST_TMP/deploy-exception-nosink.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --exit-on-deploy-error \
+    --suppress-removed-logs
+) >"$deploy_exception_nosink_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_nosink_output" >&2
+  fail "java exception fixture unexpectedly returned zero without any output target"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+assert_not_contains "$deploy_exception_nosink_output" "Java 例外解析"
+assert_not_contains "$deploy_exception_nosink_output" "WAR デプロイ時に Java の例外を"
+
+# --- --deploy-exception-display だけを指定すると、画面へは出しファイルは作らないこと ---
+deploy_exception_display_only_output="$TEST_TMP/deploy-exception-display-only.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --deploy-exception-display \
+    --exit-on-deploy-error \
+    --suppress-removed-logs
+) >"$deploy_exception_display_only_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_display_only_output" >&2
+  fail "java exception fixture unexpectedly returned zero with --deploy-exception-display"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" \
+    "$deploy_exception_display_only_output"; then
+  assert_contains "$deploy_exception_display_only_output" \
+    "WAR デプロイ時に Java の例外を 2 件検出しました (デプロイ処理中: 2 件)。"
+  assert_contains "$deploy_exception_display_only_output" "■ 対処方法"
+  assert_contains "$deploy_exception_display_only_output" \
+    "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text の指定時 (Excel は --report-dir でも) に行います。"
+fi
+
 # --- 例外が無いログでは、解析結果を 1 行にとどめ、Excel は出力すること ---
 deploy_exception_clean_output="$TEST_TMP/deploy-exception-clean.out"
+deploy_exception_clean_text_path="$TEST_TMP/deploy-exception-clean-reports/java_exceptions.txt"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3554,6 +3679,8 @@ if ! (
     --startup-service app \
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-clean-reports" \
+    --deploy-exception-display \
+    --deploy-exception-text "$deploy_exception_clean_text_path" \
     --suppress-removed-logs
 ) >"$deploy_exception_clean_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
@@ -3568,8 +3695,8 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   clean_books=("$TEST_TMP/deploy-exception-clean-reports"/build_and_verify_*_java_exceptions.xlsx)
   [ ${#clean_books[@]} -eq 1 ] && [ -s "${clean_books[0]}" ] \
     || fail "expected a java exception workbook even when no exception was found"
-  clean_texts=("$TEST_TMP/deploy-exception-clean-reports"/build_and_verify_*_java_exceptions.txt)
-  [ ${#clean_texts[@]} -eq 1 ] && [ -s "${clean_texts[0]}" ] \
+  clean_texts=("$deploy_exception_clean_text_path")
+  [ -s "${clean_texts[0]}" ] \
     || fail "expected a java exception text file even when no exception was found"
   assert_contains "${clean_texts[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
   # 例外が無くても、Excel の「デプロイログ」シートと同じ内容をテキストへ残す。
@@ -3585,6 +3712,7 @@ fi
 # 起動できない原因そのものがデプロイ処理中の Java 例外であることが多いため、
 # デプロイ結果ファイルだけを残して解析を省略してしまわないことを確認する。
 deploy_exception_upfail_output="$TEST_TMP/deploy-exception-upfail.out"
+deploy_exception_upfail_text_path="$TEST_TMP/deploy-exception-upfail-reports/java_exceptions.txt"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3599,6 +3727,8 @@ if (
     --env-list-limit 1 \
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-upfail-reports" \
+    --deploy-exception-display \
+    --deploy-exception-text "$deploy_exception_upfail_text_path" \
     --suppress-removed-logs
 ) >"$deploy_exception_upfail_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL
@@ -3630,8 +3760,8 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   upfail_books=("$TEST_TMP/deploy-exception-upfail-reports"/build_and_verify_*_java_exceptions.xlsx)
   [ ${#upfail_books[@]} -eq 1 ] && [ -s "${upfail_books[0]}" ] \
     || fail "expected a java exception workbook when compose up failed"
-  upfail_texts=("$TEST_TMP/deploy-exception-upfail-reports"/build_and_verify_*_java_exceptions.txt)
-  [ ${#upfail_texts[@]} -eq 1 ] && [ -s "${upfail_texts[0]}" ] \
+  upfail_texts=("$deploy_exception_upfail_text_path")
+  [ -s "${upfail_texts[0]}" ] \
     || fail "expected a java exception text file when compose up failed"
   assert_contains "${upfail_texts[0]}" "総合判定      : NG (デプロイ処理中に致命的な例外が発生しています)"
   assert_contains "${upfail_texts[0]}" "at com.example.orders.OrderService.<init>(OrderService.java:31)"
@@ -3653,6 +3783,7 @@ if (
     --env-list-limit 1 \
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-nolog-reports" \
+    --deploy-exception-display \
     --suppress-removed-logs
 ) >"$deploy_exception_nolog_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL \
@@ -3734,6 +3865,36 @@ if (
 fi
 assert_contains "$deploy_exception_conflict_output" \
   "--deploy-exception-excel と --no-deploy-exception-analysis は同時に指定できません。"
+
+deploy_exception_display_conflict_output="$TEST_TMP/deploy-exception-display-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --deploy-exception-display \
+    --no-deploy-exception-analysis
+) >"$deploy_exception_display_conflict_output" 2>&1; then
+  cat "$deploy_exception_display_conflict_output" >&2
+  fail "--deploy-exception-display accepted --no-deploy-exception-analysis"
+fi
+assert_contains "$deploy_exception_display_conflict_output" \
+  "--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません。"
+
+# --no-deploy-exception-display は --deploy-exception-display を打ち消すため、
+# --no-deploy-exception-analysis と併用しても衝突にはならない。
+deploy_exception_display_off_output="$TEST_TMP/deploy-exception-display-off.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --dry-run \
+    --deploy-exception-display \
+    --no-deploy-exception-display \
+    --no-deploy-exception-analysis
+) >"$deploy_exception_display_off_output" 2>&1; then
+  cat "$deploy_exception_display_off_output" >&2
+  fail "--no-deploy-exception-display did not cancel --deploy-exception-display"
+fi
+assert_not_contains "$deploy_exception_display_off_output" \
+  "--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません。"
 
 deploy_exception_text_conflict_output="$TEST_TMP/deploy-exception-text-conflict.out"
 if (
