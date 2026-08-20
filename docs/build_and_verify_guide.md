@@ -140,15 +140,22 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 3. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
 4. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
 5. teardown_container        … compose down (--keep-container 指定時は残す)
-6. prune_build_cache         … --prune-build-cache / --prune-build-cache-keep 指定時、
+                                   対話操作を最後まで終えた実行では、--keep-container が
+                                   暗黙有効でもここで削除する (6 の対象にするため)
+6. run_post_interaction_cleanup … 対話操作を最後まで終えた実行 (かつ終了コード 0) のとき、
+                                   docker-usage-check.sh --clean all --force で
+                                   未使用リソースを完全クリア (→ 5.4-2)
+7. prune_build_cache         … --prune-build-cache / --prune-build-cache-keep 指定時、
                                    ビルドキャッシュを削除 (コンテナ削除の後)
-7. report_disk_usage_at_exit … --disk-usage-report 指定時、終了時の使用量と増減を表示
+8. report_disk_usage_at_exit … --disk-usage-report 指定時、終了時の使用量と増減を表示
                                    (4 が実際に削除を行った場合は重複するため出さない)
-8. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
+9. cleanup_copied_files      … --copy-file でコピーしたファイルを削除
                                    (既存ファイルを強制上書きした分は削除せず、
                                     退避しておいた上書き前のファイルを復元)
-9. 一時ファイル削除          … Java 例外解析結果・読み取り専用 FS 分析結果・
+10. 一時ファイル削除         … Java 例外解析結果・読み取り専用 FS 分析結果・
                                    URL 応答本文・HTTP ボディ・healthcheck 診断
+11. show_post_interaction_disk_free … 6 を試行した実行のみ、各ディレクトリの
+                                   ディスク空き容量を一覧表示して終える
 ```
 
 終了コードは、本処理が既に失敗していれば**元の終了コードを優先**します。
@@ -204,7 +211,7 @@ flowchart TD
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
     AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → レポート/Excel 出力<br/>画面表示は --deploy-exception-display 指定時のみ]
     AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + Dockerfile ビルド時 + 起動スクリプト/実行状況 実行時<br/>→ tmpfs / マウントの要否判定 → Excel 出力]
-    AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down → 一時ファイル削除]
+    AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down →<br/>対話操作を終えていれば 未使用リソースの完全クリア → 一時ファイル削除 →<br/>各ディレクトリのディスク空き容量を一覧表示]
     AB --> Z2[完了 exit 0]
 ```
 
@@ -299,7 +306,9 @@ curl -s -S -m 30 -o <一時ファイル> -w '%{http_code}' -X <URL_METHOD> \
 | 状況 | コンテナの扱い |
 | --- | --- |
 | 通常 | `compose down` で停止・削除 |
-| `--keep-container` / `--keep-container-mode` 指定 | 残す (手動停止コマンドを案内) |
+| `--keep-container-mode logs` の対話操作を**すべて終了**し、終了コードが `0` | `compose down` で削除したうえで、未使用リソースまで完全クリア (→ 5.4-2) |
+| `--keep-container` / `--keep-container-mode` 指定 (上記以外) | 残す (手動停止コマンドを案内) |
+| `--keep-container-after-interaction` 指定 | 対話操作を終えても残す (従来の動作) |
 | `--cleanup-all-docker-data` 指定 | 確認フレーズ入力後、Docker 全体を削除 |
 | `--suppress-removed-logs` 指定 | `compose down` / `compose stop` の出力を抑制 |
 
@@ -471,6 +480,9 @@ compose down (削除)
 | `--jboss-context-root ROOT` | コンテキストルートのパス | (ログから検出) | `http` モード専用。URL 全体は指定不可 |
 | `--jboss-http-port PORT` | 1〜65535 | (ログから検出。既定 8080) | `http` モード専用。公開ポートがあれば自動変換 |
 | `--exit-on-deploy-error` | フラグ | `false` | デプロイエラーを検出しても調査用の対話操作へ入らず、従来どおり終了する (→ 5.10) |
+| `--keep-container-after-interaction` | フラグ | `false` | 対話操作をすべて終えても完全クリーンアップを行わず、従来どおりコンテナを残す (→ 5.4-2) |
+| `--usage-check-script PATH` | ファイルパス | (自動解決) | 完全クリアに使う `docker-usage-check.sh` のパス。読み取れない場合は `exit 2` |
+| `--disk-free-path DIR` | ディレクトリ | (既定の 7 か所) | 終了時の空き容量一覧へ表示するディレクトリを追加 (繰り返し指定可) |
 
 ### 4.7 情報表示・レポート
 
@@ -789,6 +801,71 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
+ただし `logs` モードで対話操作を**すべて終了**した場合は、暗黙の `--keep-container` を
+取り消してコンテナを削除し、未使用リソースの完全クリアまで行います (→ 5.4-2)。
+
+### 5.4-2 対話操作の終了後の完全クリーンアップ (既定で有効)
+
+`logs` モードのサービス選択で `0`（対話操作を終了）を選び、**対話操作をすべて終えた**
+時点で、その実行で確認したいことは済んでいます。従来はそのままコンテナを残し、後から
+手作業で `compose down` する運用でしたが、消し忘れたコンテナと、検証のたびに増える
+未使用イメージ・ボリューム・ビルドキャッシュが積み上がり、次の検証で data root を
+圧迫します。そこで**対話操作の終了を「片付けてよい合図」として扱い**、既定で次を
+自動実行してから終了します。
+
+| 順 | 処理 | 内容 |
+| --- | --- | --- |
+| 1 | `compose down` | 今回の Compose スタックを削除する (暗黙の `--keep-container` を取り消す) |
+| 2 | 未使用リソースの完全クリア | 別プロジェクト `Docker_usage_check` の `./docker-usage-check.sh --clean all --force` (= `docker system prune -a --volumes -f`) を実行し、確認入力なしで削除する |
+| 3 | ディスク空き容量の一覧 | 各ディレクトリの容量・使用量・空き・使用率・マウント先を表で表示する |
+
+`1` を先に行うことで、今回起動したコンテナとそのイメージ・ボリュームも `2` の
+「未使用リソース」に含まれ、まとめて回収されます。
+
+`docker-usage-check.sh` の探索順は次のとおりです。
+
+1. `--usage-check-script PATH`
+2. 環境変数 `DOCKER_USAGE_CHECK_SCRIPT`
+3. `<build_and_verify.sh のあるディレクトリ>/../Docker_usage_check/docker-usage-check.sh`
+4. `../Docker_usage_check/docker-usage-check.sh` (カレントディレクトリ基準)
+5. `$HOME/Docker_usage_check/docker-usage-check.sh`
+6. `PATH` 上の `docker-usage-check.sh`
+
+空き容量の一覧に既定で載るディレクトリは、Docker data root (`docker info` の
+`DockerRootDir`。ローカル接続時のみ特定できます)、作業ディレクトリ、compose ファイルの
+ディレクトリ、レポート出力先 (`--report-dir` 指定時)、ホーム、一時ディレクトリ、`/` の
+7 か所です。実体が同じディレクトリは 1 行にまとめます。`--disk-free-path DIR` で
+追加できます。
+
+```
+───────────────────────────────────────────────────────────────────
+各ディレクトリのディスク空き容量
+───────────────────────────────────────────────────────────────────
+  用途              ディレクトリ            サイズ       使用       空き  使用率  マウント
+  Docker data root  /var/lib/docker      100.00 GiB  38.21 GiB  61.79 GiB     39%  /
+  作業ディレクトリ  /home/ec2-user/app   100.00 GiB  38.21 GiB  61.79 GiB     39%  /
+  一時ディレクトリ  /tmp                   3.85 GiB   0.01 GiB   3.84 GiB      1%  /tmp
+───────────────────────────────────────────────────────────────────
+```
+
+**行わない条件**
+
+| 条件 | 理由 |
+| --- | --- |
+| 終了コードが `0` 以外 (デプロイエラーの調査など) | 調査対象を消さないため。従来どおりコンテナは起動したまま残る |
+| `--keep-container-after-interaction` 指定 | 明示的な抑止 |
+| `--keep-container` を明示指定 | 「残す」指定を優先する (`--keep-container-mode` による暗黙の有効化は対象外) |
+| `--cleanup-all-docker-data` 指定 | 同じ範囲を自前で削除するため二重に行わない |
+| `bash` / `http` モード | 一覧メニューを持たず、「すべて終了」に相当する操作がないため |
+
+**注意点**
+
+- `2` は同じ Docker daemon を使う**他プロジェクトの未使用リソースも削除**します
+  (使用中のコンテナ・イメージ・ボリュームは残ります)。
+- `docker-usage-check.sh` が見つからない、または失敗した場合はエラーを表示し、
+  終了コードを `1` とします (空き容量の一覧までは表示します)。
+  `docker-usage-check.sh` は `docker` と `jq` を必要とします。
+- `--dry-run` では実行予定のコマンドを表示するだけで、削除は行いません。
 
 #### `logs` モードで選べる操作
 
@@ -1936,8 +2013,8 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | コード | 意味 | 主な発生条件 |
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
-| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、`--readonly-analysis-excel` が `.xlsx` でない、`--readonly-analysis-excel` と `--readonly-analysis-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
+| `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、対話操作の終了後の完全クリーンアップ失敗 (docker-usage-check.sh が見つからない・失敗した)、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--usage-check-script` のパスを読み取れない、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、`--readonly-analysis-excel` が `.xlsx` でない、`--readonly-analysis-excel` と `--readonly-analysis-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 

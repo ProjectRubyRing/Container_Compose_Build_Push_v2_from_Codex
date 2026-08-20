@@ -79,12 +79,20 @@ mkdir -p "$TEST_TMP/bin"
 cp "$TEST_DIR/helpers/docker" "$TEST_TMP/bin/docker"
 cp "$TEST_DIR/helpers/curl" "$TEST_TMP/bin/curl"
 cp "$TEST_DIR/helpers/aws" "$TEST_TMP/bin/aws"
-chmod 755 "$TEST_TMP/bin/docker" "$TEST_TMP/bin/curl" "$TEST_TMP/bin/aws"
+cp "$TEST_DIR/helpers/docker-usage-check.sh" "$TEST_TMP/bin/docker-usage-check.sh"
+chmod 755 "$TEST_TMP/bin/docker" "$TEST_TMP/bin/curl" "$TEST_TMP/bin/aws" \
+    "$TEST_TMP/bin/docker-usage-check.sh"
 
 export PATH="$TEST_TMP/bin:$PATH"
 export FAKE_DOCKER_CALLS="$TEST_TMP/docker.calls"
 export FAKE_CURL_CALLS="$TEST_TMP/curl.calls"
 export FAKE_AWS_CALLS="$TEST_TMP/aws.calls"
+# 対話操作をすべて終えたときの完全クリアは、別プロジェクトの
+# docker-usage-check.sh へ委ねている。実物 (兄弟ディレクトリや PATH 上のもの) を
+# 拾って本当に削除してしまわないよう、必ず偽物を指させる。
+export DOCKER_USAGE_CHECK_SCRIPT="$TEST_TMP/bin/docker-usage-check.sh"
+export FAKE_USAGE_CHECK_CALLS="$TEST_TMP/usage-check.calls"
+: > "$FAKE_USAGE_CHECK_CALLS"
 
 success_output="$TEST_TMP/success.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1269,6 +1277,7 @@ assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 logs_mode_output="$TEST_TMP/keep-mode-logs.out"
 : > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
 export FAKE_COMPOSE_PS_SERVICES="app db"
 if ! printf 'invalid\n3\n2\ninvalid\n1\n\n0\n1\n2\n3\n\n0\n0\n' | (
   cd "$REPO_ROOT"
@@ -1329,7 +1338,18 @@ assert_before "$logs_mode_output" "Compose サービスログ (サービス: db"
 assert_contains "$logs_mode_output" "Compose サービス 'db' の操作を終了し、サービス選択へ戻ります。"
 assert_contains "$logs_mode_output" "Compose サービス 'app' の操作を終了し、サービス選択へ戻ります。"
 assert_contains "$logs_mode_output" "Compose サービスの対話操作を終了しました。"
-assert_contains "$logs_mode_output" "コンテナを残します (--keep-container)"
+# 対話操作をすべて終えた場合は、既定でコンテナを残さず compose down し、
+# 未使用リソースの完全クリアと空き容量の一覧まで行う。
+assert_contains "$logs_mode_output" "対話操作をすべて終了したため、コンテナを残さず後始末します。"
+assert_contains "$logs_mode_output" "対話操作をすべて終了したため、未使用リソースを含めて完全クリアします。"
+assert_contains "$logs_mode_output" "未使用リソースを含む Docker の完全クリアが完了しました。"
+assert_contains "$logs_mode_output" "各ディレクトリのディスク空き容量"
+assert_contains "$logs_mode_output" "用途"
+assert_contains "$logs_mode_output" "一時ディレクトリ"
+assert_contains "$FAKE_USAGE_CHECK_CALLS" "--clean all --force"
+assert_not_contains "$logs_mode_output" "コンテナを残します (--keep-container)"
+assert_before "$logs_mode_output" "Compose サービスの対話操作を終了しました。" \
+    "各ディレクトリのディスク空き容量"
 assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml ps --services" 3
 assert_matches "$FAKE_DOCKER_CALLS" 'compose -f compose\.yml logs --no-color --since [^ ]+ db'
 assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash"
@@ -1337,7 +1357,110 @@ assert_contains "$FAKE_DOCKER_CALLS" ".Config.Healthcheck.Test"
 assert_contains "$FAKE_DOCKER_CALLS" ".State.Health.Log"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-app /bin/sh -c curl -fs http://127.0.0.1:8080/health >/dev/null || exit 1"
 assert_contains "$FAKE_DOCKER_CALLS" "healthcheck-http-probe http://127.0.0.1:8080/health 60 GET"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# ---- 対話操作の終了後クリーンアップを抑止する ------------------------------
+# --keep-container-after-interaction を指定すると、対話操作を終えても従来どおり
+# コンテナを残し、完全クリアも空き容量の一覧も行わない。
+keep_after_interaction_output="$TEST_TMP/keep-mode-logs-keep-after.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if ! printf '0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --keep-container-after-interaction \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$keep_after_interaction_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$keep_after_interaction_output" >&2
+  fail "--keep-container-after-interaction returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$keep_after_interaction_output" "Compose サービスの対話操作を終了しました。"
+assert_contains "$keep_after_interaction_output" "コンテナを残します (--keep-container)"
+assert_not_contains "$keep_after_interaction_output" "未使用リソースを含めて完全クリアします"
+assert_not_contains "$keep_after_interaction_output" "各ディレクトリのディスク空き容量"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+[ ! -s "$FAKE_USAGE_CHECK_CALLS" ] \
+  || fail "docker-usage-check.sh was called despite --keep-container-after-interaction"
+
+# --keep-container を明示した場合も、対話操作の終了後にコンテナを残す。
+explicit_keep_output="$TEST_TMP/keep-mode-logs-explicit-keep.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if ! printf '0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$explicit_keep_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$explicit_keep_output" >&2
+  fail "explicit --keep-container with logs mode returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$explicit_keep_output" "コンテナを残します (--keep-container)"
+assert_not_contains "$explicit_keep_output" "未使用リソースを含めて完全クリアします"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+[ ! -s "$FAKE_USAGE_CHECK_CALLS" ] \
+  || fail "docker-usage-check.sh was called despite an explicit --keep-container"
+
+# 完全クリアに失敗したときは、警告ではなくエラーとして終了コード 1 にする。
+usage_check_failure_output="$TEST_TMP/keep-mode-logs-clean-failure.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_USAGE_CHECK_FAIL="true"
+if printf '0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$usage_check_failure_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_USAGE_CHECK_FAIL
+  cat "$usage_check_failure_output" >&2
+  fail "failed usage-check cleanup unexpectedly returned zero"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_USAGE_CHECK_FAIL
+
+assert_contains "$usage_check_failure_output" "未使用リソースの完全クリアに失敗しました"
+assert_contains "$usage_check_failure_output" "docker-usage-check.sh は docker と jq を必要とします"
+# 失敗しても空き容量の一覧までは出す (どこが逼迫しているかは知りたいため)。
+assert_contains "$usage_check_failure_output" "各ディレクトリのディスク空き容量"
+assert_contains "$FAKE_USAGE_CHECK_CALLS" "--clean all --force"
+
+# 読み取れないパスを --usage-check-script へ渡した場合は、実行前に弾く。
+missing_usage_check_output="$TEST_TMP/usage-check-missing.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --usage-check-script "$TEST_TMP/no-such-usage-check.sh"
+) >"$missing_usage_check_output" 2>&1; then
+  cat "$missing_usage_check_output" >&2
+  fail "unreadable --usage-check-script unexpectedly returned zero"
+fi
+assert_contains "$missing_usage_check_output" \
+    "--usage-check-script のスクリプトを読み取れません:"
 
 no_healthcheck_output="$TEST_TMP/keep-mode-no-healthcheck.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1462,7 +1585,7 @@ assert_contains "$FAKE_DOCKER_CALLS" "umask 077"
 assert_contains "$FAKE_DOCKER_CALLS" "trap cleanup_mysql_option_file EXIT HUP INT TERM"
 assert_contains "$FAKE_DOCKER_CALLS" 'set -- --defaults-extra-file="$mysql_option_file" --protocol=socket --user="$mysql_user"'
 assert_not_contains "$FAKE_DOCKER_CALLS" "--password="
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 mysql_failure_output="$TEST_TMP/keep-mode-mysql-failure.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1489,7 +1612,7 @@ assert_contains "$mysql_failure_output" "Compose サービス 'mysql80' の MySQ
 assert_contains "$mysql_failure_output" "MySQL 接続に失敗しました。サービス操作の選択へ戻ります。"
 assert_occurrences "$mysql_failure_output" "Compose サービス 'mysql80' で実行する操作を選択してください:" 2
 assert_contains "$mysql_failure_output" "Compose サービスの対話操作を終了しました。"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 cert_check_output="$TEST_TMP/keep-mode-cert-check.out"
 cert_check_reports="$TEST_TMP/cert-check-reports"
@@ -1551,7 +1674,7 @@ assert_not_contains "$cert_check_output" "0 から 4 の番号を入力してく
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-tlsapp /bin/sh -c"
 # パスワードはコンテナ内で解決するため、docker のコマンドラインへは載らない。
 assert_not_contains "$FAKE_DOCKER_CALLS" "-storepass changeit"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 cert_check_ng_output="$TEST_TMP/keep-mode-cert-check-ng.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1727,7 +1850,7 @@ assert_not_contains "$alb_healthcheck_output" "0 から 4 の番号を入力し�
 assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli has-service frontend"
 assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli report frontend"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-alb-healthcheck /bin/sh -c"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 # 偽装サービス自身を選ぶと、全ターゲットグループをまとめて確認する。
 alb_healthcheck_all_output="$TEST_TMP/keep-mode-alb-healthcheck-all.out"
@@ -1899,7 +2022,7 @@ assert_contains "$FAKE_DOCKER_CALLS" "exec cid-cwagent cat /etc/cwagentconfig/cw
 assert_contains "$FAKE_DOCKER_CALLS" "port cid-cloudwatch-logs-mock 8080/tcp"
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:18480/__admin/requests?limit=100"
 assert_contains "$FAKE_CURL_CALLS" "Logs_20140328.PutLogEvents"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 otel_helper_output="$TEST_TMP/keep-mode-otel-helper.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1954,7 +2077,7 @@ assert_contains "$FAKE_CURL_CALLS" "--data-urlencode service=myapp-front"
 # Python ヘルパーの出力に CR 等が混ざるとサービス名が壊れるため、後続引数まで検査する。
 assert_matches "$FAKE_CURL_CALLS" 'service=myapp-front --data-urlencode'
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:16686/api/traces"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 otel_no_traces_output="$TEST_TMP/keep-mode-otel-no-traces.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -1979,7 +2102,7 @@ fi
 unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY
 assert_contains "$otel_no_traces_output" "Jaeger にトレースサービスが登録されていません。"
 assert_contains "$otel_no_traces_output" "サービス操作の選択へ戻ります"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 # distroless の adot-collector: /bin/sh も wget も /healthcheck も無い状態で、
 # compose の healthcheck 定義 → シェル無し直接実行 → ホストからの HTTP 確認へ
@@ -2017,7 +2140,7 @@ assert_contains "$otel_distroless_output" "確認方式: ホストから health_
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-adot-collector wget -q -O- http://127.0.0.1:13133/"
 assert_contains "$FAKE_DOCKER_CALLS" "port cid-adot-collector 13133/tcp"
 assert_contains "$FAKE_CURL_CALLS" "http://127.0.0.1:13133/"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 # 自動確認の手段が尽きた場合は、手元で実行すべきコマンドを案内する。
 otel_manual_output="$TEST_TMP/keep-mode-otel-manual-commands.out"
@@ -2053,7 +2176,7 @@ assert_contains "$otel_manual_output" \
 assert_contains "$otel_manual_output" \
   "  docker run --rm --network container:adot-collector curlimages/curl:latest -sS -i http://127.0.0.1:13133/"
 assert_contains "$otel_manual_output" "  curl -sS -i http://127.0.0.1:13133/"
-assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 http_get_output="$TEST_TMP/keep-mode-http-get.out"
 : > "$FAKE_DOCKER_CALLS"

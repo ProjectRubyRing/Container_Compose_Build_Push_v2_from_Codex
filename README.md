@@ -187,6 +187,9 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
 | `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
+| `--usage-check-script PATH` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。完全クリアに使う `docker-usage-check.sh` のパスを明示する。未指定時は環境変数 `DOCKER_USAGE_CHECK_SCRIPT` → スクリプトの親 / カレントの親 / ホーム配下の `Docker_usage_check/docker-usage-check.sh` → `PATH` 上の `docker-usage-check.sh` の順に探す | (自動解決) |
+| `--disk-free-path DIR` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。終了時の空き容量一覧へ表示するディレクトリを追加する (繰り返し指定可) | (Docker data root / 作業ディレクトリ / compose ファイル / レポート出力先 / ホーム / 一時ディレクトリ / `/`) |
 | `--exit-on-deploy-error` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。デプロイエラー (AP サーバは起動したがアプリのデプロイに失敗) を検出しても調査用の対話操作へ入らず、従来どおりログを出力して終了する。既定ではコンテナと AP サーバを起動したまま残し、各 Compose サービスへ接続して調査できる状態にする | `false` |
 | `--jboss-context-root ROOT` | 対話式 HTTP モードの JBoss EAP コンテキストルートを明示する。未指定時は起動ログから検出する | (自動検出、検出不能時は `/`) |
 | `--jboss-http-port PORT` | 対話式 HTTP モードのコンテナ側 HTTP リスナーポートを明示する。Docker の公開ポートがあれば接続先へ自動変換する | (自動検出、検出不能時は `8080`) |
@@ -1722,6 +1725,75 @@ CloudWatch Logs には届きません。
   ログは `--suppress-startup-logs` の指定中でも表示します。bash 操作を行う対象イメージには
   `/bin/bash` が必要です。
 
+#### 対話操作の終了後の完全クリーンアップ (既定で有効)
+
+`logs` モードのサービス選択で `0`（対話操作を終了）を選び、**対話操作をすべて終えた**
+場合は、その実行で確認したいことは済んだものとして扱い、コンテナを残さず次を
+自動実行してから終了します。
+
+1. 今回の Compose スタックを `docker compose -f <compose.yml> down` で削除する
+2. 別プロジェクト `Docker_usage_check` の
+   `./docker-usage-check.sh --clean all --force`
+   （= `docker system prune -a --volumes -f`）を実行し、未使用リソース
+   （停止中コンテナ・未使用イメージ・未使用ボリューム・未使用ネットワーク・
+   ビルドキャッシュ）を**確認なしで完全クリア**する
+3. 各ディレクトリのディスク空き容量を一覧表示する
+
+`1` を先に行うことで、今回起動したコンテナとそのイメージ・ボリュームも `2` の
+「未使用リソース」に含まれ、まとめて回収されます。空き容量の一覧には Docker data root、
+作業ディレクトリ、compose ファイルのディレクトリ、レポート出力先、ホーム、
+一時ディレクトリ、`/` を表示します（`--disk-free-path DIR` で追加できます）。
+
+```
+───────────────────────────────────────────────────────────────────
+各ディレクトリのディスク空き容量
+───────────────────────────────────────────────────────────────────
+  用途              ディレクトリ            サイズ       使用       空き  使用率  マウント
+  Docker data root  /var/lib/docker      100.00 GiB  38.21 GiB  61.79 GiB     39%  /
+  作業ディレクトリ  /home/ec2-user/app   100.00 GiB  38.21 GiB  61.79 GiB     39%  /
+  一時ディレクトリ  /tmp                   3.85 GiB   0.01 GiB   3.84 GiB      1%  /tmp
+───────────────────────────────────────────────────────────────────
+```
+
+注意点:
+
+- `2` は**同じ Docker daemon を使う他プロジェクトの未使用リソースも削除**します
+  （使用中のコンテナ・イメージ・ボリュームは残ります）。
+- 終了コードが `0` 以外になる実行（デプロイエラーの調査など）では**行いません**。
+  調査対象を残すためで、その場合は従来どおりコンテナが起動したまま残ります。
+- `docker-usage-check.sh` が見つからない、または失敗した場合はエラーを表示し、
+  終了コードを `1` とします（空き容量の一覧までは表示します）。
+  `docker-usage-check.sh` は `docker` と `jq` を必要とします。
+- 従来どおりコンテナを残したい場合は `--keep-container-after-interaction` を指定します。
+  `--keep-container` を明示した場合も同じく残します。
+- `bash` / `http` モードでは従来どおりコンテナを残します（一覧メニューを持たず、
+  「すべて終了」に相当する操作がないため）。
+
+```bash
+# 対話操作をすべて終えたら、compose down → 未使用リソースの完全クリア →
+# 空き容量の一覧まで自動で行う (既定)
+./build_and_verify.sh \
+    --compose-service app,db \
+    --startup-service app \
+    --keep-container-mode logs
+
+# 従来どおり、対話操作の終了後もコンテナを残す
+./build_and_verify.sh \
+    --compose-service app,db \
+    --startup-service app \
+    --keep-container-mode logs \
+    --keep-container-after-interaction
+
+# docker-usage-check.sh の場所を明示し、空き容量の一覧へディレクトリを追加する
+./build_and_verify.sh \
+    --compose-service app,db \
+    --startup-service app \
+    --keep-container-mode logs \
+    --usage-check-script ../Docker_usage_check/docker-usage-check.sh \
+    --disk-free-path /var/log \
+    --disk-free-path /data
+```
+
 healthcheck 診断では、Docker に反映された `Config.Healthcheck` の形式、コマンド、interval、
 timeout、retries、start period と、`State.Health` の現在状態、連続失敗回数、Docker が保持する
 直近の実行開始・終了時刻、終了コード、stdout/stderr を表示します。続けて同じコマンドを
@@ -1996,9 +2068,12 @@ HTTP メソッドは `GET` / `POST` の番号選択です。POST では続けて
 
 HTTP `4xx` / `5xx` も調査対象の応答としてステータスと本文を表示します。接続失敗や
 タイムアウトなど `curl` 自体が失敗した場合は終了コード `1` になります。1 リクエストの
-最大時間は `--url-timeout` (既定 60 秒) で変更できます。操作終了後の
+最大時間は `--url-timeout` (既定 60 秒) で変更できます。`bash` / `http` モードと、
+`--keep-container-after-interaction` / `--keep-container` を指定した場合、操作終了後の
 コンテナは自動削除されないため、不要になったら表示される `docker compose ... down`
-コマンドで停止・削除してください。`--cleanup-all-docker-data` とは併用できません。
+コマンドで停止・削除してください。`logs` モードで対話操作をすべて終えた場合は、既定で
+[対話操作の終了後の完全クリーンアップ](#対話操作の終了後の完全クリーンアップ-既定で有効)
+が動き、コンテナの削除まで自動で行います。`--cleanup-all-docker-data` とは併用できません。
 `build_and_push.sh --build-only --log-dir` 経由で使う場合は、bash セッションの表示内容、
 HTTP レスポンス、選択した Compose サービスのログもログファイルへ保存されるため、
 秘密情報を画面へ出力しないでください。

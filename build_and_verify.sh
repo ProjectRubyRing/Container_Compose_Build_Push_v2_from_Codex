@@ -397,6 +397,7 @@ UNRESOLVED_HOST_LOG_PATTERN='UnknownHostException|Unknown MySQL server host|Name
 DOCKER_STATE_SUMMARY=""           # ローカルイメージ件数 / ビルドキャッシュ量
 DOCKER_STATE_COLD="unknown"       # true: コールド実行 / false: ウォーム / unknown: 未判定
 KEEP_CONTAINER="false"            # true: 確認後もコンテナを停止・削除せずに残す
+KEEP_CONTAINER_EXPLICIT="false"   # --keep-container を明示指定したか (暗黙の有効化と区別する)
 KEEP_CONTAINER_MODE=""            # bash/http/logs: 確認後に実行する対話操作 (指定時はコンテナを残す)
 # デプロイエラー (AP サーバ自体は起動したが、アプリのデプロイに失敗した状態) を
 # 検出した場合の動作。
@@ -409,6 +410,27 @@ KEEP_CONTAINER_ON_DEPLOY_ERROR="true"
 DEPLOY_ERROR_INTERACTION_MODE="logs"
 STARTUP_DEPLOY_ERROR="false"      # 起動確認でデプロイエラー (起動失敗ログ) を検出したか
 INTERACTION_MENU_ENTERED="false"  # 対話操作の選択を 1 度でも読み取れたか (調査に入れたか)
+INTERACTION_FINISHED="false"      # 対話操作を「終了」の選択まで進めて終えたか
+# ---- 対話操作を終えた後の完全クリーンアップ ---------------------------------
+# --keep-container-mode logs の対話操作を「0) 対話操作を終了」まで進めた時点で、
+# その実行の目的 (起動したコンテナ内の確認) は済んでいる。従来はそのまま
+# --keep-container としてコンテナを残し、後から手作業で compose down する運用
+# だったが、消し忘れたコンテナと、検証のたびに増える未使用イメージ・ボリューム・
+# ビルドキャッシュが積み上がり、次の検証で data root を圧迫する。
+# そこで「対話操作の終了」を片付けてよい合図として扱い、既定で
+#   (1) 今回の Compose スタックを compose down で削除する
+#   (2) 別プロジェクト Docker_usage_check の docker-usage-check.sh を
+#       --clean all --force で実行し、未使用リソース (未使用イメージ・
+#       未使用ボリューム・ビルドキャッシュ) まで確認なしで完全クリアする
+#   (3) 各ディレクトリのディスク空き容量を一覧表示する
+# までを自動で行う。削除そのものを docker-usage-check.sh へ委ねているのは、
+# 削除範囲と削減量の表示をそちらへ一本化し、二重実装を避けるため。
+# 従来どおり残したい場合は --keep-container-after-interaction を指定する。
+CLEANUP_AFTER_INTERACTION="true"  # false (--keep-container-after-interaction): 従来どおり残す
+USAGE_CHECK_SCRIPT=""             # docker-usage-check.sh のパス (未指定なら自動解決)
+DISK_FREE_PATHS=()                # 空き容量一覧へ追加するディレクトリ (--disk-free-path)
+DISK_FREE_TARGETS=()              # 一覧表示の対象 ("用途|ディレクトリ")
+POST_INTERACTION_CLEANUP_RAN="false"  # 完全クリアを試行したか (空き容量一覧の実行条件)
 SUPPRESS_REMOVED_LOGS="false"     # true: compose down の Removed ログ等を抑制する
 SUPPRESS_STARTUP_LOGS="false"     # true: 起動確認対象と同時起動サービスのログ表示を抑制する
 STARTUP_LOG_LINES="50"            # all: 全行表示 / 数値: 末尾からの最大表示行数
@@ -1328,6 +1350,45 @@ JBoss マスターパスワードの伝搬検証:
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
                            送達診断の JSON 整形には curl と Python 3 が必要。
+
+  (既定で有効) 対話操作の終了後の完全クリーンアップ
+                           --keep-container-mode logs のサービス選択で
+                           「0) 対話操作を終了」を選び、対話操作をすべて終えた
+                           場合は、その実行で確認したいことは済んだものとして
+                           コンテナを残さず、次を自動実行して終了する。
+                             1. 今回の Compose スタックを compose down で削除する
+                             2. Docker_usage_check プロジェクトの
+                                docker-usage-check.sh --clean all --force を実行し、
+                                未使用リソース (停止中コンテナ・未使用イメージ・
+                                未使用ボリューム・未使用ネットワーク・ビルド
+                                キャッシュ) を確認なしで完全クリアする
+                             3. 各ディレクトリのディスク空き容量を一覧表示する
+                           ※ 2 は同じ Docker daemon を使う他プロジェクトの
+                             未使用リソースも削除する (使用中のものは残る)。
+                           終了コードが 0 以外になる実行 (デプロイエラーの調査
+                           など) では、調査対象を消さないため行わない。
+                           docker-usage-check.sh が見つからない / 失敗した場合は
+                           エラーを表示し、終了コードを 1 とする
+                           (空き容量の一覧までは表示する)。
+                           docker-usage-check.sh は docker と jq を必要とする。
+  --keep-container-after-interaction
+                           上記の自動クリーンアップを行わず、従来どおり対話操作の
+                           終了後もコンテナを残す。--keep-container を明示指定した
+                           場合も同じ扱いとなる。
+  --usage-check-script PATH
+                           完全クリアに使う docker-usage-check.sh のパス。
+                           未指定時は次の順で探す:
+                             1. 環境変数 DOCKER_USAGE_CHECK_SCRIPT
+                             2. このスクリプトの親ディレクトリの
+                                Docker_usage_check/docker-usage-check.sh
+                             3. カレントディレクトリの親の同パス
+                             4. ホームディレクトリの同パス
+                             5. PATH 上の docker-usage-check.sh
+  --disk-free-path DIR     終了時の空き容量一覧へ表示するディレクトリを追加する
+                           (繰り返し指定可)。既定では Docker data root、
+                           作業ディレクトリ、compose ファイルのディレクトリ、
+                           レポート出力先、ホームディレクトリ、一時ディレクトリ、
+                           ルート (/) を表示する。
   --exit-on-deploy-error   デプロイエラー (AP サーバは起動したが、アプリのデプロイで
                            失敗した状態) を検出したときに、調査用の対話操作へ入らず
                            そのまま終了する (従来の動作)。
@@ -1754,8 +1815,11 @@ while [ $# -gt 0 ]; do
     --suppress-startup-logs) SUPPRESS_STARTUP_LOGS="true"; shift ;;
     --shutdown-timeout)    need_value "$1" $#; SHUTDOWN_LOG_TIMEOUT="$2"; shift 2 ;;
     --no-shutdown-logs)    CAPTURE_SHUTDOWN_LOGS="false"; shift ;;
-    --keep-container)      KEEP_CONTAINER="true"; shift ;;
+    --keep-container)      KEEP_CONTAINER="true"; KEEP_CONTAINER_EXPLICIT="true"; shift ;;
     --keep-container-mode) need_value "$1" $#; KEEP_CONTAINER_MODE="$2"; shift 2 ;;
+    --keep-container-after-interaction) CLEANUP_AFTER_INTERACTION="false"; shift ;;
+    --usage-check-script)  need_value "$1" $#; USAGE_CHECK_SCRIPT="$2"; shift 2 ;;
+    --disk-free-path)      need_value "$1" $#; DISK_FREE_PATHS+=("$2"); shift 2 ;;
     --exit-on-deploy-error) KEEP_CONTAINER_ON_DEPLOY_ERROR="false"; shift ;;
     --jboss-context-root)  need_value "$1" $#; JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
     --jboss-http-port)     need_value "$1" $#; JBOSS_HTTP_PORT="$2"; shift 2 ;;
@@ -2080,6 +2144,13 @@ case "$KEEP_CONTAINER_MODE" in
     exit 2
     ;;
 esac
+
+# 完全クリアに使うスクリプトは、終了時になって「無い」と分かっても手遅れなので、
+# 明示指定された場合だけここで実在を確認する (自動解決は終了時に行う)。
+if [ -n "$USAGE_CHECK_SCRIPT" ] && [ ! -r "$USAGE_CHECK_SCRIPT" ]; then
+  err "--usage-check-script のスクリプトを読み取れません: ${USAGE_CHECK_SCRIPT}"
+  exit 2
+fi
 
 if [ -n "$JBOSS_HTTP_PORT" ]; then
   case "$JBOSS_HTTP_PORT" in
@@ -12176,6 +12247,8 @@ run_interactive_compose_service_menu() {
       INTERACTION_MENU_ENTERED="true"
       case "$choice" in
         0)
+          # 対話操作をすべて終えた合図。終了処理で完全クリアと空き容量の一覧を行う。
+          INTERACTION_FINISHED="true"
           log "Compose サービスの対話操作を終了しました。"
           return 0
           ;;
@@ -12210,6 +12283,8 @@ run_keep_container_interaction() {
         ;;
       logs)
         log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) を繰り返し実行します。"
+        # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
+        INTERACTION_FINISHED="true"
         ;;
     esac
     return 0
@@ -12764,6 +12839,288 @@ cleanup_all_docker_data() {
   fi
   log "Docker 完全クリーンアップが完了しました。"
   return 0
+}
+
+# =============================================================================
+# 対話操作を終えた後の完全クリーンアップと、各ディレクトリの空き容量一覧
+# -----------------------------------------------------------------------------
+# --keep-container-mode logs の対話操作を最後まで終えた実行では、確認したいこと
+# は済んでいる。コンテナを残すと次の実行のウォーム再利用を壊しやすく、未使用
+# イメージ・ボリューム・ビルドキャッシュも積み上がるため、既定で
+#   今回の compose down → 未使用リソースの完全クリア → 空き容量の一覧
+# までを自動で行う。完全クリアは別プロジェクトの docker-usage-check.sh
+# (--clean all --force = docker system prune -a --volumes -f) へ委ねる。
+# =============================================================================
+
+# 対話操作の終了後クリーンアップを行う条件を満たしているか。
+# 呼び出し側は終了コードを渡す (失敗した実行では調査対象を消さない)。
+post_interaction_cleanup_enabled() {
+  local exit_status="$1"
+  [ "$INTERACTION_FINISHED" = "true" ] || return 1
+  [ "$CLEANUP_AFTER_INTERACTION" = "true" ] || return 1
+  # --keep-container を明示していれば「残す」指定を優先する
+  # (--keep-container-mode による暗黙の有効化は対象外)。
+  [ "$KEEP_CONTAINER_EXPLICIT" != "true" ] || return 1
+  # --cleanup-all-docker-data は同じ範囲を自前で削除するため、二重に行わない。
+  [ "$CLEANUP_ALL_DOCKER_DATA" != "true" ] || return 1
+  # 失敗した実行 (デプロイエラーの調査など) では、調査対象を残す。
+  [ "$exit_status" -eq 0 ] || return 1
+  return 0
+}
+
+# docker-usage-check.sh を探す。--usage-check-script → 環境変数 →
+# 兄弟プロジェクト (Docker_usage_check) → ホーム → PATH の順に見る。
+resolve_usage_check_script() {
+  local candidate script_dir
+  local -a candidates=()
+
+  [ -n "$USAGE_CHECK_SCRIPT" ] && candidates+=("$USAGE_CHECK_SCRIPT")
+  [ -n "${DOCKER_USAGE_CHECK_SCRIPT:-}" ] && candidates+=("$DOCKER_USAGE_CHECK_SCRIPT")
+  script_dir="$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)" || script_dir=""
+  [ -n "$script_dir" ] \
+    && candidates+=("${script_dir}/../Docker_usage_check/docker-usage-check.sh")
+  candidates+=("../Docker_usage_check/docker-usage-check.sh")
+  [ -n "${HOME:-}" ] \
+    && candidates+=("${HOME}/Docker_usage_check/docker-usage-check.sh")
+
+  for candidate in "${candidates[@]}"; do
+    [ -n "$candidate" ] || continue
+    [ -f "$candidate" ] && [ -r "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  if candidate="$(command -v docker-usage-check.sh 2>/dev/null)" && [ -n "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# 未使用リソースを含めた完全クリアを実行する。今回の Compose スタックは
+# 呼び出し元が compose down 済みで、ここでは「未使用リソース」として回収される。
+run_post_interaction_cleanup() {
+  local exit_status="$1" script=""
+
+  post_interaction_cleanup_enabled "$exit_status" || return 0
+  # 実行できたかに関わらず、空き容量の一覧までは必ず出す。
+  POST_INTERACTION_CLEANUP_RAN="true"
+
+  diag ""
+  diag "==================================================================="
+  diag "対話操作をすべて終了したため、未使用リソースを含めて完全クリアします。"
+  diag "  対象: 停止中コンテナ / 未使用イメージ / 未使用ボリューム /"
+  diag "        未使用ネットワーク / ビルドキャッシュ (確認入力なし)"
+  diag "  ※ 同じ Docker daemon を使う他プロジェクトの未使用リソースも削除されます。"
+  diag "  コンテナを残したい場合は --keep-container-after-interaction を指定します。"
+  diag "==================================================================="
+
+  if ! script="$(resolve_usage_check_script)"; then
+    err "docker-usage-check.sh が見つからないため、未使用リソースの完全クリアを実行できません。"
+    err "  --usage-check-script でパスを指定するか、環境変数 DOCKER_USAGE_CHECK_SCRIPT を設定してください。"
+    err "  探した場所: --usage-check-script / DOCKER_USAGE_CHECK_SCRIPT /"
+    err "              <スクリプトの親>/Docker_usage_check/docker-usage-check.sh /"
+    err "              ../Docker_usage_check/docker-usage-check.sh / \$HOME/Docker_usage_check/ / PATH"
+    return 1
+  fi
+
+  log "未使用リソースの完全クリアを実行します: ${script} --clean all --force"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] bash ${script} --clean all --force"
+    return 0
+  fi
+
+  # 対話入力は --force で不要になるが、端末を掴ませないよう stdin は閉じておく。
+  if ! bash "$script" --clean all --force < /dev/null; then
+    err "未使用リソースの完全クリアに失敗しました: ${script} --clean all --force"
+    err "  docker-usage-check.sh は docker と jq を必要とします。導入状況を確認してください。"
+    return 1
+  fi
+  log "未使用リソースを含む Docker の完全クリアが完了しました。"
+  return 0
+}
+
+# ---- 各ディレクトリのディスク空き容量 ---------------------------------------
+# 完全クリアの結果を確認できるよう、検証で書き込みが発生する場所の空き容量を
+# まとめて出す。df は同じファイルシステムでも指定したディレクトリごとに 1 行
+# 返すため、「どのディレクトリがどのファイルシステムに載っているか」も分かる。
+
+# 一覧の対象を 1 件追加する。実体が同じディレクトリは 1 度だけ載せる。
+add_disk_free_target() {
+  local label="$1" path="$2" existing resolved
+  [ -n "$path" ] || return 0
+  [ -d "$path" ] || return 0
+  resolved="$(cd -- "$path" 2>/dev/null && pwd -P)" || resolved=""
+  [ -n "$resolved" ] || resolved="$path"
+  if [ ${#DISK_FREE_TARGETS[@]} -gt 0 ]; then
+    for existing in "${DISK_FREE_TARGETS[@]}"; do
+      [ "${existing#*|}" = "$resolved" ] && return 0
+    done
+  fi
+  DISK_FREE_TARGETS+=("${label}|${resolved}")
+}
+
+collect_disk_free_targets() {
+  local docker_root path
+  DISK_FREE_TARGETS=()
+  # data root はローカル接続 (unix socket / named pipe) のときだけ特定できる。
+  docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  add_disk_free_target "Docker data root" "$docker_root"
+  add_disk_free_target "作業ディレクトリ" "$PWD"
+  add_disk_free_target "compose ファイル" "$(dirname -- "$COMPOSE_FILE")"
+  [ -n "$BUILD_REPORT_DIR" ] && add_disk_free_target "レポート出力先" "$BUILD_REPORT_DIR"
+  add_disk_free_target "ホーム" "${HOME:-}"
+  add_disk_free_target "一時ディレクトリ" "${TMPDIR:-/tmp}"
+  add_disk_free_target "ルート" "/"
+  if [ ${#DISK_FREE_PATHS[@]} -gt 0 ]; then
+    for path in "${DISK_FREE_PATHS[@]}"; do
+      if [ ! -d "$path" ]; then
+        warn "--disk-free-path のディレクトリが見つかりません: ${path}"
+        continue
+      fi
+      add_disk_free_target "指定ディレクトリ" "$path"
+    done
+  fi
+}
+
+# df -Pk の 1 行を "総容量KiB|使用KiB|空きKiB|使用率|マウント" で返す。
+# -P (POSIX 出力) を付けると 1 ファイルシステムが必ず 1 行に収まる。
+# 列位置を先頭から数えないのは、ファイルシステム名に空白が入る環境があるため
+# (Git Bash の "C:/Program Files/Git" など)。"NN%" の使用率列を目印にして、
+# その手前 3 列を総容量・使用・空き、後ろをマウント先として取り出す。
+disk_free_row_values() {
+  local path="$1"
+  LC_ALL=C df -Pk -- "$path" 2>/dev/null | awk '
+    NR == 2 {
+      capacity = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+%$/) { capacity = i; break }
+      }
+      if (capacity < 4) exit
+      mount = ""
+      for (i = capacity + 1; i <= NF; i++) {
+        mount = (mount == "") ? $i : mount " " $i
+      }
+      printf "%s|%s|%s|%s|%s\n", \
+          $(capacity - 3), $(capacity - 2), $(capacity - 1), $capacity, mount
+      exit
+    }'
+}
+
+# 表を桁揃えして出力する。1 行 = 各列を DISK_FREE_SEPARATOR で連結して渡す。
+# 日本語の用途名と半角のパスが混ざるため、桁揃えは UTF-8 のバイト列から
+# 表示幅を数えて行う (undertow_render_table と同じ考え方)。
+DISK_FREE_SEPARATOR=$'\037'
+disk_free_render_table() {
+  LC_ALL=C awk -v SEP="$DISK_FREE_SEPARATOR" '
+    function dwidth(s,   n, i, v, w, step) {
+      n = length(s); w = 0; i = 1
+      while (i <= n) {
+        v = ord[substr(s, i, 1)]
+        if (v < 128)      { step = 1; w += 1 }
+        else if (v < 192) { step = 1; w += 1 }
+        else if (v < 224) { step = 2; w += 1 }
+        else if (v < 240) { step = 3; w += 2 }
+        else              { step = 4; w += 2 }
+        i += step
+      }
+      return w
+    }
+    function lpad(s, target,   rest) {
+      rest = target - dwidth(s)
+      if (rest < 0) rest = 0
+      return s sprintf("%" rest "s", "")
+    }
+    function rpad(s, target,   rest) {
+      rest = target - dwidth(s)
+      if (rest < 0) rest = 0
+      return sprintf("%" rest "s", "") s
+    }
+    BEGIN {
+      FS = SEP
+      for (n = 1; n < 256; n++) ord[sprintf("%c", n)] = n
+      rows = 0
+    }
+    {
+      cols[rows] = NF
+      for (i = 1; i <= NF; i++) {
+        cell[rows, i] = $i
+        if (dwidth($i) > width[i]) width[i] = dwidth($i)
+      }
+      rows++
+    }
+    END {
+      for (r = 0; r < rows; r++) {
+        line = ""
+        for (i = 1; i <= cols[r]; i++) {
+          if (i == cols[r]) {
+            line = line cell[r, i]
+          } else if (i >= 3 && i <= 6) {
+            line = line rpad(cell[r, i], width[i]) "  "
+          } else {
+            line = line lpad(cell[r, i], width[i]) "  "
+          }
+        }
+        printf "  %s\n", line
+      }
+    }'
+}
+
+disk_free_table_row() {
+  local out="$1" arg
+  shift
+  for arg in "$@"; do
+    out="${out}${DISK_FREE_SEPARATOR}${arg}"
+  done
+  printf '%s\n' "$out"
+}
+
+show_disk_free_summary() {
+  local entry label path values total_kib used_kib free_kib capacity mount
+
+  collect_disk_free_targets
+  if [ ${#DISK_FREE_TARGETS[@]} -eq 0 ]; then
+    warn "ディスクの空き容量を確認できるディレクトリがありませんでした。"
+    return 0
+  fi
+
+  diag ""
+  diag "───────────────────────────────────────────────────────────────────"
+  diag "各ディレクトリのディスク空き容量"
+  diag "───────────────────────────────────────────────────────────────────"
+  {
+    disk_free_table_row "用途" "ディレクトリ" "サイズ" "使用" "空き" "使用率" "マウント"
+    for entry in "${DISK_FREE_TARGETS[@]}"; do
+      label="${entry%%|*}"
+      path="${entry#*|}"
+      values="$(disk_free_row_values "$path")"
+      if [ -z "$values" ]; then
+        disk_free_table_row "$label" "$path" "-" "-" "-" "-" "取得できませんでした"
+        continue
+      fi
+      total_kib=""; used_kib=""; free_kib=""; capacity=""; mount=""
+      IFS='|' read -r total_kib used_kib free_kib capacity mount <<< "$values"
+      # df の書式が想定と違う環境では数値が取れないため、その行は "-" で出す。
+      case "${total_kib}${used_kib}${free_kib}" in
+        ''|*[!0-9]*)
+          disk_free_table_row "$label" "$path" "-" "-" "-" "-" "取得できませんでした"
+          continue
+          ;;
+      esac
+      disk_free_table_row "$label" "$path" \
+        "$(format_bytes $(( total_kib * 1024 )))" \
+        "$(format_bytes $(( used_kib * 1024 )))" \
+        "$(format_bytes $(( free_kib * 1024 )))" \
+        "$capacity" "$mount"
+    done
+  } | disk_free_render_table >&2
+  diag "───────────────────────────────────────────────────────────────────"
+}
+
+# 完全クリアを試行した実行でだけ、最後に空き容量の一覧を出す。
+show_post_interaction_disk_free() {
+  [ "$POST_INTERACTION_CLEANUP_RAN" = "true" ] || return 0
+  show_disk_free_summary
 }
 
 # =============================================================================
@@ -21952,7 +22309,19 @@ cleanup_all() {
       cleanup_status=1
     fi
   fi
+  # 対話操作を最後まで終えた実行では、コンテナを残さず compose down まで行う。
+  # 先に今回のスタックを消しておくことで、この後の完全クリアからは今回の
+  # コンテナ・イメージ・ボリュームも「未使用リソース」として回収される。
+  if post_interaction_cleanup_enabled "$original_status"; then
+    log "対話操作をすべて終了したため、コンテナを残さず後始末します。"
+    log "  従来どおり残す場合: --keep-container-after-interaction"
+    KEEP_CONTAINER="false"
+  fi
   teardown_container
+  # 今回のスタックを消した後で、未使用リソースまでまとめて完全クリアする。
+  if ! run_post_interaction_cleanup "$original_status"; then
+    cleanup_status=1
+  fi
   # コンテナを削除した後に、今回増えたビルドキャッシュを片付けて容量を測る。
   prune_build_cache
   report_disk_usage_at_exit
@@ -21972,6 +22341,9 @@ cleanup_all() {
   esac
   # CA 証明書をまとめた tar (と作業ディレクトリ) も、ここで確実に消す。
   cleanup_cacert_work_dir
+
+  # 完全クリアの結果を確認できるよう、最後に各ディレクトリの空き容量を並べる。
+  show_post_interaction_disk_free
 
   # 本処理が既に失敗している場合は元の終了コードを優先する。
   if [ "$original_status" -ne 0 ]; then
