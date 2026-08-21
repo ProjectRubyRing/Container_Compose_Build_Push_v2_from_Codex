@@ -4452,6 +4452,359 @@ assert_contains "$copy_dry_run_output" \
   "[DRY-RUN] 上書き前のファイルを復元: $copy_dry_run_dir/copy-src.npmrc"
 assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
 
+
+# ---- コピーしたファイル (WAR など) の取り込み検証 ----------------------------
+# --copy-file で差し替えたファイルが、起動したコンテナから「今回コピーした中身」
+# として見えているかを SHA-256 で突き合わせる。名前付きボリュームがデプロイ先を
+# 覆っていると、イメージを作り直しても古い成果物が動き続けるが、ビルドも起動も
+# 成功して見えるため、照合しない限り気付けない。
+copy_artifact_src="$TEST_TMP/copy-artifact/frontend.war"
+copy_artifact_old="$TEST_TMP/copy-artifact/frontend.war.old"
+copy_artifact_ctx="$TEST_TMP/copy-artifact/context"
+mkdir -p "$TEST_TMP/copy-artifact" "$copy_artifact_ctx"
+printf 'NEW-WAR-CONTENT\n' > "$copy_artifact_src"
+printf 'OLD-WAR-CONTENT\n' > "$copy_artifact_old"
+copy_artifact_new_sha="$(sha256sum "$copy_artifact_src" | cut -d' ' -f1)"
+copy_artifact_old_sha="$(sha256sum "$copy_artifact_old" | cut -d' ' -f1)"
+copy_artifact_new_size="$(wc -c < "$copy_artifact_src" | tr -d '[:space:]')"
+copy_artifact_deploy_path="/opt/eap/standalone/deployments/frontend.war"
+
+# (1) ボリュームが古い WAR を隠している: 不一致を検出してエラー終了し、
+#     イメージ側は一致していることまで示したうえで down -v まで行う。
+copy_artifact_stale_output="$TEST_TMP/copy-artifact-stale.out"
+: > "$FAKE_DOCKER_CALLS"
+if (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|${copy_artifact_deploy_path}|16|${copy_artifact_old_sha}" \
+  FAKE_CONTAINER_MOUNTS="volume|/var/lib/docker/volumes/proj_deployments/_data|/opt/eap/standalone/deployments|true" \
+  FAKE_IMAGE_ARTIFACT_FILE="$copy_artifact_src" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_stale_output" 2>&1; then
+  cat "$copy_artifact_stale_output" >&2
+  fail "stale artifact hidden by a volume was not reported as an error"
+fi
+assert_contains "$copy_artifact_stale_output" \
+  "デプロイ先がマウントに覆われています: app (test-app-1) 名前付きボリューム proj_deployments -> /opt/eap/standalone/deployments"
+assert_contains "$copy_artifact_stale_output" \
+  "[不一致] app (test-app-1): ${copy_artifact_deploy_path}"
+assert_contains "$copy_artifact_stale_output" \
+  "このパスは次のマウントに覆われています: 名前付きボリューム proj_deployments -> /opt/eap/standalone/deployments"
+assert_contains "$copy_artifact_stale_output" \
+  "イメージ側の同じパスはコピー元と一致しています (ビルドは成功しています)。"
+assert_contains "$copy_artifact_stale_output" \
+  "=> マウントがイメージの内容を隠しているため、今回ビルドした成果物が使われていません。"
+assert_contains "$copy_artifact_stale_output" \
+  "コピーしたファイルがコンテナへ取り込まれていません (対象 1 件 (一致 0 / 不一致 1 / 未検出 0))。"
+assert_contains "$copy_artifact_stale_output" \
+  "※ --no-cache はイメージのビルドにしか効きません。マウントが原因の場合は変化しません。"
+# 古い成果物を抱えたボリュームは、次回の実行で作り直せるようその場で削除する。
+assert_contains "$copy_artifact_stale_output" \
+  "古い成果物を抱えたボリュームを検出したため、後始末で compose down -v を実行します。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30 --volumes"
+
+# (2) イメージ側も一致しない場合は、ビルドがコピーを取り込めていないと切り分ける。
+copy_artifact_build_output="$TEST_TMP/copy-artifact-build.out"
+: > "$FAKE_DOCKER_CALLS"
+if (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|${copy_artifact_deploy_path}|16|${copy_artifact_old_sha}" \
+  FAKE_IMAGE_ARTIFACT_FILE="$copy_artifact_old" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_build_output" 2>&1; then
+  cat "$copy_artifact_build_output" >&2
+  fail "artifact missing from the built image was not reported as an error"
+fi
+assert_contains "$copy_artifact_build_output" \
+  "このパスを覆っているマウントはありません (イメージの内容がそのまま見えています)。"
+assert_contains "$copy_artifact_build_output" \
+  "イメージ側の同じパスもコピー元と一致しません (SHA-256: ${copy_artifact_old_sha})。"
+assert_contains "$copy_artifact_build_output" \
+  "=> ビルドがコピーしたファイルを取り込めていません"
+# マウントが原因ではないため、ボリュームの自動削除は行わない。
+assert_not_contains "$copy_artifact_build_output" \
+  "古い成果物を抱えたボリュームを検出したため"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30 --volumes"
+
+# (3) 一致していれば成功し、全量レポートの [13] にも結果が残る。
+copy_artifact_ok_output="$TEST_TMP/copy-artifact-ok.out"
+copy_artifact_reports="$TEST_TMP/copy-artifact-reports"
+mkdir -p "$copy_artifact_reports"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|${copy_artifact_deploy_path}|${copy_artifact_new_size}|${copy_artifact_new_sha}" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$copy_artifact_reports" \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_ok_output" 2>&1; then
+  cat "$copy_artifact_ok_output" >&2
+  fail "matching copied artifact returned a non-zero status"
+fi
+assert_contains "$copy_artifact_ok_output" "[一致] app (test-app-1): ${copy_artifact_deploy_path}"
+assert_contains "$copy_artifact_ok_output" \
+  "コピーしたファイルの取り込みを確認しました (対象 1 件 (一致 1 / 不一致 0 / 未検出 0))。"
+collect_report_files "$copy_artifact_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected 1 build report for the copied artifact run, found ${#REPORT_FILES[@]}"
+assert_contains "${REPORT_FILES[0]}" "コピー取込検証: 対象 1 件 (一致 1 / 不一致 0 / 未検出 0)"
+assert_contains "${REPORT_FILES[0]}" "[13] コピーしたファイル (--copy-file) の取り込み検証"
+assert_contains "${REPORT_FILES[0]}" "判定          : OK"
+
+# (4) コンテナ内に見つからない場合、既定は警告のみ (ビルド時にだけ使うファイル用)。
+copy_artifact_missing_output="$TEST_TMP/copy-artifact-missing.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_missing_output" 2>&1; then
+  cat "$copy_artifact_missing_output" >&2
+  fail "missing copied artifact must not fail by default"
+fi
+assert_contains "$copy_artifact_missing_output" \
+  "[未検出] コンテナ内に frontend.war が見つかりませんでした (ビルド時にだけ使うファイルであれば正常です)。"
+assert_contains "$copy_artifact_missing_output" \
+  "コピーしたファイルの取り込みは確認できませんでした (対象 1 件 (一致 0 / 不一致 0 / 未検出 1))。"
+
+# (5) --copy-artifact-required を付けると、未検出もエラーになる。
+copy_artifact_required_output="$TEST_TMP/copy-artifact-required.out"
+if (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-artifact-required \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_required_output" 2>&1; then
+  cat "$copy_artifact_required_output" >&2
+  fail "--copy-artifact-required did not fail for a missing artifact"
+fi
+assert_contains "$copy_artifact_required_output" \
+  "[未検出] コンテナ内に frontend.war が見つかりませんでした (--copy-artifact-required のためエラーとします)。"
+
+# (6) 同名で中身の違うファイルが別の場所にあっても、一致するものが 1 つあれば成功。
+#     (ビルド時にだけ使うファイルが複数箇所に置かれている構成を壊さない)
+copy_artifact_mixed_output="$TEST_TMP/copy-artifact-mixed.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|/opt/backup/frontend.war|16|${copy_artifact_old_sha}
+FILE|${copy_artifact_deploy_path}|${copy_artifact_new_size}|${copy_artifact_new_sha}" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_mixed_output" 2>&1; then
+  cat "$copy_artifact_mixed_output" >&2
+  fail "a matching artifact alongside a differing same-named file must succeed"
+fi
+assert_contains "$copy_artifact_mixed_output" \
+  "(同名で中身の違うファイルが 1 件ありますが、一致するものがあるため取り込みは成功と判定します)"
+
+# (7) --no-verify-copy-artifact を指定すると照合そのものを行わない。
+copy_artifact_off_output="$TEST_TMP/copy-artifact-off.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|${copy_artifact_deploy_path}|16|${copy_artifact_old_sha}" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --no-verify-copy-artifact \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_off_output" 2>&1; then
+  cat "$copy_artifact_off_output" >&2
+  fail "--no-verify-copy-artifact returned a non-zero status"
+fi
+assert_not_contains "$copy_artifact_off_output" "コピーしたファイル (--copy-file) の取り込み検証"
+
+# (8) コンテナにシェルが無い場合は、探索できないことを明示する。
+copy_artifact_noshell_output="$TEST_TMP/copy-artifact-noshell.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE_NOSHELL=true \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_noshell_output" 2>&1; then
+  cat "$copy_artifact_noshell_output" >&2
+  fail "a container without a shell must not fail the run by itself"
+fi
+assert_contains "$copy_artifact_noshell_output" \
+  "--copy-artifact-path でコンテナ内のパスを明示指定すると、docker cp で取り出して照合します。"
+assert_contains "$copy_artifact_noshell_output" "探索不可のコンテナ 1 件"
+
+# (8-2) シェルが無くても、--copy-artifact-path を指定すれば docker cp で照合できる。
+copy_artifact_cp_output="$TEST_TMP/copy-artifact-cp.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE_NOSHELL=true \
+  FAKE_CONTAINER_ARTIFACT_FILE="$copy_artifact_src" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-artifact-path "$copy_artifact_deploy_path" \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_cp_output" 2>&1; then
+  cat "$copy_artifact_cp_output" >&2
+  fail "--copy-artifact-path did not fall back to docker cp on a shell-less container"
+fi
+assert_contains "$copy_artifact_cp_output" "コンテナ内にシェルが無いため、--copy-artifact-path のパスを docker cp で照合します"
+assert_contains "$copy_artifact_cp_output" "[一致] app (test-app-1): ${copy_artifact_deploy_path}"
+
+# (8-3) シェルが無く、docker cp でも取り出せない場合は「判定不可」として残す
+#       (中身を見ていない以上、不一致とは断定しない)。
+copy_artifact_unknown_output="$TEST_TMP/copy-artifact-unknown.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE_NOSHELL=true \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --copy-artifact-path "$copy_artifact_deploy_path" \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_unknown_output" 2>&1; then
+  cat "$copy_artifact_unknown_output" >&2
+  fail "an unreadable artifact must not be reported as a mismatch"
+fi
+assert_contains "$copy_artifact_unknown_output" "[判定不可] app (test-app-1): ${copy_artifact_deploy_path} (SHA-256 を算出できませんでした)"
+assert_contains "$copy_artifact_unknown_output" "判定不可 1 件"
+assert_not_contains "$copy_artifact_unknown_output" "[不一致] app (test-app-1)"
+
+# (9) 指定の取り違えはその場で止める。
+copy_artifact_conflict_output="$TEST_TMP/copy-artifact-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-verify-copy-artifact --copy-artifact-required
+) >"$copy_artifact_conflict_output" 2>&1; then
+  fail "--no-verify-copy-artifact with --copy-artifact-required was accepted"
+fi
+assert_contains "$copy_artifact_conflict_output" \
+  "--no-verify-copy-artifact と --copy-artifact-path / --copy-artifact-search-dir / --copy-artifact-required は同時に指定できません。"
+
+copy_artifact_relpath_output="$TEST_TMP/copy-artifact-relpath.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --copy-artifact-path deployments/frontend.war
+) >"$copy_artifact_relpath_output" 2>&1; then
+  fail "--copy-artifact-path accepted a relative path"
+fi
+assert_contains "$copy_artifact_relpath_output" \
+  "--copy-artifact-path にはコンテナ内の絶対パスを指定してください: deployments/frontend.war"
+
+copy_artifact_reldir_output="$TEST_TMP/copy-artifact-reldir.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --copy-artifact-search-dir opt/eap
+) >"$copy_artifact_reldir_output" 2>&1; then
+  fail "--copy-artifact-search-dir accepted a relative path"
+fi
+assert_contains "$copy_artifact_reldir_output" \
+  "--copy-artifact-search-dir にはコンテナ内の絶対パスを指定してください: opt/eap"
+
+# ---- 後始末でのボリューム削除 ------------------------------------------------
+# デプロイ先やログ出力先を覆っているボリュームが残っていると、イメージを作り直しても
+# 古い中身が使われ続ける。対話操作を最後まで終えた実行では、既定で down -v する。
+volume_interaction_output="$TEST_TMP/volume-interaction.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+if ! printf '0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$volume_interaction_output" 2>&1; then
+  cat "$volume_interaction_output" >&2
+  fail "interaction cleanup with volume removal returned a non-zero status"
+fi
+assert_contains "$volume_interaction_output" \
+  "Compose プロジェクトのボリュームも削除します (残す場合: --keep-volumes)。"
+assert_contains "$volume_interaction_output" \
+  "コンテナを停止・削除します (compose down -t 30 --volumes) ..."
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30 --volumes"
+
+# --keep-volumes を付けると、対話操作の終了後もボリュームは残す (従来の動作)。
+volume_keep_output="$TEST_TMP/volume-keep.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+if ! printf '0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --keep-volumes \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$volume_keep_output" 2>&1; then
+  cat "$volume_keep_output" >&2
+  fail "--keep-volumes returned a non-zero status"
+fi
+assert_not_contains "$volume_keep_output" "compose down -t 30 --volumes"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30 --volumes"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30"
+
+# --remove-volumes は、対話操作を伴わない通常の実行でもボリュームまで削除する。
+volume_always_output="$TEST_TMP/volume-always.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --remove-volumes \
+    --suppress-startup-logs
+) >"$volume_always_output" 2>&1; then
+  cat "$volume_always_output" >&2
+  fail "--remove-volumes returned a non-zero status"
+fi
+assert_contains "$volume_always_output" \
+  "この Compose プロジェクトの名前付きボリュームも削除します (残す場合: --keep-volumes)。"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down -t 30 --volumes"
+
+volume_conflict_output="$TEST_TMP/volume-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --remove-volumes --keep-volumes
+) >"$volume_conflict_output" 2>&1; then
+  fail "--remove-volumes with --keep-volumes was accepted"
+fi
+assert_contains "$volume_conflict_output" \
+  "--remove-volumes と --keep-volumes は同時に指定できません。"
+
 # ---- --cacert-dir の証明書アーカイブ (BuildKit シークレット) -----------------
 # 提供元ごとのディレクトリを繰り返し指定すると、各ディレクトリ直下の証明書が
 # <ディレクトリ名>/<ファイル名> の構成で 1 つの tar にまとまり、compose のビルド

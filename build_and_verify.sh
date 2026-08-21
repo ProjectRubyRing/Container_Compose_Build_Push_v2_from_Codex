@@ -312,6 +312,26 @@ COPY_BACKUP_DIR=""                # 上書き前ファイルの退避先 (初回
 # 退避したことを示す dry-run 用のマーカー (dry-run では実ファイルを退避しないため)
 COPY_BACKUP_DRY_RUN_MARK="(dry-run)"
 
+# ---- コピーしたファイル (WAR など) の取り込み検証 ---------------------------
+# --copy-file で差し替えたファイルが、ビルドしたイメージと起動したコンテナの
+# 双方で「今回コピーした中身」になっているかを SHA-256 で突き合わせる。
+# デプロイ先が名前付きボリューム / バインドマウントで覆われていると、イメージを
+# 何度作り直しても古い中身が使われ続けるが、ビルドも起動も成功して見えるため、
+# 照合しない限り「古い成果物で動作確認をしていた」ことに気付けない。
+#   auto (既定): --copy-file を指定した実行でのみ照合する
+#   true  (--verify-copy-artifact)   : 常に照合する
+#   false (--no-verify-copy-artifact): 照合しない
+COPY_ARTIFACT_VERIFY="auto"
+COPY_ARTIFACT_PATHS=()            # 照合するコンテナ内の絶対パス (--copy-artifact-path)
+COPY_ARTIFACT_SEARCH_DIRS=()      # 探索の起点 (--copy-artifact-search-dir、既定は /)
+COPY_ARTIFACT_REQUIRED="false"    # true: コンテナ内に見つからない場合もエラーとする
+# 照合対象 ("コピー元<US>コピー先<US>SHA-256<US>バイト数")。コピー実行時に記録する。
+COPY_ARTIFACT_ENTRIES=()
+COPY_ARTIFACT_SUMMARY=""          # 全量レポート用の 1 行要約
+COPY_ARTIFACT_REPORT_LINES=()     # 全量レポート用の明細
+COPY_ARTIFACT_MISMATCH="false"    # 1 件でも「今回の中身ではない」を検出したか
+COPY_ARTIFACT_STALE_VOLUME="false"  # 古い成果物を抱えたボリュームを検出したか
+
 # ---- 起動確認 (jbosseap) 関連 ----------------------------------------------
 VERIFY_STARTUP="false"            # true: ビルド後にコンテナを起動し起動完了を確認
 STARTUP_SERVICES=()               # 起動完了チェックの対象サービス (複数指定可)。
@@ -431,6 +451,20 @@ USAGE_CHECK_SCRIPT=""             # docker-usage-check.sh のパス (未指定�
 DISK_FREE_PATHS=()                # 空き容量一覧へ追加するディレクトリ (--disk-free-path)
 DISK_FREE_TARGETS=()              # 一覧表示の対象 ("用途|ディレクトリ")
 POST_INTERACTION_CLEANUP_RAN="false"  # 完全クリアを試行したか (空き容量一覧の実行条件)
+# ---- 後始末でのボリューム削除 -----------------------------------------------
+# compose down は既定でボリュームを削除しない。デプロイ先やログ出力先が名前付き
+# ボリュームで覆われている構成では、Docker が「イメージ側の内容をボリュームへ
+# 複製する」のはボリュームを新規作成した (中身が空の) 1 回目だけのため、2 回目
+# 以降はイメージを作り直しても古い中身が残り続ける。--no-cache を付けても症状が
+# 変わらないのはこのためで、ボリュームを消すまで直らない。
+# そこで対話操作を終えた後の後始末では、既定でボリュームまで削除する。
+#   interaction (既定)        : 対話操作を終えた後の後始末でのみ down -v する
+#   always (--remove-volumes) : この実行が行うすべての compose down で -v を付ける
+#   never  (--keep-volumes)   : 従来どおりボリュームを残す
+VOLUME_CLEANUP="interaction"
+VOLUME_CLEANUP_ALWAYS_SET="false" # --remove-volumes を明示したか (排他判定用)
+VOLUME_CLEANUP_NEVER_SET="false"  # --keep-volumes を明示したか (排他判定用)
+DOWN_REMOVE_VOLUMES="false"       # 実際に down -v するか (後始末の直前に決める)
 SUPPRESS_REMOVED_LOGS="false"     # true: compose down の Removed ログ等を抑制する
 SUPPRESS_STARTUP_LOGS="false"     # true: 起動確認対象と同時起動サービスのログ表示を抑制する
 STARTUP_LOG_LINES="50"            # all: 全行表示 / 数値: 末尾からの最大表示行数
@@ -1139,6 +1173,32 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            上書きせず処理を中止する (exit 1)。
                            既存ファイルへ一切触れたくない場合に指定する。
 
+  (既定で有効) コピーしたファイルの取り込み検証
+                           --copy-file でコピーしたファイル (WAR など) の SHA-256 を
+                           控えておき、コンテナ起動後にコンテナ内を探索して、
+                           同じ中身のファイルが実在するかを突き合わせる。
+                           一致するものが 1 つも無く、同名で中身の違うファイルが
+                           見つかった場合は「古い成果物のまま動いている」と判断し、
+                           原因 (マウントによる隠蔽 / ビルド未取り込み / コンテナが
+                           作り直されていない) を切り分けたうえでエラー終了する。
+                           イメージ側の同じパスは docker create + docker cp で
+                           取り出して照合するため、イメージを起動せずに
+                           「ビルドは正しいがコンテナへ届いていない」を判定できる。
+  --verify-copy-artifact   --copy-file を指定していない実行でも取り込み検証を行う
+  --no-verify-copy-artifact
+                           取り込み検証を行わない
+  --copy-artifact-path PATH
+                           照合するコンテナ内の絶対パスを明示指定する (繰り返し可)。
+                           コンテナにシェルが無く探索できない場合でも、このパスを
+                           docker cp で取り出して照合する
+  --copy-artifact-search-dir DIR
+                           コンテナ内の探索起点を絞る (繰り返し可、既定: /)。
+                           ファイル数の多いイメージで探索時間を短縮したいときに使う
+  --copy-artifact-required コピーしたファイルがコンテナ内に見つからない場合も
+                           エラーとする。既定では警告に留める
+                           (ビルド時にだけ必要なファイルは、イメージへ残らないのが
+                            正しいため)
+
 JBoss マスターパスワード (BuildKit シークレット):
   --jboss-password-param NAME
                            JBoss のマスターパスワードを AWS パラメータストア
@@ -1375,6 +1435,12 @@ JBoss マスターパスワードの伝搬検証:
                            上記の自動クリーンアップを行わず、従来どおり対話操作の
                            終了後もコンテナを残す。--keep-container を明示指定した
                            場合も同じ扱いとなる。
+  --remove-volumes         この実行が行うすべての compose down に --volumes を付け、
+                           Compose プロジェクトの名前付きボリュームも毎回削除する。
+                           デプロイ先やログ出力先をボリュームで持つ構成で、常に
+                           イメージの内容から作り直したい場合に指定する
+  --keep-volumes           対話操作の終了後の後始末でもボリュームを削除しない
+                           (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する
   --usage-check-script PATH
                            完全クリアに使う docker-usage-check.sh のパス。
                            未指定時は次の順で探す:
@@ -1779,6 +1845,11 @@ while [ $# -gt 0 ]; do
     --cleanup-all-docker-data) CLEANUP_ALL_DOCKER_DATA="true"; shift ;;
     --copy-file)           need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
     --copy-file-no-overwrite) COPY_OVERWRITE="false"; shift ;;
+    --verify-copy-artifact)    COPY_ARTIFACT_VERIFY="true"; shift ;;
+    --no-verify-copy-artifact) COPY_ARTIFACT_VERIFY="false"; shift ;;
+    --copy-artifact-path)      need_value "$1" $#; COPY_ARTIFACT_PATHS+=("$2"); shift 2 ;;
+    --copy-artifact-search-dir) need_value "$1" $#; COPY_ARTIFACT_SEARCH_DIRS+=("$2"); shift 2 ;;
+    --copy-artifact-required)  COPY_ARTIFACT_REQUIRED="true"; shift ;;
     --region)              need_value "$1" $#; REGION="$2"; shift 2 ;;
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
@@ -1818,6 +1889,8 @@ while [ $# -gt 0 ]; do
     --keep-container)      KEEP_CONTAINER="true"; KEEP_CONTAINER_EXPLICIT="true"; shift ;;
     --keep-container-mode) need_value "$1" $#; KEEP_CONTAINER_MODE="$2"; shift 2 ;;
     --keep-container-after-interaction) CLEANUP_AFTER_INTERACTION="false"; shift ;;
+    --remove-volumes)      VOLUME_CLEANUP="always"; VOLUME_CLEANUP_ALWAYS_SET="true"; shift ;;
+    --keep-volumes)        VOLUME_CLEANUP="never";  VOLUME_CLEANUP_NEVER_SET="true";  shift ;;
     --usage-check-script)  need_value "$1" $#; USAGE_CHECK_SCRIPT="$2"; shift 2 ;;
     --disk-free-path)      need_value "$1" $#; DISK_FREE_PATHS+=("$2"); shift 2 ;;
     --exit-on-deploy-error) KEEP_CONTAINER_ON_DEPLOY_ERROR="false"; shift ;;
@@ -1935,6 +2008,39 @@ for _deployment_env in "${DEPLOYMENT_DIR_ENVS[@]}"; do
     exit 2
   fi
 done
+# ボリュームを「毎回消す」と「絶対に残す」は両立しない。取り違えたまま実行すると
+# 消えては困るデータを消すため、その場で止める。
+if [ "$VOLUME_CLEANUP_ALWAYS_SET" = "true" ] && [ "$VOLUME_CLEANUP_NEVER_SET" = "true" ]; then
+  err "--remove-volumes と --keep-volumes は同時に指定できません。"
+  exit 2
+fi
+# 取り込み検証を無効にしたうえで、その付随指定を渡すのは指定の取り違えである
+# 可能性が高い (検証しないので、いずれの指定も効かない)。
+if [ "$COPY_ARTIFACT_VERIFY" = "false" ] \
+    && { [ ${#COPY_ARTIFACT_PATHS[@]} -gt 0 ] || [ ${#COPY_ARTIFACT_SEARCH_DIRS[@]} -gt 0 ] \
+      || [ "$COPY_ARTIFACT_REQUIRED" = "true" ]; }; then
+  err "--no-verify-copy-artifact と --copy-artifact-path / --copy-artifact-search-dir / --copy-artifact-required は同時に指定できません。"
+  exit 2
+fi
+for _copy_artifact_path in ${COPY_ARTIFACT_PATHS[@]+"${COPY_ARTIFACT_PATHS[@]}"}; do
+  case "$_copy_artifact_path" in
+    /*) ;;
+    *)
+      err "--copy-artifact-path にはコンテナ内の絶対パスを指定してください: $_copy_artifact_path"
+      exit 2
+      ;;
+  esac
+done
+for _copy_artifact_dir in ${COPY_ARTIFACT_SEARCH_DIRS[@]+"${COPY_ARTIFACT_SEARCH_DIRS[@]}"}; do
+  case "$_copy_artifact_dir" in
+    /*) ;;
+    *)
+      err "--copy-artifact-search-dir にはコンテナ内の絶対パスを指定してください: $_copy_artifact_dir"
+      exit 2
+      ;;
+  esac
+done
+
 # 深さ・ファイル表示・環境変数の指定は「ツリーを見たい」という意思表示のため、
 # --directory-tree が無くても画面表示を有効にする。--no-directory-tree を
 # 明示した場合はそちらを優先し、自動有効化は行わない。
@@ -3793,6 +3899,9 @@ prepare_copy_files() {
         exit 1
       fi
       log "コピーしました: $src -> $dest"
+      # 取り込み検証の基準となる「コピーした中身」を、この時点で控えておく。
+      # 処理終了時の復元でコピー先が元へ戻っても、照合対象は変わらない。
+      record_copy_artifact "$src" "$dest"
     fi
     # dry-run でも記録し、削除プレビューを表示できるようにする
     COPIED_FILES+=("$dest")
@@ -3840,6 +3949,624 @@ cleanup_copied_files() {
       warn "退避したファイルが残っています: $COPY_BACKUP_DIR (内容を確認し、手動で復元・削除してください)"
     fi
   fi
+}
+
+
+# =============================================================================
+# コピーしたファイル (WAR など) の取り込み検証
+# -----------------------------------------------------------------------------
+# --copy-file でビルドコンテキストへ差し替えたファイルが、
+#   (1) ビルドしたイメージへ取り込まれているか
+#   (2) 起動したコンテナから、その中身のまま見えているか
+# を SHA-256 で突き合わせる。
+#
+# ここを確認しないと、次の壊れ方にまったく気付けない。イメージは指示どおり
+# 作り直されているため、ビルドログも起動ログもデプロイ結果もすべて成功に見え、
+# 「差し替えたはずのファイルではない状態」で動作確認だけが通ってしまう。
+#
+#   (A) 名前付きボリュームがデプロイ先を覆っている  ← 最も多い
+#       Docker が「イメージ側の内容をボリュームへ複製する」のは、そのボリュームを
+#       新規作成した (= 中身が空の) 1 回目だけ。2 回目以降の実行では既存の中身が
+#       優先され、イメージへ焼いた新しい WAR はコンテナから一切見えない。
+#       compose down は既定でボリュームを削除しないため、一度作られたボリュームは
+#       消すまで残り、何度ビルドし直しても同じ古い WAR が動き続ける。
+#       --no-cache はイメージ側にしか効かないため、付けても症状は変わらない。
+#   (B) バインドマウントがデプロイ先を覆っている
+#       ホスト側ディレクトリの中身がそのまま見えるため、(A) と同じく届かない。
+#   (C) コンテナが作り直されていない
+#       --no-recreate-containers 指定時などに、前回のイメージのままのコンテナが残る。
+#   (D) ビルドがコピーしたファイルを取り込んでいない
+#       .dockerignore による除外、COPY 元パスの取り違え、コピー先がビルド
+#       コンテキストの外、など。
+#
+# 判定は「今回コピーした中身と一致するファイルがコンテナ内に 1 つでもあるか」で
+# 行う。同名のファイルが複数あっても 1 つ一致していれば取り込みは成功とみなす
+# (ビルド時にだけ使うファイルが、別の場所にも同名で置かれている構成があるため)。
+# =============================================================================
+
+# COPY_ARTIFACT_ENTRIES の 1 要素を組み立てる区切り文字 (パスに現れない制御文字)。
+COPY_ARTIFACT_FIELD_SEP=$'\x1f'
+
+# ホスト側ファイルの SHA-256 を返す。算出手段が無ければ 1 を返す。
+host_file_sha256() {
+  local path="$1" out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out="$(sha256sum -- "$path" 2>/dev/null)" || return 1
+    printf '%s\n' "${out%% *}"
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 -- "$path" 2>/dev/null)" || return 1
+    printf '%s\n' "${out%% *}"
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    # "SHA2-256(path)= <hash>" 形式のため、最後の '=' 以降を取り出す。
+    out="$(openssl dgst -sha256 "$path" 2>/dev/null)" || return 1
+    out="${out##*=}"
+    out="${out## }"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+  return 1
+}
+
+host_file_size() {
+  local path="$1" size
+  size="$(wc -c < "$path" 2>/dev/null)" || return 1
+  size="${size//[[:space:]]/}"
+  [ -n "$size" ] || return 1
+  printf '%s\n' "$size"
+}
+
+# コピー元ファイルの中身 (SHA-256 とサイズ) を検証対象として控える。
+# 控えるのは「コピーした時点のコピー元」であり、処理終了時の復元やコピー先の
+# 書き換えには影響されない。
+record_copy_artifact() {
+  local src="$1" dest="$2" sha size
+  if ! sha="$(host_file_sha256 "$src")"; then
+    warn "コピー元ファイルの SHA-256 を算出できませんでした: ${src}"
+    warn "  取り込み検証はこのファイルについて行いません (sha256sum / shasum / openssl のいずれかが必要です)。"
+    return 0
+  fi
+  size="$(host_file_size "$src" 2>/dev/null || printf '不明')"
+  COPY_ARTIFACT_ENTRIES+=("${src}${COPY_ARTIFACT_FIELD_SEP}${dest}${COPY_ARTIFACT_FIELD_SEP}${sha}${COPY_ARTIFACT_FIELD_SEP}${size}")
+}
+
+copy_artifact_verify_enabled() {
+  case "$COPY_ARTIFACT_VERIFY" in
+    false) return 1 ;;
+    true)  return 0 ;;
+    *)     [ ${#COPY_SPECS[@]} -gt 0 ] || return 1 ;;
+  esac
+  return 0
+}
+
+# 画面へ出しつつ、全量レポートへ載せる明細としても控える。
+copy_artifact_out() {
+  diag "$*"
+  COPY_ARTIFACT_REPORT_LINES+=("$*")
+}
+
+# コンテナ内で対象ファイルを探し、"種別|パス|バイト数|SHA-256" を 1 行ずつ返す。
+# 引数は改行区切りの文字列で受け取る ($1: 探索の起点, $2: ファイル名, $3: 明示パス)。
+# コンテナ内に SHA-256 の算出手段が無い場合はハッシュを空で返し、呼び出し側が
+# docker cp でホストへ取り出して算出する。
+COPY_ARTIFACT_PROBE_SCRIPT='
+# copy-artifact-probe
+roots=$1
+names=$2
+explicit=$3
+old_ifs=$IFS
+IFS="
+"
+candidates=""
+for target in $explicit; do
+  [ -n "$target" ] || continue
+  candidates="${candidates}${target}
+"
+done
+for name in $names; do
+  [ -n "$name" ] || continue
+  for root in $roots; do
+    [ -n "$root" ] || continue
+    hits=$(find "$root" \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o -name "$name" -print 2>/dev/null)
+    candidates="${candidates}${hits}
+"
+  done
+done
+seen=""
+for target in $candidates; do
+  [ -n "$target" ] || continue
+  case "$seen" in
+    *"[${target}]"*) continue ;;
+  esac
+  seen="${seen}[${target}]"
+  if [ -d "$target" ]; then
+    printf "DIR|%s|-|-\n" "$target"
+    continue
+  fi
+  [ -f "$target" ] || continue
+  size=$(wc -c < "$target" 2>/dev/null | tr -d " ")
+  hash=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(sha256sum "$target" 2>/dev/null | cut -d" " -f1)
+  elif command -v openssl >/dev/null 2>&1; then
+    hash=$(openssl dgst -sha256 "$target" 2>/dev/null | sed "s/^.*= *//")
+  fi
+  printf "FILE|%s|%s|%s\n" "$target" "$size" "$hash"
+done
+IFS=$old_ifs
+'
+
+probe_container_copy_artifacts() {
+  local cid="$1" roots="$2" names="$3" explicit="$4" shell_path
+  if ! shell_path="$(detect_container_shell "$cid")"; then
+    return 2
+  fi
+  docker exec "$cid" "$shell_path" -c "$COPY_ARTIFACT_PROBE_SCRIPT" \
+      copy-artifact-probe "$roots" "$names" "$explicit" 2>/dev/null
+}
+
+# コンテナ / イメージから 1 ファイルを取り出して SHA-256 を算出する。
+# docker cp は起動していないコンテナ (docker create しただけのもの) でも使えるため、
+# イメージ側の中身を、イメージを起動せずに確認できる。
+#   0: 取得できた   1: 取り出せなかった   2: 通常ファイルではなかった
+container_path_sha256_via_cp() {
+  local ref="$1" path="$2" tmp_dir out
+  if ! tmp_dir="$(mktemp -d 2>/dev/null)"; then
+    return 1
+  fi
+  if ! docker cp "${ref}:${path}" "${tmp_dir}/artifact" >/dev/null 2>&1; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  if [ ! -f "${tmp_dir}/artifact" ]; then
+    rm -rf -- "$tmp_dir"
+    return 2
+  fi
+  if ! out="$(host_file_sha256 "${tmp_dir}/artifact")"; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  rm -rf -- "$tmp_dir"
+  printf '%s\n' "$out"
+  return 0
+}
+
+# イメージ側 (マウントに覆われる前) の同じパスの SHA-256 を返す。
+image_path_sha256() {
+  local image="$1" path="$2" tmp_cid out status=0
+  # 起動はしないため、CMD を持たないイメージでも作れるようダミーのコマンドを付ける。
+  if ! tmp_cid="$(docker create "$image" copy-artifact-inspect 2>/dev/null)"; then
+    tmp_cid="$(docker create "$image" 2>/dev/null)" || return 1
+  fi
+  [ -n "$tmp_cid" ] || return 1
+  out="$(container_path_sha256_via_cp "$tmp_cid" "$path")" || status=$?
+  docker rm -f "$tmp_cid" >/dev/null 2>&1 || true
+  [ "$status" -eq 0 ] || return "$status"
+  printf '%s\n' "$out"
+  return 0
+}
+
+# コンテナで実際に効いているマウント ("種別|ソース|マウント先|RW" の行)。
+container_mount_rows() {
+  docker inspect \
+      -f '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' \
+      "$1" 2>/dev/null
+}
+
+# 名前付きボリュームのソースパス (/var/lib/docker/volumes/<名前>/_data) から名前を取り出す。
+volume_name_from_mount_source() {
+  local source="$1" name
+  case "$source" in
+    */volumes/*/_data)
+      name="${source%/_data}"
+      name="${name##*/}"
+      [ -n "$name" ] || return 1
+      printf '%s\n' "$name"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# 指定したコンテナ内パスを覆っているマウントを "種別|ソース|マウント先" で返す。
+# 入れ子になっている場合は、実際に効いている最も深いマウントを返す。
+find_covering_mount() {
+  local cid="$1" path="$2"
+  local mount_type mount_source mount_dest mount_rw
+  local best="" best_len=-1 dest_len
+  while IFS='|' read -r mount_type mount_source mount_dest mount_rw; do
+    [ -n "$mount_dest" ] || continue
+    case "$mount_dest" in
+      /) ;;
+      *)
+        case "$path" in
+          "$mount_dest"|"$mount_dest"/*) ;;
+          *) continue ;;
+        esac
+        ;;
+    esac
+    dest_len=${#mount_dest}
+    if [ "$dest_len" -gt "$best_len" ]; then
+      best_len="$dest_len"
+      best="${mount_type}|${mount_source}|${mount_dest}"
+    fi
+  done < <(container_mount_rows "$cid")
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
+}
+
+# マウント 1 件を、種別に応じた分かりやすい表記にする。
+describe_mount() {
+  local mount_type="$1" mount_source="$2" mount_dest="$3" volume_name
+  case "$mount_type" in
+    volume)
+      if volume_name="$(volume_name_from_mount_source "$mount_source")"; then
+        printf '名前付きボリューム %s -> %s' "$volume_name" "$mount_dest"
+      else
+        printf 'ボリューム %s -> %s' "${mount_source:-(不明)}" "$mount_dest"
+      fi
+      ;;
+    bind)  printf 'バインドマウント %s -> %s' "${mount_source:-(不明)}" "$mount_dest" ;;
+    tmpfs) printf 'tmpfs -> %s' "$mount_dest" ;;
+    *)     printf '%s %s -> %s' "${mount_type:-マウント}" "${mount_source:-(不明)}" "$mount_dest" ;;
+  esac
+}
+
+# 一致しなかった 1 パスについて、原因 (マウントか、ビルドか) を切り分けて表示する。
+# 名前付きボリュームがイメージの内容を隠している場合は、後始末で down -v するよう
+# COPY_ARTIFACT_STALE_VOLUME を立てる (残したままだと次回以降も同じ結果になる)。
+diagnose_copy_artifact_mismatch() {
+  local cid="$1" svc="$2" cname="$3" path="$4" found_hash="$5" found_size="$6" expect_hash="$7"
+  local mount_row mount_type="" mount_source="" mount_dest=""
+  local image_ref image_hash="" image_status=0
+
+  copy_artifact_out "    [不一致] ${svc} (${cname}): ${path}"
+  copy_artifact_out "        コンテナ内の SHA-256: ${found_hash:-(算出できませんでした)}  サイズ: ${found_size} bytes"
+
+  mount_row="$(find_covering_mount "$cid" "$path" || printf '')"
+  if [ -n "$mount_row" ]; then
+    IFS='|' read -r mount_type mount_source mount_dest <<< "$mount_row"
+    copy_artifact_out "        このパスは次のマウントに覆われています: $(describe_mount "$mount_type" "$mount_source" "$mount_dest")"
+  else
+    copy_artifact_out "        このパスを覆っているマウントはありません (イメージの内容がそのまま見えています)。"
+  fi
+
+  image_ref="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
+  if [ -z "$image_ref" ]; then
+    copy_artifact_out "        イメージ ID を取得できなかったため、イメージ側との突き合わせは行えませんでした。"
+    return 0
+  fi
+  image_hash="$(image_path_sha256 "$image_ref" "$path")" || image_status=$?
+  if [ "$image_status" -eq 0 ] && [ "$image_hash" = "$expect_hash" ]; then
+    copy_artifact_out "        イメージ側の同じパスはコピー元と一致しています (ビルドは成功しています)。"
+    if [ -n "$mount_row" ]; then
+      copy_artifact_out "        => マウントがイメージの内容を隠しているため、今回ビルドした成果物が使われていません。"
+      [ "$mount_type" = "volume" ] && COPY_ARTIFACT_STALE_VOLUME="true"
+    else
+      copy_artifact_out "        => コンテナが今回のイメージから作り直されていない可能性があります (--recreate-containers を試してください)。"
+    fi
+    return 0
+  fi
+  if [ "$image_status" -eq 0 ]; then
+    copy_artifact_out "        イメージ側の同じパスもコピー元と一致しません (SHA-256: ${image_hash})。"
+    copy_artifact_out "        => ビルドがコピーしたファイルを取り込めていません (.dockerignore の除外、Dockerfile の COPY 元、コピー先がビルドコンテキスト外、などを確認してください)。"
+    return 0
+  fi
+  copy_artifact_out "        イメージ側の同じパスは取得できませんでした (イメージには存在しない可能性があります)。"
+  if [ -n "$mount_row" ]; then
+    copy_artifact_out "        => このファイルはイメージではなくマウントの側から来ています。"
+    [ "$mount_type" = "volume" ] && COPY_ARTIFACT_STALE_VOLUME="true"
+  fi
+  return 0
+}
+
+# デプロイ先がマウントで覆われていないかを、コピー検証とは独立に点検する。
+# 覆われている場合、イメージへ焼いた WAR は「ボリュームを新規作成した 1 回目」しか
+# 反映されないため、--copy-file を使っていない構成でも同じ壊れ方をする。
+warn_shadowed_deployment_mounts() {
+  local cid="$1" svc="$2" cname="$3"
+  local mount_type mount_source mount_dest mount_rw
+  while IFS='|' read -r mount_type mount_source mount_dest mount_rw; do
+    [ -n "$mount_dest" ] || continue
+    case "$mount_dest" in
+      */standalone/deployments|*/standalone/deployments/) ;;
+      *) continue ;;
+    esac
+    case "$mount_type" in
+      volume|bind) ;;
+      *) continue ;;
+    esac
+    warn "デプロイ先がマウントに覆われています: ${svc} (${cname}) $(describe_mount "$mount_type" "$mount_source" "$mount_dest")"
+    warn "  イメージへ取り込んだ成果物は、このマウントの中身が優先されるためコンテナから見えません。"
+    warn "  名前付きボリュームの場合、イメージの内容が複製されるのは新規作成時 (中身が空のとき) の 1 回だけです。"
+  done < <(container_mount_rows "$cid")
+}
+
+# 起動対象のコンテナすべてについて、デプロイ先が覆われていないかを点検する。
+# --copy-file を使っていない構成でも同じ壊れ方をするため、取り込み検証の対象が
+# 無い実行でも行う (--no-verify-copy-artifact のときだけ行わない)。
+warn_shadowed_deploy_mounts_for_targets() {
+  [ "$COPY_ARTIFACT_VERIFY" = "false" ] && return 0
+  [ "$DRY_RUN" = "true" ] && return 0
+  local -a cids=()
+  mapfile -t cids < <(verification_target_container_ids)
+  [ ${#cids[@]} -gt 0 ] || return 0
+  local cid service_name container_name
+  for cid in "${cids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    case "$service_name" in
+      ""|"<no value>") service_name="(unknown)" ;;
+    esac
+    container_name="$(normalize_container_name \
+        "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    warn_shadowed_deployment_mounts "$cid" "$service_name" "$container_name"
+  done
+  return 0
+}
+
+# 起動したコンテナが「今回コピーしたファイル」で動いているかを確認する。
+# 一致するものが 1 つも無く、同名で中身の違うファイルがある場合はエラーとする。
+verify_copied_artifacts() {
+  COPY_ARTIFACT_REPORT_LINES=()
+  COPY_ARTIFACT_MISMATCH="false"
+  COPY_ARTIFACT_STALE_VOLUME="false"
+
+  # 照合できるコピー元が無くても、デプロイ先がマウントで覆われていること自体は
+  # 「イメージへ焼いた成果物が反映されない」ため、先に点検して知らせる。
+  warn_shadowed_deploy_mounts_for_targets
+
+  if ! copy_artifact_verify_enabled; then
+    COPY_ARTIFACT_SUMMARY="未実施 (--no-verify-copy-artifact)"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    COPY_ARTIFACT_SUMMARY="DRY-RUN (未実施)"
+    log "[DRY-RUN] コピーしたファイルがイメージ・コンテナへ取り込まれたかを SHA-256 で照合します。"
+    return 0
+  fi
+  if [ ${#COPY_ARTIFACT_ENTRIES[@]} -eq 0 ]; then
+    COPY_ARTIFACT_SUMMARY="未実施 (照合できるコピー元がありません)"
+    return 0
+  fi
+
+  local -a cids=()
+  mapfile -t cids < <(verification_target_container_ids)
+  if [ ${#cids[@]} -eq 0 ]; then
+    COPY_ARTIFACT_SUMMARY="未実施 (対象コンテナが起動していません)"
+    warn "コピーしたファイルの取り込み検証: 対象コンテナが起動していないため確認できませんでした。"
+    return 0
+  fi
+
+  local -a roots=()
+  if [ ${#COPY_ARTIFACT_SEARCH_DIRS[@]} -gt 0 ]; then
+    roots=("${COPY_ARTIFACT_SEARCH_DIRS[@]}")
+  else
+    roots=("/")
+  fi
+
+  local entry src dest sha size name root path
+  local roots_arg="" names_arg="" explicit_arg=""
+  local -A name_seen=() explicit_seen=()
+  for entry in "${COPY_ARTIFACT_ENTRIES[@]}"; do
+    IFS="$COPY_ARTIFACT_FIELD_SEP" read -r src dest sha size <<< "$entry"
+    name="$(basename -- "$dest")"
+    [ -n "$name" ] || continue
+    [ -n "${name_seen[$name]+_}" ] && continue
+    name_seen["$name"]=1
+    names_arg="${names_arg}${name}"$'\n'
+  done
+  for root in "${roots[@]}"; do
+    roots_arg="${roots_arg}${root}"$'\n'
+  done
+  for path in ${COPY_ARTIFACT_PATHS[@]+"${COPY_ARTIFACT_PATHS[@]}"}; do
+    explicit_seen["$path"]=1
+    explicit_arg="${explicit_arg}${path}"$'\n'
+  done
+
+  local rows_file probe_file
+  if ! rows_file="$(mktemp 2>/dev/null)"; then
+    COPY_ARTIFACT_SUMMARY="未実施 (一時ファイルを作成できませんでした)"
+    warn "コピーしたファイルの取り込み検証用の一時ファイルを作成できませんでした。"
+    return 0
+  fi
+  if ! probe_file="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$rows_file"
+    COPY_ARTIFACT_SUMMARY="未実施 (一時ファイルを作成できませんでした)"
+    warn "コピーしたファイルの取り込み検証用の一時ファイルを作成できませんでした。"
+    return 0
+  fi
+
+  diag ""
+  diag "==================================================================="
+  diag "コピーしたファイル (--copy-file) の取り込み検証"
+  diag "==================================================================="
+  if [ ${#COPY_ARTIFACT_PATHS[@]} -gt 0 ]; then
+    copy_artifact_out "探索の起点: ${roots[*]} / 明示指定: ${COPY_ARTIFACT_PATHS[*]}"
+  else
+    copy_artifact_out "探索の起点: ${roots[*]}"
+  fi
+
+  local cid service_name container_name probe_status kind r_size r_hash
+  local probe_started probe_elapsed unreadable=0
+  for cid in "${cids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    case "$service_name" in
+      ""|"<no value>") service_name="(unknown)" ;;
+    esac
+    container_name="$(normalize_container_name \
+        "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+
+    probe_started="$(date '+%s' 2>/dev/null || printf '0')"
+    probe_status=0
+    probe_container_copy_artifacts "$cid" "$roots_arg" "$names_arg" "$explicit_arg" \
+        > "$probe_file" || probe_status=$?
+    probe_elapsed=$(( $(date '+%s' 2>/dev/null || printf '0') - probe_started ))
+    if [ "$probe_status" -eq 2 ]; then
+      if [ ${#COPY_ARTIFACT_PATHS[@]} -eq 0 ]; then
+        unreadable=$(( unreadable + 1 ))
+        warn "コンテナ内にシェルが無いため探索できません: ${service_name} (${container_name})"
+        warn "  --copy-artifact-path でコンテナ内のパスを明示指定すると、docker cp で取り出して照合します。"
+        continue
+      fi
+      # シェルが無くても、明示指定されたパスなら docker cp で取り出して照合できる。
+      # ハッシュを空で積んでおき、後段のホスト側フォールバックに算出させる。
+      log "コンテナ内にシェルが無いため、--copy-artifact-path のパスを docker cp で照合します: ${service_name} (${container_name})"
+      : > "$probe_file"
+      for path in "${COPY_ARTIFACT_PATHS[@]}"; do
+        printf 'FILE|%s|-|\n' "$path" >> "$probe_file"
+      done
+      probe_status=0
+    fi
+    if [ "$probe_status" -ne 0 ]; then
+      unreadable=$(( unreadable + 1 ))
+      warn "コンテナ内の探索に失敗しました: ${service_name} (${container_name})"
+      continue
+    fi
+    copy_artifact_out "対象コンテナ: ${service_name} (${container_name}) 探索所要 ${probe_elapsed}s"
+    while IFS='|' read -r kind path r_size r_hash; do
+      [ -n "$path" ] || continue
+      printf '%s|%s|%s|%s|%s|%s|%s\n' \
+          "$cid" "$service_name" "$container_name" "$kind" "$path" "$r_size" "$r_hash" >> "$rows_file"
+    done < "$probe_file"
+  done
+  rm -f -- "$probe_file"
+
+  local r_cid r_svc r_name r_kind r_path
+  local matched mismatched dir_hits unknown_hits
+  local ok_count=0 ng_count=0 missing_count=0 unknown_count=0
+  local mismatch_row m_cid m_svc m_name m_path m_hash m_size
+  local -a mismatch_rows=()
+  for entry in "${COPY_ARTIFACT_ENTRIES[@]}"; do
+    IFS="$COPY_ARTIFACT_FIELD_SEP" read -r src dest sha size <<< "$entry"
+    name="$(basename -- "$dest")"
+    matched=0
+    mismatched=0
+    dir_hits=0
+    unknown_hits=0
+    mismatch_rows=()
+    copy_artifact_out ""
+    copy_artifact_out "  コピー元: ${src}"
+    copy_artifact_out "    SHA-256: ${sha}  サイズ: ${size} bytes"
+    copy_artifact_out "    ビルドコンテキストへのコピー先: ${dest}"
+    while IFS='|' read -r r_cid r_svc r_name r_kind r_path r_size r_hash; do
+      [ -n "$r_path" ] || continue
+      if [ "$(basename -- "$r_path")" != "$name" ] && [ -z "${explicit_seen[$r_path]+_}" ]; then
+        continue
+      fi
+      if [ "$r_kind" = "DIR" ]; then
+        dir_hits=$(( dir_hits + 1 ))
+        copy_artifact_out "    [参考] ${r_svc} (${r_name}): ${r_path} は展開済みディレクトリのため内容照合の対象外"
+        continue
+      fi
+      if [ -z "$r_hash" ] || [ "$r_hash" = "-" ]; then
+        # コンテナ内に算出手段が無い場合はホストへ取り出して算出する。
+        r_hash="$(container_path_sha256_via_cp "$r_cid" "$r_path" 2>/dev/null || printf '')"
+      fi
+      if [ -z "$r_hash" ]; then
+        # 中身を取れていない以上「違う」とは断定できない。取り違えを避けるため、
+        # 一致とも不一致ともせず、判定できなかったことだけを残す。
+        unknown_hits=$(( unknown_hits + 1 ))
+        copy_artifact_out "    [判定不可] ${r_svc} (${r_name}): ${r_path} (SHA-256 を算出できませんでした)"
+        continue
+      fi
+      if [ "$r_hash" = "$sha" ]; then
+        matched=$(( matched + 1 ))
+        copy_artifact_out "    [一致] ${r_svc} (${r_name}): ${r_path}"
+      else
+        mismatched=$(( mismatched + 1 ))
+        mismatch_rows+=("${r_cid}|${r_svc}|${r_name}|${r_path}|${r_hash}|${r_size}")
+      fi
+    done < "$rows_file"
+
+    if [ "$matched" -gt 0 ]; then
+      ok_count=$(( ok_count + 1 ))
+      if [ "$mismatched" -gt 0 ]; then
+        copy_artifact_out "    (同名で中身の違うファイルが ${mismatched} 件ありますが、一致するものがあるため取り込みは成功と判定します)"
+      fi
+      continue
+    fi
+
+    if [ "$mismatched" -gt 0 ]; then
+      ng_count=$(( ng_count + 1 ))
+      COPY_ARTIFACT_MISMATCH="true"
+      copy_artifact_out "    コピー元と一致するファイルがコンテナ内にありません。同名で中身の違うファイルを ${mismatched} 件検出しました:"
+      for mismatch_row in "${mismatch_rows[@]}"; do
+        IFS='|' read -r m_cid m_svc m_name m_path m_hash m_size <<< "$mismatch_row"
+        diagnose_copy_artifact_mismatch "$m_cid" "$m_svc" "$m_name" "$m_path" "$m_hash" "$m_size" "$sha"
+      done
+      continue
+    fi
+
+    if [ "$unknown_hits" -gt 0 ]; then
+      # 同名のファイルはあるが中身を取れなかった。取り込めているとは言えないため
+      # 成功にはせず、判定できなかったことを結果へ残す。
+      unknown_count=$(( unknown_count + 1 ))
+      copy_artifact_out "    同名のファイルは ${unknown_hits} 件見つかりましたが、SHA-256 を算出できず照合できませんでした。"
+      copy_artifact_out "        コンテナに sha256sum / openssl が無く、docker cp でも取り出せない場合に起こります。"
+      if [ "$COPY_ARTIFACT_REQUIRED" = "true" ]; then
+        # 「取り込みを確認できなければエラー」という指定のため、判定不可も通さない。
+        COPY_ARTIFACT_MISMATCH="true"
+        copy_artifact_out "        --copy-artifact-required が指定されているため、確認できなかったことをエラーとします。"
+      fi
+      continue
+    fi
+
+    missing_count=$(( missing_count + 1 ))
+    if [ "$COPY_ARTIFACT_REQUIRED" = "true" ]; then
+      COPY_ARTIFACT_MISMATCH="true"
+      copy_artifact_out "    [未検出] コンテナ内に ${name} が見つかりませんでした (--copy-artifact-required のためエラーとします)。"
+    else
+      copy_artifact_out "    [未検出] コンテナ内に ${name} が見つかりませんでした (ビルド時にだけ使うファイルであれば正常です)。"
+      copy_artifact_out "        イメージへ取り込まれている前提のファイルであれば --copy-artifact-required でエラーにできます。"
+    fi
+  done
+  rm -f -- "$rows_file"
+
+  COPY_ARTIFACT_SUMMARY="対象 ${#COPY_ARTIFACT_ENTRIES[@]} 件 (一致 ${ok_count} / 不一致 ${ng_count} / 未検出 ${missing_count})"
+  if [ "$unknown_count" -gt 0 ]; then
+    COPY_ARTIFACT_SUMMARY="${COPY_ARTIFACT_SUMMARY} / 判定不可 ${unknown_count} 件"
+  fi
+  if [ "$unreadable" -gt 0 ]; then
+    COPY_ARTIFACT_SUMMARY="${COPY_ARTIFACT_SUMMARY} / 探索不可のコンテナ ${unreadable} 件"
+  fi
+
+  if [ "$COPY_ARTIFACT_MISMATCH" != "true" ]; then
+    diag "==================================================================="
+    if [ "$ok_count" -gt 0 ]; then
+      log "コピーしたファイルの取り込みを確認しました (${COPY_ARTIFACT_SUMMARY})。"
+    else
+      # 一致も不一致も無い = コンテナ内に同名のファイルが 1 つも無かった。
+      # 取り込まれていないこと自体は正常な構成もあるため、成功とは言わずに残す。
+      warn "コピーしたファイルの取り込みは確認できませんでした (${COPY_ARTIFACT_SUMMARY})。"
+    fi
+    return 0
+  fi
+
+  copy_artifact_out ""
+  copy_artifact_out "  対処:"
+  copy_artifact_out "   1. デプロイ先を覆っているボリュームを削除して作り直す (中のデータは消えます):"
+  copy_artifact_out "        ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v"
+  copy_artifact_out "      本スクリプトから毎回削除する場合は --remove-volumes を指定します。"
+  copy_artifact_out "   2. 成果物をボリューム / バインドマウントで受け渡している場合は、そのマウントを"
+  copy_artifact_out "      compose.yml から外し、イメージへ取り込む形へ寄せる。"
+  copy_artifact_out "   3. イメージ側でも一致しない場合は、.dockerignore の除外と Dockerfile の COPY 元を確認する。"
+  copy_artifact_out "   ※ --no-cache はイメージのビルドにしか効きません。マウントが原因の場合は変化しません。"
+  diag "==================================================================="
+  err "コピーしたファイルがコンテナへ取り込まれていません (${COPY_ARTIFACT_SUMMARY})。"
+
+  if [ "$COPY_ARTIFACT_STALE_VOLUME" = "true" ] && [ "$VOLUME_CLEANUP" != "never" ]; then
+    DOWN_REMOVE_VOLUMES="true"
+    warn "古い成果物を抱えたボリュームを検出したため、後始末で compose down -v を実行します。"
+    warn "  次回の実行でボリュームが作り直され、イメージの内容が反映されるようになります。"
+    warn "  ボリュームを残したい場合は --keep-volumes を指定してください。"
+  fi
+  return 1
 }
 
 # ---- CA 証明書の tar アーカイブ生成 (BuildKit シークレット) -------------------
@@ -6460,25 +7187,49 @@ start_container() {
 }
 
 # コンテナを停止・削除する (EXIT トラップから呼び出す)。
+# 今回の compose down でボリュームまで削除するかを決める。
+#   --remove-volumes : 常に削除する
+#   --keep-volumes   : 常に残す
+#   既定             : 呼び出し側が DOWN_REMOVE_VOLUMES を立てたときだけ削除する
+#                      (対話操作を最後まで終えた後始末と、古い成果物を抱えた
+#                       ボリュームを検出したとき)
+resolve_down_volume_removal() {
+  case "$VOLUME_CLEANUP" in
+    always) DOWN_REMOVE_VOLUMES="true" ;;
+    never)  DOWN_REMOVE_VOLUMES="false" ;;
+  esac
+}
+
 teardown_container() {
   [ "$STARTED_CONTAINER" = "true" ] || return 0
   if [ "$KEEP_CONTAINER" = "true" ]; then
     log "コンテナを残します (--keep-container)。手動で停止する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+    log "  ボリュームまで消して次回をまっさらな状態から始める場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down -v"
     return 0
   fi
   # 停止猶予を明示する。既定の 10 秒では、DB の初期化中や InnoDB の書き出し中に
   # SIGKILL となり、データ用ボリュームが中途半端な状態で残ることがある。そうなると
   # 次回以降は down -v するまで DB が起動できず、接続側には「ホストが見つからない」
   # (UnknownHostException) だけが出る、という追いにくい壊れ方をする。
-  log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT}) ..."
+  resolve_down_volume_removal
+  local -a down_args=(-f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT")
+  if [ "$DOWN_REMOVE_VOLUMES" = "true" ]; then
+    # ボリュームを残すと、デプロイ先やログ出力先を覆っているボリュームの中身が
+    # 次回もそのまま使われ、イメージを作り直しても反映されない状態が続く。
+    down_args+=(--volumes)
+    log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT} --volumes) ..."
+    log "  この Compose プロジェクトの名前付きボリュームも削除します (残す場合: --keep-volumes)。"
+  else
+    log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT}) ..."
+  fi
   local down_ok=0
   if [ "$SUPPRESS_REMOVED_LOGS" = "true" ] && [ "$DRY_RUN" != "true" ]; then
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT" > /dev/null 2>&1 || down_ok=$?
+    "${COMPOSE_CMD[@]}" "${down_args[@]}" > /dev/null 2>&1 || down_ok=$?
   else
-    run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT" || down_ok=$?
+    run "${COMPOSE_CMD[@]}" "${down_args[@]}" || down_ok=$?
   fi
   if [ "$down_ok" -ne 0 ]; then
-    warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+    warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} ${down_args[*]}"
   fi
 }
 
@@ -12911,6 +13662,7 @@ run_post_interaction_cleanup() {
   diag "対話操作をすべて終了したため、未使用リソースを含めて完全クリアします。"
   diag "  対象: 停止中コンテナ / 未使用イメージ / 未使用ボリューム /"
   diag "        未使用ネットワーク / ビルドキャッシュ (確認入力なし)"
+  diag "  ※ 今回の Compose スタックは、直前の compose down -v でボリュームごと削除済みです。"
   diag "  ※ 同じ Docker daemon を使う他プロジェクトの未使用リソースも削除されます。"
   diag "  コンテナを残したい場合は --keep-container-after-interaction を指定します。"
   diag "==================================================================="
@@ -21908,6 +22660,28 @@ append_undertow_analysis_report() {
   return 0
 }
 
+# 全量レポートへ、コピーしたファイルの取り込み検証の結果を追記する。
+# 画面表示と同じ明細を控えてあるため、ここではそれを書き出すだけとする。
+append_copy_artifact_report() {
+  local report_file="$1" line
+
+  printf '結果          : %s\n' "${COPY_ARTIFACT_SUMMARY:-(未実施)}" >> "$report_file"
+  if [ "$COPY_ARTIFACT_MISMATCH" = "true" ]; then
+    printf '判定          : NG (今回コピーしたファイルがコンテナへ取り込まれていません)\n' >> "$report_file"
+  elif [ ${#COPY_ARTIFACT_REPORT_LINES[@]} -gt 0 ]; then
+    printf '判定          : OK\n' >> "$report_file"
+  fi
+  if [ ${#COPY_ARTIFACT_REPORT_LINES[@]} -eq 0 ]; then
+    printf '%s\n' "検証の明細はありません (--copy-file 未指定、コンテナ未起動、または検証を無効化)。" \
+        >> "$report_file"
+    return 0
+  fi
+  for line in "${COPY_ARTIFACT_REPORT_LINES[@]}"; do
+    printf '%s\n' "$line" >> "$report_file"
+  done
+  return 0
+}
+
 append_compose_service_logs_report() {
   local report_file="$1"
   local service_name index=0 normalized_logs line_count containers log_scope
@@ -22123,6 +22897,9 @@ write_build_report() {
     # 前回の実行が残したコンテナを再利用したのか作り直したのかで、同じ compose.yml
     # でも起動確認の結果が変わる。あとから突き合わせられるよう点検結果も残す。
     printf '既存コンテナ  : %s\n' "${STALE_CONTAINER_SUMMARY:-(未点検)}"
+    # 差し替えたファイルが本当にコンテナへ届いていたか。ここが不一致の実行は、
+    # 起動確認や URL 応答が通っていても「古い成果物を確認しただけ」になる。
+    printf 'コピー取込検証: %s\n' "${COPY_ARTIFACT_SUMMARY:-(未実施)}"
     if [ "$DIRECTORY_TREE_REPORT" = "true" ]; then
       printf '保存ポリシー  : 環境変数は全件、ツリーは全深度・全ファイル名\n'
     else
@@ -22139,6 +22916,7 @@ write_build_report() {
     printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
     printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
     printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
+    printf '                コピーしたファイルの取り込み検証は [13] に記載\n'
     printf '                (テキストも併せて出力。Host ヘッダーごとの振り分けと実測結果を含む)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
@@ -22260,6 +23038,11 @@ write_build_report() {
   printf '\n[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析\n' >> "$report_tmp"
   append_undertow_analysis_report "$report_tmp"
 
+  # 差し替えたファイルの取り込み結果。コンテナを停止する前に採取済みのため、
+  # ここではその明細を書き出すだけとする。
+  printf '\n[13] コピーしたファイル (--copy-file) の取り込み検証\n' >> "$report_tmp"
+  append_copy_artifact_report "$report_tmp"
+
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートを確定できませんでした: $candidate"
@@ -22316,6 +23099,12 @@ cleanup_all() {
     log "対話操作をすべて終了したため、コンテナを残さず後始末します。"
     log "  従来どおり残す場合: --keep-container-after-interaction"
     KEEP_CONTAINER="false"
+    # ボリュームも削除する。残すと、デプロイ先を覆っているボリュームの中身が
+    # 次回の実行でもそのまま使われ、イメージを作り直しても反映されない。
+    if [ "$VOLUME_CLEANUP" != "never" ]; then
+      DOWN_REMOVE_VOLUMES="true"
+      log "  Compose プロジェクトのボリュームも削除します (残す場合: --keep-volumes)。"
+    fi
   fi
   teardown_container
   # 今回のスタックを消した後で、未使用リソースまでまとめて完全クリアする。
@@ -22566,6 +23355,13 @@ if [ "$NEED_CONTAINER" != "true" ]; then
   if [ "$BUILD_REPORT_DIR_SET" = "true" ]; then
     warn "全量レポートの環境変数・ツリー・JBoss EAP デプロイ構造・JVM パラメータ・OpenTelemetry 設定は、コンテナ未起動のため未取得として記録します。"
   fi
+  # ビルドだけではコンテナ内を確認できないため、取り込み検証は行えない。
+  # 差し替えたファイルが実際に使われるかは、起動して初めて分かる。
+  if copy_artifact_verify_enabled && [ ${#COPY_ARTIFACT_ENTRIES[@]} -gt 0 ]; then
+    COPY_ARTIFACT_SUMMARY="未実施 (コンテナを起動していません)"
+    warn "コピーしたファイルの取り込み検証は、コンテナ起動を伴う実行でのみ行えます。--verify-startup または --verify-url を併用してください。"
+    warn "  デプロイ先がボリューム / バインドマウントで覆われている場合、ビルドが成功していても古い成果物が使われ続けます。"
+  fi
   if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
       || [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ]; then
     warn "WAR デプロイ時 Java 例外解析は、コンテナを起動していないため解析対象のログがありません (結果は「未評価」として出力します)。--verify-startup または --verify-url を併用してください。"
@@ -22592,6 +23388,15 @@ fi
 # コールド実行ではここが最も失敗しやすく、取得だけなら安全に再試行できるため。
 pull_required_images
 if ! start_container; then
+  exit 1
+fi
+
+# ---- コピーしたファイルの取り込み検証 ---------------------------------------
+# 差し替えたファイル (WAR など) が、今回ビルドしたイメージとコンテナへ実際に
+# 届いているかを SHA-256 で突き合わせる。デプロイ先が名前付きボリュームなどで
+# 覆われていると、ビルドも起動もデプロイも成功したまま前回の成果物が動き続ける
+# ため、起動確認より前にここで落として「古い成果物での動作確認」を防ぐ。
+if ! verify_copied_artifacts; then
   exit 1
 fi
 

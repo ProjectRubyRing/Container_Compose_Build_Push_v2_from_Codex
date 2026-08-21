@@ -423,6 +423,39 @@ if [ "${1:-}" = "builder" ] && [ "${2:-}" = "prune" ]; then
   exit 0
 fi
 
+# ---- イメージ側の中身の取り出し (docker create -> docker cp -> docker rm) ----
+# 取り込み検証は、起動していないコンテナから docker cp でファイルを取り出して
+# SHA-256 を算出する。FAKE_IMAGE_ARTIFACT_FILE / FAKE_CONTAINER_ARTIFACT_FILE で
+# 「取り出されるファイルの中身」をホスト側の実ファイルとして与える。
+if [ "${1:-}" = "create" ]; then
+  if [ "${FAKE_DOCKER_CREATE_FAIL:-false}" = "true" ]; then
+    printf 'Error response from daemon: No command specified\n' >&2
+    exit 125
+  fi
+  printf '%s\n' "${FAKE_DOCKER_CREATE_ID:-cid-image-probe}"
+  exit 0
+fi
+
+if [ "${1:-}" = "cp" ]; then
+  fake_cp_src="${2:-}"
+  fake_cp_dst="${3:-}"
+  case "$fake_cp_src" in
+    cid-image-probe:*) fake_cp_file="${FAKE_IMAGE_ARTIFACT_FILE:-}" ;;
+    *)                 fake_cp_file="${FAKE_CONTAINER_ARTIFACT_FILE:-}" ;;
+  esac
+  if [ -z "$fake_cp_file" ] || [ ! -f "$fake_cp_file" ]; then
+    printf 'Error response from daemon: Could not find the file %s\n' "$fake_cp_src" >&2
+    exit 1
+  fi
+  cp "$fake_cp_file" "$fake_cp_dst" || exit 1
+  exit 0
+fi
+
+if [ "${1:-}" = "rm" ]; then
+  printf '%s\n' "${!#}"
+  exit 0
+fi
+
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ]; then
   if ! is_cleaned; then
     printf 'sha256:image-one\nsha256:image-two\n'
@@ -803,6 +836,20 @@ if [ "${FAKE_ADOT_DISTROLESS:-false}" = "true" ] \
   esac
 fi
 
+# シェルを持たないイメージの再現 (取り込み検証用)。
+# build_and_verify.sh は detect_container_shell でシェルを探すため、その探索
+# (sh -c "exit 0") ごと失敗させないと「探索不可」の分岐に入らない。
+if [ "${FAKE_COPY_ARTIFACT_PROBE_NOSHELL:-false}" = "true" ] && [ "${1:-}" = "exec" ] \
+    && [ "${4:-}" = "-c" ]; then
+  case "${5:-}" in
+    "exit 0"|*copy-artifact-probe*)
+      printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
+        "${3:-}" "${3:-}" >&2
+      exit 126
+      ;;
+  esac
+fi
+
 # ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
 # build_and_verify.sh が投げる各プローブを、環境変数で挙動を切り替えながら再現する。
 #   FAKE_JBOSS_SECRET_VALUE       : ビルド中の /run/secrets が返す値 (未設定なら $JBOSS_MASTER_PASSWORD)
@@ -864,6 +911,14 @@ if [ "${1:-}" = "exec" ]; then
 
   case "$fake_exec_script" in
     '') ;;
+    *'copy-artifact-probe'*)
+      # コピーしたファイルの取り込み検証。コンテナ内の探索結果を差し替える。
+      #   FAKE_COPY_ARTIFACT_PROBE : 全コンテナ共通で返す "種別|パス|バイト数|SHA-256" の行
+      if [ -n "${FAKE_COPY_ARTIFACT_PROBE:-}" ]; then
+        printf '%s\n' "$FAKE_COPY_ARTIFACT_PROBE"
+      fi
+      exit 0
+      ;;
     *'undertow-host-probe'*)
       # Undertow バーチャルホスト分析の実リクエスト。
       #   docker exec <cid> /bin/sh -c '<script>' _ <URL> <Host ヘッダー> <秒>

@@ -410,6 +410,7 @@ arg_takes_value() {
     --startup-service|--startup-log-pattern|--startup-timeout|--startup-interval) return 0 ;;
     --startup-log-lines|--wait-timeout|--allow-service-exit|--keep-container-mode) return 0 ;;
     --usage-check-script|--disk-free-path) return 0 ;;
+    --copy-artifact-path|--copy-artifact-search-dir) return 0 ;;
     --pull-retry|--pull-retry-interval|--up-retry|--up-retry-interval) return 0 ;;
     --jboss-context-root|--jboss-http-port|--env-list-limit|--env-list-file) return 0 ;;
     --jboss-secret-id|--jboss-config-file|--jboss-cli-path|--jboss-elytron-tool) return 0 ;;

@@ -188,6 +188,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
 | `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
+| `--remove-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。この実行が行うすべての `compose down` に `--volumes` を付け、Compose プロジェクトの名前付きボリュームも毎回削除する | `false` |
+| `--keep-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。対話操作の終了後の後始末でもボリュームを削除しない (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する | `false` |
 | `--usage-check-script PATH` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。完全クリアに使う `docker-usage-check.sh` のパスを明示する。未指定時は環境変数 `DOCKER_USAGE_CHECK_SCRIPT` → スクリプトの親 / カレントの親 / ホーム配下の `Docker_usage_check/docker-usage-check.sh` → `PATH` 上の `docker-usage-check.sh` の順に探す | (自動解決) |
 | `--disk-free-path DIR` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。終了時の空き容量一覧へ表示するディレクトリを追加する (繰り返し指定可) | (Docker data root / 作業ディレクトリ / compose ファイル / レポート出力先 / ホーム / 一時ディレクトリ / `/`) |
 | `--exit-on-deploy-error` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。デプロイエラー (AP サーバは起動したがアプリのデプロイに失敗) を検出しても調査用の対話操作へ入らず、従来どおりログを出力して終了する。既定ではコンテナと AP サーバを起動したまま残し、各 Compose サービスへ接続して調査できる状態にする | `false` |
@@ -197,6 +199,11 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述)。ECR 関連オプション (`--account-id` / `--registry` / `--repository` / `--tag-prefix` / `--container-name` / `--output` / `--switchback-shell` / `--auto-switchback` / `--warn-only`) は委譲先が解釈できないため、**警告のうえ無視される** | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応。コピー先に同名ファイルがある場合の動作はスクリプトごとに異なる (後述) | (なし) |
 | `--copy-file-no-overwrite` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` のコピー先に同名ファイルがある場合、強制上書きせずに処理を中止する (`exit 1`) | `false` |
+| `--verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` を指定していない実行でも、コピーしたファイルの取り込み検証を行う。既定は `--copy-file` を指定した実行でのみ自動で有効 | `auto` |
+| `--no-verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。取り込み検証を行わない | `false` |
+| `--copy-artifact-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。照合するコンテナ内の**絶対パス**を明示指定する (繰り返し可)。コンテナにシェルが無く探索できない場合でも、このパスを `docker cp` で取り出して照合する | (自動探索) |
+| `--copy-artifact-search-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コンテナ内の探索起点を絞る (繰り返し可)。ファイル数の多いイメージで探索時間を短縮したいときに使う | `/` |
+| `--copy-artifact-required` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コピーしたファイルがコンテナ内に見つからない場合もエラーとする。既定は警告のみ (ビルド時にだけ必要なファイルは、イメージに残らないのが正しいため) | `false` |
 | `--env-list-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後に表示する環境変数一覧の件数。各対象コンテナごとに先頭 `N` 件を表示し、既定は `all` | `all` |
 | `--env-list-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後の環境変数一覧を `FILE` にも出力する。画面表示も継続 | (なし) |
 | `--directory-tree` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造を画面へ表示する。`--directory-tree-depth` / `--directory-file-limit` / `--deployment-dir-env` を指定した場合は、この指定が無くても表示を有効にする | `false` (画面表示しない) |
@@ -415,6 +422,135 @@ data root の空き容量と inode を自動で調べ、上表の原因と対処
   (`build_and_push.sh --build-only` からもそのまま委譲されます)。
 - **安全策**: コピー先が通常ファイル以外 (ディレクトリ・シンボリックリンク等) の場合は、
   `--copy-file-no-overwrite` の有無にかかわらず、上書き・自動削除のいずれも行わず中止します。
+
+### 差し替えたファイルが本当に取り込まれたかの検証 (既定で有効)
+
+`--copy-file` で WAR などを毎回差し替えてビルド・デプロイを確認する使い方では、
+**「コピー元を差し替えたのに、動いているのは前回の成果物のまま」** という壊れ方が起こります。
+やっかいなのは、この状態でも
+
+- `compose build` は成功する (イメージには新しい WAR が入っている)
+- `compose up` も成功し、JBoss EAP の起動完了ログ (`WFLYSRV0025`) も出る
+- デプロイも成功する (ただし**古い WAR** が)
+- `--no-cache` を付けても症状が変わらない
+
+ため、**ログのどこにも異常が出ません**。`--keep-container-mode logs` の bash でコンテナ内の
+`server.log` を見ても「変更が反映されていないログ」が見えるだけで、原因は分かりません。
+
+そこで `--copy-file` を指定した実行では、コピー元ファイルの **SHA-256** をコピー時点で控えておき、
+コンテナ起動直後に**コンテナ内を探索して同じ中身のファイルが実在するか**を突き合わせます。
+一致するものが 1 つも無く、同名で中身の違うファイルが見つかった場合は
+**「古い成果物のまま動いている」と判断してエラー終了** (`exit 1`) します。
+
+```text
+===================================================================
+コピーしたファイル (--copy-file) の取り込み検証
+===================================================================
+[WARN] デプロイ先がマウントに覆われています: frontend (frontend-1) 名前付きボリューム proj_deployments -> /opt/jboss/standalone/deployments
+[WARN]   イメージへ取り込んだ成果物は、このマウントの中身が優先されるためコンテナから見えません。
+探索の起点: /
+対象コンテナ: frontend (frontend-1) 探索所要 6s
+
+  コピー元: ./dist/frontend.war
+    SHA-256: 4f2c...  サイズ: 52428800 bytes
+    ビルドコンテキストへのコピー先: ./app/frontend.war
+    コピー元と一致するファイルがコンテナ内にありません。同名で中身の違うファイルを 1 件検出しました:
+    [不一致] frontend (frontend-1): /opt/jboss/standalone/deployments/frontend.war
+        コンテナ内の SHA-256: 9a71...  サイズ: 51380224 bytes
+        このパスは次のマウントに覆われています: 名前付きボリューム proj_deployments -> /opt/jboss/standalone/deployments
+        イメージ側の同じパスはコピー元と一致しています (ビルドは成功しています)。
+        => マウントがイメージの内容を隠しているため、今回ビルドした成果物が使われていません。
+
+  対処:
+   1. デプロイ先を覆っているボリュームを削除して作り直す (中のデータは消えます):
+        docker compose -f compose.yml down -v
+      本スクリプトから毎回削除する場合は --remove-volumes を指定します。
+   ...
+===================================================================
+[ERROR] コピーしたファイルがコンテナへ取り込まれていません (対象 1 件 (一致 0 / 不一致 1 / 未検出 0))。
+```
+
+#### 何を見て「原因」を切り分けているか
+
+一致しなかったパスごとに、次の 3 つを突き合わせて原因を特定します。
+
+| 見るもの | 取得方法 |
+| --- | --- |
+| コピー元の中身 | コピーを実行した時点で `sha256sum` (無ければ `shasum` / `openssl`) |
+| **コンテナ**から見えた中身 | `docker exec` でコンテナ内を `find` → コンテナ内で SHA-256 を算出 (算出手段が無ければ `docker cp` でホストへ取り出して算出) |
+| **イメージ**に入っている中身 | `docker create` (起動しない) → `docker cp` で同じパスを取り出してホストで SHA-256 を算出 |
+
+この 3 つの組み合わせで、次のように切り分けます。
+
+| イメージ側 | コンテナ側 | 判定 | 表示される診断 |
+| --- | --- | --- | --- |
+| 一致 | 一致 | **OK** | `[一致] <サービス> (<コンテナ>): <パス>` |
+| 一致 | 不一致・**マウントあり** | NG | `マウントがイメージの内容を隠しているため、今回ビルドした成果物が使われていません` |
+| 一致 | 不一致・マウントなし | NG | `コンテナが今回のイメージから作り直されていない可能性があります` |
+| 不一致 | 不一致 | NG | `ビルドがコピーしたファイルを取り込めていません` (`.dockerignore` の除外 / `COPY` 元の誤り / コピー先がビルドコンテキスト外) |
+| 取得不可 | 不一致・マウントあり | NG | `このファイルはイメージではなくマウントの側から来ています` |
+
+#### なぜボリュームだと「何度ビルドしても直らない」のか
+
+Docker が**イメージ側の内容をボリュームへ複製するのは、そのボリュームを新規作成した
+(= 中身が空の) 1 回目だけ**です。2 回目以降の実行では既存の中身が優先されるため、
+イメージへ焼いた新しい WAR はコンテナから一切見えません。
+そして `docker compose down` は**既定でボリュームを削除しません**。
+したがって一度ボリュームが作られると、**消すまで永遠に古い WAR が動き続けます**。
+
+`--no-cache` はイメージのビルドにしか効かないため、この状態では何も変わりません
+(むしろ「イメージは毎回正しく作り直されている」ことの裏付けになります)。
+
+#### 判定のルール
+
+- **一致するファイルが 1 つでもあれば成功**とします。同名で中身の違うファイルが
+  別の場所にあっても構いません (ビルド時にだけ使うファイルが複数箇所に置かれている
+  構成を壊さないため)。その場合は参考情報として件数だけ表示します。
+- **コンテナ内に同名のファイルが 1 つも無い場合は、既定では警告のみ**です。
+  `.npmrc` や資格情報のように「ビルド時にだけ必要で、イメージに残らないのが正しい」
+  ファイルがあるためです。**イメージへ取り込まれる前提のファイル (WAR など) では
+  `--copy-artifact-required` を付けて、未検出もエラーにしてください。**
+- 同名の**ディレクトリ** (展開済みデプロイ) は内容照合の対象外とし、参考情報として表示します。
+- コンテナにシェルが無く探索できない場合は、`--copy-artifact-path` で
+  コンテナ内の絶対パスを明示指定すると `docker cp` で取り出して照合します。
+- 同名のファイルは見つかったが SHA-256 を算出できなかった場合 (コンテナに
+  `sha256sum` / `openssl` が無く、`docker cp` でも取り出せない) は、**不一致とは断定せず**
+  `[判定不可]` として残します。`--copy-artifact-required` を付けた場合はエラーになります。
+
+```bash
+# WAR を差し替えて検証する: 未検出もエラーにし、探索先をデプロイ先に絞る
+./build_and_verify.sh \
+    --verify-startup --compose-service frontend --startup-service frontend \
+    --copy-file ./dist/frontend.war:./app \
+    --copy-artifact-required \
+    --copy-artifact-search-dir /opt/jboss/standalone
+```
+
+- 検証結果は全量レポート (`--report-dir`) の `[13] コピーしたファイル (--copy-file) の取り込み検証`
+  と、ヘッダーの `コピー取込検証` 行にも残ります。
+- コンテナを起動しない実行 (ビルドのみ) では照合できないため、その旨を警告します。
+  `--verify-startup` または `--verify-url` を併用してください。
+- `--copy-file` を使っていない構成でも、デプロイ先 (`*/standalone/deployments`) が
+  ボリューム / バインドマウントで覆われている場合は警告を出します。
+
+### 後始末でのボリューム削除 (`--remove-volumes` / `--keep-volumes`)
+
+上記の壊れ方の根本原因は「`compose down` がボリュームを残すこと」です。
+そこで **`--keep-container-mode logs` の対話操作を「0) 対話操作を終了」まで進めた実行では、
+既定で `compose down --volumes` まで行い、ボリュームも削除**します
+(従来はコンテナだけを削除し、ボリュームは残していました)。
+
+| 指定 | 動作 |
+| --- | --- |
+| (既定) | 対話操作を最後まで終えた後の後始末でのみ `compose down -v` する。加えて、取り込み検証で「古い成果物を抱えたボリューム」を検出した場合も `-v` を付ける |
+| `--remove-volumes` | この実行が行う**すべての** `compose down` に `--volumes` を付ける |
+| `--keep-volumes` | 従来どおりボリュームを残す (DB のデータを実行間で引き継ぎたい場合) |
+
+- `--remove-volumes` と `--keep-volumes` は同時に指定できません (`exit 2`)。
+- `--keep-container` / `--keep-container-after-interaction` を指定した実行では
+  `compose down` 自体を行わないため、ボリュームも残ります。
+  その場合は `docker compose -f compose.yml down -v` を手動で実行してください
+  (画面にも同じコマンドを表示します)。
 
 ## ログファイル出力 (`--log-dir`)
 
@@ -907,7 +1043,11 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   `[6] OpenTelemetry 環境変数・JVM パラメータ` / `[7] JBoss マスターパスワードの伝搬検証` /
   `[8] CloudWatch Logs 送信検証 (cwagent)` / `[9] Compose サービス別ログ` /
   `[10] WAR デプロイ時 Java 例外解析` /
-  `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` です。
+  `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` /
+  `[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析` /
+  `[13] コピーしたファイル (--copy-file) の取り込み検証` です。
+  ヘッダーの `コピー取込検証` 行には、差し替えたファイルがコンテナへ届いたかの
+  要約 (一致 / 不一致 / 未検出の件数) を残します。
 - `--report-dir DIR` を指定すると、デプロイ結果ファイルとは**別に**
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` を追加出力します。
   WAR のデプロイ処理で発生した Java 例外の解析結果をまとめたもので、

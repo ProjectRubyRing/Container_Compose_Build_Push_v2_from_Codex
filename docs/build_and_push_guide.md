@@ -365,6 +365,7 @@ flowchart TD
 | コピー先 | **既存のディレクトリ**である必要がある |
 | 同名ファイル | コピー先に既存ファイルがあると、事故防止のため中止する (`exit 1`)。ただし `--build-only` で `build_and_verify.sh` へ委譲した場合は、委譲先の既定に従い**強制上書き** (終了時に上書き前のファイルへ復元) となる。委譲時に中止させたい場合は `--copy-file-no-overwrite` を併用する |
 | 削除 | 終了時 (成功・失敗・中断のいずれでも) 自動削除。削除するのはコピーしたファイルのみ |
+| 取り込み検証 | `--build-only` で委譲し、かつコンテナを起動する実行 (`--verify-startup` / `--verify-url`) では、コピーしたファイルが本当にコンテナへ届いているかを SHA-256 で照合する。届いていなければエラー終了する (委譲先の `--verify-copy-artifact` / `--no-verify-copy-artifact` / `--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` で制御。詳細は [build_and_verify.sh 詳細ガイド](build_and_verify_guide.md) の 5.13) |
 
 ```bash
 ./build_and_push.sh --account-id 123456789012 \
