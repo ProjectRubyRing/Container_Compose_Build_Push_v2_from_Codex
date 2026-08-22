@@ -75,6 +75,11 @@ volumes:
 
 新オプション: `--verify-copy-artifact` / `--no-verify-copy-artifact` / `--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required`
 
+> 補足 (2026-08-22 の変更): 取り込み検証は**既定では行わない**ようになりました。
+> `--verify-copy-artifact`、または `--copy-artifact-path` / `--copy-artifact-search-dir` /
+> `--copy-artifact-required` のいずれかを指定した実行でだけ有効になります
+> (`--copy-file` 未使用時のデプロイ先マウント警告も同じ条件です)。
+
 ### (2) 対話モード終了時のボリューム削除
 
 - 対話操作を「0) 対話操作を終了」まで進めた実行は **既定で `compose down --volumes`**（従来はコンテナのみ削除）

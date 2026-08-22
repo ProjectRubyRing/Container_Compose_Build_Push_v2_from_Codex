@@ -33,7 +33,9 @@
 #                          ツリーとデプロイ構造は --directory-tree-report 指定時
 #                          のみ保存する。
 #   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
-#                          bash 接続するか、対話式の HTTP リクエスト、または
+#                          bash 接続 (接続前に tree を使える状態にする。コンテナに
+#                          tree が無ければ bash だけで動く簡易実装を用意する) するか、
+#                          対話式の HTTP リクエスト、または
 #                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
 #                          healthcheck 設定・実行履歴・HTTP 通信、
 #                          cwagent / OTel のローカル送達診断、および
@@ -56,13 +58,13 @@
 #                          スタックトレースと Caused by の連鎖から根本原因の
 #                          例外クラスを特定し、発生の仕組み・想定される原因・
 #                          確認手順・対処方法・再発防止を生成する。
-#                          画面表示とテキスト出力は既定では行わず、それぞれ
-#                          --deploy-exception-display / --deploy-exception-text
-#                          を指定したときだけ出す (ビルド結果を埋もれさせない)。
-#                          解析結果は全量レポートへ保存するほか、Excel ブック
-#                          (build_and_verify_<日時>_java_exceptions.xlsx) として
-#                          も出力する。同じ内容のテキストは
-#                          --deploy-exception-text FILE で指定した先へ出す。
+#                          画面表示・Excel・テキストの出力は既定では行わず、
+#                          それぞれ --deploy-exception-display /
+#                          --deploy-exception-excel FILE /
+#                          --deploy-exception-text FILE を指定したときだけ出す
+#                          (ビルド結果を埋もれさせない。--report-dir を指定した
+#                           だけでは Excel もテキストも作らない)。
+#                          解析結果そのものは、指定が無くても全量レポートへ保存する。
 #                          ブックは 概要 / 例外一覧 / 原因分析 /
 #                          対処方法 / スタックトレース / デプロイログ の 6 シート
 #                          構成で、フォントは Meiryo UI、行高は内容と列幅から
@@ -318,10 +320,14 @@ COPY_BACKUP_DRY_RUN_MARK="(dry-run)"
 # デプロイ先が名前付きボリューム / バインドマウントで覆われていると、イメージを
 # 何度作り直しても古い中身が使われ続けるが、ビルドも起動も成功して見えるため、
 # 照合しない限り「古い成果物で動作確認をしていた」ことに気付けない。
-#   auto (既定): --copy-file を指定した実行でのみ照合する
-#   true  (--verify-copy-artifact)   : 常に照合する
-#   false (--no-verify-copy-artifact): 照合しない
-COPY_ARTIFACT_VERIFY="auto"
+# ただしコンテナ内の全探索は時間を要するため、既定では行わず、照合したい実行で
+# だけパラメータを指定して有効にする。
+#   false (既定 / --no-verify-copy-artifact): 照合しない
+#   true  (--verify-copy-artifact)          : 照合する
+# --copy-artifact-path / --copy-artifact-search-dir / --copy-artifact-required は
+# 「照合したい」という意思表示のため、指定するだけで照合を有効にする。
+COPY_ARTIFACT_VERIFY="false"
+COPY_ARTIFACT_VERIFY_SET="false"  # 有効・無効を明示指定したか (付随指定との排他判定用)
 COPY_ARTIFACT_PATHS=()            # 照合するコンテナ内の絶対パス (--copy-artifact-path)
 COPY_ARTIFACT_SEARCH_DIRS=()      # 探索の起点 (--copy-artifact-search-dir、既定は /)
 COPY_ARTIFACT_REQUIRED="false"    # true: コンテナ内に見つからない場合もエラーとする
@@ -750,13 +756,14 @@ CERT_CHECK_TEXT_OUTPUT=""         # 直近に出力したテキストのパス
 #
 # 解析結果は 1 例外あたり数十行になり、ビルドの成否や動作確認の結果を画面から
 # 押し流してしまう。そのため画面表示は既定で行わず、--deploy-exception-display を
-# 指定したときだけ出す。テキストファイルも同じ考え方で、--report-dir を指定した
-# だけでは書き出さず、--deploy-exception-text FILE で出力先を指定したときだけ
-# 出力する (Excel と全量レポートへの記載は従来どおり)。
+# 指定したときだけ出す。Excel ブックとテキストファイルも同じ考え方で、
+# --report-dir を指定しただけでは書き出さず、--deploy-exception-excel FILE /
+# --deploy-exception-text FILE で出力先を指定したときだけ出力する
+# (全量レポートへの記載は指定が無くても行う)。
 DEPLOY_EXCEPTION_ANALYSIS="true"   # false: Java 例外の解析を行わない
 DEPLOY_EXCEPTION_DISPLAY="false"   # true (--deploy-exception-display): 解析結果を画面へ表示する
-DEPLOY_EXCEPTION_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名する
-DEPLOY_EXCEPTION_EXCEL_SET="false" # 出力先が明示指定されたか (未指定時の警告条件)
+DEPLOY_EXCEPTION_EXCEL=""          # Excel の出力先 (--deploy-exception-excel の指定時のみ出力)
+DEPLOY_EXCEPTION_EXCEL_SET="false" # 出力先が明示指定されたか (Excel 出力の有無そのもの)
 DEPLOY_EXCEPTION_TEXT=""           # テキストの出力先 (--deploy-exception-text の指定時のみ出力)
 DEPLOY_EXCEPTION_TEXT_SET="false"  # 出力先が明示指定されたか (テキスト出力の有無そのもの)
 DEPLOY_EXCEPTION_MAX="50"          # 詳細分析を行う例外の最大件数
@@ -1173,7 +1180,7 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            上書きせず処理を中止する (exit 1)。
                            既存ファイルへ一切触れたくない場合に指定する。
 
-  (既定で有効) コピーしたファイルの取り込み検証
+  (既定で無効) コピーしたファイルの取り込み検証
                            --copy-file でコピーしたファイル (WAR など) の SHA-256 を
                            控えておき、コンテナ起動後にコンテナ内を探索して、
                            同じ中身のファイルが実在するかを突き合わせる。
@@ -1184,18 +1191,24 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            イメージ側の同じパスは docker create + docker cp で
                            取り出して照合するため、イメージを起動せずに
                            「ビルドは正しいがコンテナへ届いていない」を判定できる。
-  --verify-copy-artifact   --copy-file を指定していない実行でも取り込み検証を行う
+  --verify-copy-artifact   取り込み検証を行う。既定では行わない
+                           (コンテナ内の探索に時間を要するため、確認したい実行で
+                            明示的に指定する)
   --no-verify-copy-artifact
-                           取り込み検証を行わない
+                           取り込み検証を行わない (既定と同じ。
+                           --verify-copy-artifact を打ち消す)
   --copy-artifact-path PATH
                            照合するコンテナ内の絶対パスを明示指定する (繰り返し可)。
                            コンテナにシェルが無く探索できない場合でも、このパスを
-                           docker cp で取り出して照合する
+                           docker cp で取り出して照合する。
+                           指定すると取り込み検証を自動で有効にする
   --copy-artifact-search-dir DIR
                            コンテナ内の探索起点を絞る (繰り返し可、既定: /)。
-                           ファイル数の多いイメージで探索時間を短縮したいときに使う
+                           ファイル数の多いイメージで探索時間を短縮したいときに使う。
+                           指定すると取り込み検証を自動で有効にする
   --copy-artifact-required コピーしたファイルがコンテナ内に見つからない場合も
-                           エラーとする。既定では警告に留める
+                           エラーとする。既定では警告に留める。
+                           指定すると取り込み検証を自動で有効にする
                            (ビルド時にだけ必要なファイルは、イメージへ残らないのが
                             正しいため)
 
@@ -1380,6 +1393,9 @@ JBoss マスターパスワードの伝搬検証:
                            --keep-container を暗黙に有効化する。
                            MODE:
                              bash  docker exec で /bin/bash へ直接接続する
+                                   (接続前に tree を使える状態にする。コンテナに
+                                    tree が無ければ bash だけで動く簡易実装を
+                                    用意する)
                              http  JBoss EAP へ対話式の HTTP リクエストを送る
                               logs  起動中 Compose サービスを番号で選択後、
                                     ログ表示、対話式 bash 接続、healthcheck の
@@ -1519,10 +1535,7 @@ JBoss マスターパスワードの伝搬検証:
                            コンテナ内ツリーと JBoss EAP デプロイ構造は既定では
                            保存せず、--directory-tree-report を併用したときだけ
                            画面の制限にかかわらず全深度・全ファイル名で保存する。
-                           あわせて Java 例外解析を
-                           DIR/build_and_verify_<日時>_java_exceptions.xlsx と
-                           DIR/build_and_verify_<日時>_java_exceptions.txt へ、
-                           読み取り専用ファイルシステム分析を
+                           あわせて読み取り専用ファイルシステム分析を
                            DIR/build_and_verify_<日時>_readonly_filesystem.xlsx と
                            DIR/build_and_verify_<日時>_readonly_filesystem.txt へ、
                            Undertow バーチャルホスト分析を
@@ -1542,7 +1555,7 @@ JBoss マスターパスワードの伝搬検証:
 
 WAR デプロイ時の Java 例外解析:
   (デプロイ処理のログに Java 例外があれば自動で解析する。ただし画面表示と
-   テキスト出力は既定では行わず、下のオプションを指定したときだけ出力する)
+   Excel・テキスト出力は既定では行わず、下のオプションを指定したときだけ出力する)
   解析内容               コンテナ起動後のログから Java の例外ブロックを切り出し、
                          Caused by の連鎖をたどって根本原因の例外クラスを特定する。
                          例外クラスごとに「何が起きたか」「発生の仕組み」
@@ -1563,9 +1576,9 @@ WAR デプロイ時の Java 例外解析:
                          --deploy-exception-display を打ち消す)
   --deploy-exception-excel FILE
                          Java 例外解析の結果を Excel ブック (.xlsx) として
-                         FILE へ出力する。--report-dir 指定時は未指定でも
-                         DIR/build_and_verify_<日時>_java_exceptions.xlsx へ
-                         自動出力する。ブックは「概要」「例外一覧」「原因分析」
+                         FILE へ出力する。既定では出力せず、このオプションを
+                         指定したときだけ書き出す (--report-dir を指定した
+                         だけでは出力しない)。ブックは「概要」「例外一覧」「原因分析」
                          「対処方法」「スタックトレース」「デプロイログ」の
                          6 シート構成 (フォントは Meiryo UI、列幅・行高・
                          折り返しを内容から計算し、文字が切れないようにする)。
@@ -1845,8 +1858,8 @@ while [ $# -gt 0 ]; do
     --cleanup-all-docker-data) CLEANUP_ALL_DOCKER_DATA="true"; shift ;;
     --copy-file)           need_value "$1" $#; COPY_SPECS+=("$2"); shift 2 ;;
     --copy-file-no-overwrite) COPY_OVERWRITE="false"; shift ;;
-    --verify-copy-artifact)    COPY_ARTIFACT_VERIFY="true"; shift ;;
-    --no-verify-copy-artifact) COPY_ARTIFACT_VERIFY="false"; shift ;;
+    --verify-copy-artifact)    COPY_ARTIFACT_VERIFY="true"; COPY_ARTIFACT_VERIFY_SET="true"; shift ;;
+    --no-verify-copy-artifact) COPY_ARTIFACT_VERIFY="false"; COPY_ARTIFACT_VERIFY_SET="true"; shift ;;
     --copy-artifact-path)      need_value "$1" $#; COPY_ARTIFACT_PATHS+=("$2"); shift 2 ;;
     --copy-artifact-search-dir) need_value "$1" $#; COPY_ARTIFACT_SEARCH_DIRS+=("$2"); shift 2 ;;
     --copy-artifact-required)  COPY_ARTIFACT_REQUIRED="true"; shift ;;
@@ -2016,11 +2029,18 @@ if [ "$VOLUME_CLEANUP_ALWAYS_SET" = "true" ] && [ "$VOLUME_CLEANUP_NEVER_SET" = 
 fi
 # 取り込み検証を無効にしたうえで、その付随指定を渡すのは指定の取り違えである
 # 可能性が高い (検証しないので、いずれの指定も効かない)。
-if [ "$COPY_ARTIFACT_VERIFY" = "false" ] \
+if [ "$COPY_ARTIFACT_VERIFY_SET" = "true" ] && [ "$COPY_ARTIFACT_VERIFY" = "false" ] \
     && { [ ${#COPY_ARTIFACT_PATHS[@]} -gt 0 ] || [ ${#COPY_ARTIFACT_SEARCH_DIRS[@]} -gt 0 ] \
       || [ "$COPY_ARTIFACT_REQUIRED" = "true" ]; }; then
   err "--no-verify-copy-artifact と --copy-artifact-path / --copy-artifact-search-dir / --copy-artifact-required は同時に指定できません。"
   exit 2
+fi
+# 照合対象・探索範囲・未検出時の扱いを指定するのは「照合したい」という意思表示の
+# ため、--verify-copy-artifact を書き忘れていても取り込み検証を有効にする。
+if [ "$COPY_ARTIFACT_VERIFY_SET" != "true" ] \
+    && { [ ${#COPY_ARTIFACT_PATHS[@]} -gt 0 ] || [ ${#COPY_ARTIFACT_SEARCH_DIRS[@]} -gt 0 ] \
+      || [ "$COPY_ARTIFACT_REQUIRED" = "true" ]; }; then
+  COPY_ARTIFACT_VERIFY="true"
 fi
 for _copy_artifact_path in ${COPY_ARTIFACT_PATHS[@]+"${COPY_ARTIFACT_PATHS[@]}"}; do
   case "$_copy_artifact_path" in
@@ -4025,6 +4045,9 @@ host_file_size() {
 # 書き換えには影響されない。
 record_copy_artifact() {
   local src="$1" dest="$2" sha size
+  # 照合しない実行では、コピー元の SHA-256 算出 (大きな WAR では数秒かかる) ごと
+  # 省く。控えても使い道が無く、算出手段が無い環境で警告だけが出てしまうため。
+  copy_artifact_verify_enabled || return 0
   if ! sha="$(host_file_sha256 "$src")"; then
     warn "コピー元ファイルの SHA-256 を算出できませんでした: ${src}"
     warn "  取り込み検証はこのファイルについて行いません (sha256sum / shasum / openssl のいずれかが必要です)。"
@@ -4035,12 +4058,7 @@ record_copy_artifact() {
 }
 
 copy_artifact_verify_enabled() {
-  case "$COPY_ARTIFACT_VERIFY" in
-    false) return 1 ;;
-    true)  return 0 ;;
-    *)     [ ${#COPY_SPECS[@]} -gt 0 ] || return 1 ;;
-  esac
-  return 0
+  [ "$COPY_ARTIFACT_VERIFY" = "true" ]
 }
 
 # 画面へ出しつつ、全量レポートへ載せる明細としても控える。
@@ -4288,9 +4306,9 @@ warn_shadowed_deployment_mounts() {
 
 # 起動対象のコンテナすべてについて、デプロイ先が覆われていないかを点検する。
 # --copy-file を使っていない構成でも同じ壊れ方をするため、取り込み検証の対象が
-# 無い実行でも行う (--no-verify-copy-artifact のときだけ行わない)。
+# 無い実行でも行う (取り込み検証そのものが有効な場合に限る)。
 warn_shadowed_deploy_mounts_for_targets() {
-  [ "$COPY_ARTIFACT_VERIFY" = "false" ] && return 0
+  copy_artifact_verify_enabled || return 0
   [ "$DRY_RUN" = "true" ] && return 0
   local -a cids=()
   mapfile -t cids < <(verification_target_container_ids)
@@ -4321,7 +4339,11 @@ verify_copied_artifacts() {
   warn_shadowed_deploy_mounts_for_targets
 
   if ! copy_artifact_verify_enabled; then
-    COPY_ARTIFACT_SUMMARY="未実施 (--no-verify-copy-artifact)"
+    if [ "$COPY_ARTIFACT_VERIFY_SET" = "true" ]; then
+      COPY_ARTIFACT_SUMMARY="未実施 (--no-verify-copy-artifact)"
+    else
+      COPY_ARTIFACT_SUMMARY="未実施 (--verify-copy-artifact 未指定)"
+    fi
     return 0
   fi
   if [ "$DRY_RUN" = "true" ]; then
@@ -8702,6 +8724,248 @@ run_interactive_compose_healthcheck() {
   return 0
 }
 
+# ---- コンテナ内の対話 bash セッション ---------------------------------------
+# 調査で最初に見たいのは「どこに何が配置されているか」であり、tree が使えると
+# デプロイ先やログ出力先の構造をその場で把握できる。ところが RHEL UBI や
+# JBoss EAP のイメージに tree は同梱されておらず、コンテナ内から dnf で入れるには
+# ネットワークとリポジトリ設定が要る (閉じた環境では入れられない)。
+# そこで接続時に tree の有無を調べ、無ければ bash だけで動く簡易実装を用意して
+# から対話セッションを始める。用意の仕方は次の順に試す。
+#   (1) 書き込めるディレクトリへ実行可能なスクリプトとして置き、PATH の先頭へ足す
+#       (サブシェルや xargs 経由でも tree を呼べる、通常のコマンドと同じ状態)
+#   (2) 置けない場合 (read_only / noexec など) は export -f したシェル関数にする
+#       (ファイルを 1 つも作らずに済むが、bash から呼ぶときだけ有効)
+# どちらもできなければ、その旨を伝えて従来どおり bash だけを起動する。
+# 簡易実装は find / awk / sort を使わず bash の展開だけで動くため、コンテナ内に
+# コマンドがほとんど無い (distroless に近い) イメージでも同じように動く。
+CONTAINER_INTERACTIVE_BASH_SCRIPT="$(cat <<'CONTAINER_INTERACTIVE_BASH_SCRIPT_END'
+_bv_tree_usage() {
+  cat <<'BV_TREE_USAGE_END'
+使い方: tree [-a] [-d] [-f] [-L 深さ] [--noreport] [ディレクトリ...]
+  -a          ドットで始まるファイルも表示する
+  -d          ディレクトリだけを表示する
+  -f          各行にパス全体を表示する
+  -L 深さ     たどる深さの上限 (既定: 制限なし)
+  --noreport  末尾の集計行 (N directories, M files) を表示しない
+  --help      この使い方を表示する
+BV_TREE_USAGE_END
+}
+
+# シンボリックリンクの参照先。readlink が無いコンテナでは空を返す。
+_bv_tree_link_target() {
+  local target=""
+  if command -v readlink >/dev/null 2>&1; then
+    target="$(readlink -- "$1" 2>/dev/null)" || target=""
+  fi
+  printf '%s' "$target"
+}
+
+# $1 のディレクトリの中身を 1 階層ぶん出力し、必要なら再帰する。
+# $2 は行頭の飾り、$3 はこの階層の深さ (直下を 1 とする)。
+_bv_tree_walk() {
+  local dir="$1" prefix="$2" depth="$3"
+  local base="$dir" entry name display connector next_prefix target index last
+  local -a entries=()
+  local -a shown=()
+
+  if [ ! -r "$dir" ] || [ ! -x "$dir" ]; then
+    printf '%s└── [error opening dir]\n' "$prefix"
+    return 0
+  fi
+  [ "$base" = "/" ] && base=""
+  entries=("$base"/*)
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    if [ "$_BV_TREE_DIRSONLY" = "1" ] && [ ! -d "$entry" ]; then
+      continue
+    fi
+    shown+=("$entry")
+  done
+  [ ${#shown[@]} -gt 0 ] || return 0
+
+  last=$(( ${#shown[@]} - 1 ))
+  for index in "${!shown[@]}"; do
+    entry="${shown[$index]}"
+    name="${entry##*/}"
+    display="$name"
+    [ "$_BV_TREE_FULL" = "1" ] && display="$entry"
+    if [ "$index" -eq "$last" ]; then
+      connector="└── "
+      next_prefix="${prefix}    "
+    else
+      connector="├── "
+      next_prefix="${prefix}│   "
+    fi
+    # シンボリックリンクは参照先を併記し、たどらない (循環を避けるため)。
+    if [ -L "$entry" ]; then
+      target="$(_bv_tree_link_target "$entry")"
+      if [ -n "$target" ]; then
+        printf '%s%s%s -> %s\n' "$prefix" "$connector" "$display" "$target"
+      else
+        printf '%s%s%s\n' "$prefix" "$connector" "$display"
+      fi
+      _BV_TREE_FILES=$(( _BV_TREE_FILES + 1 ))
+      continue
+    fi
+    printf '%s%s%s\n' "$prefix" "$connector" "$display"
+    if [ -d "$entry" ]; then
+      _BV_TREE_DIRS=$(( _BV_TREE_DIRS + 1 ))
+      if [ -z "$_BV_TREE_LEVEL" ] || [ "$depth" -lt "$_BV_TREE_LEVEL" ]; then
+        _bv_tree_walk "$entry" "$next_prefix" $(( depth + 1 ))
+      fi
+    else
+      _BV_TREE_FILES=$(( _BV_TREE_FILES + 1 ))
+    fi
+  done
+}
+
+_bv_tree_main() {
+  local target level saved_glob status=0
+  local -a targets=()
+
+  _BV_TREE_ALL=0
+  _BV_TREE_DIRSONLY=0
+  _BV_TREE_FULL=0
+  _BV_TREE_LEVEL=""
+  _BV_TREE_REPORT=1
+  _BV_TREE_DIRS=0
+  _BV_TREE_FILES=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a) _BV_TREE_ALL=1; shift ;;
+      -d) _BV_TREE_DIRSONLY=1; shift ;;
+      -f) _BV_TREE_FULL=1; shift ;;
+      -L)
+        if [ $# -lt 2 ]; then
+          printf 'tree: -L には深さを指定してください。\n' >&2
+          return 2
+        fi
+        level="$2"
+        case "$level" in
+          ''|*[!0-9]*)
+            printf 'tree: -L には 1 以上の数値を指定してください: %s\n' "$level" >&2
+            return 2
+            ;;
+        esac
+        if [ "$level" -lt 1 ]; then
+          printf 'tree: -L には 1 以上の数値を指定してください: %s\n' "$level" >&2
+          return 2
+        fi
+        _BV_TREE_LEVEL="$level"
+        shift 2
+        ;;
+      --noreport) _BV_TREE_REPORT=0; shift ;;
+      -h|--help) _bv_tree_usage; return 0 ;;
+      --version)
+        printf 'tree (build_and_verify.sh がセッション用に用意した簡易実装)\n'
+        return 0
+        ;;
+      --)
+        shift
+        while [ $# -gt 0 ]; do
+          targets+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        printf 'tree: 未対応のオプションです: %s (--help で使い方を表示します)\n' "$1" >&2
+        return 2
+        ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  [ ${#targets[@]} -gt 0 ] || targets=(".")
+
+  # 一覧はグロブ展開の順 (LC_COLLATE 順) で得る。find も sort も使わないため、
+  # コマンドがほとんど無いコンテナでも動く。
+  saved_glob="$(shopt -p nullglob dotglob)"
+  shopt -s nullglob
+  if [ "$_BV_TREE_ALL" = "1" ]; then
+    shopt -s dotglob
+  else
+    shopt -u dotglob
+  fi
+
+  for target in "${targets[@]}"; do
+    while [ "$target" != "/" ] && [ "${target%/}" != "$target" ]; do
+      target="${target%/}"
+    done
+    printf '%s\n' "$target"
+    if [ -d "$target" ]; then
+      _bv_tree_walk "$target" "" 1
+    else
+      printf '└── [error opening dir]\n'
+      status=1
+    fi
+  done
+  if [ "$_BV_TREE_REPORT" = "1" ]; then
+    printf '\n%s directories, %s files\n' "$_BV_TREE_DIRS" "$_BV_TREE_FILES"
+  fi
+
+  eval "$saved_glob"
+  return "$status"
+}
+
+# tree を使える状態にする。コンテナに導入済みならそれを使う。
+_bv_tree_bin=""
+_bv_tree_hint=""
+_bv_tree_note=""
+if command -v tree >/dev/null 2>&1; then
+  _bv_tree_hint="tree コマンドが利用できます (コンテナに導入済みのものを使用します)。"
+else
+  _bv_tree_note="tree の簡易実装は -a / -d / -f / -L 深さ / --noreport に対応しています (tree --help)。"
+  for _bv_tree_dir in "${TMPDIR:-}" /tmp /var/tmp /dev/shm "${HOME:-}"; do
+    [ -n "$_bv_tree_dir" ] && [ -d "$_bv_tree_dir" ] && [ -w "$_bv_tree_dir" ] || continue
+    _bv_tree_bin="${_bv_tree_dir}/.build_and_verify_tree.$$"
+    if mkdir "$_bv_tree_bin" 2>/dev/null \
+        && {
+             printf '#!/bin/bash\n'
+             declare -f _bv_tree_usage _bv_tree_link_target _bv_tree_walk _bv_tree_main
+             printf '_bv_tree_main "$@"\n'
+           } > "${_bv_tree_bin}/tree" 2>/dev/null \
+        && chmod 755 "${_bv_tree_bin}/tree" 2>/dev/null \
+        && "${_bv_tree_bin}/tree" --version >/dev/null 2>&1; then
+      PATH="${_bv_tree_bin}:${PATH}"
+      export PATH
+      _bv_tree_hint="tree コマンドが利用できます (このセッション用の簡易実装を ${_bv_tree_bin}/tree へ用意しました)。"
+      break
+    fi
+    rm -rf -- "$_bv_tree_bin" 2>/dev/null
+    _bv_tree_bin=""
+  done
+  # 書き込めるディレクトリが無い (read_only / noexec など) 場合は、ファイルを
+  # 作らずにシェル関数として渡す。bash から呼ぶ限り同じように使える。
+  if [ -z "$_bv_tree_hint" ]; then
+    tree() { _bv_tree_main "$@"; }
+    if export -f tree _bv_tree_main _bv_tree_walk _bv_tree_link_target _bv_tree_usage 2>/dev/null; then
+      _bv_tree_hint="tree コマンドが利用できます (簡易実装をシェル関数として用意しました)。"
+    else
+      _bv_tree_hint="tree コマンドは利用できません (簡易実装を用意できませんでした)。"
+      _bv_tree_note=""
+    fi
+  fi
+fi
+printf '%s\n' "$_bv_tree_hint" >&2
+[ -n "$_bv_tree_note" ] && printf '%s\n' "$_bv_tree_note" >&2
+
+# 対話 bash はここで起動する。終了したら、用意した簡易実装を片付けてから抜ける。
+/bin/bash
+_bv_tree_status=$?
+[ -n "$_bv_tree_bin" ] && rm -rf -- "$_bv_tree_bin" 2>/dev/null
+exit "$_bv_tree_status"
+CONTAINER_INTERACTIVE_BASH_SCRIPT_END
+)"
+# 本スクリプト自身が CRLF で持ち込まれた場合、上の文字列にも CR が残る。
+# そのままコンテナ内の bash へ渡すと 1 行目から構文エラーになるため落としておく。
+CONTAINER_INTERACTIVE_BASH_SCRIPT="${CONTAINER_INTERACTIVE_BASH_SCRIPT//$'\r'/}"
+
+# コンテナ内の対話 bash を起動する。素の docker exec ではなく、上のセッション
+# スクリプト経由で起動して tree を使える状態にしてから bash を開始する。
+exec_container_interactive_bash() {
+  local container_id="$1"
+  docker exec -it "$container_id" /bin/bash -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
+}
+
 # 選択された Compose サービスの実行中コンテナへ対話式 bash で接続する。
 # 同じシェルセッションが続くため、cd で移動しながら任意のコマンドを実行できる。
 run_interactive_compose_bash() {
@@ -8722,8 +8986,9 @@ run_interactive_compose_bash() {
   diag ""
   diag "Compose サービスの bash へ接続します (service=${service_name}, container=${container_name})。"
   diag "この bash セッション内では cd によるディレクトリ移動と任意のコマンド実行が可能です。"
+  diag "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
   diag "bash を終了するとサービス操作の選択へ戻ります。コンテナは起動状態を維持します。"
-  if ! docker exec -it "$container_id" /bin/bash; then
+  if ! exec_container_interactive_bash "$container_id"; then
     err "Compose サービス '${service_name}' の /bin/bash へ接続できませんでした: ${container_name}"
     return 1
   fi
@@ -12882,7 +13147,7 @@ run_interactive_compose_service_actions() {
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
     diag "  1) ログを表示"
-    diag "  2) bash へ接続 (cd・任意コマンドを実行可能)"
+    diag "  2) bash へ接続 (cd・tree・任意コマンドを実行可能)"
     diag "  3) healthcheck 設定・実行履歴・通信を確認"
     if [ "$mysql_action" -gt 0 ]; then
       diag "  ${mysql_action}) MySQL クライアントへ接続 (SQL クエリを対話実行)"
@@ -13027,7 +13292,7 @@ run_keep_container_interaction() {
   if [ "$DRY_RUN" = "true" ]; then
     case "$KEEP_CONTAINER_MODE" in
       bash)
-        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します。"
+        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します (tree コマンドを使える状態にしてから開始します)。"
         ;;
       http)
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
@@ -13046,8 +13311,9 @@ run_keep_container_interaction() {
       select_interaction_target || return 1
       diag ""
       diag "検証対象コンテナの bash へ接続します (service=${INTERACTION_SERVICE_NAME}, container=${INTERACTION_CONTAINER_NAME})。"
+      diag "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
       diag "bash を終了してもコンテナは起動状態のまま残ります。"
-      if ! docker exec -it "$INTERACTION_CONTAINER_ID" /bin/bash; then
+      if ! exec_container_interactive_bash "$INTERACTION_CONTAINER_ID"; then
         err "検証対象コンテナの /bin/bash へ接続できませんでした: ${INTERACTION_CONTAINER_NAME}"
         return 1
       fi
@@ -17542,12 +17808,14 @@ analyze_war_deploy_exceptions() {
   fi
   write_deploy_exception_meta "$meta_file" "$exit_status"
 
-  excel_path="$(prepare_analysis_output \
-      "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel" \
-      "_java_exceptions" "Java 例外解析")"
-  # テキストは --deploy-exception-text で出力先を指定したときだけ書き出す。
+  # Excel も、テキストと同じく出力先を明示指定したときだけ書き出す。
   # (--report-dir 配下への自動命名は行わない。全量レポートの [10] へ同じ内容が
   #  載るため、既定でもう 1 つ同じファイルを増やさない)
+  if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ]; then
+    excel_path="$(prepare_analysis_output \
+        "$DEPLOY_EXCEPTION_EXCEL" "$DEPLOY_EXCEPTION_EXCEL_SET" "xlsx" " Excel" \
+        "_java_exceptions" "Java 例外解析")"
+  fi
   if [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ]; then
     text_path="$(prepare_analysis_output \
         "$DEPLOY_EXCEPTION_TEXT" "$DEPLOY_EXCEPTION_TEXT_SET" "txt" "テキスト" \
@@ -17641,9 +17909,8 @@ show_war_deploy_exception_outputs() {
   if [ -n "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ]; then
     log "Java 例外解析のテキストを出力しました: $DEPLOY_EXCEPTION_TEXT_OUTPUT"
   fi
-  if [ -z "$DEPLOY_EXCEPTION_EXCEL_FILE" ] && [ -z "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ] \
-      && [ -z "$BUILD_REPORT_DIR" ]; then
-    log "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text の指定時 (Excel は --report-dir でも) に行います。"
+  if [ -z "$DEPLOY_EXCEPTION_EXCEL_FILE" ] && [ -z "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ]; then
+    log "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text を指定したときだけ行います。"
   fi
   return 0
 }
@@ -17660,7 +17927,7 @@ append_deploy_exception_report() {
   if [ -n "$DEPLOY_EXCEPTION_EXCEL_FILE" ]; then
     printf 'Excel ブック  : %s\n' "$DEPLOY_EXCEPTION_EXCEL_FILE" >> "$report_file"
   else
-    printf 'Excel ブック  : (未出力)\n' >> "$report_file"
+    printf 'Excel ブック  : (未出力。--deploy-exception-excel FILE を指定すると出力します)\n' >> "$report_file"
   fi
   if [ -n "$DEPLOY_EXCEPTION_TEXT_OUTPUT" ]; then
     printf 'テキスト      : %s (Excel と同じ内容。全スタックフレームとデプロイログを含む)\n' \
@@ -22672,7 +22939,7 @@ append_copy_artifact_report() {
     printf '判定          : OK\n' >> "$report_file"
   fi
   if [ ${#COPY_ARTIFACT_REPORT_LINES[@]} -eq 0 ]; then
-    printf '%s\n' "検証の明細はありません (--copy-file 未指定、コンテナ未起動、または検証を無効化)。" \
+    printf '%s\n' "検証の明細はありません (--verify-copy-artifact 未指定、--copy-file 未指定、またはコンテナ未起動)。" \
         >> "$report_file"
     return 0
   fi
@@ -22909,8 +23176,9 @@ write_build_report() {
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
-    printf '                デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)\n'
-    printf '                (画面表示は --deploy-exception-display、テキストは\n'
+    printf '                デプロイ処理の Java 例外解析は [10] に記載\n'
+    printf '                (画面表示は --deploy-exception-display、Excel は\n'
+    printf '                 --deploy-exception-excel FILE、テキストは\n'
     printf '                 --deploy-exception-text FILE を指定したときだけ出力する)\n'
     printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
     printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'

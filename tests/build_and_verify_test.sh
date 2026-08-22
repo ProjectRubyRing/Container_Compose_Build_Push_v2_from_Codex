@@ -1184,7 +1184,7 @@ assert_occurrences "${build_failure_reports[0]}" "(このサービスのログ�
 # ビルド失敗で compose up まで到達しなかった場合も Java 例外解析は必ず実行し、
 # 「0 件検出」ではなく「未評価」として理由まで残す。
 # 画面表示は既定で行わないため (--deploy-exception-display 未指定)、結果が残るのは
-# 全量レポートの [10] と Excel だけになる。テキストも既定では出力しない。
+# 全量レポートの [10] だけになる。Excel もテキストも既定では出力しない。
 if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$build_failure_output"; then
   assert_not_contains "$build_failure_output" \
     "WAR デプロイ時 Java 例外解析: コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
@@ -1195,8 +1195,8 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   assert_not_contains "${build_failure_reports[0]}" "総合判定      : OK (Java 例外は検出されませんでした)"
   assert_contains "${build_failure_reports[0]}" "解析対象のログが 1 行も無いため、Java 例外の有無を判定できていません。"
   build_failure_books=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#build_failure_books[@]} -eq 1 ] && [ -s "${build_failure_books[0]}" ] \
-    || fail "expected a java exception workbook even when the build failed"
+  [ ! -e "${build_failure_books[0]}" ] \
+    || fail "did not expect a java exception workbook without --deploy-exception-excel"
   build_failure_texts=("$TEST_TMP/build-failure-reports"/build_and_verify_*_java_exceptions.txt)
   [ ! -e "${build_failure_texts[0]}" ] \
     || fail "did not expect a java exception text file without --deploy-exception-text"
@@ -1270,9 +1270,14 @@ if ! (
 fi
 
 assert_contains "$bash_mode_output" "検証対象コンテナの bash へ接続します"
+assert_contains "$bash_mode_output" \
+  "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
 assert_contains "$bash_mode_output" "bash セッションを終了しました。コンテナは起動状態を維持します"
 assert_contains "$bash_mode_output" "コンテナを残します (--keep-container)"
-assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash"
+# 素の bash ではなく、tree を用意するセッションスクリプト経由で起動する。
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash -c"
+assert_contains "$FAKE_DOCKER_CALLS" "_bv_tree_main"
+assert_contains "$FAKE_DOCKER_CALLS" "tree コマンドが利用できます"
 assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
 logs_mode_output="$TEST_TMP/keep-mode-logs.out"
@@ -1304,7 +1309,7 @@ assert_occurrences "$logs_mode_output" "0 から 3 の番号を入力してく�
 assert_occurrences "$logs_mode_output" "Compose サービス 'db' で実行する操作を選択してください:" 3
 assert_occurrences "$logs_mode_output" "Compose サービス 'app' で実行する操作を選択してください:" 3
 assert_occurrences "$logs_mode_output" "  1) ログを表示" 6
-assert_occurrences "$logs_mode_output" "  2) bash へ接続 (cd・任意コマンドを実行可能)" 6
+assert_occurrences "$logs_mode_output" "  2) bash へ接続 (cd・tree・任意コマンドを実行可能)" 6
 assert_occurrences "$logs_mode_output" "  3) healthcheck 設定・実行履歴・通信を確認" 6
 assert_not_contains "$logs_mode_output" "MySQL クライアントへ接続 (SQL クエリを対話実行)"
 assert_occurrences "$logs_mode_output" "Compose サービスログ (サービス:" 1
@@ -1315,6 +1320,8 @@ assert_not_contains "$logs_mode_output" "DB001: companion service log"
 assert_not_contains "$logs_mode_output" "DB002: companion service log"
 assert_contains "$logs_mode_output" "Compose サービスの bash へ接続します (service=app, container=test-app-1)。"
 assert_contains "$logs_mode_output" "この bash セッション内では cd によるディレクトリ移動と任意のコマンド実行が可能です。"
+assert_contains "$logs_mode_output" \
+  "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
 assert_contains "$logs_mode_output" "bash セッションを終了しました。サービス操作の選択へ戻ります。"
 assert_contains "$logs_mode_output" "Docker healthcheck 診断"
 assert_contains "$logs_mode_output" "Compose サービス : app"
@@ -3521,13 +3528,14 @@ assert_contains "$cwagent_option_error_output" "--cwagent-delivery-target には
 #   - 例外の連鎖 (Caused by) をたどって根本原因の例外クラスを特定すること
 #   - 例外クラスに応じた原因分析と対処提案を --deploy-exception-display で画面へ出すこと
 #   - 全量レポートの [10] へ同じ内容を残すこと
-#   - デプロイ結果ファイルとは別に Excel ブックを追加出力すること
+#   - --deploy-exception-excel の指定時に Excel ブックを出力すること
 #   - --deploy-exception-text の指定時にテキストを出力すること
 # を確認する。base はビルド専用でコンテナを持たないため、解析対象は app だけにする。
 # 画面表示とテキスト出力はいずれも既定では行わないため、この実行では明示的に
 # 有効化する (既定の挙動そのものは後段の deploy-exception-quiet で確認する)。
 deploy_exception_output="$TEST_TMP/deploy-exception.out"
 deploy_exception_text_path="$TEST_TMP/deploy-exception-reports/java_exceptions.txt"
+deploy_exception_excel_path="$TEST_TMP/deploy-exception-reports/java_exceptions.xlsx"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3541,6 +3549,7 @@ if (
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-reports" \
     --deploy-exception-display \
+    --deploy-exception-excel "$deploy_exception_excel_path" \
     --deploy-exception-text "$deploy_exception_text_path" \
     --exit-on-deploy-error \
     --suppress-removed-logs
@@ -3590,15 +3599,19 @@ else
   [ ${#deploy_exception_reports[@]} -eq 1 ] && [ -f "${deploy_exception_reports[0]}" ] \
     || fail "expected one report for the java exception scenario"
   assert_contains "${deploy_exception_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
-  assert_contains "${deploy_exception_reports[0]}" "デプロイ処理の Java 例外解析は [10] に記載 (Excel も併せて出力)"
+  assert_contains "${deploy_exception_reports[0]}" "デプロイ処理の Java 例外解析は [10] に記載"
   assert_contains "${deploy_exception_reports[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
   assert_before "${deploy_exception_reports[0]}" \
     "[9] Compose サービス別ログ (全サービス・全行)" "[10] WAR デプロイ時 Java 例外解析"
 
-  # --- デプロイ結果ファイルとは別に Excel ブックを追加出力すること ---
-  deploy_exception_books=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#deploy_exception_books[@]} -eq 1 ] && [ -s "${deploy_exception_books[0]}" ] \
-    || fail "expected one java exception workbook next to the deploy report"
+  # --- --deploy-exception-excel で指定した先へ Excel ブックを出力すること ---
+  deploy_exception_books=("$deploy_exception_excel_path")
+  [ -s "${deploy_exception_books[0]}" ] \
+    || fail "expected the java exception workbook at --deploy-exception-excel"
+  # 自動命名 (build_and_verify_<日時>_java_exceptions.xlsx) は行わない。
+  deploy_exception_auto_books=("$TEST_TMP/deploy-exception-reports"/build_and_verify_*_java_exceptions.xlsx)
+  [ ! -e "${deploy_exception_auto_books[0]}" ] \
+    || fail "did not expect an auto-named java exception workbook"
   assert_contains "$deploy_exception_output" \
     "Java 例外解析の Excel ブックを出力しました: ${deploy_exception_books[0]}"
   assert_contains "${deploy_exception_reports[0]}" "Excel ブック  : ${deploy_exception_books[0]}"
@@ -3675,10 +3688,11 @@ else
   fi
 fi
 
-# --- 既定では画面表示もテキスト出力も行わないこと ---
-# 同じ例外ログを与えても、--deploy-exception-display / --deploy-exception-text を
-# 指定しなければ、解析結果はビルド結果の画面に現れず、テキストも作らない。
-# 解析そのものは動いており、結果は全量レポートの [10] と Excel に残る。
+# --- 既定では画面表示も Excel / テキスト出力も行わないこと ---
+# 同じ例外ログを与えても、--deploy-exception-display / --deploy-exception-excel /
+# --deploy-exception-text を指定しなければ、解析結果はビルド結果の画面に現れず、
+# Excel もテキストも作らない。解析そのものは動いており、結果は全量レポートの
+# [10] に残る。
 deploy_exception_quiet_output="$TEST_TMP/deploy-exception-quiet.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
@@ -3712,18 +3726,20 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   quiet_texts=("$TEST_TMP/deploy-exception-quiet-reports"/build_and_verify_*_java_exceptions.txt)
   [ ! -e "${quiet_texts[0]}" ] \
     || fail "did not expect a java exception text file without --deploy-exception-text"
-  # Excel と全量レポートへは従来どおり残す (出力先だけは画面へ 1 行で知らせる)。
+  # Excel も自動命名では作らない (--report-dir だけでは出力しない)。
   quiet_books=("$TEST_TMP/deploy-exception-quiet-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#quiet_books[@]} -eq 1 ] && [ -s "${quiet_books[0]}" ] \
-    || fail "expected a java exception workbook even without --deploy-exception-display"
-  assert_contains "$deploy_exception_quiet_output" \
-    "Java 例外解析の Excel ブックを出力しました: ${quiet_books[0]}"
+  [ ! -e "${quiet_books[0]}" ] \
+    || fail "did not expect a java exception workbook without --deploy-exception-excel"
+  assert_not_contains "$deploy_exception_quiet_output" \
+    "Java 例外解析の Excel ブックを出力しました:"
   collect_report_files "$TEST_TMP/deploy-exception-quiet-reports"
   quiet_reports=("${REPORT_FILES[@]}")
   [ ${#quiet_reports[@]} -eq 1 ] && [ -f "${quiet_reports[0]}" ] \
     || fail "expected one report for the quiet java exception scenario"
   assert_contains "${quiet_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
   assert_contains "${quiet_reports[0]}" "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+  assert_contains "${quiet_reports[0]}" \
+    "Excel ブック  : (未出力。--deploy-exception-excel FILE を指定すると出力します)"
   assert_contains "${quiet_reports[0]}" \
     "テキスト      : (未出力。--deploy-exception-text FILE を指定すると出力します)"
 fi
@@ -3784,12 +3800,13 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
     "WAR デプロイ時に Java の例外を 2 件検出しました (デプロイ処理中: 2 件)。"
   assert_contains "$deploy_exception_display_only_output" "■ 対処方法"
   assert_contains "$deploy_exception_display_only_output" \
-    "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text の指定時 (Excel は --report-dir でも) に行います。"
+    "Java 例外解析のファイル出力は、--deploy-exception-excel / --deploy-exception-text を指定したときだけ行います。"
 fi
 
-# --- 例外が無いログでは、解析結果を 1 行にとどめ、Excel は出力すること ---
+# --- 例外が無いログでは、解析結果を 1 行にとどめ、Excel は指定時に出力すること ---
 deploy_exception_clean_output="$TEST_TMP/deploy-exception-clean.out"
 deploy_exception_clean_text_path="$TEST_TMP/deploy-exception-clean-reports/java_exceptions.txt"
+deploy_exception_clean_excel_path="$TEST_TMP/deploy-exception-clean-reports/java_exceptions.xlsx"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3803,6 +3820,7 @@ if ! (
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-clean-reports" \
     --deploy-exception-display \
+    --deploy-exception-excel "$deploy_exception_clean_excel_path" \
     --deploy-exception-text "$deploy_exception_clean_text_path" \
     --suppress-removed-logs
 ) >"$deploy_exception_clean_output" 2>&1; then
@@ -3815,8 +3833,8 @@ unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$deploy_exception_clean_output"; then
   assert_contains "$deploy_exception_clean_output" "WAR デプロイ時の Java 例外は検出されませんでした。"
   assert_not_contains "$deploy_exception_clean_output" "■ 発生の仕組み (なぜこの例外になるのか)"
-  clean_books=("$TEST_TMP/deploy-exception-clean-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#clean_books[@]} -eq 1 ] && [ -s "${clean_books[0]}" ] \
+  clean_books=("$deploy_exception_clean_excel_path")
+  [ -s "${clean_books[0]}" ] \
     || fail "expected a java exception workbook even when no exception was found"
   clean_texts=("$deploy_exception_clean_text_path")
   [ -s "${clean_texts[0]}" ] \
@@ -3836,6 +3854,7 @@ fi
 # デプロイ結果ファイルだけを残して解析を省略してしまわないことを確認する。
 deploy_exception_upfail_output="$TEST_TMP/deploy-exception-upfail.out"
 deploy_exception_upfail_text_path="$TEST_TMP/deploy-exception-upfail-reports/java_exceptions.txt"
+deploy_exception_upfail_excel_path="$TEST_TMP/deploy-exception-upfail-reports/java_exceptions.xlsx"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
 export FAKE_COMPOSE_CONFIG_SERVICES="app"
@@ -3851,6 +3870,7 @@ if (
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-upfail-reports" \
     --deploy-exception-display \
+    --deploy-exception-excel "$deploy_exception_upfail_excel_path" \
     --deploy-exception-text "$deploy_exception_upfail_text_path" \
     --suppress-removed-logs
 ) >"$deploy_exception_upfail_output" 2>&1; then
@@ -3880,8 +3900,8 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   # 旧実装がここへ記録していた「解析していません」に戻っていないこと。
   assert_not_contains "${upfail_reports[0]}" "コンテナを起動していないため、デプロイ処理のログがありません。"
 
-  upfail_books=("$TEST_TMP/deploy-exception-upfail-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#upfail_books[@]} -eq 1 ] && [ -s "${upfail_books[0]}" ] \
+  upfail_books=("$deploy_exception_upfail_excel_path")
+  [ -s "${upfail_books[0]}" ] \
     || fail "expected a java exception workbook when compose up failed"
   upfail_texts=("$deploy_exception_upfail_text_path")
   [ -s "${upfail_texts[0]}" ] \
@@ -3907,6 +3927,7 @@ if (
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-nolog-reports" \
     --deploy-exception-display \
+    --deploy-exception-excel "$TEST_TMP/deploy-exception-nolog-reports/java_exceptions.xlsx" \
     --suppress-removed-logs
 ) >"$deploy_exception_nolog_output" 2>&1; then
   unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_UP_FAIL \
@@ -3927,8 +3948,8 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   [ ${#nolog_reports[@]} -eq 1 ] && [ -f "${nolog_reports[0]}" ] \
     || fail "expected one report when no container log was available"
   assert_contains "${nolog_reports[0]}" "総合判定      : 未評価 (解析対象のログが無いため判定できません)"
-  nolog_books=("$TEST_TMP/deploy-exception-nolog-reports"/build_and_verify_*_java_exceptions.xlsx)
-  [ ${#nolog_books[@]} -eq 1 ] && [ -s "${nolog_books[0]}" ] \
+  nolog_books=("$TEST_TMP/deploy-exception-nolog-reports/java_exceptions.xlsx")
+  [ -s "${nolog_books[0]}" ] \
     || fail "expected a java exception workbook when no container log was available"
 fi
 
@@ -4458,6 +4479,8 @@ assert_contains "$copy_dry_run_dir/copy-src.npmrc" "dry-run-original"
 # として見えているかを SHA-256 で突き合わせる。名前付きボリュームがデプロイ先を
 # 覆っていると、イメージを作り直しても古い成果物が動き続けるが、ビルドも起動も
 # 成功して見えるため、照合しない限り気付けない。
+# 照合は既定では行わないため、各シナリオで --verify-copy-artifact
+# (または --copy-artifact-path などの付随オプション) を指定して有効にする。
 copy_artifact_src="$TEST_TMP/copy-artifact/frontend.war"
 copy_artifact_old="$TEST_TMP/copy-artifact/frontend.war.old"
 copy_artifact_ctx="$TEST_TMP/copy-artifact/context"
@@ -4468,6 +4491,38 @@ copy_artifact_new_sha="$(sha256sum "$copy_artifact_src" | cut -d' ' -f1)"
 copy_artifact_old_sha="$(sha256sum "$copy_artifact_old" | cut -d' ' -f1)"
 copy_artifact_new_size="$(wc -c < "$copy_artifact_src" | tr -d '[:space:]')"
 copy_artifact_deploy_path="/opt/eap/standalone/deployments/frontend.war"
+
+# (0) 既定では照合しない。--copy-file を指定しただけの実行では、コンテナ内の
+#     探索も SHA-256 の突き合わせも行わず、全量レポートへ理由だけを残す。
+copy_artifact_default_output="$TEST_TMP/copy-artifact-default.out"
+copy_artifact_default_reports="$TEST_TMP/copy-artifact-default-reports"
+mkdir -p "$copy_artifact_default_reports"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COPY_ARTIFACT_PROBE="FILE|${copy_artifact_deploy_path}|16|${copy_artifact_old_sha}" \
+  FAKE_CONTAINER_MOUNTS="volume|/var/lib/docker/volumes/proj_deployments/_data|/opt/eap/standalone/deployments|true" \
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$copy_artifact_default_reports" \
+    --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
+) >"$copy_artifact_default_output" 2>&1; then
+  cat "$copy_artifact_default_output" >&2
+  fail "the default run must not verify copied artifacts"
+fi
+assert_not_contains "$copy_artifact_default_output" \
+  "コピーしたファイル (--copy-file) の取り込み検証"
+# 古い成果物 (不一致) を仕込んでいても、照合しない以上エラーにはしない。
+assert_not_contains "$copy_artifact_default_output" "[不一致] app (test-app-1)"
+# デプロイ先を覆うマウントの点検も、取り込み検証と同じ条件でのみ行う。
+assert_not_contains "$copy_artifact_default_output" "デプロイ先がマウントに覆われています"
+collect_report_files "$copy_artifact_default_reports"
+assert_contains "${REPORT_FILES[0]}" "コピー取込検証: 未実施 (--verify-copy-artifact 未指定)"
+assert_contains "${REPORT_FILES[0]}" \
+  "検証の明細はありません (--verify-copy-artifact 未指定、--copy-file 未指定、またはコンテナ未起動)。"
 
 # (1) ボリュームが古い WAR を隠している: 不一致を検出してエラー終了し、
 #     イメージ側は一致していることまで示したうえで down -v まで行う。
@@ -4483,6 +4538,7 @@ if (
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_stale_output" 2>&1; then
   cat "$copy_artifact_stale_output" >&2
@@ -4519,6 +4575,7 @@ if (
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_build_output" 2>&1; then
   cat "$copy_artifact_build_output" >&2
@@ -4547,6 +4604,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --report-dir "$copy_artifact_reports" \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_ok_output" 2>&1; then
@@ -4573,6 +4631,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_missing_output" 2>&1; then
   cat "$copy_artifact_missing_output" >&2
@@ -4584,6 +4643,7 @@ assert_contains "$copy_artifact_missing_output" \
   "コピーしたファイルの取り込みは確認できませんでした (対象 1 件 (一致 0 / 不一致 0 / 未検出 1))。"
 
 # (5) --copy-artifact-required を付けると、未検出もエラーになる。
+#     (--verify-copy-artifact を書かなくても、この指定だけで照合が有効になる)
 copy_artifact_required_output="$TEST_TMP/copy-artifact-required.out"
 if (
   cd "$REPO_ROOT"
@@ -4614,6 +4674,7 @@ FILE|${copy_artifact_deploy_path}|${copy_artifact_new_size}|${copy_artifact_new_
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_mixed_output" 2>&1; then
   cat "$copy_artifact_mixed_output" >&2
@@ -4650,6 +4711,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --suppress-startup-logs \
+    --verify-copy-artifact \
     --copy-file "${copy_artifact_src}:${copy_artifact_ctx}"
 ) >"$copy_artifact_noshell_output" 2>&1; then
   cat "$copy_artifact_noshell_output" >&2
@@ -4660,6 +4722,7 @@ assert_contains "$copy_artifact_noshell_output" \
 assert_contains "$copy_artifact_noshell_output" "探索不可のコンテナ 1 件"
 
 # (8-2) シェルが無くても、--copy-artifact-path を指定すれば docker cp で照合できる。
+#       (--verify-copy-artifact を書かなくても、この指定だけで照合が有効になる)
 copy_artifact_cp_output="$TEST_TMP/copy-artifact-cp.out"
 if ! (
   cd "$REPO_ROOT"

@@ -55,10 +55,10 @@
 | 11-3 | 終了時のビルドキャッシュ削除・使用量の計測 | `--prune-build-cache` / `--prune-build-cache-keep` / `--disk-usage-report` |
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
-| 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。結果は全量レポート `[10]` と Excel へ。**画面表示は `--deploy-exception-display` 指定時のみ**、**テキスト出力は `--deploy-exception-text` 指定時のみ**) |
+| 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。結果は全量レポート `[10]` へ。**画面表示は `--deploy-exception-display` 指定時のみ**、**Excel 出力は `--deploy-exception-excel` 指定時のみ**、**テキスト出力は `--deploy-exception-text` 指定時のみ**) |
 | 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
 | 16 | JBoss EAP Undertow バーチャルホスト (`default-host`) の分析 (`Host` ヘッダーごとの振り分け判定、`default-host` の利用状況、`Host` ヘッダーを差し替えた実リクエストによる確認) | (起動確認時に既定で自動。無効化は `--no-undertow-analysis`。テキスト出力は `--report-dir` / `--undertow-analysis-text` 指定時) |
-| 17 | コピーしたファイル (WAR など) の取り込み検証 (差し替えたファイルが本当にコンテナへ届いているかを SHA-256 で照合し、届いていなければエラー終了) | (`--copy-file` 指定時は既定で自動。無効化は `--no-verify-copy-artifact`。未検出もエラーにするのは `--copy-artifact-required`) |
+| 17 | コピーしたファイル (WAR など) の取り込み検証 (差し替えたファイルが本当にコンテナへ届いているかを SHA-256 で照合し、届いていなければエラー終了) | (**既定では行わない**。`--verify-copy-artifact` で有効化。`--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` を指定した場合も有効になる) |
 | 18 | 後始末でのボリューム削除 (デプロイ先を覆っているボリュームを残さない) | (対話操作をすべて終えた実行では既定で `compose down -v`。常に削除は `--remove-volumes`、残すのは `--keep-volumes`) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
@@ -198,7 +198,7 @@ flowchart TD
     R -- 不要 --> Z1[ビルドのみ完了 exit 0]
     R -- 必要 --> R2[イメージ事前取得<br/>compose pull --ignore-buildable --policy missing<br/>一過性エラーは --pull-retry 回まで再試行 / 失敗しても続行]
     R2 --> S[compose up -d --no-build<br/>--wait-healthy 指定時は --wait<br/>失敗時は診断を出し、一過性なら --up-retry 回まで再試行]
-    S --> S2[コピーしたファイルの取り込み検証<br/>コピー元 SHA-256 とコンテナ内 / イメージ内を照合<br/>不一致なら原因を切り分けて exit 1]
+    S --> S2[コピーしたファイルの取り込み検証<br/>--verify-copy-artifact 指定時のみ<br/>コピー元 SHA-256 とコンテナ内 / イメージ内を照合<br/>不一致なら原因を切り分けて exit 1]
     S2 --> T{--verify-startup?}
     T -- あり --> U[起動完了ログを待つ<br/>WFLYSRV0025 検出まで]
     T -- なし --> V
@@ -381,11 +381,11 @@ compose down (削除)
 | `--dry-run` | フラグ | `false` | — | ビルド/起動/URL 呼び出し/ファイル操作を行わずプレビュー |
 | `--copy-file SRC:DEST_DIR` | `コピー元:コピー先ディレクトリ` | (なし) | **可** | ビルド前にコピーし、終了後に自動削除。コピー先に同名ファイルがあれば強制上書きし、終了時に上書き前のファイルへ復元 |
 | `--copy-file-no-overwrite` | フラグ | `false` | — | `--copy-file` のコピー先に同名ファイルがあれば上書きせず中止 (`exit 1`) |
-| `--verify-copy-artifact` | フラグ | `auto` (`--copy-file` 指定時のみ有効) | — | `--copy-file` を指定していない実行でも取り込み検証を行う (→ 5.13) |
-| `--no-verify-copy-artifact` | フラグ | `false` | — | 取り込み検証を行わない。`--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` とは排他 |
-| `--copy-artifact-path PATH` | コンテナ内の絶対パス | (自動探索) | **可** | 照合するコンテナ内パスを明示指定。シェルの無いコンテナでも `docker cp` で取り出して照合する |
-| `--copy-artifact-search-dir DIR` | コンテナ内の絶対パス | `/` | **可** | コンテナ内の探索起点を絞る (探索時間の短縮) |
-| `--copy-artifact-required` | フラグ | `false` | — | コピーしたファイルがコンテナ内に見つからない場合もエラーとする (既定は警告のみ) |
+| `--verify-copy-artifact` | フラグ | `false` (既定では照合しない) | — | 取り込み検証を行う (→ 5.13) |
+| `--no-verify-copy-artifact` | フラグ | (既定と同じ) | — | 取り込み検証を行わない。`--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` とは排他 |
+| `--copy-artifact-path PATH` | コンテナ内の絶対パス | (自動探索) | **可** | 照合するコンテナ内パスを明示指定。シェルの無いコンテナでも `docker cp` で取り出して照合する。指定すると取り込み検証を有効にする |
+| `--copy-artifact-search-dir DIR` | コンテナ内の絶対パス | `/` | **可** | コンテナ内の探索起点を絞る (探索時間の短縮)。指定すると取り込み検証を有効にする |
+| `--copy-artifact-required` | フラグ | `false` | — | コピーしたファイルがコンテナ内に見つからない場合もエラーとする (既定は警告のみ)。指定すると取り込み検証を有効にする |
 
 ### 4.2 JBoss マスターパスワード (BuildKit シークレット)
 
@@ -515,12 +515,12 @@ compose down (削除)
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
 | `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。Java 例外解析の Excel と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析のテキストは `--deploy-exception-text` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report` 併用時のみ保存 |
-| `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない (結果は全量レポート `[10]` と Excel に残る)。`--no-deploy-exception-analysis` とは排他 |
+| `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない (結果は全量レポート `[10]` に残る)。`--no-deploy-exception-analysis` とは排他 |
 | `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
-| `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。`--report-dir` 指定時は未指定でも自動出力。`--no-deploy-exception-analysis` とは排他 |
+| `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | 不可 | WAR デプロイ時 Java 例外解析の Excel 出力先。**指定したときだけ出力する** (`--report-dir` だけでは出力しない)。`--no-deploy-exception-analysis` とは排他 |
 | `--deploy-exception-text FILE` | ファイルパス | (なし。**指定時のみ出力**) | 不可 | 同じ内容のテキスト出力先。`--report-dir` を指定しただけでは出力しない。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 不可 | 詳細分析を行う例外の最大件数 |
-| `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析と Excel 出力を行わない |
+| `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析とファイル出力を行わない |
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 不可 | 読み取り専用ファイルシステム分析の Excel 出力先。`--no-readonly-analysis` とは排他 |
 | `--readonly-analysis-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他。Excel と同じパスは不可 |
 | `--no-readonly-analysis` | フラグ | `false` | 不可 | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |
@@ -812,7 +812,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 
 | モード | 動作 |
 | --- | --- |
-| `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る |
+| `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
 | `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認を繰り返す |
 
@@ -889,7 +889,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | 操作 | 内容 | 追加要件 |
 | --- | --- | --- |
 | ログ表示 | 選択サービスのログを `--startup-log-lines` の行数で表示 | — |
-| bash 接続 | 選択サービスへ対話接続 | 接続先に `/bin/bash` |
+| bash 接続 | 選択サービスへ対話接続 (`cd` / 任意コマンド / `tree` が使える → 5.4-3) | 接続先に `/bin/bash` |
 | healthcheck 調査 | 設定・実行履歴・実際の通信確認を表示 (機微情報はマスク) | — |
 | MySQL 実行 | MySQL サーバーで SQL を対話実行 | MySQL クライアント |
 | CloudWatch Logs 送達診断 | `cwagent` / `cloudwatch-logs-mock` への偽装送達を確認 | `curl` + Python 3 |
@@ -1036,7 +1036,7 @@ AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイ
 | 対象 | 起動失敗ログ (`WFLYSRV0026` / `WFLYSRV0056`) を検出したデプロイエラー |
 | 対象外 | 起動確認のタイムアウト、コンテナの途中停止、`compose up` の失敗 (いずれも従来どおり終了) |
 | 開始する操作 | `--keep-container-mode` 指定時はそのモード。未指定時は `logs` (→ 5.4) |
-| 対話の前 | 失敗した起動ログを表示し、WAR デプロイ時 Java 例外解析を先に済ませる (画面へ出すのは `--deploy-exception-display` 指定時。既定では全量レポート `[10]` と Excel へ残すだけ) |
+| 対話の前 | 失敗した起動ログを表示し、WAR デプロイ時 Java 例外解析を先に済ませる (画面へ出すのは `--deploy-exception-display` 指定時。既定では全量レポート `[10]` へ残すだけ) |
 | 対話の後 | コンテナは起動状態のまま残る。不要になったら `docker compose -f compose.yml down` |
 | 終了コード | デプロイエラーは失敗のままなので `1` |
 
@@ -1065,6 +1065,39 @@ AP サーバ (JBoss EAP 等) は起動したものの、アプリのデプロイ
 # 従来どおり、デプロイエラーならそのまま終了する
 ./build_and_verify.sh --verify-startup --exit-on-deploy-error
 ```
+
+### 5.4-3 対話 bash セッションの `tree`
+
+調査で最初に見たいのは「どこに何が配置されているか」です。ところが RHEL UBI や
+JBoss EAP のイメージに `tree` は同梱されておらず、コンテナ内から `dnf` で入れるには
+ネットワークとリポジトリ設定が要ります (閉じた環境では入れられません)。
+
+そこで `bash` 接続 (`--keep-container-mode bash` / `logs` モードの「bash へ接続」、
+デプロイエラー時の調査モードを含む) では、接続の直前に `tree` の有無を調べ、
+無ければ **bash だけで動く簡易実装**を用意してからセッションを開始します。
+
+| 状況 | 用意のしかた | セッション開始時の表示 |
+| --- | --- | --- |
+| コンテナに `tree` が入っている | そのまま使う | `tree コマンドが利用できます (コンテナに導入済みのものを使用します)。` |
+| 書き込めるディレクトリがある (`$TMPDIR` / `/tmp` / `/var/tmp` / `/dev/shm` / `$HOME` の順) | 実行可能なスクリプトとして置き、`PATH` の先頭へ足す (サブシェルや `xargs` からも呼べる) | `tree コマンドが利用できます (このセッション用の簡易実装を … へ用意しました)。` |
+| `read_only` / `noexec` などで置けない | `export -f` したシェル関数として渡す (ファイルを 1 つも作らない) | `tree コマンドが利用できます (簡易実装をシェル関数として用意しました)。` |
+
+簡易実装が対応するオプションは次のとおりです (`tree --help` でも表示します)。
+`find` / `awk` / `sort` を使わず bash の展開だけで動くため、コマンドがほとんど無い
+イメージでも同じように使えます。
+
+| オプション | 意味 |
+| --- | --- |
+| `-a` | ドットで始まるファイルも表示する |
+| `-d` | ディレクトリだけを表示する |
+| `-f` | 各行にパス全体を表示する |
+| `-L 深さ` | たどる深さの上限 (既定: 制限なし) |
+| `--noreport` | 末尾の集計行 (`N directories, M files`) を表示しない |
+
+- シンボリックリンクは `名前 -> 参照先` と表示し、**たどりません** (循環を避けるため)。
+- 読めないディレクトリは `[error opening dir]` と表示します。
+- セッションを終了すると、置いた簡易実装は削除します (コンテナには残しません)。
+- `/` を起点にすると巨大な出力になります。`-L` で深さを絞ってください。
 
 ### 5.5 `--verify-url` 関連オプションの組み合わせ
 
@@ -1233,7 +1266,7 @@ bash build_and_verify.sh --no-cache --verify-startup \
 | 対話操作 | 実行内容の説明のみ |
 | デプロイエラー時の調査モード | 対話操作へは入らず、調査できる状態にする旨だけを表示 |
 | `--copy-file` | コピー・上書き・退避・復元・削除を行わず予定を表示 |
-| 取り込み検証 | コンテナを起動しないため照合せず、実施予定だけを表示 |
+| 取り込み検証 | (有効にした実行のみ) コンテナを起動しないため照合せず、実施予定だけを表示 |
 | `--report-dir` | ファイル出力をスキップ |
 | ローカルイメージ確認 | スキップ |
 | 旧世代イメージの回収 | ID の取得・削除とも行わず `[DRY-RUN] 世代交代した旧イメージの削除は行いません` と表示 |
@@ -1360,7 +1393,11 @@ RUN --mount=type=secret,id=cacerts \
 
 #### 検証のしかた
 
-`--copy-file` を指定した実行では、**コピーを実行した時点でコピー元の SHA-256 を控え**、
+照合はコンテナ内の全探索を伴い時間がかかるため、**既定では行いません**。
+`--verify-copy-artifact` (または `--copy-artifact-path` / `--copy-artifact-search-dir` /
+`--copy-artifact-required` のいずれか) を指定した実行でだけ有効になります。
+
+有効にした実行では、**コピーを実行した時点でコピー元の SHA-256 を控え**、
 コンテナ起動直後 (起動完了の確認より**前**) に照合します。
 
 1. `docker exec` でコンテナ内を `find` し、コピー元と同じファイル名を探す
@@ -1397,8 +1434,9 @@ RUN --mount=type=secret,id=cacerts \
   `openssl` が無く、`docker cp` でも取り出せない) は、中身を見ていない以上**不一致とは
   断定せず** `[判定不可]` として残します (要約にも `判定不可 N 件` を出します)。
   `--copy-artifact-required` を付けた場合は、確認できなかったこと自体をエラーとします。
-- `--copy-file` を使っていない構成でも、デプロイ先 (`*/standalone/deployments`) が
-  ボリューム / バインドマウントで覆われていれば警告を出します。
+- 取り込み検証を有効にした実行では、`--copy-file` を使っていない構成でも、
+  デプロイ先 (`*/standalone/deployments`) がボリューム / バインドマウントで
+  覆われていれば警告を出します。
 - コンテナを起動しない実行 (ビルドのみ) では照合できないため、その旨を警告します。
 
 #### 出力例 (NG のとき)
@@ -1456,7 +1494,17 @@ RUN --mount=type=secret,id=cacerts \
 #### 実行例
 
 ```bash
-# WAR を差し替えて検証する。未検出もエラーにし、探索先をデプロイ先に絞る
+# WAR を差し替えて検証する (取り込み検証は既定で無効のため明示的に有効化する)
+./build_and_verify.sh \
+    --verify-startup \
+    --compose-service frontend \
+    --startup-service frontend \
+    --copy-file ./dist/frontend.war:./app \
+    --verify-copy-artifact \
+    --report-dir ./reports
+
+# 未検出もエラーにし、探索先をデプロイ先に絞る
+# (--copy-artifact-* を指定すると --verify-copy-artifact は省略できる)
 ./build_and_verify.sh \
     --verify-startup \
     --compose-service frontend \
@@ -1519,8 +1567,7 @@ RUN --mount=type=secret,id=cacerts \
 | --- | --- | --- |
 | `--env-list-file` のパス | 指定時 | 環境変数一覧 |
 | `--report-dir/build_and_verify_<日時>.txt` | 指定時 | 全量レポート (デプロイ結果ファイル) |
-| `--report-dir/build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時 (コンテナ起動を伴う実行) | WAR デプロイ時 Java 例外エラー解析の Excel ブック |
-| `--deploy-exception-excel` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--deploy-exception-excel` のパス | **指定時のみ** (`--report-dir` だけでは出力しない) | WAR デプロイ時 Java 例外エラー解析の Excel ブック |
 | `--deploy-exception-text` のパス | **指定時のみ** (`--report-dir` だけでは出力しない) | Excel と同じ内容のテキスト版 (全スタックフレーム + 区分付きデプロイログ) |
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.xlsx` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 読み取り専用ファイルシステム分析の Excel ブック |
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.txt` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 同じ内容のテキスト版 (全ディレクトリの判定・根拠・参考知識) |
@@ -1542,7 +1589,7 @@ RUN --mount=type=secret,id=cacerts \
 | `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス。**画面表示 (`--deploy-exception-display`) の有無にかかわらず記録する** | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
 | `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
 | `[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析` | `subsystem` の既定値、`server` とリスナー、バーチャルホストと受け付けるホスト名、`Host` ヘッダーごとの振り分け、実リクエストによる確認、要確認 | 「未取得」として理由を記録 |
-| `[13] コピーしたファイル (--copy-file) の取り込み検証` | コピー元の SHA-256 / サイズ、コンテナ内で見つかったパスと一致・不一致、不一致時の原因診断 (覆っているマウント / イメージ側との突き合わせ)、判定 (OK / NG) | 「コンテナを起動していません」と記録 |
+| `[13] コピーしたファイル (--copy-file) の取り込み検証` | コピー元の SHA-256 / サイズ、コンテナ内で見つかったパスと一致・不一致、不一致時の原因診断 (覆っているマウント / イメージ側との突き合わせ)、判定 (OK / NG)。`--verify-copy-artifact` を指定していない実行では `未実施 (--verify-copy-artifact 未指定)` と記録 | 「コンテナを起動していません」と記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -1942,12 +1989,11 @@ CDI / JPA / Servlet の初期化) で Java の例外が投げられると、そ�
 
 | ファイル | 出力条件 | 内容 |
 | --- | --- | --- |
-| `build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir` 指定時に自動命名。`--deploy-exception-excel FILE` で明示も可 | 後述の 6 シート構成の Excel ブック |
+| `--deploy-exception-excel FILE` のパス | **`--deploy-exception-excel FILE` を指定したときだけ** (`--report-dir` だけでは出力しない) | 後述の 6 シート構成の Excel ブック |
 | `--deploy-exception-text FILE` のパス | **`--deploy-exception-text FILE` を指定したときだけ** (`--report-dir` だけでは出力しない) | Excel と同じ内容のテキスト版。Excel を開けない環境や、`grep` / `diff` で追いたい場合に使う |
 
-Excel は `--report-dir` を指定していれば、デプロイ結果ファイル
-(`build_and_verify_<日時>.txt`) と**同じディレクトリへ追加で**出力します。
-テキストは自動命名を行わないため、必要なときに出力先を明示してください
+Excel もテキストも自動命名は行いません。解析結果そのものは `--report-dir` の
+全量レポート `[10]` へ必ず残るため、ファイルが要るときだけ出力先を明示してください
 (同じ内容が全量レポート `[10]` にも載るため、既定では同じファイルを 2 つ作りません)。
 
 テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
@@ -2320,10 +2366,9 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 # 16) build_and_push.sh 経由での呼び出し (同じ処理)
 ./build_and_push.sh --build-only --verify-startup --log-dir ./logs
 
-# 17) デプロイ結果ファイルと Java 例外解析の Excel をまとめて保存
-#     (reports/build_and_verify_<日時>.txt … [10] に例外解析の全文、
-#      reports/build_and_verify_<日時>_java_exceptions.xlsx が出力される。
-#      画面には解析結果を出さない ← 既定)
+# 17) デプロイ結果ファイルへ Java 例外解析を残す
+#     (reports/build_and_verify_<日時>.txt … [10] に例外解析の全文。
+#      画面表示も Excel / テキストの出力も行わない ← 既定)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
@@ -2430,7 +2475,7 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `[NG] 収集対象パスが cwagent にマウントされていません` | `collect_list` の `file_path` が `cwagent` の `volumes` に無く、tail 対象が存在しない | ログ出力元と同じボリュームを `cwagent` へマウントする (読み取り専用で可) |
 | `[NG] log_group_name が CloudWatch Logs の命名規則に反します` | 空白など使用できない文字が含まれる | `[A-Za-z0-9_./#-]` の範囲・512 文字以内へ直す |
 | `[NG] リージョンが設定ファイルにも cwagent の environment にもありません` | `agent.region` も `AWS_REGION` も無く、送信先エンドポイントを決められない | 設定 JSON の `agent.region` か `cwagent` の `environment.AWS_REGION` を設定する |
-| `WAR デプロイ時に Java の例外を N 件検出しました` (`--deploy-exception-display` 指定時のみ) | デプロイ処理で例外が投げられた | 直前に出力された例外ごとの `■ 対処方法` を上から実施する。全量レポート `[10]` と Excel の「対処方法」シートにも同じ内容がある |
+| `WAR デプロイ時に Java の例外を N 件検出しました` (`--deploy-exception-display` 指定時のみ) | デプロイ処理で例外が投げられた | 直前に出力された例外ごとの `■ 対処方法` を上から実施する。全量レポート `[10]` (と `--deploy-exception-excel` 指定時は Excel の「対処方法」シート) にも同じ内容がある |
 | `Java 例外解析をスキップしました: Python 3 が見つかりません` | `python3` / `python` / `/usr/libexec/platform-python` のいずれも無い | Python 3 を導入する (Excel 生成に標準ライブラリだけを使うため追加パッケージは不要) |
 | `WAR デプロイ時 Java 例外解析に失敗しました (exit=…)` | 解析ヘルパーが異常終了した | 続けて表示されるヘルパーのメッセージを確認。ビルドの成否には影響しない |
 | `Java 例外解析 Excel / テキストの出力先を作成できませんでした` | 出力先ディレクトリを作れない (権限不足) | 書き込み可能なパスを `--report-dir` / `--deploy-exception-excel` / `--deploy-exception-text` に指定する |

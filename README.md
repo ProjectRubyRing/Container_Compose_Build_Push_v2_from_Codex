@@ -13,6 +13,8 @@
 > | `buildx_build_and_push.sh` | [詳細ガイド](docs/buildx_build_and_push_guide.md) | [buildx_build_and_push_guide.xlsx](docs/buildx_build_and_push_guide.xlsx) |
 > | `build_and_verify.sh` | [詳細ガイド](docs/build_and_verify_guide.md) | [build_and_verify_guide.xlsx](docs/build_and_verify_guide.xlsx) |
 >
+> - [parameters_cheatsheet.md](docs/parameters_cheatsheet.md) — **3 スクリプトが指定できる
+>   パラメータだけ**を、値・既定値・1 行説明の表にまとめたチートシートです。
 > - Excel 版は各ガイドと同じ内容を 5 シート構成へ組み直したものです (後述)。
 > - [scripts_reference.xlsx](docs/scripts_reference.xlsx) — 3 スクリプトを横断して一覧化した
 >   Excel 資料 (全 9 シート。`08_JVM_OTel設定` に JVM パラメータの分類と
@@ -199,11 +201,11 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述)。ECR 関連オプション (`--account-id` / `--registry` / `--repository` / `--tag-prefix` / `--container-name` / `--output` / `--switchback-shell` / `--auto-switchback` / `--warn-only`) は委譲先が解釈できないため、**警告のうえ無視される** | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応。コピー先に同名ファイルがある場合の動作はスクリプトごとに異なる (後述) | (なし) |
 | `--copy-file-no-overwrite` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` のコピー先に同名ファイルがある場合、強制上書きせずに処理を中止する (`exit 1`) | `false` |
-| `--verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--copy-file` を指定していない実行でも、コピーしたファイルの取り込み検証を行う。既定は `--copy-file` を指定した実行でのみ自動で有効 | `auto` |
-| `--no-verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。取り込み検証を行わない | `false` |
-| `--copy-artifact-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。照合するコンテナ内の**絶対パス**を明示指定する (繰り返し可)。コンテナにシェルが無く探索できない場合でも、このパスを `docker cp` で取り出して照合する | (自動探索) |
-| `--copy-artifact-search-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コンテナ内の探索起点を絞る (繰り返し可)。ファイル数の多いイメージで探索時間を短縮したいときに使う | `/` |
-| `--copy-artifact-required` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コピーしたファイルがコンテナ内に見つからない場合もエラーとする。既定は警告のみ (ビルド時にだけ必要なファイルは、イメージに残らないのが正しいため) | `false` |
+| `--verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コピーしたファイルの取り込み検証を行う。**既定では行わない** (コンテナ内の探索に時間を要するため) | `false` |
+| `--no-verify-copy-artifact` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。取り込み検証を行わない (既定と同じ。`--verify-copy-artifact` を打ち消す) | (既定) |
+| `--copy-artifact-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。照合するコンテナ内の**絶対パス**を明示指定する (繰り返し可)。コンテナにシェルが無く探索できない場合でも、このパスを `docker cp` で取り出して照合する。指定すると取り込み検証を有効にする | (自動探索) |
+| `--copy-artifact-search-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コンテナ内の探索起点を絞る (繰り返し可)。ファイル数の多いイメージで探索時間を短縮したいときに使う。指定すると取り込み検証を有効にする | `/` |
+| `--copy-artifact-required` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。コピーしたファイルがコンテナ内に見つからない場合もエラーとする。既定は警告のみ (ビルド時にだけ必要なファイルは、イメージに残らないのが正しいため)。指定すると取り込み検証を有効にする | `false` |
 | `--env-list-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後に表示する環境変数一覧の件数。各対象コンテナごとに先頭 `N` 件を表示し、既定は `all` | `all` |
 | `--env-list-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。動作確認成功後の環境変数一覧を `FILE` にも出力する。画面表示も継続 | (なし) |
 | `--directory-tree` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造を画面へ表示する。`--directory-tree-depth` / `--directory-file-limit` / `--deployment-dir-env` を指定した場合は、この指定が無くても表示を有効にする | `false` (画面表示しない) |
@@ -213,10 +215,10 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて Java 例外解析を `build_and_verify_<日時>_java_exceptions.xlsx`、読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析のテキストは `--deploy-exception-text` を指定したときだけ出力する | (なし) |
-| `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示せず、全量レポート `[10]` と Excel にだけ残す | `false` (非表示) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する | (なし) |
+| `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示せず、全量レポート `[10]` にだけ残す | `false` (非表示) |
 | `--no-deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--deploy-exception-display` を打ち消す) | `true` (既定) |
-| `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
+| `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブック (`.xlsx`) を出力する。**指定したときだけ出力する** (`--report-dir` だけでは出力しない) | (なし) |
 | `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を指定する。**指定したときだけ出力**し、`--report-dir` だけでは出力しない | (出力しない) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
 | `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
@@ -423,7 +425,7 @@ data root の空き容量と inode を自動で調べ、上表の原因と対処
 - **安全策**: コピー先が通常ファイル以外 (ディレクトリ・シンボリックリンク等) の場合は、
   `--copy-file-no-overwrite` の有無にかかわらず、上書き・自動削除のいずれも行わず中止します。
 
-### 差し替えたファイルが本当に取り込まれたかの検証 (既定で有効)
+### 差し替えたファイルが本当に取り込まれたかの検証 (`--verify-copy-artifact`)
 
 `--copy-file` で WAR などを毎回差し替えてビルド・デプロイを確認する使い方では、
 **「コピー元を差し替えたのに、動いているのは前回の成果物のまま」** という壊れ方が起こります。
@@ -437,10 +439,15 @@ data root の空き容量と inode を自動で調べ、上表の原因と対処
 ため、**ログのどこにも異常が出ません**。`--keep-container-mode logs` の bash でコンテナ内の
 `server.log` を見ても「変更が反映されていないログ」が見えるだけで、原因は分かりません。
 
-そこで `--copy-file` を指定した実行では、コピー元ファイルの **SHA-256** をコピー時点で控えておき、
-コンテナ起動直後に**コンテナ内を探索して同じ中身のファイルが実在するか**を突き合わせます。
-一致するものが 1 つも無く、同名で中身の違うファイルが見つかった場合は
-**「古い成果物のまま動いている」と判断してエラー終了** (`exit 1`) します。
+そこで `--verify-copy-artifact` を指定した実行では、コピー元ファイルの **SHA-256** を
+コピー時点で控えておき、コンテナ起動直後に**コンテナ内を探索して同じ中身のファイルが
+実在するか**を突き合わせます。一致するものが 1 つも無く、同名で中身の違うファイルが
+見つかった場合は **「古い成果物のまま動いている」と判断してエラー終了** (`exit 1`) します。
+
+> **この検証は既定では行いません。** コンテナ内の全探索に時間がかかるため、
+> 確認したい実行でだけ `--verify-copy-artifact` を指定してください。
+> `--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` の
+> いずれかを指定した場合も、「照合したい」という意思表示として自動的に有効になります。
 
 ```text
 ===================================================================
@@ -518,7 +525,14 @@ Docker が**イメージ側の内容をボリュームへ複製するのは、�
   `[判定不可]` として残します。`--copy-artifact-required` を付けた場合はエラーになります。
 
 ```bash
-# WAR を差し替えて検証する: 未検出もエラーにし、探索先をデプロイ先に絞る
+# WAR を差し替えて検証する (取り込み検証は既定で無効のため明示的に有効化する)
+./build_and_verify.sh \
+    --verify-startup --compose-service frontend --startup-service frontend \
+    --copy-file ./dist/frontend.war:./app \
+    --verify-copy-artifact
+
+# 未検出もエラーにし、探索先をデプロイ先に絞る
+# (--copy-artifact-* を指定すると --verify-copy-artifact は省略できる)
 ./build_and_verify.sh \
     --verify-startup --compose-service frontend --startup-service frontend \
     --copy-file ./dist/frontend.war:./app \
@@ -527,11 +541,13 @@ Docker が**イメージ側の内容をボリュームへ複製するのは、�
 ```
 
 - 検証結果は全量レポート (`--report-dir`) の `[13] コピーしたファイル (--copy-file) の取り込み検証`
-  と、ヘッダーの `コピー取込検証` 行にも残ります。
+  と、ヘッダーの `コピー取込検証` 行にも残ります。有効にしていない実行では
+  `未実施 (--verify-copy-artifact 未指定)` と記録します。
 - コンテナを起動しない実行 (ビルドのみ) では照合できないため、その旨を警告します。
   `--verify-startup` または `--verify-url` を併用してください。
-- `--copy-file` を使っていない構成でも、デプロイ先 (`*/standalone/deployments`) が
-  ボリューム / バインドマウントで覆われている場合は警告を出します。
+- 取り込み検証を有効にした実行では、`--copy-file` を使っていない構成でも、
+  デプロイ先 (`*/standalone/deployments`) がボリューム / バインドマウントで
+  覆われている場合は警告を出します。
 
 ### 後始末でのボリューム削除 (`--remove-volumes` / `--keep-volumes`)
 
@@ -1048,12 +1064,10 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   `[13] コピーしたファイル (--copy-file) の取り込み検証` です。
   ヘッダーの `コピー取込検証` 行には、差し替えたファイルがコンテナへ届いたかの
   要約 (一致 / 不一致 / 未検出の件数) を残します。
-- `--report-dir DIR` を指定すると、デプロイ結果ファイルとは**別に**
-  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_java_exceptions.xlsx` を追加出力します。
-  WAR のデプロイ処理で発生した Java 例外の解析結果をまとめたもので、
-  **コンテナの起動に失敗した場合でも必ず出力します** (デプロイ結果ファイルだけが
-  残る状態にはなりません)。解析対象のログを取得できなかった場合は、その理由と
-  `未評価` の判定を記録したうえで出力します。同じ内容のテキストは
+- WAR のデプロイ処理で発生した Java 例外の解析結果は、`--report-dir` を指定していれば
+  全量レポートの `[10]` へ必ず残ります (**コンテナの起動に失敗した場合でも解析します**。
+  解析対象のログを取得できなかった場合は、その理由と `未評価` の判定を記録します)。
+  Excel ブックとテキストは `--deploy-exception-excel FILE` /
   `--deploy-exception-text FILE` を指定したときだけ出力します (`--report-dir` の
   指定だけでは出力しません)。詳細は後述の
   [WAR デプロイ時の Java 例外エラー解析](#war-デプロイ時の-java-例外エラー解析) を参照してください。
@@ -1099,7 +1113,7 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
   未指定なら `logs` です。`logs` では起動中の各 Compose サービスを番号で選び、
   ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断を繰り返し行えます。
 - 対話操作に入る前に、失敗した起動ログを表示し、**WAR デプロイ時 Java 例外解析**も
-  先に済ませます (結果は全量レポート `[10]` と Excel へ。画面でも読みたい場合は
+  先に済ませます (結果は全量レポート `[10]` へ。画面でも読みたい場合は
   `--deploy-exception-display` を指定します)。
 - 対話操作を終えてもコンテナは起動状態のまま残ります。不要になったら
   `docker compose -f compose.yml down` で削除してください。
@@ -1287,16 +1301,16 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 検出した例外の詳細な分析と対処提案を**全量レポートの `[10]`** と
 **Excel ブック**へ残します。
 
-> **画面への表示とテキストファイルへの出力は、既定では行いません。**
+> **画面への表示と Excel / テキストファイルへの出力は、既定では行いません。**
 > 解析結果は 1 例外あたり数十行になり、ビルドの成否や動作確認の結果を画面から
 > 押し流してしまうためです。必要なときだけ次のオプションで有効にします。
 >
 > | 出力 | 既定 | 有効にするオプション |
 > | --- | --- | --- |
 > | 画面表示 | 出さない | `--deploy-exception-display` |
+> | Excel ブック | 出さない (`--report-dir` だけでは出力しない) | `--deploy-exception-excel FILE` |
 > | テキストファイル | 出さない (`--report-dir` だけでは出力しない) | `--deploy-exception-text FILE` |
 > | 全量レポート `[10]` | 出す | (`--report-dir` 指定時) |
-> | Excel ブック | 出す | (`--report-dir` 指定時。`--deploy-exception-excel FILE` で明示も可) |
 >
 > 上記のいずれも要求されていない実行 (`--report-dir` も `--deploy-exception-*` も
 > 無い) では、結果を出す先が無いため解析自体を行いません。
@@ -1304,8 +1318,7 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 **コンテナの起動 (`compose up`) に失敗した実行でも解析は必ず行います。**
 起動できない原因そのものがデプロイ処理中の Java 例外であることが多いため、
 失敗するまでに出力されたログを対象に、成功時と同じ内容の解析結果
-(`[10]` / Excel、指定時は画面 / テキスト) を出力します。デプロイ結果ファイル
-(`build_and_verify_<日時>.txt`) だけが残る状態にはなりません。
+(`[10]`、指定時は画面 / Excel / テキスト) を出力します。
 
 #### 解析の内容
 
@@ -1361,11 +1374,11 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 
 | ファイル | 出力条件 | 内容 |
 | --- | --- | --- |
-| `build_and_verify_<日時>_java_exceptions.xlsx` | `--report-dir DIR` 指定時に、デプロイ結果ファイル `DIR/build_and_verify_<日時>.txt` と**同じディレクトリへ追加で**出力する。`--deploy-exception-excel FILE` で出力先の明示も可 | 下表の 6 シート構成の Excel ブック |
+| `--deploy-exception-excel FILE` のパス | **`--deploy-exception-excel FILE` を指定したときだけ**出力する (`--report-dir` を指定しただけでは出力しない) | 下表の 6 シート構成の Excel ブック |
 | `--deploy-exception-text FILE` のパス | **`--deploy-exception-text FILE` を指定したときだけ**出力する (`--report-dir` を指定しただけでは出力しない) | **Excel と同じ内容のテキスト版**。Excel を開けない環境や、`grep` / `diff` で追跡したい場合に使う |
 
-テキストは自動命名を行いません。同じ内容が全量レポート `[10]` にも載るため、
-既定で同じファイルを 2 つ作らないようにしています。
+Excel もテキストも自動命名を行いません。同じ内容が全量レポート `[10]` にも載るため、
+既定で同じファイルを増やさないようにしています。
 
 テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
 含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
@@ -1396,8 +1409,8 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 `未評価 (解析対象のログが無いため判定できません)` で理由が分かるようにします。
 
 ```bash
-# デプロイ結果ファイルと Java 例外解析の Excel をまとめて保存
-# (画面には解析結果を出さない ← 既定。結果は [10] と Excel に残る)
+# デプロイ結果ファイルへ Java 例外解析を残す
+# (画面表示も Excel / テキストの出力も行わない ← 既定。結果は [10] に残る)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
@@ -1848,7 +1861,8 @@ CloudWatch Logs には届きません。
 
 - `bash`: 選択したコンテナへ `docker exec -it <container> /bin/bash` で直接接続します。
   bash を終了した後もコンテナは起動状態を維持します。対象イメージには
-  `/bin/bash` が必要です。
+  `/bin/bash` が必要です。接続前に `tree` を使える状態にします
+  (→ [対話 bash セッションの `tree`](#対話-bash-セッションの-tree))。
 - `http`: JBoss EAP の接続情報を解決した後、パス、HTTP メソッド、必要な POST
   ボディをダイアログで入力し、ホスト側の `curl` から 1 回リクエストします。
   HTTP ステータスコードとレスポンスボディ全体を区切り付きで表示します。
@@ -1864,6 +1878,28 @@ CloudWatch Logs には届きません。
   ログ表示行数は `--startup-log-lines` (既定: 末尾 50 行) に従い、明示的に選択した
   ログは `--suppress-startup-logs` の指定中でも表示します。bash 操作を行う対象イメージには
   `/bin/bash` が必要です。
+
+#### 対話 bash セッションの `tree`
+
+調査で最初に見たいのは「どこに何が配置されているか」ですが、RHEL UBI や JBoss EAP の
+イメージに `tree` は同梱されておらず、コンテナ内から `dnf` で入れるにはネットワークと
+リポジトリ設定が必要です。そこで bash 接続 (`bash` モード / `logs` モードの
+「bash へ接続」/ デプロイエラー時の調査モード) では、接続の直前に `tree` の有無を調べ、
+**無ければ bash だけで動く簡易実装**を用意してからセッションを開始します。
+
+| 状況 | 用意のしかた |
+| --- | --- |
+| コンテナに `tree` が入っている | そのまま使う |
+| 書き込めるディレクトリがある (`$TMPDIR` / `/tmp` / `/var/tmp` / `/dev/shm` / `$HOME` の順) | 実行可能なスクリプトとして置き、`PATH` の先頭へ足す (サブシェルや `xargs` からも呼べる) |
+| `read_only` / `noexec` などで置けない | `export -f` したシェル関数として渡す (ファイルを 1 つも作らない) |
+
+簡易実装は `-a` (ドットファイルも表示) / `-d` (ディレクトリのみ) / `-f` (パス全体) /
+`-L 深さ` / `--noreport` に対応します (`tree --help` で一覧を表示)。
+`find` / `awk` / `sort` を使わず bash の展開だけで動くため、コマンドがほとんど無い
+イメージでも同じように使えます。シンボリックリンクは `名前 -> 参照先` と表示して
+たどらず、読めないディレクトリは `[error opening dir]` と表示します。
+セッションを終了すると、置いた簡易実装は削除します。`/` を起点にすると出力が
+巨大になるため、`-L` で深さを絞ってください。
 
 #### 対話操作の終了後の完全クリーンアップ (既定で有効)
 
