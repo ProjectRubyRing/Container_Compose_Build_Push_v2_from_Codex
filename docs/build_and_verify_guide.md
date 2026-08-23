@@ -92,6 +92,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 中盤 | 引数パース | `append_services` によるカンマ区切り分割、`need_value` による値欠落検出 |
 | 中盤 | 入力値の検証 | 数値・モード・排他関係・サービス指定の整合性 |
 | 中盤 | 依存コマンド / AWS 認証 / compose 判定 | 実行環境の確認 |
+| 中盤 | build コンテキスト / Dockerfile の上書き | `compose_build_scan` / `compose_build_rewrite` / `apply_compose_build_overrides` |
 | 中盤 | シークレット準備・一時ファイルコピー | `prepare_jboss_password` / `prepare_copy_files` |
 | 中盤 | マスターパスワードの伝搬検証 | 危険文字の分析、段ごとの比較、`compose.yml` と `standalone.xml` の解析、CredentialStore の開封確認 |
 | 中盤 | 起動確認・ログ表示ヘルパ | ログ取得、ANSI 除去、色分け、companion ログ |
@@ -113,6 +114,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | ログ・時刻 | `log` / `warn` / `err` / `diag` / `to_jst_display_time` | 出力整形と UTC→JST 変換 |
 | 引数処理 | `append_services` / `need_value` / `validate_positive_integer` / `validate_non_negative_integer` | カンマ区切り分割、値欠落検出、数値検証 (ビルド監視の各値は 0 を許す) |
 | Compose 操作 | `compose_container_ids` / `compose_logs` / `compose_started_services` | 対象サービスの ID・ログ・サービス名取得 |
+| build 設定の上書き | `apply_compose_build_overrides` / `compose_build_scan` / `compose_build_rewrite` / `cleanup_generated_compose_file` / `compose_file_display` | `--base-context` などの指定を反映した実効 compose ファイルの生成・検証・後始末 (→ 5.1-2) |
+| サービスの保護 | `validate_keep_services` / `resolve_keep_service_targets` / `service_is_kept` / `run_compose_build` / `remove_project_volumes_except_kept` / `remove_all_images_except_kept` / `remove_all_volumes_except_kept` | `--keep-service` の no-cache 除外と、イメージ・ボリュームの保護 (→ 5.1-3) |
 | 起動確認 | `start_container` / `wait_for_startup` / `containers_all_running` / `target_services_all_running` | 起動、ログポーリング、途中停止の検知 |
 | ログ表示 | `show_startup_logs` / `print_startup_logs_with_highlights` / `show_companion_service_logs` | 行数制御と重要ログの色分け |
 | URL 確認 | `verify_url` / `show_url_body` | curl のリトライと応答本文表示 |
@@ -142,6 +145,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 3. write_build_report        … --report-dir 指定時、全量レポートを保存 (削除より前に実行)
 4. cleanup_all_docker_data   … --cleanup-all-docker-data 指定時、確認フレーズ入力後に全削除
 5. teardown_container        … compose down (--keep-container 指定時は残す)
+                                   --keep-service を指定した実行では --volumes を付けず、
+                                   保護対象以外のボリュームだけを個別に削除する (→ 5.1-3)
                                    対話操作を最後まで終えた実行では、--keep-container が
                                    暗黙有効でもここで削除する (6 の対象にするため)
                                    そのとき、および取り込み検証で古い成果物を抱えた
@@ -160,6 +165,8 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
                                     退避しておいた上書き前のファイルを復元)
 10. 一時ファイル削除         … Java 例外解析結果・読み取り専用 FS 分析結果・
                                    URL 応答本文・HTTP ボディ・healthcheck 診断
+                                   および build 設定の上書きで生成した実効 compose ファイル
+                                   (元の compose ファイルには触れない)
 11. show_post_interaction_disk_free … 6 を試行した実行のみ、各ディレクトリの
                                    ディスク空き容量を一覧表示して終える
 ```
@@ -184,7 +191,8 @@ flowchart TD
     F -- なし --> H
     G --> H[compose コマンド判定<br/>並列オプションの準備]
     H --> I[EXIT トラップ設定 cleanup_all]
-    I --> J[JBoss マスターパスワード取得 → export]
+    I --> I2[build コンテキスト / Dockerfile の上書き<br/>--base-context などの指定を反映した<br/>実効 compose ファイルを生成 指定が無ければ何もしない]
+    I2 --> J[JBoss マスターパスワード取得 → export]
     J --> J2[伝搬検証 1-2: 取得元 → 環境変数 → compose.yml の secrets<br/>--verify-jboss-password 指定時]
     J2 --> J3[cwagent 設定ファイルチェック<br/>compose.yml の定義 + 設定 JSON の静的照合]
     J3 --> J4[ロググループ準備<br/>実 CloudWatch Logs 宛てで存在しなければ設定の名前で作成]
@@ -373,7 +381,14 @@ compose down (削除)
 | `--local-image NAME` | イメージ名 | `j1/base.local` | 不可 | compose build で生成されるローカルイメージ名 |
 | `--compose-file FILE` | ファイルパス | `compose.yml` | 不可 | compose 定義ファイル |
 | `--compose-service NAME` | サービス名 | (全サービス) | **可** (繰り返し / カンマ区切り) | ビルド・起動対象。複数指定時は `base` を先行ビルド。`base` は起動対象にならない |
+| `--base-context DIR` | ディレクトリパス | (compose の値) | 不可 | サービス名に `base` を含むサービスの `build.context` を上書き (→ 5.1-2) |
+| `--base-dockerfile FILE` | Dockerfile 名 / 相対パス | (compose の値) | 不可 | 同じ対象サービスの `build.dockerfile` を上書き。`build.context` からの相対パスとして解釈される (→ 5.1-2) |
+| `--frontend-context DIR` | ディレクトリパス | (compose の値) | 不可 | サービス名に `frontend` を含むサービスの `build.context` を上書き (→ 5.1-2) |
+| `--frontend-dockerfile FILE` | Dockerfile 名 / 相対パス | (compose の値) | 不可 | 同じ対象サービスの `build.dockerfile` を上書き (→ 5.1-2) |
+| `--backend-context DIR` | ディレクトリパス | (compose の値) | 不可 | サービス名に `backend` を含むサービスの `build.context` を上書き (→ 5.1-2) |
+| `--backend-dockerfile FILE` | Dockerfile 名 / 相対パス | (compose の値) | 不可 | 同じ対象サービスの `build.dockerfile` を上書き (→ 5.1-2) |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
+| `--keep-service NAME` | サービス名 | (なし) | **可** (繰り返し / カンマ区切り) | 指定したサービスを `--no-cache` の対象から外し、後始末でイメージと名前付きボリュームを残す (→ 5.1-3) |
 | `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | 不可 | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔。`0` で表示しない |
 | `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | 不可 | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は中断しない |
 | `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | 不可 | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM で中断し (20 秒後に SIGKILL)、`exit 1` |
@@ -584,6 +599,125 @@ compose down (削除)
 
 `base` はベースイメージを提供する**ビルド専用サービス**であり、起動しても即終了するため、
 明示指定されていても起動・ログ収集・生存監視の対象からは除外されます。
+
+### 5.1-2 build コンテキスト / Dockerfile の上書き (`--base-context` / `--base-dockerfile` ほか)
+
+> 節番号は既存の並びを崩さないため `5.1-2` としています。
+
+`compose.yml` に書かれた `build.context` (ビルドコンテキストのディレクトリ) と
+`build.dockerfile` (使用する Dockerfile 名) を、スクリプトのパラメータで差し替えます。
+**指定しなかったものは `compose.yml` の値がそのまま使われる**ため、6 つのオプションを
+どれも指定しない実行の挙動は従来と 1 バイトも変わりません。
+
+| キーワード | context | dockerfile |
+| --- | --- | --- |
+| `base` | `--base-context DIR` | `--base-dockerfile FILE` |
+| `frontend` | `--frontend-context DIR` | `--frontend-dockerfile FILE` |
+| `backend` | `--backend-context DIR` | `--backend-dockerfile FILE` |
+
+```bash
+./build_and_verify.sh \
+    --base-context ./base     --base-dockerfile Dockerfile.base \
+    --frontend-context ./web  --frontend-dockerfile Dockerfile \
+    --backend-context ./api   --backend-dockerfile Dockerfile.api
+```
+
+#### 対象サービスの判定
+
+「**サービス名がキーワードと完全一致、またはキーワードを含む**」で判定します
+(`--compose-service` によるビルド対象の絞り込みとは独立)。
+
+| compose のサービス名 | `--frontend-*` | `--backend-*` | `--base-*` |
+| --- | --- | --- | --- |
+| `frontend` | 対象 (完全一致) | — | — |
+| `frontend-web` | 対象 (含む) | — | — |
+| `api-backend` | — | 対象 (含む) | — |
+| `base` | — | — | 対象 (完全一致) |
+| `database` | — | — | 対象 (含む) ※ build 定義が無ければ適用せず警告 |
+| `frontend-backend` | 両方に指定があれば `exit 2` | 同左 | — |
+
+| 状況 | 動作 |
+| --- | --- |
+| 一致したサービスに `build` 定義が無い (`image:` だけ) | そのサービスへは適用せず警告。ビルドしないはずのサービスをビルド対象へ作り変えないため |
+| 指定したキーワードに一致する「`build` 定義を持つサービス」が 0 件 | `exit 1`。指定が黙って無視されると、意図と違う Dockerfile でできたイメージを正しいものとして扱ってしまうため |
+| 1 サービスが複数キーワードに一致し、そのどちらにも指定がある | 完全一致するキーワードを優先。完全一致が無ければ `exit 2` |
+| 値が空文字 | `exit 2` (未指定と区別が付かないため) |
+| 定義がフロー形式 (`build: {context: ., dockerfile: X}`) | `exit 1`。行単位の書き換えでは中身だけを差し替えられないため、黙って別の値でビルドせず断る。ブロック形式へ直してから指定する |
+
+#### 反映のしかた
+
+元の compose ファイルは**書き換えません**。指定を反映した**実効 compose ファイル**
+`.build_and_verify_compose.<PID>.yml` を元ファイルと同じディレクトリへ生成し、
+以降の `docker compose` (build / up / logs / down) をすべてそのファイルで実行します。
+
+- 同じディレクトリへ置くのは、`context` などの**相対パスの解決結果**と、ディレクトリ名から
+  決まる **Compose のプロジェクト名**を元ファイルのときと完全に同じに保つためです。
+- 生成したファイルは EXIT トラップ (`cleanup_all`) で、`compose down` を終えたあとに
+  削除します。強制終了で元ファイルが壊れることはありません。
+- 手動停止コマンドの案内 (`docker compose -f ... down` など) には、消えずに残る
+  **元ファイル**の方を表示します (プロジェクト名は同じなので対象は変わりません)。
+- 短縮形式 `build: ./api` は `dockerfile` を書けないため、同じ意味の
+  `build:` マッピングへ展開したうえで上書きします。
+- 生成後に実効ファイルを読み直し、指定どおりの値になっているかを突き合わせます。
+  反映できていなければ `exit 1` とし、指定と違う Dockerfile でビルドが進むことを防ぎます。
+- `--dry-run` では実効ファイルを生成せず、差し替え内容のプレビューだけを表示します。
+
+差し替えた内容は画面と全量レポート (`Compose 定義` / `ビルド上書き` 行) の両方に残ります。
+
+### 5.1-3 一部のサービスだけ残す (`--keep-service`)
+
+> 節番号は既存の並びを崩さないため `5.1-3` としています。
+
+`--keep-service NAME` で指定したサービスには、次の 3 つがまとめて適用されます。
+指定が 1 つも無ければ、これらの処理はすべて素通りします (既定の動作は従来どおり)。
+
+| | `--keep-service` で指定 | 指定なし |
+| --- | --- | --- |
+| `--no-cache` を指定したビルド | キャッシュを使ってビルド | キャッシュを破棄してビルド |
+| 後始末のイメージ | ローカルに残す | 削除する |
+| 後始末の名前付きボリューム | 残す | 削除する |
+
+サービス名は**完全一致**で判定します。compose ファイルに無い名前を指定した場合は、
+保護したいものの取り違えでボリュームの中身を失わないよう `exit 2` で止めます
+(判定は引数パースの直後、ビルドを始める前)。
+
+#### ビルドの分割
+
+`docker compose build` はサービス単位に `--no-cache` を切り替えられないため、
+`--no-cache` と併用した実行では 2 回に分けてビルドします。
+
+```text
+1. docker compose -f compose.yml build --no-cache base app   ← no-cache 対象
+2. docker compose -f compose.yml build db                    ← --keep-service で除外
+```
+
+no-cache 対象を先にビルドするのは、除外側が `FROM` で参照するイメージが先に
+作り直され、キャッシュ判定が新しいイメージを見た状態になるようにするためです。
+`--compose-service` 未指定 (= 全サービス) の場合は、compose ファイルから build 定義を
+持つサービスを列挙して分割します。
+
+#### 保護の対象
+
+| 種別 | 何を保護するか |
+| --- | --- |
+| イメージ | compose の `image:` 指定。無ければ Compose の既定名 `<プロジェクト>-<サービス>` / `<プロジェクト>_<サービス>` |
+| ボリューム | compose の `volumes:` に書かれた名前付きボリューム (短縮形式 `- name:/path` / 長形式 `- type: volume` + `source:` の両方)。バインドマウントは対象外 |
+
+プロジェクト名は `COMPOSE_PROJECT_NAME` → 今回のコンテナのラベル
+(`com.docker.compose.project`) → compose ファイルのディレクトリ名の正規化、の順で求めます。
+
+#### 後始末の各経路での扱い
+
+| 経路 | `--keep-service` 指定時の動作 |
+| --- | --- |
+| 旧世代イメージの回収 (`reclaim_previous_image`) | 保護対象のローカルイメージなら、世代交代した旧世代 (dangling) も回収しない |
+| `compose down` のボリューム削除 | `--volumes` を付けずに `down` し、そのあと保護対象以外のボリュームだけを `docker volume rm` で個別に削除する |
+| `--cleanup-all-docker-data` | `docker image prune --all` / `docker volume prune --all` の代わりに一覧を取って保護対象を引き算し、残りだけを削除する。最後の一括 prune も `--all --volumes` を外す |
+| 対話操作後の完全クリア (`docker-usage-check.sh`) | **行わない**。外部スクリプトへ委譲しており、サービス単位で残す指定を渡せないため。理由を表示して飛ばす |
+
+削除後の確認も保護指定に合わせて変わります。「1 件も残っていないこと」ではなく
+「残ったものがすべて保護対象であること」を確かめ、`docker system df` が 0 でないことも
+失敗として扱いません (残して当然のため)。
 
 ### 5.2-0 ビルドの停滞検知・進捗表示 (`--build-progress-interval` / `--build-stall-timeout` / `--build-timeout`)
 

@@ -178,6 +178,41 @@ DRY_RUN="false"                   # true: 実際の変更は行わず、実行�
 CLEANUP_ALL_DOCKER_DATA="false"   # true: 終了時に確認後、現在の Docker context の全データを削除
 DOCKER_CLEANUP_CONFIRM_PHRASE="DELETE ALL DOCKER DATA"
 
+# ---- build コンテキスト / Dockerfile の上書き -------------------------------
+# compose ファイルに書かれた build.context (ビルドコンテキストのディレクトリ) と
+# build.dockerfile (使用する Dockerfile 名) を、スクリプト側の指定で差し替える。
+# 未指定のものは compose ファイルの値をそのまま使う (既定の動作は変わらない)。
+#
+# 対象サービスは「サービス名がキーワード (base / frontend / backend) と完全一致、
+# または キーワードを含む」もので判定する。例えば --frontend-context を指定した
+# 場合、frontend / frontend-web / my-frontend はいずれも対象になる。
+#
+# 元の compose ファイルは書き換えず、指定を反映した実効 compose ファイルを
+# 同じディレクトリへ生成して、そちらを -f で使う。同じディレクトリに置くのは、
+# context などの相対パスと Compose のプロジェクト名 (ディレクトリ名から決まる)
+# を元ファイルと完全に同じに保つため。生成したファイルは EXIT トラップで消す。
+BASE_BUILD_CONTEXT=""             # --base-context     : base 系サービスの build.context
+BASE_BUILD_DOCKERFILE=""          # --base-dockerfile  : base 系サービスの build.dockerfile
+FRONTEND_BUILD_CONTEXT=""         # --frontend-context
+FRONTEND_BUILD_DOCKERFILE=""      # --frontend-dockerfile
+BACKEND_BUILD_CONTEXT=""          # --backend-context
+BACKEND_BUILD_DOCKERFILE=""       # --backend-dockerfile
+BUILD_OVERRIDE_KEYWORDS=("base" "frontend" "backend")  # 対象サービスの判定に使うキーワード
+BUILD_OVERRIDE_SEP=$'\037'        # 走査結果の区切り (compose の値には現れない制御文字)
+COMPOSE_FILE_ORIGINAL=""          # 上書きした場合の元 compose ファイル (未使用時は空)
+COMPOSE_FILE_GENERATED=""         # 生成した実効 compose ファイル (EXIT トラップで削除)
+BUILD_OVERRIDE_SUMMARY=""         # 全量レポートへ載せる上書き内容
+
+# ---- 保護するサービス (--keep-service) --------------------------------------
+# 指定したサービスは、--no-cache の対象から外し (キャッシュを使ってビルドする)、
+# 後始末でもイメージとボリュームをローカルへ残す。指定していないサービスの
+# 扱いは従来どおり (no-cache の対象、イメージ・ボリュームとも削除)。
+KEEP_SERVICES=()                  # --keep-service: 保護するサービス名 (複数指定可)
+KEEP_SERVICE_IMAGE_REFS=()        # 保護対象サービスのイメージ参照 (解決結果)
+KEEP_SERVICE_VOLUME_NAMES=()      # 保護対象サービスが使う名前付きボリュームの宣言名
+KEEP_SERVICE_RESOLVED="false"     # 上記を解決済みか (解決は 1 度だけ行う)
+COMPOSE_PROJECT_NAME_CACHE=""     # Compose プロジェクト名 (解決結果のキャッシュ)
+
 # ---- ディスク使用量の抑制 ---------------------------------------------------
 # compose build はローカルイメージ名のタグを新しいイメージへ付け替えるだけで、
 # 直前の世代はタグを失った <none>:<none> (dangling) として残り続ける。
@@ -1080,7 +1115,75 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            base はビルド専用のため、指定に含めても起動対象にはしない。
                            例: --compose-service app --compose-service db
                                --compose-service app,db
+  --base-context DIR       compose ファイルの build.context (ビルドコンテキストの
+                           ディレクトリ) を、サービス名に base を含むサービスに
+                           対して DIR で上書きする。
+                           未指定なら compose ファイルの値をそのまま使う。
+  --base-dockerfile FILE   同じ対象サービスの build.dockerfile (使用する
+                           Dockerfile 名) を FILE で上書きする。
+                           FILE は build.context からの相対パスで解釈される
+                           (Compose の仕様どおり)。未指定なら compose ファイルの
+                           値をそのまま使う。
+  --frontend-context DIR   サービス名に frontend を含むサービスの build.context
+                           を DIR で上書きする。
+  --frontend-dockerfile FILE
+                           同じ対象サービスの build.dockerfile を FILE で上書きする。
+  --backend-context DIR    サービス名に backend を含むサービスの build.context
+                           を DIR で上書きする。
+  --backend-dockerfile FILE
+                           同じ対象サービスの build.dockerfile を FILE で上書きする。
+                           ※ 上記 6 つの上書きについて
+                             - 対象サービスは「サービス名がキーワード
+                               (base / frontend / backend) と完全一致、または
+                               キーワードを含む」で判定する。
+                               例: --frontend-context は frontend / frontend-web /
+                                   my-frontend のいずれにも適用される。
+                             - 元の compose ファイルは書き換えない。指定を反映した
+                               実効 compose ファイルを元ファイルと同じディレクトリへ
+                               生成し、ビルド・起動・停止のすべてでそれを使う
+                               (相対パスと Compose のプロジェクト名を元ファイルと
+                                同じに保つため)。生成したファイルは処理終了時
+                               (成功・失敗を問わず) に自動削除する。
+                             - build 定義を持たないサービス (image 指定のみ) が
+                               キーワードに一致した場合は、そのサービスへは適用せず
+                               警告を表示する。
+                             - 指定したキーワードに一致する「build 定義を持つ
+                               サービス」が 1 つも無い場合は、指定が無効になった
+                               ことに気付けるようエラー終了する。
+                             - 1 つのサービスが複数のキーワードに一致し、どちらにも
+                               上書き指定がある場合は、完全一致するキーワードを
+                               優先する。完全一致が無い場合はエラー終了する。
+                           例: --base-context ./base --base-dockerfile Dockerfile.base
+                               --frontend-context ./web --frontend-dockerfile Dockerfile
+                               --backend-context ./api --backend-dockerfile Dockerfile.api
   --no-cache               キャッシュを破棄して compose build する
+  --keep-service NAME      指定したサービスを「触らない」対象にする。
+                           繰り返し指定またはカンマ区切りで複数指定できる。
+                           サービス名は完全一致で判定する。
+                           次の 3 つがまとめて適用される:
+                             (1) --no-cache を指定した実行でも、このサービスだけは
+                                 キャッシュを使ってビルドする (no-cache の対象外)。
+                                 no-cache 対象を先にビルドし、そのあとで
+                                 このサービスをビルドする。
+                             (2) 後始末でイメージをローカルに残す。
+                                 compose の image 指定があればその名前、無ければ
+                                 Compose が付ける既定名 (<プロジェクト>-<サービス>)
+                                 を保護対象とする。
+                             (3) 後始末で名前付きボリュームを残す。
+                                 compose の volumes に書かれた名前付きボリューム
+                                 (バインドマウントを除く) が保護対象になる。
+                           保護は compose down のボリューム削除、旧世代イメージの
+                           回収、--cleanup-all-docker-data のすべてに効く。
+                           指定していないサービスのイメージ・ボリュームは、
+                           これまでどおり削除する。
+                           ※ compose ファイルに無いサービス名を指定した場合は、
+                             保護したいものの取り違えを防ぐためエラー終了する。
+                           ※ 対話操作をすべて終えた実行の「未使用リソースの完全
+                             クリア」(docker-usage-check.sh) は外部スクリプトへ
+                             委譲しており保護できないため、--keep-service を
+                             指定した実行では実行せず、理由を表示する。
+                           例: --keep-service db
+                               --keep-service db,cache
   --dry-run                実際のビルド/起動/URL 呼び出し/ファイル操作は行わず、
                            実行される内容のプレビューのみ表示する
 
@@ -1836,12 +1939,32 @@ need_value() {
   fi
 }
 
+# 空文字を渡されると「未指定 (compose の値をそのまま使う)」と区別が付かない
+# オプション用。値の有無に加えて、中身が空でないことまで確かめる。
+# 使い方: need_nonempty_value "$1" $# "${2-}"
+need_nonempty_value() {
+  need_value "$1" "$2"
+  case "$3" in
+    *[![:space:]]*) return 0 ;;
+  esac
+  err "${1} には空でない値を指定してください"
+  err "  使い方は --help を参照してください。"
+  exit 2
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --local-image)         need_value "$1" $#; LOCAL_IMAGE="$2"; shift 2 ;;
     --compose-file)        need_value "$1" $#; COMPOSE_FILE="$2"; shift 2 ;;
     --compose-service)     need_value "$1" $#; append_services COMPOSE_SERVICES "$2"; shift 2 ;;
+    --base-context)        need_nonempty_value "$1" $# "${2-}"; BASE_BUILD_CONTEXT="$2"; shift 2 ;;
+    --base-dockerfile)     need_nonempty_value "$1" $# "${2-}"; BASE_BUILD_DOCKERFILE="$2"; shift 2 ;;
+    --frontend-context)    need_nonempty_value "$1" $# "${2-}"; FRONTEND_BUILD_CONTEXT="$2"; shift 2 ;;
+    --frontend-dockerfile) need_nonempty_value "$1" $# "${2-}"; FRONTEND_BUILD_DOCKERFILE="$2"; shift 2 ;;
+    --backend-context)     need_nonempty_value "$1" $# "${2-}"; BACKEND_BUILD_CONTEXT="$2"; shift 2 ;;
+    --backend-dockerfile)  need_nonempty_value "$1" $# "${2-}"; BACKEND_BUILD_DOCKERFILE="$2"; shift 2 ;;
     --no-cache)            NO_CACHE="true"; shift ;;
+    --keep-service)        need_value "$1" $#; append_services KEEP_SERVICES "$2"; shift 2 ;;
     --build-progress-interval) need_value "$1" $#; BUILD_PROGRESS_INTERVAL="$2"; shift 2 ;;
     --build-stall-timeout) need_value "$1" $#; BUILD_STALL_TIMEOUT="$2"; shift 2 ;;
     --build-timeout)       need_value "$1" $#; BUILD_TIMEOUT="$2"; shift 2 ;;
@@ -4573,7 +4696,7 @@ verify_copied_artifacts() {
   copy_artifact_out ""
   copy_artifact_out "  対処:"
   copy_artifact_out "   1. デプロイ先を覆っているボリュームを削除して作り直す (中のデータは消えます):"
-  copy_artifact_out "        ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v"
+  copy_artifact_out "        ${COMPOSE_CMD[*]} -f $(compose_file_display) down -v"
   copy_artifact_out "      本スクリプトから毎回削除する場合は --remove-volumes を指定します。"
   copy_artifact_out "   2. 成果物をボリューム / バインドマウントで受け渡している場合は、そのマウントを"
   copy_artifact_out "      compose.yml から外し、イメージへ取り込む形へ寄せる。"
@@ -4589,6 +4712,926 @@ verify_copied_artifacts() {
     warn "  ボリュームを残したい場合は --keep-volumes を指定してください。"
   fi
   return 1
+}
+
+# ---- build コンテキスト / Dockerfile の上書き --------------------------------
+# --base-context / --base-dockerfile / --frontend-context / --frontend-dockerfile /
+# --backend-context / --backend-dockerfile で指定された値を compose ファイルへ反映する。
+#
+# 反映は「元ファイルを書き換える」のではなく「指定を反映した実効 compose ファイルを
+# 元ファイルと同じディレクトリへ生成し、以後の -f をそれへ差し替える」方式で行う。
+#   - 元ファイルを一切壊さない (途中で強制終了されても元ファイルは無傷)
+#   - context / secrets.file などの相対パスは compose ファイルの位置を基準に
+#     解決されるため、同じディレクトリなら解決結果が元ファイルと完全に一致する
+#   - Compose のプロジェクト名は compose ファイルの「ディレクトリ名」から決まるため、
+#     同じディレクトリなら ps / logs / down の対象も元ファイルのときと同じになる
+# 生成したファイルは cleanup_all (EXIT トラップ) から削除する。
+
+# 走査 (compose_build_scan) と書き換え (compose_build_rewrite) は同じインデント
+# 解析を使う。YAML パーサを持ち込まずに済ませるため、Compose が実際に使う範囲
+# (services.<名前>.build.context / .dockerfile) だけを見る。共通部分はここに置く。
+compose_build_override_awk_common() {
+  cat <<'AWKCOMMON'
+# "key: value" 行から key を取り出す (取り出せない行は空文字)
+function ykey(c,   k) {
+  if (c !~ /:/) return ""
+  k = c
+  sub(/:.*$/, "", k)
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+  gsub(/^["']|["']$/, "", k)
+  return k
+}
+# "key: value" 行から value を取り出す (値が無ければ空文字 = ブロックの開始)
+function yval(c,   v) {
+  v = c
+  sub(/^[^:]*:[[:space:]]*/, "", v)
+  sub(/[[:space:]]+$/, "", v)
+  # 引用符で囲まれていない値だけ、行末コメントを落とす
+  if (v !~ /^["']/) sub(/[[:space:]]+#.*$/, "", v)
+  gsub(/^["']|["']$/, "", v)
+  return v
+}
+AWKCOMMON
+}
+
+# compose ファイルのサービスを走査する awk。1 行 1 サービスで次を出力する。
+#   <サービス名><SEP><build 定義の有無 (1/0)><SEP><現在の context><SEP><現在の dockerfile>
+# 現在の値が書かれていない場合は空文字になる。
+compose_build_scan_awk() {
+  compose_build_override_awk_common
+  cat <<'AWKSCAN'
+BEGIN { in_services = 0; services_indent = 0; svc_indent = -1; cur_svc = "" }
+function flush_svc() {
+  if (cur_svc == "") return
+  printf "%s%s%s%s%s%s%s\n", cur_svc, SEP, has_build, SEP, cur_ctx, SEP, cur_dfl
+  cur_svc = ""
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+  match(line, /^[ ]*/)
+  indent = RLENGTH
+  content = substr(line, indent + 1)
+
+  if (!in_services) {
+    if (indent == 0 && ykey(content) == "services") {
+      in_services = 1; services_indent = indent; svc_indent = -1
+    }
+    next
+  }
+  # services ブロックを抜けた
+  if (indent <= services_indent) { flush_svc(); in_services = 0; next }
+  if (svc_indent < 0) svc_indent = indent
+  # サービス名の行
+  if (indent == svc_indent) {
+    if (content ~ /^- /) next
+    k = ykey(content)
+    if (k == "") next
+    flush_svc()
+    cur_svc = k; has_build = 0; cur_ctx = ""; cur_dfl = ""
+    svc_child_indent = -1; in_build = 0; build_indent = -1; build_child_indent = -1
+    # サービス定義そのものがフロー形式 ("name: {build: {...}}") の場合、行単位の
+    # 書き換えでは build の中だけを差し替えられない。build を含むものだけ 2 を返して
+    # 呼び出し側で断り、build を持たないもの ("name: {image: ...}") は 0 のままにする
+    # (キーワードに一致しただけの image 専用サービスで実行全体を止めないため)。
+    if (yval(content) ~ /^\{/) {
+      if (yval(content) ~ /[{,][[:space:]]*["']?build["']?[[:space:]]*:/) has_build = 2
+    }
+    next
+  }
+  if (cur_svc == "") next
+  if (svc_child_indent < 0) svc_child_indent = indent
+  if (in_build && indent <= build_indent) in_build = 0
+  # サービス直下のキー
+  if (!in_build && indent == svc_child_indent) {
+    if (ykey(content) != "build") next
+    has_build = 1
+    v = yval(content)
+    if (v == "") { in_build = 1; build_indent = indent; build_child_indent = -1 }
+    else if (v ~ /^\{/) has_build = 2   # フロー形式 "build: {context: ., ...}"
+    else cur_ctx = v   # 短縮形式 "build: <ディレクトリ>" は context 指定と同じ意味
+    next
+  }
+  # build ブロック直下のキー
+  if (in_build && indent > build_indent) {
+    if (build_child_indent < 0) build_child_indent = indent
+    if (indent == build_child_indent) {
+      k = ykey(content)
+      if (k == "context") cur_ctx = yval(content)
+      else if (k == "dockerfile") cur_dfl = yval(content)
+    }
+  }
+}
+END { flush_svc() }
+AWKSCAN
+}
+
+# 指定を反映した compose ファイルを書き出す awk。
+# SPECFILE は「<サービス名><SEP><新しい context><SEP><新しい dockerfile>」の一覧
+# (空文字の項目は変更しない)。対象外の行は 1 バイトも変えずにそのまま通す。
+compose_build_rewrite_awk() {
+  compose_build_override_awk_common
+  cat <<'AWKAPPLY'
+BEGIN {
+  in_services = 0; services_indent = 0; svc_indent = -1; cur_svc = ""; CR = ""
+  while ((getline spec < SPECFILE) > 0) {
+    sub(/\r$/, "", spec)
+    if (spec == "") continue
+    n = split(spec, f, SEP)
+    if (n < 3) continue
+    WANT[f[1]] = 1; CTX[f[1]] = f[2]; DFL[f[1]] = f[3]
+  }
+  close(SPECFILE)
+}
+# YAML のシングルクォート形式は「'' が ' を表す」だけがエスケープ規則のため、
+# Windows パスのバックスラッシュや記号もそのまま安全に書ける。
+function yq(s) { gsub(/'/, "''", s); return "'" s "'" }
+function sp(n,   i, s) { s = ""; for (i = 0; i < n; i++) s = s " "; return s }
+# build ブロック内で保留していたコメント・空行を、そのままの並びで出す。
+function flush_pending(   i) {
+  for (i = 1; i <= npending; i++) print pending[i]
+  npending = 0
+}
+# build ブロックを抜けるときに、書かれていなかったキーを補う。
+# 補う位置は「観測した build 直下のインデント」に合わせる (2 スペース決め打ちに
+# すると、4 スペースインデントの compose ファイルで階層が壊れるため)。
+function flush_build(   ind) {
+  if (!in_build) return
+  in_build = 0
+  ind = (build_child_indent >= 0 ? build_child_indent : build_indent + 2)
+  if (CTX[cur_svc] != "" && !found_ctx) print sp(ind) "context: " yq(CTX[cur_svc]) CR
+  if (DFL[cur_svc] != "" && !found_dfl) print sp(ind) "dockerfile: " yq(DFL[cur_svc]) CR
+}
+{
+  line = $0
+  cr = ""
+  if (sub(/\r$/, "", line)) { cr = "\r"; CR = "\r" }
+  # build ブロックの内側にいる間のコメント・空行はいったん保留する。補ったキーを
+  # コメントより後ろへ置くと「コメントの位置がずれた」ように見えるため、
+  # ブロックを抜けるときは「補ったキー → 保留していた行」の順で出す。
+  if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) {
+    if (in_build) { pending[++npending] = line cr; next }
+    print line cr; next
+  }
+  match(line, /^[ ]*/)
+  indent = RLENGTH
+  content = substr(line, indent + 1)
+  if (npending > 0) {
+    if (in_build && indent <= build_indent) flush_build()
+    flush_pending()
+  }
+
+  if (!in_services) {
+    if (indent == 0 && ykey(content) == "services") {
+      in_services = 1; services_indent = indent; svc_indent = -1
+    }
+    print line cr; next
+  }
+  if (indent <= services_indent) {
+    flush_build(); in_services = 0; cur_svc = ""
+    print line cr; next
+  }
+  if (svc_indent < 0) svc_indent = indent
+  if (indent == svc_indent) {
+    if (content !~ /^- /) {
+      k = ykey(content)
+      if (k != "") {
+        flush_build()
+        cur_svc = k; svc_child_indent = -1
+        in_build = 0; build_indent = -1; build_child_indent = -1
+        found_ctx = 0; found_dfl = 0
+      }
+    }
+    print line cr; next
+  }
+  if (cur_svc == "" || !(cur_svc in WANT)) { print line cr; next }
+  if (svc_child_indent < 0) svc_child_indent = indent
+  if (in_build && indent <= build_indent) flush_build()
+  if (!in_build && indent == svc_child_indent) {
+    if (ykey(content) == "build") {
+      v = yval(content)
+      if (v == "") {
+        in_build = 1; build_indent = indent; build_child_indent = -1
+        found_ctx = 0; found_dfl = 0
+        print line cr; next
+      }
+      # フロー形式 "build: {...}" は行単位では中身を差し替えられないため、
+      # 手を触れずにそのまま通す (呼び出し側が事前にエラーで止める)。
+      if (v ~ /^\{/) { print line cr; next }
+      # 短縮形式 "build: <ディレクトリ>" は dockerfile を書けないため、
+      # 同じ意味のマッピング形式へ展開したうえで上書きする。
+      print sp(indent) "build:" cr
+      print sp(indent + 2) "context: " yq(CTX[cur_svc] != "" ? CTX[cur_svc] : v) cr
+      if (DFL[cur_svc] != "") print sp(indent + 2) "dockerfile: " yq(DFL[cur_svc]) cr
+      next
+    }
+    print line cr; next
+  }
+  if (in_build && indent > build_indent) {
+    if (build_child_indent < 0) build_child_indent = indent
+    if (indent == build_child_indent) {
+      k = ykey(content)
+      if (k == "context") {
+        found_ctx = 1
+        if (CTX[cur_svc] != "") { print sp(indent) "context: " yq(CTX[cur_svc]) cr; next }
+      } else if (k == "dockerfile") {
+        found_dfl = 1
+        if (DFL[cur_svc] != "") { print sp(indent) "dockerfile: " yq(DFL[cur_svc]) cr; next }
+      }
+    }
+  }
+  print line cr
+}
+END { flush_build(); flush_pending() }
+AWKAPPLY
+}
+
+compose_build_scan() {
+  local compose_file="$1"
+  [ -f "$compose_file" ] || return 1
+  awk -v SEP="$BUILD_OVERRIDE_SEP" "$(compose_build_scan_awk)" "$compose_file"
+}
+
+compose_build_rewrite() {
+  local compose_file="$1" spec_file="$2"
+  [ -f "$compose_file" ] || return 1
+  awk -v SEP="$BUILD_OVERRIDE_SEP" -v SPECFILE="$spec_file" \
+      "$(compose_build_rewrite_awk)" "$compose_file"
+}
+
+# キーワード (base/frontend/backend) と種別 (context/dockerfile) に対応する指定値を返す。
+build_override_value() {
+  case "${1}:${2}" in
+    base:context)        printf '%s' "$BASE_BUILD_CONTEXT" ;;
+    base:dockerfile)     printf '%s' "$BASE_BUILD_DOCKERFILE" ;;
+    frontend:context)    printf '%s' "$FRONTEND_BUILD_CONTEXT" ;;
+    frontend:dockerfile) printf '%s' "$FRONTEND_BUILD_DOCKERFILE" ;;
+    backend:context)     printf '%s' "$BACKEND_BUILD_CONTEXT" ;;
+    backend:dockerfile)  printf '%s' "$BACKEND_BUILD_DOCKERFILE" ;;
+  esac
+}
+
+# そのキーワードに context / dockerfile のいずれかの指定があるか。
+build_override_keyword_specified() {
+  [ -n "$(build_override_value "$1" context)$(build_override_value "$1" dockerfile)" ]
+}
+
+# 6 つのオプションのいずれかが指定されているか (未指定なら以降の処理を一切行わない)。
+build_override_requested() {
+  local kw
+  for kw in "${BUILD_OVERRIDE_KEYWORDS[@]}"; do
+    build_override_keyword_specified "$kw" && return 0
+  done
+  return 1
+}
+
+# 現在値の表示。書かれていない場合は "(未指定)" とし、あるものと区別できるようにする。
+build_override_display_value() {
+  if [ -n "$1" ]; then printf "'%s'" "$1"; else printf '(未指定)'; fi
+}
+
+# 生成した実効 compose ファイルを削除する (EXIT トラップから呼ぶ)。
+# 想定した名前のファイルだけを消し、利用者の compose.yml には決して触れない。
+cleanup_generated_compose_file() {
+  local target="$COMPOSE_FILE_GENERATED"
+  [ -n "$target" ] || return 0
+  COMPOSE_FILE_GENERATED=""
+  case "$(basename -- "$target")" in
+    .build_and_verify_compose.*.yml) rm -f -- "$target" ;;
+    *) warn "生成した compose ファイルの名前が想定と異なるため削除しません: ${target}" ;;
+  esac
+}
+
+# 利用者が手で実行する compose コマンドの案内に使うファイル名。
+# 実効 compose ファイルは処理終了時に消えるため、案内には元ファイルを使う
+# (プロジェクト名は同じなので down / logs はどちらを指定しても同じ対象になる)。
+compose_file_display() {
+  printf '%s' "${COMPOSE_FILE_ORIGINAL:-$COMPOSE_FILE}"
+}
+
+# 指定を compose ファイルへ反映し、COMPOSE_FILE を実効ファイルへ差し替える。
+# 指定が 1 つも無ければ何もしない (既定の動作は完全に従来どおり)。
+apply_compose_build_overrides() {
+  build_override_requested || return 0
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    err "compose ファイルが見つかりません: ${COMPOSE_FILE}"
+    err "  --base-context / --frontend-dockerfile などの上書き指定には compose ファイルが必要です。"
+    exit 1
+  fi
+
+  # ---- compose ファイルのサービスと現在の build 設定を読み取る --------------
+  local -a svc_names=()
+  local -A cur_has_build=() cur_context=() cur_dockerfile=()
+  local scan_line name has_build ctx dfl
+  while IFS= read -r scan_line; do
+    [ -n "$scan_line" ] || continue
+    IFS="$BUILD_OVERRIDE_SEP" read -r name has_build ctx dfl <<< "$scan_line"
+    [ -n "$name" ] || continue
+    svc_names+=("$name")
+    cur_has_build["$name"]="$has_build"
+    cur_context["$name"]="$ctx"
+    cur_dockerfile["$name"]="$dfl"
+  done < <(compose_build_scan "$COMPOSE_FILE")
+
+  if [ ${#svc_names[@]} -eq 0 ]; then
+    err "compose ファイルからサービスを読み取れませんでした: ${COMPOSE_FILE}"
+    err "  services: の定義があるか確認してください。"
+    exit 1
+  fi
+
+  # ---- キーワードごとに対象サービスを決める --------------------------------
+  local -A keyword_applied=() keyword_skipped=()
+  local -a tgt_svc=() tgt_ctx=() tgt_dfl=() tgt_kw=()
+  local kw i matched_count matched_kw matched_list exact_kw
+  for kw in "${BUILD_OVERRIDE_KEYWORDS[@]}"; do
+    keyword_applied["$kw"]=""
+    keyword_skipped["$kw"]=""
+  done
+
+  for name in "${svc_names[@]}"; do
+    matched_count=0; matched_kw=""; matched_list=""; exact_kw=""
+    for kw in "${BUILD_OVERRIDE_KEYWORDS[@]}"; do
+      build_override_keyword_specified "$kw" || continue
+      # 「完全一致、もしくは含む」で判定する (完全一致は「含む」の一種)。
+      case "$name" in
+        *"$kw"*) ;;
+        *) continue ;;
+      esac
+      matched_count=$((matched_count + 1))
+      matched_kw="$kw"
+      matched_list="${matched_list:+${matched_list}, }${kw}"
+      [ "$name" = "$kw" ] && exact_kw="$kw"
+    done
+    [ "$matched_count" -eq 0 ] && continue
+
+    if [ "$matched_count" -gt 1 ]; then
+      if [ -n "$exact_kw" ]; then
+        # 完全一致するキーワードがあれば、そちらを優先する。
+        matched_kw="$exact_kw"
+        warn "サービス '${name}' が複数のキーワード (${matched_list}) に一致するため、完全一致する '${exact_kw}' の指定を使います。"
+      else
+        err "サービス '${name}' が複数のキーワード (${matched_list}) に一致し、いずれにも上書き指定があるため、どれを適用するか決められません。"
+        err "  一致するキーワードの指定を 1 つに絞るか、サービス名を見直してください。"
+        exit 2
+      fi
+    fi
+
+    if [ "${cur_has_build[$name]}" = "2" ]; then
+      # フロー形式 ("build: {context: ., dockerfile: X}") は行単位の書き換えでは
+      # 中身だけを差し替えられない。黙って別の値でビルドするより、その場で断る。
+      err "サービス '${name}' の定義がフロー形式 ({ } を使った 1 行の書き方) のため、--${matched_kw}-context / --${matched_kw}-dockerfile を反映できません。"
+      err "  compose ファイルの build 定義をブロック形式 (キーを行ごとに書く形) へ直してから指定してください。"
+      exit 1
+    fi
+    if [ "${cur_has_build[$name]}" != "1" ]; then
+      # image 指定のみのサービス。build を新設すると「ビルドしないはずのものを
+      # ビルドする」ことになり別物になるため、適用せず警告にとどめる。
+      warn "サービス '${name}' は build 定義を持たないため、--${matched_kw}-context / --${matched_kw}-dockerfile は適用しません。"
+      keyword_skipped["$matched_kw"]="${keyword_skipped[$matched_kw]:+${keyword_skipped[$matched_kw]}, }${name}"
+      continue
+    fi
+
+    tgt_svc+=("$name")
+    tgt_ctx+=("$(build_override_value "$matched_kw" context)")
+    tgt_dfl+=("$(build_override_value "$matched_kw" dockerfile)")
+    tgt_kw+=("$matched_kw")
+    keyword_applied["$matched_kw"]="${keyword_applied[$matched_kw]:+${keyword_applied[$matched_kw]}, }${name}"
+  done
+
+  # ---- 指定が無効になっていないか確認する ----------------------------------
+  # 指定したのに 1 つも当たらない場合、compose の値のまま黙ってビルドが進み、
+  # 「指定したはずの Dockerfile と違うものでできたイメージ」が完成してしまう。
+  for kw in "${BUILD_OVERRIDE_KEYWORDS[@]}"; do
+    build_override_keyword_specified "$kw" || continue
+    [ -n "${keyword_applied[$kw]}" ] && continue
+    err "--${kw}-context / --${kw}-dockerfile を指定しましたが、適用できるサービスがありません: ${COMPOSE_FILE}"
+    if [ -n "${keyword_skipped[$kw]}" ]; then
+      err "  '${kw}' に一致したサービス (${keyword_skipped[$kw]}) は build 定義を持たないため対象外です。"
+    else
+      err "  サービス名に '${kw}' を含むサービスがありません。定義されているサービス: ${svc_names[*]}"
+    fi
+    exit 1
+  done
+
+  # ---- 反映内容を表示する --------------------------------------------------
+  local summary_line
+  BUILD_OVERRIDE_SUMMARY=""
+  log "build コンテキスト / Dockerfile の上書きを反映します (対象 ${#tgt_svc[@]} サービス)。"
+  for ((i = 0; i < ${#tgt_svc[@]}; i++)); do
+    name="${tgt_svc[$i]}"
+    summary_line="${name} (--${tgt_kw[$i]}-*)"
+    if [ -n "${tgt_ctx[$i]}" ]; then
+      log "  ${name}: context $(build_override_display_value "${cur_context[$name]}") -> '${tgt_ctx[$i]}'"
+      summary_line="${summary_line} context=${tgt_ctx[$i]}"
+    fi
+    if [ -n "${tgt_dfl[$i]}" ]; then
+      log "  ${name}: dockerfile $(build_override_display_value "${cur_dockerfile[$name]}") -> '${tgt_dfl[$i]}'"
+      summary_line="${summary_line} dockerfile=${tgt_dfl[$i]}"
+    fi
+    BUILD_OVERRIDE_SUMMARY="${BUILD_OVERRIDE_SUMMARY:+${BUILD_OVERRIDE_SUMMARY} / }${summary_line}"
+  done
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] 実効 compose ファイルの生成をスキップします (元ファイルのまま実行内容を表示します): ${COMPOSE_FILE}"
+    return 0
+  fi
+
+  # ---- 実効 compose ファイルを生成する -------------------------------------
+  local compose_dir spec_file generated_file
+  compose_dir="$(dirname -- "$COMPOSE_FILE")"
+  case "$compose_dir" in
+    */) generated_file="${compose_dir}.build_and_verify_compose.$$.yml" ;;
+    *)  generated_file="${compose_dir}/.build_and_verify_compose.$$.yml" ;;
+  esac
+
+  if ! spec_file="$(mktemp 2>/dev/null)"; then
+    err "上書き指定の一時ファイルを作成できませんでした。"
+    exit 1
+  fi
+  for ((i = 0; i < ${#tgt_svc[@]}; i++)); do
+    printf '%s%s%s%s%s\n' \
+      "${tgt_svc[$i]}" "$BUILD_OVERRIDE_SEP" "${tgt_ctx[$i]}" "$BUILD_OVERRIDE_SEP" "${tgt_dfl[$i]}"
+  done > "$spec_file"
+
+  if ! compose_build_rewrite "$COMPOSE_FILE" "$spec_file" > "$generated_file"; then
+    rm -f -- "$spec_file"
+    rm -f -- "$generated_file"
+    err "上書きを反映した compose ファイルを生成できませんでした: ${generated_file}"
+    err "  出力先ディレクトリに書き込めるか確認してください: ${compose_dir}"
+    exit 1
+  fi
+  rm -f -- "$spec_file"
+  # ここで登録しておくことで、以降どこで失敗しても EXIT トラップで確実に消える。
+  COMPOSE_FILE_GENERATED="$generated_file"
+
+  if [ ! -s "$generated_file" ]; then
+    err "生成した compose ファイルが空です: ${generated_file}"
+    exit 1
+  fi
+
+  # ---- 生成結果を読み直して、指定どおりになっているか確かめる --------------
+  # 「生成したつもりで反映されていない」まま進むと、指定と違う Dockerfile で
+  # できたイメージを正しいものとして扱ってしまう。ここで必ず突き合わせる。
+  local -A new_context=() new_dockerfile=()
+  while IFS= read -r scan_line; do
+    [ -n "$scan_line" ] || continue
+    IFS="$BUILD_OVERRIDE_SEP" read -r name has_build ctx dfl <<< "$scan_line"
+    [ -n "$name" ] || continue
+    new_context["$name"]="$ctx"
+    new_dockerfile["$name"]="$dfl"
+  done < <(compose_build_scan "$generated_file")
+
+  for ((i = 0; i < ${#tgt_svc[@]}; i++)); do
+    name="${tgt_svc[$i]}"
+    if [ -n "${tgt_ctx[$i]}" ] && [ "${new_context[$name]:-}" != "${tgt_ctx[$i]}" ]; then
+      err "生成した compose ファイルへ context を反映できませんでした: サービス '${name}'"
+      err "  期待: '${tgt_ctx[$i]}' / 実際: $(build_override_display_value "${new_context[$name]:-}")"
+      err "  生成ファイル: ${generated_file}"
+      exit 1
+    fi
+    if [ -n "${tgt_dfl[$i]}" ] && [ "${new_dockerfile[$name]:-}" != "${tgt_dfl[$i]}" ]; then
+      err "生成した compose ファイルへ dockerfile を反映できませんでした: サービス '${name}'"
+      err "  期待: '${tgt_dfl[$i]}' / 実際: $(build_override_display_value "${new_dockerfile[$name]:-}")"
+      err "  生成ファイル: ${generated_file}"
+      exit 1
+    fi
+  done
+
+  COMPOSE_FILE_ORIGINAL="$COMPOSE_FILE"
+  COMPOSE_FILE="$generated_file"
+  log "上書きを反映した compose ファイルを生成しました: ${generated_file}"
+  log "  元ファイル (変更していません): ${COMPOSE_FILE_ORIGINAL}"
+  log "  以降のビルド・起動・停止はこの実効ファイルで行い、処理終了時に自動削除します。"
+}
+
+# ---- 保護するサービス (--keep-service) --------------------------------------
+# --keep-service で指定したサービスは、次の 3 つで「触らない」扱いにする。
+#   (1) --no-cache を指定した実行でも、そのサービスだけはキャッシュを使ってビルドする
+#   (2) 後始末でイメージをローカルに残す
+#   (3) 後始末で名前付きボリュームを残す
+# 指定していないサービスの扱いは従来どおり (no-cache の対象、削除の対象)。
+#
+# サービス名は完全一致で判定する (build コンテキストの上書きの「含む」判定とは
+# 別物)。保護したいものを取り違えるとボリュームの中身が消えるため、compose
+# ファイルに存在しない名前はその場でエラーにする。
+
+# --keep-service が 1 つでも指定されているか。
+# 指定が無ければ、以降の保護処理はすべて素通りする (既定の動作は従来どおり)。
+keep_service_protection_active() {
+  [ ${#KEEP_SERVICES[@]} -gt 0 ]
+}
+
+# 指定のサービス名が保護対象か (完全一致)。
+service_is_kept() {
+  local target="$1" svc
+  keep_service_protection_active || return 1
+  for svc in "${KEEP_SERVICES[@]}"; do
+    [ "$svc" = "$target" ] && return 0
+  done
+  return 1
+}
+
+# compose ファイルから、サービスごとの image と名前付きボリュームを読み取る awk。
+# 1 行 1 事実で次を出力する。
+#   <サービス名><SEP>image<SEP><image の値>
+#   <サービス名><SEP>volume<SEP><compose 上の宣言名>
+# ボリュームは短縮形式 ("- name:/path") と長形式 ("- type: volume" + "source:")
+# の両方を拾う。ホストパスのバインドマウント ("- ./dir:/path") は名前付き
+# ボリュームではないため出力しない。
+compose_service_facts_awk() {
+  compose_build_override_awk_common
+  cat <<'AWKFACTS'
+BEGIN { in_services = 0; services_indent = 0; svc_indent = -1; cur_svc = "" }
+# 長形式のボリューム項目 ("- type: volume" / "source: name") を 1 件出す
+function flush_volume_item() {
+  if (item_type == "volume" && item_source != "")
+    printf "%s%svolume%s%s\n", cur_svc, SEP, SEP, item_source
+  item_type = ""; item_source = ""
+}
+# 短縮形式 "name:/path" から名前付きボリュームの名前を返す (バインドなら空文字)
+function short_volume_name(entry,   name) {
+  if (entry !~ /:/) return ""            # 匿名ボリューム ("- /data") は対象外
+  name = entry
+  sub(/:.*$/, "", name)
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+  if (name == "") return ""
+  # 絶対パス / 相対パス / ホームからのパス / Windows のドライブ指定はバインドマウント
+  if (name ~ /^[\/.~]/) return ""
+  if (name ~ /^[A-Za-z]$/) return ""
+  return name
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+  match(line, /^[ ]*/)
+  indent = RLENGTH
+  content = substr(line, indent + 1)
+
+  if (!in_services) {
+    if (indent == 0 && ykey(content) == "services") {
+      in_services = 1; services_indent = indent; svc_indent = -1
+    }
+    next
+  }
+  if (indent <= services_indent) { flush_volume_item(); in_services = 0; cur_svc = ""; next }
+  if (svc_indent < 0) svc_indent = indent
+  if (indent == svc_indent) {
+    if (content ~ /^- /) next
+    k = ykey(content)
+    if (k == "") next
+    flush_volume_item()
+    cur_svc = k; svc_child_indent = -1; in_vol = 0; vol_indent = -1
+    item_type = ""; item_source = ""
+    next
+  }
+  if (cur_svc == "") next
+  if (svc_child_indent < 0) svc_child_indent = indent
+  # volumes ブロックを抜けた
+  if (in_vol && indent <= vol_indent) { flush_volume_item(); in_vol = 0 }
+  # サービス直下のキー
+  if (!in_vol && indent == svc_child_indent) {
+    k = ykey(content)
+    if (k == "image") {
+      v = yval(content)
+      if (v != "") printf "%s%simage%s%s\n", cur_svc, SEP, SEP, v
+      next
+    }
+    if (k == "volumes" && yval(content) == "") { in_vol = 1; vol_indent = indent }
+    next
+  }
+  # volumes ブロックの中
+  if (in_vol && indent > vol_indent) {
+    if (content ~ /^- /) {
+      flush_volume_item()
+      entry = substr(content, 3)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", entry)
+      gsub(/^["']|["']$/, "", entry)
+      k = ykey(entry)
+      # 長形式の項目は type / source / target ... のキーで始まる
+      if (k == "type" || k == "source" || k == "target" || k == "read_only" \
+          || k == "bind" || k == "volume" || k == "tmpfs" || k == "consistency") {
+        if (k == "type")   item_type = yval(entry)
+        if (k == "source") item_source = yval(entry)
+        next
+      }
+      v = short_volume_name(entry)
+      if (v != "") printf "%s%svolume%s%s\n", cur_svc, SEP, SEP, v
+      next
+    }
+    k = ykey(content)
+    if (k == "type")   item_type = yval(content)
+    if (k == "source") item_source = yval(content)
+  }
+}
+END { flush_volume_item() }
+AWKFACTS
+}
+
+compose_service_facts() {
+  local compose_file="$1"
+  [ -f "$compose_file" ] || return 1
+  awk -v SEP="$BUILD_OVERRIDE_SEP" "$(compose_service_facts_awk)" "$compose_file"
+}
+
+# Compose のプロジェクト名を求める。イメージ名・ボリューム名の接頭辞になる。
+#   1. COMPOSE_PROJECT_NAME が設定されていればそれ
+#   2. 今回のスタックのコンテナが持つラベル (最も確実)
+#   3. compose ファイルのあるディレクトリ名を Compose と同じ規則で正規化したもの
+compose_project_name() {
+  local cid label dir
+  if [ -n "$COMPOSE_PROJECT_NAME_CACHE" ]; then
+    printf '%s' "$COMPOSE_PROJECT_NAME_CACHE"
+    return 0
+  fi
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    COMPOSE_PROJECT_NAME_CACHE="$COMPOSE_PROJECT_NAME"
+    printf '%s' "$COMPOSE_PROJECT_NAME_CACHE"
+    return 0
+  fi
+  cid="$(compose_project_container_ids_all 2>/dev/null | head -n 1 || true)"
+  if [ -n "$cid" ]; then
+    label="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$cid" 2>/dev/null || true)"
+    if [ -n "$label" ] && [ "$label" != "<no value>" ]; then
+      COMPOSE_PROJECT_NAME_CACHE="$label"
+      printf '%s' "$COMPOSE_PROJECT_NAME_CACHE"
+      return 0
+    fi
+  fi
+  dir="$(compose_file_dir 2>/dev/null || true)"
+  [ -n "$dir" ] || dir="$PWD"
+  # Compose の既定と同じ正規化: 小文字化し、英数字と _ - . 以外を落とす
+  label="$(basename -- "$dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]//g; s/^[^a-z0-9]*//')"
+  COMPOSE_PROJECT_NAME_CACHE="$label"
+  printf '%s' "$COMPOSE_PROJECT_NAME_CACHE"
+}
+
+# compose ファイルに定義されたサービス名を 1 行ずつ返す。
+compose_defined_service_names() {
+  local scan_line scan_name scan_rest
+  while IFS= read -r scan_line; do
+    [ -n "$scan_line" ] || continue
+    IFS="$BUILD_OVERRIDE_SEP" read -r scan_name scan_rest <<< "$scan_line"
+    [ -n "$scan_name" ] && printf '%s\n' "$scan_name"
+  done < <(compose_build_scan "$COMPOSE_FILE" 2>/dev/null || true)
+}
+
+# --keep-service に書かれたサービスが compose ファイルに実在するかを確かめる。
+# 取り違えたまま進むと、残すつもりだったボリュームの中身が消える。
+# 引数パースの直後に呼び、ビルドを始める前に気付けるようにする。
+validate_keep_services() {
+  keep_service_protection_active || return 0
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    err "compose ファイルが見つかりません: ${COMPOSE_FILE}"
+    err "  --keep-service の指定には compose ファイルが必要です。"
+    exit 1
+  fi
+  local -a defined=()
+  local name found
+  while IFS= read -r name; do
+    [ -n "$name" ] && defined+=("$name")
+  done < <(compose_defined_service_names)
+  if [ ${#defined[@]} -eq 0 ]; then
+    err "compose ファイルからサービスを読み取れませんでした: ${COMPOSE_FILE}"
+    err "  --keep-service の指定を検証できないため中止します。"
+    exit 1
+  fi
+  for name in "${KEEP_SERVICES[@]}"; do
+    found="false"
+    for found_name in "${defined[@]}"; do
+      [ "$found_name" = "$name" ] && found="true"
+    done
+    if [ "$found" != "true" ]; then
+      err "--keep-service '${name}' が compose ファイルにありません: ${COMPOSE_FILE}"
+      err "  定義されているサービス: ${defined[*]}"
+      err "  保護するつもりのサービスを取り違えると、イメージとボリュームが消えます。"
+      exit 2
+    fi
+  done
+  log "--keep-service で保護するサービス: ${KEEP_SERVICES[*]}"
+  log "  これらは --no-cache の対象外とし、イメージとボリュームを後始末で残します。"
+  return 0
+}
+
+# --keep-service の保護対象となるイメージ参照とボリューム宣言名を確定する。
+# プロジェクト名はコンテナのラベルから取れるようになってから確定させたいため、
+# 検証 (validate_keep_services) とは分けて、実際に使う直前へ遅延させる。
+resolve_keep_service_targets() {
+  keep_service_protection_active || return 0
+  [ "$KEEP_SERVICE_RESOLVED" = "true" ] && return 0
+  KEEP_SERVICE_RESOLVED="true"
+
+  local -A svc_image=() svc_volumes=()
+  local fact_line svc kind value project svc_name ref
+  while IFS= read -r fact_line; do
+    [ -n "$fact_line" ] || continue
+    IFS="$BUILD_OVERRIDE_SEP" read -r svc kind value <<< "$fact_line"
+    [ -n "$svc" ] || continue
+    case "$kind" in
+      image)  svc_image["$svc"]="$value" ;;
+      volume) svc_volumes["$svc"]="${svc_volumes[$svc]:+${svc_volumes[$svc]} }${value}" ;;
+    esac
+  done < <(compose_service_facts "$COMPOSE_FILE" 2>/dev/null || true)
+
+  project="$(compose_project_name)"
+  KEEP_SERVICE_IMAGE_REFS=()
+  KEEP_SERVICE_VOLUME_NAMES=()
+  for svc_name in "${KEEP_SERVICES[@]}"; do
+    # イメージ: compose の image 指定があればそれ。無ければ Compose が付ける既定名。
+    if [ -n "${svc_image[$svc_name]:-}" ]; then
+      KEEP_SERVICE_IMAGE_REFS+=("${svc_image[$svc_name]}")
+    elif [ -n "$project" ]; then
+      # Compose v2 は "-"、v1 は "_" で連結するため、両方を保護対象にする。
+      KEEP_SERVICE_IMAGE_REFS+=("${project}-${svc_name}" "${project}_${svc_name}")
+    fi
+    # ボリューム: compose 上の宣言名 (実体名は <プロジェクト>_<宣言名>)
+    for ref in ${svc_volumes[$svc_name]:-}; do
+      KEEP_SERVICE_VOLUME_NAMES+=("$ref")
+    done
+  done
+  return 0
+}
+
+# 保護対象イメージの image ID を集める (存在しないものは黙って飛ばす)。
+keep_service_image_ids() {
+  local ref id
+  keep_service_protection_active || return 0
+  resolve_keep_service_targets
+  for ref in ${KEEP_SERVICE_IMAGE_REFS[@]+"${KEEP_SERVICE_IMAGE_REFS[@]}"}; do
+    id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    [ -n "$id" ] && printf '%s\n' "$id"
+  done
+}
+
+# 指定のイメージ参照が保護対象か。
+image_ref_is_kept() {
+  local target="$1" ref
+  keep_service_protection_active || return 1
+  resolve_keep_service_targets
+  for ref in ${KEEP_SERVICE_IMAGE_REFS[@]+"${KEEP_SERVICE_IMAGE_REFS[@]}"}; do
+    [ "$ref" = "$target" ] && return 0
+  done
+  return 1
+}
+
+# 指定のボリューム宣言名 (compose 上の名前) が保護対象か。
+volume_name_is_kept() {
+  local target="$1" name
+  keep_service_protection_active || return 1
+  resolve_keep_service_targets
+  for name in ${KEEP_SERVICE_VOLUME_NAMES[@]+"${KEEP_SERVICE_VOLUME_NAMES[@]}"}; do
+    [ "$name" = "$target" ] && return 0
+  done
+  return 1
+}
+
+# 保護内容を 1 行で表す (レポート・画面表示用)。
+keep_service_summary() {
+  keep_service_protection_active || { printf '(なし)'; return 0; }
+  resolve_keep_service_targets
+  local images="(なし)" volumes="(なし)"
+  [ ${#KEEP_SERVICE_IMAGE_REFS[@]} -gt 0 ] && images="${KEEP_SERVICE_IMAGE_REFS[*]}"
+  [ ${#KEEP_SERVICE_VOLUME_NAMES[@]} -gt 0 ] && volumes="${KEEP_SERVICE_VOLUME_NAMES[*]}"
+  printf 'サービス: %s / イメージ: %s / ボリューム: %s' \
+    "${KEEP_SERVICES[*]}" "$images" "$volumes"
+}
+
+# 指定の image ID が保護対象か。
+image_id_is_kept() {
+  local target="$1" id
+  keep_service_protection_active || return 1
+  while IFS= read -r id; do
+    [ "$id" = "$target" ] && return 0
+  done < <(keep_service_image_ids)
+  return 1
+}
+
+# docker のボリューム名から compose 上の宣言名を求める。
+# Compose が付けるラベル (com.docker.compose.volume) が最も確実で、
+# 取れない場合はプロジェクト名の接頭辞を外した名前を使う。
+compose_volume_declared_name() {
+  local vol="$1" project="$2" declared
+  declared="$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$vol" 2>/dev/null || true)"
+  if [ -z "$declared" ] || [ "$declared" = "<no value>" ]; then
+    declared="$vol"
+    if [ -n "$project" ]; then
+      case "$declared" in
+        "${project}_"*) declared="${declared#${project}_}" ;;
+      esac
+    fi
+  fi
+  printf '%s' "$declared"
+}
+
+# ---- compose build の実行 ---------------------------------------------------
+# --no-cache と --keep-service を併用した実行では、compose build がサービス単位に
+# --no-cache を切り替えられないため、no-cache 対象と除外対象を 2 回に分けて
+# ビルドする。no-cache 対象を先にビルドするのは、除外側が FROM で参照する
+# イメージが先に作り直され、キャッシュ判定が新しいイメージを見た状態に
+# なるようにするため (逆順だと除外側が古いイメージの上に積まれる)。
+# 引数: <監視ラベル> [<サービス名>...]  (サービス名を省略すると全サービス)
+run_compose_build() {
+  local label="$1"; shift
+  local -a targets=()
+  [ $# -gt 0 ] && targets=("$@")
+  local -a nocache_group=() cached_group=()
+  local svc status=0
+
+  # 分割が要らない実行 (--no-cache 無し / --keep-service 無し) は従来どおり 1 回。
+  if [ "$NO_CACHE" != "true" ] || ! keep_service_protection_active; then
+    run_build_with_watchdog "$label" "${COMPOSE_CMD[@]}" \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
+      ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} ${targets[@]+"${targets[@]}"}
+    return $?
+  fi
+
+  # 対象を省略した呼び出し (全サービス) は、分割のために build 定義を持つ
+  # サービスを compose ファイルから列挙する。
+  if [ ${#targets[@]} -eq 0 ]; then
+    local scan_line scan_name scan_has_build scan_rest
+    while IFS= read -r scan_line; do
+      [ -n "$scan_line" ] || continue
+      IFS="$BUILD_OVERRIDE_SEP" read -r scan_name scan_has_build scan_rest <<< "$scan_line"
+      [ -n "$scan_name" ] || continue
+      [ "$scan_has_build" = "0" ] && continue
+      targets+=("$scan_name")
+    done < <(compose_build_scan "$COMPOSE_FILE" 2>/dev/null || true)
+    if [ ${#targets[@]} -eq 0 ]; then
+      err "--no-cache と --keep-service を併用するには、compose ファイルから"
+      err "  ビルド対象のサービスを読み取れる必要があります: ${COMPOSE_FILE}"
+      err "  --compose-service でビルド対象を明示するか、--keep-service を外してください。"
+      return 1
+    fi
+  fi
+
+  for svc in "${targets[@]}"; do
+    if service_is_kept "$svc"; then
+      cached_group+=("$svc")
+    else
+      nocache_group+=("$svc")
+    fi
+  done
+
+  if [ ${#nocache_group[@]} -gt 0 ]; then
+    log "  キャッシュを破棄してビルド (--no-cache): ${nocache_group[*]}"
+    run_build_with_watchdog "${label} / --no-cache" "${COMPOSE_CMD[@]}" \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
+      ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} "${nocache_group[@]}" || return $?
+  fi
+  if [ ${#cached_group[@]} -gt 0 ]; then
+    log "  キャッシュを使ってビルド (--keep-service で no-cache から除外): ${cached_group[*]}"
+    run_build_with_watchdog "${label} / キャッシュ利用" "${COMPOSE_CMD[@]}" \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
+      ${BUILD_OPTS_CACHED[@]+"${BUILD_OPTS_CACHED[@]}"} "${cached_group[@]}" || return $?
+  fi
+  return $status
+}
+
+# ---- Compose プロジェクトのボリュームを選んで削除する -----------------------
+# --keep-service を指定した実行では compose down --volumes が使えない
+# (プロジェクトのボリュームを一括で消してしまうため)。down ではボリュームを
+# 残し、そのあとで保護対象以外だけをここで個別に削除する。
+remove_project_volumes_except_kept() {
+  local project vol declared
+  local -a remove_list=() keep_list=()
+  project="$(compose_project_name)"
+  if [ -z "$project" ]; then
+    warn "Compose プロジェクト名を特定できないため、ボリュームの個別削除を行いません。"
+    warn "  保護対象以外のボリュームが残ります。手動で確認してください: docker volume ls"
+    return 1
+  fi
+  while IFS= read -r vol; do
+    [ -n "$vol" ] || continue
+    declared="$(compose_volume_declared_name "$vol" "$project")"
+    if volume_name_is_kept "$declared"; then
+      keep_list+=("$vol")
+    else
+      remove_list+=("$vol")
+    fi
+  done < <(docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)
+
+  if [ ${#keep_list[@]} -gt 0 ]; then
+    log "  残すボリューム (--keep-service): ${keep_list[*]}"
+  fi
+  if [ ${#remove_list[@]} -eq 0 ]; then
+    log "  削除する Compose ボリュームはありません。"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] docker volume rm ${remove_list[*]}"
+    return 0
+  fi
+  log "  Compose ボリュームを削除します (${#remove_list[@]} 件): ${remove_list[*]}"
+  if ! docker volume rm "${remove_list[@]}" > /dev/null 2>&1; then
+    warn "ボリュームを削除できませんでした。手動で確認してください: docker volume rm ${remove_list[*]}"
+    return 1
+  fi
+  return 0
 }
 
 # ---- CA 証明書の tar アーカイブ生成 (BuildKit シークレット) -------------------
@@ -6917,7 +7960,7 @@ diagnose_broken_data_volume() {
   diag "    接続側には java.net.UnknownHostException / Unknown MySQL server host だけが"
   diag "    出て、原因が DB 側にあることが見えにくくなります。"
   diag "    対処 (ボリュームのデータは消えます):"
-  diag "      ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v"
+  diag "      ${COMPOSE_CMD[*]} -f $(compose_file_display) down -v"
   return 0
 }
 
@@ -7104,7 +8147,7 @@ diagnose_compose_up_failure() {
       diag "   4. 逆に、ボリュームを残したまま再実行している場合は、前回の中断で"
       diag "      DB のデータディレクトリが壊れたまま残っている可能性がある。"
       diag "      → 上のログに初期化エラーが出ていないかを確認し、出ていれば"
-      diag "        ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} down -v で作り直す。"
+      diag "        ${COMPOSE_CMD[*]} -f $(compose_file_display) down -v で作り直す。"
       ;;
     *)
       diag "  一過性のエラーとして判断できませんでした。上の状態と healthcheck の"
@@ -7225,8 +8268,8 @@ resolve_down_volume_removal() {
 teardown_container() {
   [ "$STARTED_CONTAINER" = "true" ] || return 0
   if [ "$KEEP_CONTAINER" = "true" ]; then
-    log "コンテナを残します (--keep-container)。手動で停止する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
-    log "  ボリュームまで消して次回をまっさらな状態から始める場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down -v"
+    log "コンテナを残します (--keep-container)。手動で停止する場合: ${COMPOSE_CMD[*]} -f $(compose_file_display) down"
+    log "  ボリュームまで消して次回をまっさらな状態から始める場合: ${COMPOSE_CMD[*]} -f $(compose_file_display) down -v"
     return 0
   fi
   # 停止猶予を明示する。既定の 10 秒では、DB の初期化中や InnoDB の書き出し中に
@@ -7235,12 +8278,22 @@ teardown_container() {
   # (UnknownHostException) だけが出る、という追いにくい壊れ方をする。
   resolve_down_volume_removal
   local -a down_args=(-f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT")
+  local remove_volumes_selectively="false"
   if [ "$DOWN_REMOVE_VOLUMES" = "true" ]; then
     # ボリュームを残すと、デプロイ先やログ出力先を覆っているボリュームの中身が
     # 次回もそのまま使われ、イメージを作り直しても反映されない状態が続く。
-    down_args+=(--volumes)
-    log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT} --volumes) ..."
-    log "  この Compose プロジェクトの名前付きボリュームも削除します (残す場合: --keep-volumes)。"
+    if keep_service_protection_active; then
+      # compose down --volumes はプロジェクトのボリュームを一括で消すため、
+      # --keep-service の保護と両立しない。down ではボリュームを残し、
+      # このあと保護対象以外だけを個別に削除する。
+      remove_volumes_selectively="true"
+      log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT}) ..."
+      log "  ボリュームは --keep-service の保護対象を除いて、この後で個別に削除します。"
+    else
+      down_args+=(--volumes)
+      log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT} --volumes) ..."
+      log "  この Compose プロジェクトの名前付きボリュームも削除します (残す場合: --keep-volumes)。"
+    fi
   else
     log "コンテナを停止・削除します (compose down -t ${SHUTDOWN_LOG_TIMEOUT}) ..."
   fi
@@ -7252,6 +8305,9 @@ teardown_container() {
   fi
   if [ "$down_ok" -ne 0 ]; then
     warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} ${down_args[*]}"
+  fi
+  if [ "$remove_volumes_selectively" = "true" ]; then
+    remove_project_volumes_except_kept || true
   fi
 }
 
@@ -8203,7 +9259,7 @@ print_healthcheck_manual_commands() {
   diag "  # Docker が記録した healthcheck の状態と履歴 (コンテナ内シェル不要)"
   diag "  docker inspect --format '{{json .State.Health}}' ${container_name}"
   diag "  # コンテナのログから稼働状況を確認"
-  diag "  ${COMPOSE_CMD[*]} -f ${COMPOSE_FILE} logs ${service_name}"
+  diag "  ${COMPOSE_CMD[*]} -f $(compose_file_display) logs ${service_name}"
   case "$health_mode" in
     CMD)
       diag "  # healthcheck と同じコマンドを直接実行 (シェル不要)"
@@ -13389,7 +14445,7 @@ handle_deploy_error_investigation() {
 
   if [ "$interaction_status" -eq 0 ] || [ "$INTERACTION_MENU_ENTERED" = "true" ]; then
     log "デプロイエラーの調査用対話操作を終了しました。コンテナは起動状態のまま残します。"
-    log "  手動で停止・削除する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+    log "  手動で停止・削除する場合: ${COMPOSE_CMD[*]} -f $(compose_file_display) down"
     return 0
   fi
 
@@ -13545,6 +14601,14 @@ show_docker_cleanup_notice() {
   diag "  4. 全ローカルボリュームと、その中の永続データ: $volume_count 件"
   diag "  5. 未使用のユーザー定義ネットワーク: $network_count 件"
   diag "  6. 現在の Docker daemon で削除可能な全ビルドキャッシュ"
+  if keep_service_protection_active; then
+    resolve_keep_service_targets
+    diag ""
+    diag "残すもの (--keep-service ${KEEP_SERVICES[*]}):"
+    diag "  - イメージ: ${KEEP_SERVICE_IMAGE_REFS[*]:-(なし)}"
+    diag "  - ボリューム: ${KEEP_SERVICE_VOLUME_NAMES[*]:-(なし)}"
+    diag "  上記を除いたイメージ・ボリュームを削除します (prune ではなく個別削除)。"
+  fi
   diag ""
   diag "この操作は同じ Docker daemon を使う他プロジェクトにも影響し、元に戻せません。"
   diag "Docker daemon / Docker Desktop、標準ネットワーク、Docker context、"
@@ -13569,6 +14633,94 @@ run_docker_cleanup_step() {
   fi
   warn "失敗しました: $description"
   return 1
+}
+
+# ---- --keep-service の保護対象を除いた一括削除 ------------------------------
+# docker image prune --all / docker volume prune --all は「保護対象を除く」を
+# 表現できないため、--keep-service を指定した実行では一覧を取って引き算する。
+
+# 保護対象を除く全ローカルイメージを削除する。
+remove_all_images_except_kept() {
+  local id keep_id kept
+  local -a keep_ids=() remove_ids=()
+  while IFS= read -r id; do
+    [ -n "$id" ] && keep_ids+=("$id")
+  done < <(keep_service_image_ids)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    kept="false"
+    for keep_id in ${keep_ids[@]+"${keep_ids[@]}"}; do
+      if [ "$keep_id" = "$id" ]; then kept="true"; break; fi
+    done
+    [ "$kept" = "true" ] && continue
+    remove_ids+=("$id")
+  done < <(docker image ls -aq --no-trunc 2>/dev/null | awk 'NF && !seen[$0]++')
+
+  if [ ${#keep_ids[@]} -gt 0 ]; then
+    log "  残すイメージ (--keep-service): ${KEEP_SERVICE_IMAGE_REFS[*]}"
+  else
+    warn "  --keep-service の保護対象イメージがローカルに見つかりませんでした: ${KEEP_SERVICE_IMAGE_REFS[*]:-(なし)}"
+  fi
+  if [ ${#remove_ids[@]} -eq 0 ]; then
+    log "  削除するイメージはありません。"
+    return 0
+  fi
+  docker image rm -f "${remove_ids[@]}" > /dev/null 2>&1 || true
+  return 0
+}
+
+# 保護対象を除く全ローカルボリュームを削除する。
+remove_all_volumes_except_kept() {
+  local vol declared project
+  local -a remove_list=() keep_list=()
+  project="$(compose_project_name)"
+  while IFS= read -r vol; do
+    [ -n "$vol" ] || continue
+    declared="$(compose_volume_declared_name "$vol" "$project")"
+    if volume_name_is_kept "$declared"; then
+      keep_list+=("$vol")
+    else
+      remove_list+=("$vol")
+    fi
+  done < <(docker volume ls -q 2>/dev/null || true)
+
+  if [ ${#keep_list[@]} -gt 0 ]; then
+    log "  残すボリューム (--keep-service): ${keep_list[*]}"
+  fi
+  if [ ${#remove_list[@]} -eq 0 ]; then
+    log "  削除するボリュームはありません。"
+    return 0
+  fi
+  docker volume rm "${remove_list[@]}" > /dev/null 2>&1 || true
+  return 0
+}
+
+# クリーンアップ後に残ってよいのは --keep-service の保護対象だけ。
+# 残ったものがすべて保護対象なら OK、そうでなければ警告する。
+# 引数: <表示名> <image|volume> <一覧を出すコマンド...>
+verify_docker_list_only_kept() {
+  local description="$1" kind="$2" remaining item project="" unexpected=0
+  shift 2
+  if ! remaining="$("$@" 2>/dev/null)"; then
+    warn "クリーンアップ後の確認に失敗しました: $description"
+    return 1
+  fi
+  [ -z "$remaining" ] && return 0
+  [ "$kind" = "volume" ] && project="$(compose_project_name)"
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    case "$kind" in
+      image)  image_id_is_kept "$item" && continue ;;
+      volume) volume_name_is_kept "$(compose_volume_declared_name "$item" "$project")" && continue ;;
+    esac
+    unexpected=$((unexpected + 1))
+  done <<< "$remaining"
+  if [ "$unexpected" -gt 0 ]; then
+    warn "クリーンアップ後も $description が $unexpected 件残っています (--keep-service の保護対象を除く)。"
+    return 1
+  fi
+  log "$description は --keep-service の保護対象だけが残りました。"
+  return 0
 }
 
 verify_docker_list_empty() {
@@ -13607,6 +14759,11 @@ remember_current_image_id() {
 # 他プロジェクトの dangling イメージには影響しない。
 reclaim_previous_image() {
   [ "$RECLAIM_OLD_IMAGE" = "true" ] || return 0
+  if image_ref_is_kept "$LOCAL_IMAGE"; then
+    # 保護対象サービスのイメージ。旧世代 (dangling) も含めてローカルに残す。
+    log "ローカルイメージは --keep-service の保護対象のため、旧世代の回収は行いません: ${LOCAL_IMAGE}"
+    return 0
+  fi
   if [ "$DRY_RUN" = "true" ]; then
     log "[DRY-RUN] 世代交代した旧イメージの削除は行いません (docker image rm <旧 ID>)。"
     return 0
@@ -13738,10 +14895,20 @@ cleanup_all_docker_data() {
     log "[DRY-RUN] docker container stop <実行中の全コンテナ ID>"
     log "[DRY-RUN] docker container prune --force"
     log "[DRY-RUN] docker builder prune --all --force"
-    log "[DRY-RUN] docker image prune --all --force"
-    log "[DRY-RUN] docker volume prune --all --force"
-    log "[DRY-RUN] docker network prune --force"
-    log "[DRY-RUN] docker system prune --all --volumes --force"
+    if keep_service_protection_active; then
+      resolve_keep_service_targets
+      log "[DRY-RUN] docker image rm -f <保護対象を除く全イメージ ID>"
+      log "[DRY-RUN]   残すイメージ: ${KEEP_SERVICE_IMAGE_REFS[*]:-(なし)}"
+      log "[DRY-RUN] docker volume rm <保護対象を除く全ボリューム名>"
+      log "[DRY-RUN]   残すボリューム (compose 上の宣言名): ${KEEP_SERVICE_VOLUME_NAMES[*]:-(なし)}"
+      log "[DRY-RUN] docker network prune --force"
+      log "[DRY-RUN] docker system prune --force (--all --volumes は保護対象を消すため使わない)"
+    else
+      log "[DRY-RUN] docker image prune --all --force"
+      log "[DRY-RUN] docker volume prune --all --force"
+      log "[DRY-RUN] docker network prune --force"
+      log "[DRY-RUN] docker system prune --all --volumes --force"
+    fi
     return 0
   fi
 
@@ -13799,18 +14966,40 @@ cleanup_all_docker_data() {
     docker container prune --force || cleanup_failed=1
   run_docker_cleanup_step "削除可能な全 Docker ビルドキャッシュを削除します" \
     docker builder prune --all --force || cleanup_failed=1
-  run_docker_cleanup_step "全ローカルイメージを削除します" \
-    docker image prune --all --force || cleanup_failed=1
-  run_docker_cleanup_step "全ローカルボリュームと永続データを削除します" \
-    docker volume prune --all --force || cleanup_failed=1
-  run_docker_cleanup_step "未使用のユーザー定義ネットワークを削除します" \
-    docker network prune --force || cleanup_failed=1
-  run_docker_cleanup_step "Docker の未使用データを最終確認・削除します" \
-    docker system prune --all --volumes --force || cleanup_failed=1
+  if keep_service_protection_active; then
+    # prune は「保護対象を除く」を表現できないため、一覧を取って引き算する。
+    resolve_keep_service_targets
+    run_docker_cleanup_step "--keep-service の保護対象を除く全ローカルイメージを削除します" \
+      remove_all_images_except_kept || cleanup_failed=1
+    run_docker_cleanup_step "--keep-service の保護対象を除く全ローカルボリュームを削除します" \
+      remove_all_volumes_except_kept || cleanup_failed=1
+    run_docker_cleanup_step "未使用のユーザー定義ネットワークを削除します" \
+      docker network prune --force || cleanup_failed=1
+    # --all --volumes は保護対象まで消してしまうため、最終確認は範囲を狭める
+    # (停止コンテナ / 未使用ネットワーク / dangling イメージ / ビルドキャッシュ)。
+    run_docker_cleanup_step "Docker の未使用データを最終確認・削除します (保護対象は残す)" \
+      docker system prune --force || cleanup_failed=1
+  else
+    run_docker_cleanup_step "全ローカルイメージを削除します" \
+      docker image prune --all --force || cleanup_failed=1
+    run_docker_cleanup_step "全ローカルボリュームと永続データを削除します" \
+      docker volume prune --all --force || cleanup_failed=1
+    run_docker_cleanup_step "未使用のユーザー定義ネットワークを削除します" \
+      docker network prune --force || cleanup_failed=1
+    run_docker_cleanup_step "Docker の未使用データを最終確認・削除します" \
+      docker system prune --all --volumes --force || cleanup_failed=1
+  fi
 
   verify_docker_list_empty "コンテナ" docker container ls -aq || cleanup_failed=1
-  verify_docker_list_empty "ローカルイメージ" docker image ls -aq || cleanup_failed=1
-  verify_docker_list_empty "ローカルボリューム" docker volume ls -q || cleanup_failed=1
+  if keep_service_protection_active; then
+    verify_docker_list_only_kept "ローカルイメージ" image \
+      docker image ls -aq --no-trunc || cleanup_failed=1
+    verify_docker_list_only_kept "ローカルボリューム" volume \
+      docker volume ls -q || cleanup_failed=1
+  else
+    verify_docker_list_empty "ローカルイメージ" docker image ls -aq || cleanup_failed=1
+    verify_docker_list_empty "ローカルボリューム" docker volume ls -q || cleanup_failed=1
+  fi
   verify_docker_list_empty "ユーザー定義ネットワーク" \
     docker network ls --filter type=custom -q || cleanup_failed=1
 
@@ -13827,8 +15016,14 @@ cleanup_all_docker_data() {
       measurement_reported="true"
     fi
     if [ "$after_bytes" -ne 0 ]; then
-      warn "クリーンアップ後も Docker 管理対象データが約 $(format_bytes "$after_bytes") 残っています。"
-      cleanup_failed=1
+      if keep_service_protection_active; then
+        # --keep-service で残したイメージ・ボリュームの分は残って当然。
+        log "クリーンアップ後に残っている Docker 管理対象データ: 約 $(format_bytes "$after_bytes")"
+        log "  --keep-service の保護対象 (${KEEP_SERVICES[*]}) を残しているためです。"
+      else
+        warn "クリーンアップ後も Docker 管理対象データが約 $(format_bytes "$after_bytes") 残っています。"
+        cleanup_failed=1
+      fi
     fi
   fi
 
@@ -13920,6 +15115,17 @@ run_post_interaction_cleanup() {
   local exit_status="$1" script=""
 
   post_interaction_cleanup_enabled "$exit_status" || return 0
+  if keep_service_protection_active; then
+    # 完全クリアは外部の docker-usage-check.sh (docker system prune -a
+    # --volumes -f 相当) へ委譲しており、サービス単位で残す指定を渡せない。
+    # 黙って実行すると --keep-service で残したはずのものまで消えるため行わない。
+    log "--keep-service を指定しているため、未使用リソースの完全クリアは行いません。"
+    log "  完全クリアは docker-usage-check.sh へ委譲しており、サービス単位で"
+    log "  イメージ・ボリュームを残す指定を渡せないためです。"
+    log "  保護対象: $(keep_service_summary)"
+    log "  完全クリアまで行う場合は --keep-service を外して実行してください。"
+    return 0
+  fi
   # 実行できたかに関わらず、空き容量の一覧までは必ず出す。
   POST_INTERACTION_CLEANUP_RAN="true"
 
@@ -17618,7 +18824,7 @@ write_deploy_exception_meta() {
     analysis_meta_entry "analyzed_at" "$(now_display_time)"
     analysis_meta_entry "run_started_at" "$RUN_STARTED_AT"
     analysis_meta_entry "script" "build_and_verify.sh"
-    analysis_meta_entry "compose_file" "$COMPOSE_FILE"
+    analysis_meta_entry "compose_file" "$(compose_file_display)"
     if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
       analysis_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
     else
@@ -21665,7 +22871,7 @@ write_readonly_analysis_meta() {
     analysis_meta_entry "analyzed_at" "$(now_display_time)"
     analysis_meta_entry "run_started_at" "$RUN_STARTED_AT"
     analysis_meta_entry "script" "build_and_verify.sh"
-    analysis_meta_entry "compose_file" "$COMPOSE_FILE"
+    analysis_meta_entry "compose_file" "$(compose_file_display)"
     if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
       analysis_meta_entry "build_services" "${COMPOSE_SERVICES[*]}"
     else
@@ -22722,7 +23928,7 @@ undertow_write_analysis_text() {
     printf '===================================================================\n'
     printf '処理開始日時 : %s\n' "$RUN_STARTED_AT"
     printf '出力日時     : %s\n' "$(now_display_time)"
-    printf 'Compose 定義 : %s\n' "$COMPOSE_FILE"
+    printf 'Compose 定義 : %s\n' "$(compose_file_display)"
     printf '情報の取得   : %s\n' "${UNDERTOW_ANALYSIS_COLLECT_STATUS:-(不明)}"
     printf '総合判定     : %s\n' "${UNDERTOW_ANALYSIS_VERDICT:-(なし)}"
     cat -- "$UNDERTOW_ANALYSIS_DIGEST_FILE"
@@ -23137,7 +24343,18 @@ write_build_report() {
     printf '処理開始日時 : %s\n' "$RUN_STARTED_AT"
     printf 'レポート日時 : %s\n' "$report_finished_at"
     printf '全体結果     : %s\n' "$overall_status"
-    printf 'Compose 定義 : %s\n' "$COMPOSE_FILE"
+    if [ -n "$COMPOSE_FILE_ORIGINAL" ]; then
+      # build コンテキスト / Dockerfile を上書きした実行。実際に使った実効定義と、
+      # 何をどう差し替えたのかを残しておかないと、あとから再現できなくなる。
+      printf 'Compose 定義 : %s (実効定義: %s)\n' "$COMPOSE_FILE_ORIGINAL" "$COMPOSE_FILE"
+      printf 'ビルド上書き : %s\n' "${BUILD_OVERRIDE_SUMMARY:-(なし)}"
+    else
+      printf 'Compose 定義 : %s\n' "$COMPOSE_FILE"
+    fi
+    if keep_service_protection_active; then
+      # 何を残した実行なのかが分からないと、次回の結果と突き合わせられない。
+      printf '保護サービス : %s\n' "$(keep_service_summary)"
+    fi
     if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
       printf 'ビルド対象   : %s\n' "${COMPOSE_SERVICES[*]}"
     else
@@ -23398,6 +24615,10 @@ cleanup_all() {
   esac
   # CA 証明書をまとめた tar (と作業ディレクトリ) も、ここで確実に消す。
   cleanup_cacert_work_dir
+  # build コンテキスト / Dockerfile の上書きで生成した実効 compose ファイルは、
+  # teardown_container (compose down) を終えたここで消す。元の compose ファイルは
+  # 生成時から一切触っていないため、ここで消えるのは生成物だけになる。
+  cleanup_generated_compose_file
 
   # 完全クリアの結果を確認できるよう、最後に各ディレクトリの空き容量を並べる。
   show_post_interaction_disk_free
@@ -23410,6 +24631,20 @@ cleanup_all() {
 }
 # ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に後始末する
 trap cleanup_all EXIT
+
+# ---- build コンテキスト / Dockerfile の上書きを compose へ反映 ---------------
+# --base-context / --frontend-dockerfile などの指定を反映した実効 compose ファイルを
+# 生成し、以降の COMPOSE_FILE をそれへ差し替える。指定が無ければ何もしない。
+# EXIT トラップを張った後に行うことで、この先どこで失敗しても生成物は消える。
+# compose ファイルを読む処理 (JBoss シークレット定義の確認・CloudWatch Agent の
+# 定義確認・ビルド・起動) はすべてこの後にあるため、どこから見ても上書き後の
+# 内容で一貫する。
+apply_compose_build_overrides
+
+# ---- --keep-service の指定を compose ファイルと突き合わせる ------------------
+# 実在しないサービス名のまま進むと、残すつもりだったイメージ・ボリュームが
+# 保護されないまま削除される。ビルドを始める前にここで気付けるようにする。
+validate_keep_services
 
 # URL 応答本文の一時ファイル (URL 確認時のみ使用)
 if [ -n "$VERIFY_URL" ]; then
@@ -23474,14 +24709,26 @@ else
   log "ビルドの停滞検知: 無効 (--no-build-watchdog または各値に 0 を指定)"
 fi
 BUILD_OPTS=()
+# --keep-service で no-cache から除外したサービス用に、--no-cache を抜いた
+# オプション列も用意しておく (将来ビルドオプションが増えても引き継がれる)。
+BUILD_OPTS_CACHED=()
 if [ "$NO_CACHE" = "true" ]; then
   BUILD_OPTS+=(--no-cache)
   log "キャッシュを破棄して (--no-cache) ビルドします。"
+  if keep_service_protection_active; then
+    log "  --keep-service で指定したサービスは --no-cache の対象外です: ${KEEP_SERVICES[*]}"
+    log "  no-cache 対象を先にビルドし、そのあとで除外したサービスをビルドします。"
+  fi
   if [ "$PRUNE_BUILD_CACHE" != "true" ]; then
     log "  ※ --no-cache は既存キャッシュを読まない指定で、書き込みは行われます。"
     log "     終了時にキャッシュを片付けるには --prune-build-cache を併用してください。"
   fi
 fi
+for _bo in ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}; do
+  [ "$_bo" = "--no-cache" ] && continue
+  BUILD_OPTS_CACHED+=("$_bo")
+done
+unset _bo
 
 # ビルド前の使用量と、世代交代の判定に使う現在のイメージ ID を控える。
 report_disk_usage "ビルド前"
@@ -23522,7 +24769,7 @@ if [ ${#COMPOSE_SERVICES[@]} -gt 1 ]; then
   # 完成前に他サービスのビルドが始まる可能性がある。そこで base を第 1 フェーズで
   # 必ず単独ビルドし、成功確認後に残りを 1 回の compose build で並列ビルドする。
   log "複数の compose サービスが指定されました。ベースサービス '${BASE_SERVICE}' を先行ビルドします ..."
-  if ! run_build_with_watchdog "ベースサービス ${BASE_SERVICE}" "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} "$BASE_SERVICE"; then
+  if ! run_compose_build "ベースサービス ${BASE_SERVICE}" "$BASE_SERVICE"; then
     BUILD_RESULT_STATUS="失敗"
     if [ "$BUILD_TIMED_OUT" = "true" ]; then
       BUILD_RESULT_DETAIL="ベースサービス '${BASE_SERVICE}' のビルドが上限時間 (${BUILD_TIMEOUT} 秒) を超えたため中断しました。"
@@ -23547,7 +24794,7 @@ if [ ${#COMPOSE_SERVICES[@]} -gt 1 ]; then
 
   if [ ${#REMAINING_SERVICES[@]} -gt 0 ]; then
     log "ベースサービス以外をまとめて並列ビルドします (${COMPOSE_FILE}, 対象サービス: ${REMAINING_SERVICES[*]}) ..."
-    if ! run_build_with_watchdog "サービス ${REMAINING_SERVICES[*]}" "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} "${REMAINING_SERVICES[@]}"; then
+    if ! run_compose_build "サービス ${REMAINING_SERVICES[*]}" "${REMAINING_SERVICES[@]}"; then
       BUILD_RESULT_STATUS="失敗"
       if [ "$BUILD_TIMED_OUT" = "true" ]; then
         BUILD_RESULT_DETAIL="ベースサービス以外のビルドが上限時間 (${BUILD_TIMEOUT} 秒) を超えたため中断しました: ${REMAINING_SERVICES[*]}"
@@ -23569,7 +24816,7 @@ else
     log "docker compose build を実行します (${COMPOSE_FILE}, 全サービス) ..."
     _build_watchdog_desc="全サービス"
   fi
-  if ! run_build_with_watchdog "${_build_watchdog_desc}" "${COMPOSE_CMD[@]}" ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} ${COMPOSE_SERVICES[@]+"${COMPOSE_SERVICES[@]}"}; then
+  if ! run_compose_build "${_build_watchdog_desc}" ${COMPOSE_SERVICES[@]+"${COMPOSE_SERVICES[@]}"}; then
     BUILD_RESULT_STATUS="失敗"
     if [ "$BUILD_TIMED_OUT" = "true" ]; then
       BUILD_RESULT_DETAIL="compose build が上限時間 (${BUILD_TIMEOUT} 秒) を超えたため中断しました。"

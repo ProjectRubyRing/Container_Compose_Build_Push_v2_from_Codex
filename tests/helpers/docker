@@ -14,6 +14,21 @@ if [ -n "${FAKE_BUILD_SNAPSHOT:-}" ] && [ -n "${FAKE_BUILD_SNAPSHOT_SRC:-}" ] \
     || printf '<missing>\n' > "$FAKE_BUILD_SNAPSHOT"
 fi
 
+# compose へ渡された -f のファイル内容を控える。
+# build コンテキスト / Dockerfile の上書きで生成される実効 compose ファイルは
+# 処理終了時に消えるため、中身を確かめられるようにしておく。
+# FAKE_COMPOSE_FILE_SNAPSHOT を指定したときだけ動く (未指定なら従来どおり)。
+if [ -n "${FAKE_COMPOSE_FILE_SNAPSHOT:-}" ] && [ "${1:-}" = "compose" ]; then
+  fake_compose_prev=""
+  for fake_compose_arg in "$@"; do
+    if [ "$fake_compose_prev" = "-f" ] && [ -f "$fake_compose_arg" ]; then
+      cp "$fake_compose_arg" "$FAKE_COMPOSE_FILE_SNAPSHOT" 2>/dev/null || :
+      break
+    fi
+    fake_compose_prev="$fake_compose_arg"
+  done
+  unset fake_compose_prev fake_compose_arg
+fi
 fail() {
   printf 'fake docker: unsupported arguments: %s\n' "$*" >&2
   exit 64
@@ -21,6 +36,18 @@ fail() {
 
 is_cleaned() {
   [ -n "${FAKE_DOCKER_CLEANED:-}" ] && [ -f "$FAKE_DOCKER_CLEANED" ]
+}
+
+# --keep-service の検証用。docker volume rm / docker image rm で消したものを
+# 記録し、以降の ls から外す (「保護対象だけが残った」を確かめられるようにする)。
+fake_record_removed() {
+  local store="$1"; shift
+  [ -n "$store" ] || return 0
+  printf '%s\n' "$@" >> "$store"
+}
+fake_is_removed() {
+  local store="$1" name="$2"
+  [ -n "$store" ] && [ -f "$store" ] && grep -Fxq -- "$name" "$store"
 }
 
 # compose stop (SIGTERM) 済みかどうか。停止後は終了処理のログが増える様子を再現する。
@@ -458,7 +485,10 @@ fi
 
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ]; then
   if ! is_cleaned; then
-    printf 'sha256:image-one\nsha256:image-two\n'
+    for fake_img in ${FAKE_DOCKER_IMAGES:-sha256:image-one sha256:image-two}; do
+      fake_is_removed "${FAKE_DOCKER_IMAGE_RM_FILE:-}" "$fake_img" && continue
+      printf '%s\n' "$fake_img"
+    done
   fi
   exit 0
 fi
@@ -473,7 +503,18 @@ if [ "${1:-}" = "image" ] && [ "${2:-}" = "rm" ]; then
     printf 'Error response from daemon: conflict: unable to delete %s\n' "${3:-}" >&2
     exit 1
   fi
-  printf 'Deleted: %s\n' "${3:-}"
+  shift 2
+  fake_rm_targets=()
+  for fake_arg in "$@"; do
+    case "$fake_arg" in
+      -*) continue ;;
+      *) fake_rm_targets+=("$fake_arg") ;;
+    esac
+  done
+  if [ ${#fake_rm_targets[@]} -gt 0 ]; then
+    fake_record_removed "${FAKE_DOCKER_IMAGE_RM_FILE:-}" "${fake_rm_targets[@]}"
+    printf 'Deleted: %s\n' "${fake_rm_targets[@]}"
+  fi
   exit 0
 fi
 
@@ -507,7 +548,52 @@ fi
 
 if [ "${1:-}" = "volume" ] && [ "${2:-}" = "ls" ]; then
   if ! is_cleaned; then
-    printf 'volume-one\nvolume-two\n'
+    if [[ " $* " == *"label=com.docker.compose.project="* ]]; then
+      fake_volume_list="${FAKE_DOCKER_PROJECT_VOLUMES:-}"
+    else
+      fake_volume_list="${FAKE_DOCKER_VOLUMES:-volume-one volume-two}"
+    fi
+    for fake_vol in $fake_volume_list; do
+      fake_is_removed "${FAKE_DOCKER_VOLUME_RM_FILE:-}" "$fake_vol" && continue
+      printf '%s\n' "$fake_vol"
+    done
+  fi
+  exit 0
+fi
+
+# 名前付きボリュームの compose ラベル (宣言名) を返す。
+# FAKE_DOCKER_VOLUME_LABELS="proj_app-data=app-data proj_db-data=db-data"
+if [ "${1:-}" = "volume" ] && [ "${2:-}" = "inspect" ]; then
+  fake_vol="${!#}"
+  case "$*" in
+    *"com.docker.compose.volume"*)
+      for fake_pair in ${FAKE_DOCKER_VOLUME_LABELS:-}; do
+        if [ "${fake_pair%%=*}" = "$fake_vol" ]; then
+          printf '%s\n' "${fake_pair#*=}"
+          exit 0
+        fi
+      done
+      printf '<no value>\n'
+      ;;
+    *)
+      printf '{}\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "volume" ] && [ "${2:-}" = "rm" ]; then
+  shift 2
+  fake_rm_targets=()
+  for fake_arg in "$@"; do
+    case "$fake_arg" in
+      -*) continue ;;
+      *) fake_rm_targets+=("$fake_arg") ;;
+    esac
+  done
+  if [ ${#fake_rm_targets[@]} -gt 0 ]; then
+    fake_record_removed "${FAKE_DOCKER_VOLUME_RM_FILE:-}" "${fake_rm_targets[@]}"
+    printf '%s\n' "${fake_rm_targets[@]}"
   fi
   exit 0
 fi
@@ -599,6 +685,9 @@ if [ "${1:-}" = "inspect" ]; then
       ;;
     *".State.Running"*)
       printf 'true\n'
+      ;;
+    *"com.docker.compose.project"*)
+      printf '%s\n' "${FAKE_COMPOSE_PROJECT_NAME:-testproj}"
       ;;
     *"com.docker.compose.service"*)
       printf 'app\n'

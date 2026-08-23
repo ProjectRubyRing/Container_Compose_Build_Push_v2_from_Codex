@@ -28,7 +28,14 @@
 | `--local-image NAME` | イメージ名 | `j1/base.local` | compose build で生成されるローカルイメージ名 |
 | `--compose-file FILE` | ファイルパス | `compose.yml` | compose 定義ファイル |
 | `--compose-service NAME` | サービス名<br>(繰り返し / カンマ区切り) | (全サービス) | ビルド・起動対象。複数指定時は `base` を先行ビルド |
+| `--base-context DIR` | ディレクトリパス | (compose の値) | サービス名に `base` を含むサービスの `build.context` を上書き |
+| `--base-dockerfile FILE` | Dockerfile 名 | (compose の値) | 同じ対象サービスの `build.dockerfile` を上書き |
+| `--frontend-context DIR` | ディレクトリパス | (compose の値) | サービス名に `frontend` を含むサービスの `build.context` を上書き |
+| `--frontend-dockerfile FILE` | Dockerfile 名 | (compose の値) | 同じ対象サービスの `build.dockerfile` を上書き |
+| `--backend-context DIR` | ディレクトリパス | (compose の値) | サービス名に `backend` を含むサービスの `build.context` を上書き |
+| `--backend-dockerfile FILE` | Dockerfile 名 | (compose の値) | 同じ対象サービスの `build.dockerfile` を上書き |
 | `--no-cache` | フラグ | `false` | キャッシュを破棄してビルド |
+| `--keep-service NAME` | サービス名<br>(繰り返し / カンマ区切り) | (なし) | 指定したサービスを `--no-cache` の対象から外し、後始末でイメージと名前付きボリュームを残す |
 | `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔 |
 | `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する |
 | `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | ビルド全体の上限秒数 |

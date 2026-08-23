@@ -162,7 +162,14 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--container-name NAME` | `imagedefinition.json` の name | `--repository` の値 |
 | `--compose-file FILE` | compose ファイル (**compose 版のみ**) | `compose.yml` |
 | `--compose-service NAME` | ビルド対象サービス名 (未指定なら全サービス) (**compose 版のみ**)。`build_and_verify.sh` / `--build-only` では繰り返し指定またはカンマ区切りで複数指定できる。複数指定時は `base` を先行ビルドする。`base` はビルド専用のため、指定に含めても**起動対象にはならない** | (全サービス) |
+| `--base-context DIR` | サービス名に `base` を含むサービスの `build.context` (ビルドコンテキストのディレクトリ) を `DIR` で上書きする (**`build_and_verify.sh` のみ**) | (compose の値) |
+| `--base-dockerfile FILE` | 同じ対象サービスの `build.dockerfile` (使用する Dockerfile 名) を `FILE` で上書きする。`FILE` は `build.context` からの相対パスとして解釈される (**`build_and_verify.sh` のみ**) | (compose の値) |
+| `--frontend-context DIR` | サービス名に `frontend` を含むサービスの `build.context` を `DIR` で上書きする (**`build_and_verify.sh` のみ**) | (compose の値) |
+| `--frontend-dockerfile FILE` | 同じ対象サービスの `build.dockerfile` を `FILE` で上書きする (**`build_and_verify.sh` のみ**) | (compose の値) |
+| `--backend-context DIR` | サービス名に `backend` を含むサービスの `build.context` を `DIR` で上書きする (**`build_and_verify.sh` のみ**) | (compose の値) |
+| `--backend-dockerfile FILE` | 同じ対象サービスの `build.dockerfile` を `FILE` で上書きする (**`build_and_verify.sh` のみ**) | (compose の値) |
 | `--no-cache` | キャッシュを破棄してビルドする | `false` |
+| `--keep-service NAME` | 指定したサービスを「触らない」対象にする (**`build_and_verify.sh` のみ**)。繰り返し指定またはカンマ区切りで複数指定できる。`--no-cache` の対象から外し、後始末でイメージと名前付きボリュームをローカルに残す。指定していないサービスの扱いは従来どおり | (なし) |
 | `--build-progress-interval SEC` | ビルド中に「経過時間 / 直近の出力からの経過 / BuildKit のフェーズ / Docker data root の空き容量の増減」を表示する間隔。`0` で表示しない (後述) | `30` |
 | `--build-stall-timeout SEC` | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は継続する | `300` |
 | `--build-timeout SEC` | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM でビルドを中断し (20 秒後に SIGKILL)、終了コード `1` で終了する。`0` は無制限 | `0` |
@@ -770,6 +777,155 @@ Compose v2 では `--parallel <指定サービス数>`、Compose v1 では
   正常に終了しうるサービスは `--allow-service-exit NAME` で除外できます。
 - 1サービスだけを指定した場合と、`--compose-service` を省略した場合は、従来どおり
   1回の `docker compose build` を実行します。
+
+### build コンテキスト / Dockerfile をスクリプト側から指定する
+
+`compose.yml` に書かれた `build.context` (ビルドコンテキストのディレクトリ) と
+`build.dockerfile` (使用する Dockerfile 名) を、`build_and_verify.sh` の
+パラメータで差し替えられます。**指定しなかったものは `compose.yml` の値が
+そのまま使われる**ため、既定の動作は従来と変わりません。
+
+| キーワード | context を指定するオプション | dockerfile を指定するオプション |
+| --- | --- | --- |
+| `base` | `--base-context DIR` | `--base-dockerfile FILE` |
+| `frontend` | `--frontend-context DIR` | `--frontend-dockerfile FILE` |
+| `backend` | `--backend-context DIR` | `--backend-dockerfile FILE` |
+
+```bash
+./build_and_verify.sh \
+    --base-context ./base     --base-dockerfile Dockerfile.base \
+    --frontend-context ./web  --frontend-dockerfile Dockerfile \
+    --backend-context ./api   --backend-dockerfile Dockerfile.api
+```
+
+#### 対象サービスの決まり方
+
+対象は「**サービス名がキーワードと完全一致、またはキーワードを含む**」で判定します。
+`--frontend-context` は `frontend` / `frontend-web` / `my-frontend` のいずれにも
+適用されます。`--compose-service` によるビルド対象の絞り込みとは独立した判定です。
+
+- **build 定義を持たないサービス** (`image:` だけのサービス) がキーワードに一致した
+  場合は、そのサービスへは適用せず警告を表示します。`database` のように `base` を
+  含むだけのサービスを、ビルド対象へ作り変えてしまわないためです。
+- 指定したキーワードに一致する「build 定義を持つサービス」が **1 つも無い場合は
+  エラー終了** します (exit 1)。指定が黙って無視されると、意図と違う Dockerfile で
+  できたイメージを「指定どおりのもの」として扱ってしまうためです。
+- 1 つのサービスが複数のキーワードに一致し、**そのどちらにも指定がある**場合は、
+  完全一致するキーワードを優先します。完全一致が無い場合 (例: `frontend-backend`
+  に `--frontend-context` と `--backend-context` の両方を指定) はエラー終了します
+  (exit 2)。
+- 値に空文字は指定できません (未指定と区別が付かないため、exit 2)。
+- `build: {context: ., dockerfile: X}` のような**フロー形式** ({ } を使った 1 行の
+  書き方) の定義には反映できません。行単位の書き換えでは中身だけを差し替えられない
+  ため、黙って別の値でビルドせずエラー終了します (exit 1)。キーを行ごとに書く
+  ブロック形式へ直してから指定してください。
+
+#### 反映のしかた (元の compose.yml は書き換えません)
+
+指定を反映した **実効 compose ファイル** を、元ファイルと同じディレクトリへ
+`.build_and_verify_compose.<PID>.yml` という名前で生成し、以降の `docker compose`
+(build / up / logs / down) をすべてそのファイルで実行します。
+
+- **元の `compose.yml` は 1 バイトも書き換えません**。途中で強制終了しても、元ファイルは
+  無傷のまま残ります。
+- 同じディレクトリへ生成するのは、`context` などの**相対パスの解決結果**と、
+  ディレクトリ名から決まる **Compose のプロジェクト名**を元ファイルのときと
+  完全に同じに保つためです。
+- 生成したファイルは、処理終了時 (成功・失敗を問わず) に自動削除します。
+  停止コマンドの案内 (`docker compose -f ... down` など) には、消えない元ファイルの
+  方を表示します。
+- 短縮形式の `build: ./api` は、`dockerfile` を書けないため、同じ意味の
+  `build: { context: ./api, dockerfile: ... }` へ展開したうえで上書きします。
+- `--dry-run` では実効ファイルを生成せず、差し替え内容のプレビューだけを表示します。
+
+実行すると、何をどう差し替えたのかが画面と全量レポートの両方に残ります。
+
+```text
+[2026-08-23 07:20:20 JST] build コンテキスト / Dockerfile の上書きを反映します (対象 1 サービス)。
+[2026-08-23 07:20:20 JST]   base: context '.' -> './app'
+[2026-08-23 07:20:20 JST]   base: dockerfile 'Dockerfile' -> 'Dockerfile.base'
+[2026-08-23 07:20:21 JST] 上書きを反映した compose ファイルを生成しました: ./.build_and_verify_compose.1563.yml
+[2026-08-23 07:20:21 JST]   元ファイル (変更していません): compose.yml
+[2026-08-23 07:20:21 JST]   以降のビルド・起動・停止はこの実効ファイルで行い、処理終了時に自動削除します。
+```
+
+### 一部のサービスだけ作り直さず残す (`--keep-service`)
+
+`--keep-service NAME` を指定したサービスは、次の 3 つがまとめて適用されます。
+指定していないサービスの扱いは従来どおりです (no-cache の対象、イメージ・
+ボリュームとも削除)。
+
+| | `--keep-service` で指定したサービス | 指定していないサービス |
+| --- | --- | --- |
+| `--no-cache` を指定したビルド | **キャッシュを使ってビルド** (no-cache の対象外) | キャッシュを破棄してビルド |
+| 後始末のイメージ | **ローカルに残す** | 削除する |
+| 後始末の名前付きボリューム | **残す** | 削除する |
+
+```bash
+# db だけはキャッシュを使ってビルドし、イメージとボリュームも残す
+./build_and_verify.sh --no-cache \
+    --compose-service base,app,db \
+    --keep-service db
+
+# 繰り返し指定・カンマ区切りのどちらでも複数指定できる
+./build_and_verify.sh --no-cache --keep-service db --keep-service cache
+./build_and_verify.sh --no-cache --keep-service db,cache
+```
+
+サービス名は**完全一致**で判定します (build コンテキストの上書きの「含む」判定
+とは別)。compose ファイルに無いサービス名を指定した場合は、保護したいものの
+取り違えでボリュームの中身を失わないよう、ビルドを始める前にエラー終了します
+(exit 2)。
+
+#### (1) `--no-cache` からの除外
+
+`docker compose build` はサービス単位に `--no-cache` を切り替えられないため、
+**2 回に分けてビルド**します。
+
+```text
+1. docker compose -f compose.yml build --no-cache base app   ← no-cache 対象
+2. docker compose -f compose.yml build db                    ← --keep-service で除外
+```
+
+no-cache 対象を先にビルドするのは、除外側が `FROM` で参照するイメージが先に
+作り直され、キャッシュ判定が新しいイメージを見た状態になるようにするためです
+(逆順だと、除外側が古いイメージの上に積まれます)。
+`--compose-service` を省略した (= 全サービス) 実行では、compose ファイルから
+build 定義を持つサービスを列挙して分割します。
+
+#### (2) イメージの保護
+
+保護対象のイメージは、compose の `image:` 指定があればその名前、無ければ
+Compose が付ける既定名 (`<プロジェクト>-<サービス>` / `<プロジェクト>_<サービス>`)
+です。次の後始末で残します。
+
+- **旧世代イメージの回収** (既定で有効): 保護対象のローカルイメージは、
+  世代交代した旧世代 (dangling) も含めて回収しません。
+- **`--cleanup-all-docker-data`**: `docker image prune --all` は「保護対象を除く」を
+  表現できないため、イメージ ID を列挙して保護対象を引き算し、残りだけを削除します。
+  最後の一括 prune も `--all --volumes` を外し、保護対象を消さない範囲
+  (停止コンテナ / 未使用ネットワーク / dangling イメージ / ビルドキャッシュ) に
+  絞ります。
+
+#### (3) ボリュームの保護
+
+保護対象は、compose の `volumes:` に書かれた**名前付きボリューム**です
+(短縮形式 `- name:/path` と長形式 `- type: volume` + `source:` の両方を読み取り、
+バインドマウントは対象外)。
+
+- **`compose down`**: `--volumes` はプロジェクトのボリュームを一括で消してしまい
+  保護と両立しないため、`--volumes` を付けずに `down` し、そのあと保護対象以外の
+  ボリュームだけを個別に削除します。
+- **`--cleanup-all-docker-data`**: ボリューム名を列挙して保護対象を引き算し、
+  残りだけを削除します。
+
+#### 保護できない経路
+
+対話操作をすべて終えた実行の「未使用リソースの完全クリア」は、別プロジェクトの
+`docker-usage-check.sh --clean all --force` へ委譲しており、サービス単位で残す
+指定を渡せません。黙って実行すると保護したはずのものまで消えるため、
+**`--keep-service` を指定した実行では完全クリアを行わず**、理由を表示します。
+完全クリアまで行いたい場合は `--keep-service` を外して実行してください。
 
 ### イメージ・キャッシュを削除した直後の実行 (コールド実行)
 

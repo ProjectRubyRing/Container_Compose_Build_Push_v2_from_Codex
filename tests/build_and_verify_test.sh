@@ -5462,4 +5462,471 @@ CERT_CHECK_FAKE_GETENT
   unset MSYS2_ARG_CONV_EXCL
 fi
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, and Docker cleanup scenarios\n'
+
+# ---- build コンテキスト / Dockerfile の上書き -------------------------------
+# --base-context / --base-dockerfile / --frontend-context / --frontend-dockerfile /
+# --backend-context / --backend-dockerfile の確認。
+#   - 指定した値が compose へ反映された状態でビルドが行われること
+#   - 元の compose ファイルは 1 バイトも書き換えないこと
+#   - 生成した実効 compose ファイルは処理終了時に消えること
+#   - 指定しなかった項目・キーワードに一致しないサービスは元の値のままであること
+#   - build 定義を持たないサービスは、キーワードに一致しても対象にしないこと
+# 直前までのシナリオが export したフィクスチャ設定 (ビルド失敗の再現など) を
+# 引きずると、この節の確認が別の理由で落ちる。呼び出し記録に使うものだけ残して
+# FAKE_* をいったん全部解除する。
+while IFS='=' read -r override_fake_var _; do
+  case "$override_fake_var" in
+    FAKE_DOCKER_CALLS|FAKE_CURL_CALLS|FAKE_AWS_CALLS|FAKE_USAGE_CHECK_CALLS) continue ;;
+    FAKE_*) unset "$override_fake_var" ;;
+  esac
+done < <(env | grep '^FAKE_' || true)
+
+override_compose="$TEST_TMP/override-compose.yml"
+cat > "$override_compose" <<'YML'
+# 先頭コメント
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      secrets:
+        - jboss_master_password
+    image: j1/base.local
+
+  frontend-web:
+    build:
+      context: ./web
+    # build ブロックの途中のコメント
+    ports:
+      - "8080:8080"
+
+  api-backend:
+    build: ./api
+
+  database:
+    image: mysql:8.4
+
+  other:
+    build:
+      context: ./other
+      dockerfile: Dockerfile.other
+
+secrets:
+  jboss_master_password:
+    environment: JBOSS_MASTER_PASSWORD
+YML
+override_compose_before="$TEST_TMP/override-compose.before.yml"
+cp "$override_compose" "$override_compose_before"
+
+override_output="$TEST_TMP/build-override.out"
+override_snapshot="$TEST_TMP/override-effective.yml"
+override_report_dir="$TEST_TMP/override-reports"
+rm -f "$override_snapshot"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_FILE_SNAPSHOT="$override_snapshot" bash ./build_and_verify.sh \
+    --compose-file "$override_compose" \
+    --base-context ./base-ctx --base-dockerfile Dockerfile.base \
+    --frontend-context ./web-ctx --frontend-dockerfile Dockerfile.front \
+    --backend-dockerfile Dockerfile.api \
+    --report-dir "$override_report_dir"
+) >"$override_output" 2>&1; then
+  cat "$override_output" >&2
+  fail "build context override returned a non-zero status"
+fi
+
+assert_contains "$override_output" "build コンテキスト / Dockerfile の上書きを反映します (対象 3 サービス)。"
+assert_contains "$override_output" "base: context '.' -> './base-ctx'"
+assert_contains "$override_output" "base: dockerfile 'Dockerfile' -> 'Dockerfile.base'"
+assert_contains "$override_output" "frontend-web: context './web' -> './web-ctx'"
+assert_contains "$override_output" "frontend-web: dockerfile (未指定) -> 'Dockerfile.front'"
+assert_contains "$override_output" "api-backend: dockerfile (未指定) -> 'Dockerfile.api'"
+assert_contains "$override_output" "元ファイル (変更していません): ${override_compose}"
+# image 指定のみのサービスは、キーワード (base) に一致しても対象にしない
+assert_contains "$override_output" "サービス 'database' は build 定義を持たないため、--base-context / --base-dockerfile は適用しません。"
+# 対象外のサービスには一切触れない
+assert_not_contains "$override_output" "other: context"
+assert_not_contains "$override_output" "other: dockerfile"
+
+# 元ファイルは 1 バイトも変わらない
+cmp -s "$override_compose" "$override_compose_before" \
+  || fail "the original compose file must not be modified by build context override"
+
+# 生成した実効 compose ファイルは処理終了時に消える
+for override_leftover in "$TEST_TMP"/.build_and_verify_compose.*.yml; do
+  if [ -e "$override_leftover" ]; then
+    fail "generated compose file was left behind: $override_leftover"
+  fi
+done
+
+# compose へ渡ったのは、指定を反映した実効ファイル
+[ -s "$override_snapshot" ] || fail "compose did not receive an effective compose file"
+assert_contains "$override_snapshot" "context: './base-ctx'"
+assert_contains "$override_snapshot" "dockerfile: 'Dockerfile.base'"
+assert_contains "$override_snapshot" "context: './web-ctx'"
+assert_contains "$override_snapshot" "dockerfile: 'Dockerfile.front'"
+assert_contains "$override_snapshot" "dockerfile: 'Dockerfile.api'"
+# 短縮形式 "build: ./api" はマッピングへ展開され、元の値が context として残る
+assert_contains "$override_snapshot" "context: './api'"
+# 上書きしていない定義・対象外サービスはそのまま
+assert_contains "$override_snapshot" "dockerfile: Dockerfile.other"
+assert_contains "$override_snapshot" "context: ./other"
+assert_contains "$override_snapshot" "image: mysql:8.4"
+assert_contains "$override_snapshot" "- jboss_master_password"
+assert_contains "$override_snapshot" "environment: JBOSS_MASTER_PASSWORD"
+assert_contains "$override_snapshot" "# 先頭コメント"
+assert_contains "$override_snapshot" "# build ブロックの途中のコメント"
+# 差し替え前の値は残らない (残る "context: ." は対象外サービス other の ./other だけ)
+assert_occurrences "$override_snapshot" "context: ." 1
+assert_not_contains "$override_snapshot" "context: ./web"
+
+# 全量レポートには、何をどう差し替えたのかが残る
+collect_report_files "$override_report_dir"
+[ ${#REPORT_FILES[@]} -eq 1 ] || fail "expected exactly one report for the build context override run"
+override_report="${REPORT_FILES[0]}"
+assert_contains "$override_report" "Compose 定義 : ${override_compose} (実効定義: "
+assert_contains "$override_report" "ビルド上書き : "
+assert_contains "$override_report" "base (--base-*) context=./base-ctx dockerfile=Dockerfile.base"
+assert_contains "$override_report" "frontend-web (--frontend-*) context=./web-ctx dockerfile=Dockerfile.front"
+assert_contains "$override_report" "api-backend (--backend-*) dockerfile=Dockerfile.api"
+
+# --- 指定が無ければ compose ファイルはそのまま使う (既定の動作) -------------
+override_none_output="$TEST_TMP/build-override-none.out"
+override_none_snapshot="$TEST_TMP/override-none-effective.yml"
+rm -f "$override_none_snapshot"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_FILE_SNAPSHOT="$override_none_snapshot" bash ./build_and_verify.sh \
+    --compose-file "$override_compose"
+) >"$override_none_output" 2>&1; then
+  cat "$override_none_output" >&2
+  fail "build without context override returned a non-zero status"
+fi
+assert_not_contains "$override_none_output" "build コンテキスト / Dockerfile の上書きを反映します"
+assert_not_contains "$override_none_output" "上書きを反映した compose ファイルを生成しました"
+cmp -s "$override_none_snapshot" "$override_compose" \
+  || fail "compose should receive the original compose file when no override is given"
+
+# --- キーワードに一致するサービスが無ければエラーで止める -------------------
+# 指定が黙って無視されると、意図と違う Dockerfile でできたイメージを
+# 「指定どおりのもの」として扱ってしまうため、必ず気付けるようにする。
+override_missing_output="$TEST_TMP/build-override-missing.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --frontend-context ./web-ctx
+) >"$override_missing_output" 2>&1; then
+  cat "$override_missing_output" >&2
+  fail "build context override without a matching service unexpectedly returned zero"
+fi
+assert_contains "$override_missing_output" "--frontend-context / --frontend-dockerfile を指定しましたが、適用できるサービスがありません"
+assert_contains "$override_missing_output" "サービス名に 'frontend' を含むサービスがありません。定義されているサービス: base"
+
+# --- 一致したサービスが build 定義を持たない場合もエラーで止める -------------
+override_nobuild_compose="$TEST_TMP/override-nobuild.yml"
+cat > "$override_nobuild_compose" <<'YML'
+services:
+  database:
+    image: mysql:8.4
+YML
+override_nobuild_output="$TEST_TMP/build-override-nobuild.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --compose-file "$override_nobuild_compose" --base-context ./base-ctx
+) >"$override_nobuild_output" 2>&1; then
+  cat "$override_nobuild_output" >&2
+  fail "build context override against a service without build unexpectedly returned zero"
+fi
+assert_contains "$override_nobuild_output" "サービス 'database' は build 定義を持たないため"
+assert_contains "$override_nobuild_output" "'base' に一致したサービス (database) は build 定義を持たないため対象外です。"
+
+# --- 複数キーワードに一致し、どちらにも指定がある場合はエラーで止める --------
+override_ambiguous_compose="$TEST_TMP/override-ambiguous.yml"
+cat > "$override_ambiguous_compose" <<'YML'
+services:
+  frontend-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+YML
+override_ambiguous_output="$TEST_TMP/build-override-ambiguous.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --compose-file "$override_ambiguous_compose" \
+    --frontend-context ./web-ctx --backend-context ./api-ctx
+) >"$override_ambiguous_output" 2>&1; then
+  cat "$override_ambiguous_output" >&2
+  fail "ambiguous build context override unexpectedly returned zero"
+fi
+assert_contains "$override_ambiguous_output" "サービス 'frontend-backend' が複数のキーワード (frontend, backend) に一致し"
+assert_contains "$override_ambiguous_output" "一致するキーワードの指定を 1 つに絞るか、サービス名を見直してください。"
+
+# 片方だけの指定なら、そのまま適用できる
+override_single_output="$TEST_TMP/build-override-single.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --compose-file "$override_ambiguous_compose" \
+    --frontend-context ./web-ctx
+) >"$override_single_output" 2>&1; then
+  cat "$override_single_output" >&2
+  fail "single-keyword build context override returned a non-zero status"
+fi
+assert_contains "$override_single_output" "frontend-backend: context '.' -> './web-ctx'"
+
+# --- 空文字は「未指定」と区別が付かないため受け付けない ---------------------
+override_empty_output="$TEST_TMP/build-override-empty.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --base-context ""
+) >"$override_empty_output" 2>&1; then
+  cat "$override_empty_output" >&2
+  fail "empty --base-context unexpectedly returned zero"
+fi
+assert_contains "$override_empty_output" "--base-context には空でない値を指定してください"
+
+# --- dry-run では実効 compose ファイルを作らない ----------------------------
+override_dry_output="$TEST_TMP/build-override-dry.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --base-context ./dry-ctx --base-dockerfile Dockerfile.dry
+) >"$override_dry_output" 2>&1; then
+  cat "$override_dry_output" >&2
+  fail "dry-run build context override returned a non-zero status"
+fi
+assert_contains "$override_dry_output" "base: context '.' -> './dry-ctx'"
+assert_contains "$override_dry_output" "base: dockerfile 'Dockerfile' -> 'Dockerfile.dry'"
+assert_contains "$override_dry_output" "[DRY-RUN] 実効 compose ファイルの生成をスキップします"
+assert_contains "$override_dry_output" "[DRY-RUN] docker compose -f compose.yml build"
+for override_leftover in "$REPO_ROOT"/.build_and_verify_compose.*.yml; do
+  if [ -e "$override_leftover" ]; then
+    fail "dry-run must not generate an effective compose file: $override_leftover"
+  fi
+done
+
+
+# ---- --keep-service (no-cache 除外 / イメージ・ボリュームの保護) -------------
+# --keep-service で指定したサービスについて、次の 3 つを確認する。
+#   - --no-cache を指定しても、そのサービスだけはキャッシュを使ってビルドすること
+#   - 後始末でイメージをローカルに残すこと
+#   - 後始末で名前付きボリュームを残すこと
+#   - 指定していないサービスは、これまでどおり no-cache でビルドし、削除すること
+# 直前までのシナリオが export したフィクスチャ設定を引きずらないよう、
+# 呼び出し記録に使うものだけ残して FAKE_* をいったん全部解除する。
+while IFS='=' read -r keep_fake_var _; do
+  case "$keep_fake_var" in
+    FAKE_DOCKER_CALLS|FAKE_CURL_CALLS|FAKE_AWS_CALLS|FAKE_USAGE_CHECK_CALLS) continue ;;
+    FAKE_*) unset "$keep_fake_var" ;;
+  esac
+done < <(env | grep '^FAKE_' || true)
+
+keep_compose="$TEST_TMP/keep-service-compose.yml"
+cat > "$keep_compose" <<'YML'
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: j1/base.local
+  app:
+    build:
+      context: ./app
+    volumes:
+      - app-logs:/var/log
+      - ./conf:/etc/app:ro
+  db:
+    build:
+      context: ./db
+    volumes:
+      - type: volume
+        source: db-data
+        target: /var/lib/mysql
+volumes:
+  app-logs:
+  db-data:
+YML
+
+# --- (1) --no-cache は保護対象を除いて適用する -------------------------------
+keep_nocache_output="$TEST_TMP/keep-service-nocache.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$keep_compose" \
+    --no-cache \
+    --keep-service db
+) >"$keep_nocache_output" 2>&1; then
+  cat "$keep_nocache_output" >&2
+  fail "--keep-service with --no-cache returned a non-zero status"
+fi
+assert_contains "$keep_nocache_output" "--keep-service で保護するサービス: db"
+assert_contains "$keep_nocache_output" "--keep-service で指定したサービスは --no-cache の対象外です: db"
+assert_contains "$keep_nocache_output" "キャッシュを破棄してビルド (--no-cache): base app"
+assert_contains "$keep_nocache_output" "キャッシュを使ってビルド (--keep-service で no-cache から除外): db"
+# compose build は 2 回に分かれ、保護対象には --no-cache が付かない
+assert_contains "$FAKE_DOCKER_CALLS" "build --no-cache base app"
+assert_contains "$FAKE_DOCKER_CALLS" "${keep_compose} build db"
+assert_not_contains "$FAKE_DOCKER_CALLS" "build --no-cache base app db"
+assert_not_contains "$FAKE_DOCKER_CALLS" "build --no-cache db"
+
+# --- (2) --keep-service が無ければ従来どおり 1 回のビルド --------------------
+keep_none_output="$TEST_TMP/keep-service-none.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --compose-file "$keep_compose" --no-cache
+) >"$keep_none_output" 2>&1; then
+  cat "$keep_none_output" >&2
+  fail "--no-cache without --keep-service returned a non-zero status"
+fi
+assert_not_contains "$keep_none_output" "--keep-service"
+assert_contains "$FAKE_DOCKER_CALLS" "${keep_compose} build --no-cache"
+assert_occurrences "$FAKE_DOCKER_CALLS" " build " 1
+
+# --- (3) compose ファイルに無いサービス名はエラーで止める --------------------
+# 取り違えたまま進むと、残すつもりだったボリュームの中身が消える。
+keep_unknown_output="$TEST_TMP/keep-service-unknown.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --compose-file "$keep_compose" --keep-service dbb
+) >"$keep_unknown_output" 2>&1; then
+  cat "$keep_unknown_output" >&2
+  fail "--keep-service with an unknown service unexpectedly returned zero"
+fi
+assert_contains "$keep_unknown_output" "--keep-service 'dbb' が compose ファイルにありません"
+assert_contains "$keep_unknown_output" "定義されているサービス: base app db"
+assert_contains "$keep_unknown_output" "保護するつもりのサービスを取り違えると、イメージとボリュームが消えます。"
+
+# --- (4) 旧世代イメージの回収は、保護対象のイメージでは行わない --------------
+keep_reclaim_image_id="$TEST_TMP/keep-service-image-id"
+keep_reclaim_output="$TEST_TMP/keep-service-reclaim.out"
+printf 'sha256:before-keep\n' > "$keep_reclaim_image_id"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_IMAGE_ID_FILE="$keep_reclaim_image_id" \
+  FAKE_DOCKER_IMAGE_ID_AFTER_BUILD="sha256:after-keep" \
+  bash ./build_and_verify.sh --compose-file "$keep_compose" --keep-service base
+) >"$keep_reclaim_output" 2>&1; then
+  cat "$keep_reclaim_output" >&2
+  fail "--keep-service base returned a non-zero status"
+fi
+assert_contains "$keep_reclaim_output" "ローカルイメージは --keep-service の保護対象のため、旧世代の回収は行いません: j1/base.local"
+assert_not_contains "$keep_reclaim_output" "世代交代した旧イメージを削除します"
+
+# 保護対象でなければ従来どおり回収する
+keep_reclaim_other_output="$TEST_TMP/keep-service-reclaim-other.out"
+printf 'sha256:before-keep\n' > "$keep_reclaim_image_id"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_IMAGE_ID_FILE="$keep_reclaim_image_id" \
+  FAKE_DOCKER_IMAGE_ID_AFTER_BUILD="sha256:after-keep" \
+  bash ./build_and_verify.sh --compose-file "$keep_compose" --keep-service db
+) >"$keep_reclaim_other_output" 2>&1; then
+  cat "$keep_reclaim_other_output" >&2
+  fail "--keep-service db returned a non-zero status"
+fi
+assert_contains "$keep_reclaim_other_output" "世代交代した旧イメージを削除します: sha256:before-keep"
+
+# --- (5) compose down のボリューム削除から保護対象を外す ---------------------
+keep_volume_output="$TEST_TMP/keep-service-volume.out"
+keep_volume_removed="$TEST_TMP/keep-service-volume-removed"
+rm -f "$keep_volume_removed"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log" \
+  FAKE_COMPOSE_PS_SERVICES="app" \
+  FAKE_COMPOSE_PROJECT_NAME="testproj" \
+  FAKE_DOCKER_PROJECT_VOLUMES="testproj_app-logs testproj_db-data" \
+  FAKE_DOCKER_VOLUME_LABELS="testproj_app-logs=app-logs testproj_db-data=db-data" \
+  FAKE_DOCKER_VOLUME_RM_FILE="$keep_volume_removed" \
+  bash ./build_and_verify.sh \
+    --compose-file "$keep_compose" \
+    --compose-service app --startup-service app --verify-startup \
+    --keep-service db \
+    --remove-volumes \
+    --suppress-startup-logs --suppress-removed-logs \
+    --env-list-limit 1 --directory-tree-depth 1
+) >"$keep_volume_output" 2>&1; then
+  cat "$keep_volume_output" >&2
+  fail "--keep-service volume protection returned a non-zero status"
+fi
+assert_contains "$keep_volume_output" "ボリュームは --keep-service の保護対象を除いて、この後で個別に削除します。"
+assert_contains "$keep_volume_output" "残すボリューム (--keep-service): testproj_db-data"
+assert_contains "$keep_volume_output" "Compose ボリュームを削除します (1 件): testproj_app-logs"
+# compose down --volumes は使わない (プロジェクトのボリュームを一括で消すため)
+assert_not_contains "$FAKE_DOCKER_CALLS" "down -t 30 --volumes"
+[ -s "$keep_volume_removed" ] || fail "expected the unprotected volume to be removed"
+assert_contains "$keep_volume_removed" "testproj_app-logs"
+assert_not_contains "$keep_volume_removed" "testproj_db-data"
+
+# --- (6) --cleanup-all-docker-data でも保護対象を残す ------------------------
+keep_cleanup_output="$TEST_TMP/keep-service-cleanup-all.out"
+keep_cleanup_images="$TEST_TMP/keep-service-cleanup-images"
+keep_cleanup_volumes="$TEST_TMP/keep-service-cleanup-volumes"
+rm -f "$keep_cleanup_images" "$keep_cleanup_volumes"
+if ! (
+  cd "$REPO_ROOT"
+  printf 'DELETE ALL DOCKER DATA\n' | \
+  FAKE_COMPOSE_PROJECT_NAME="testproj" \
+  FAKE_DOCKER_IMAGES="sha256:test-image sha256:image-two sha256:image-three" \
+  FAKE_DOCKER_VOLUMES="testproj_app-logs testproj_db-data other-volume" \
+  FAKE_DOCKER_VOLUME_LABELS="testproj_app-logs=app-logs testproj_db-data=db-data" \
+  FAKE_DOCKER_IMAGE_RM_FILE="$keep_cleanup_images" \
+  FAKE_DOCKER_VOLUME_RM_FILE="$keep_cleanup_volumes" \
+  FAKE_DOCKER_CLEANED="$TEST_TMP/keep-service-cleaned-marker" \
+  bash ./build_and_verify.sh \
+    --compose-file "$keep_compose" \
+    --keep-service db \
+    --cleanup-all-docker-data
+) >"$keep_cleanup_output" 2>&1; then
+  cat "$keep_cleanup_output" >&2
+  fail "--keep-service with --cleanup-all-docker-data returned a non-zero status"
+fi
+assert_contains "$keep_cleanup_output" "残すもの (--keep-service db):"
+assert_contains "$keep_cleanup_output" "--keep-service の保護対象を除く全ローカルイメージを削除します"
+assert_contains "$keep_cleanup_output" "--keep-service の保護対象を除く全ローカルボリュームを削除します"
+assert_contains "$keep_cleanup_output" "残すボリューム (--keep-service): testproj_db-data"
+# 保護対象まで消す prune は使わない (ログの接頭辞込みで、保護版の行と区別する)
+assert_not_contains "$keep_cleanup_output" "] 全ローカルイメージを削除します"
+assert_not_contains "$keep_cleanup_output" "] 全ローカルボリュームと永続データを削除します"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image prune --all --force"
+assert_not_contains "$FAKE_DOCKER_CALLS" "volume prune --all --force"
+assert_not_contains "$FAKE_DOCKER_CALLS" "system prune --all --volumes --force"
+assert_contains "$keep_cleanup_output" "Docker の未使用データを最終確認・削除します (保護対象は残す)"
+# 保護対象は削除対象から外れている
+assert_contains "$keep_cleanup_images" "sha256:image-two"
+assert_contains "$keep_cleanup_images" "sha256:image-three"
+assert_not_contains "$keep_cleanup_images" "sha256:test-image"
+assert_contains "$keep_cleanup_volumes" "testproj_app-logs"
+assert_contains "$keep_cleanup_volumes" "other-volume"
+assert_not_contains "$keep_cleanup_volumes" "testproj_db-data"
+
+# --- (7) 対話操作後の完全クリアは、保護できないため行わない ------------------
+keep_post_output="$TEST_TMP/keep-service-post-interaction.out"
+: > "$FAKE_USAGE_CHECK_CALLS"
+if ! printf '0\n' | (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log" \
+  FAKE_COMPOSE_PS_SERVICES="app" \
+  FAKE_COMPOSE_PROJECT_NAME="testproj" \
+  FAKE_DOCKER_PROJECT_VOLUMES="testproj_app-logs testproj_db-data" \
+  FAKE_DOCKER_VOLUME_LABELS="testproj_app-logs=app-logs testproj_db-data=db-data" \
+  bash ./build_and_verify.sh \
+    --compose-file "$keep_compose" \
+    --compose-service app --startup-service app --verify-startup \
+    --keep-container-mode logs \
+    --keep-service db \
+    --suppress-startup-logs --suppress-removed-logs \
+    --env-list-limit 1 --directory-tree-depth 1
+) >"$keep_post_output" 2>&1; then
+  cat "$keep_post_output" >&2
+  fail "--keep-service with the logs interaction returned a non-zero status"
+fi
+assert_contains "$keep_post_output" "--keep-service を指定しているため、未使用リソースの完全クリアは行いません。"
+assert_contains "$keep_post_output" "保護対象: サービス: db / イメージ: "
+assert_contains "$keep_post_output" "完全クリアまで行う場合は --keep-service を外して実行してください。"
+assert_not_contains "$keep_post_output" "未使用リソースを含めて完全クリアします。"
+[ ! -s "$FAKE_USAGE_CHECK_CALLS" ] \
+  || fail "docker-usage-check.sh must not run while --keep-service is in effect"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection\n'
