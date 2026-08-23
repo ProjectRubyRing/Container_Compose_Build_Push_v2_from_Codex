@@ -561,6 +561,18 @@ OBSERVABILITY_TRACE_LIMIT="5"
 # healthcheck コマンドを実行できない場合の代替確認先として使う。
 OTEL_HEALTH_CHECK_PORT="13133"
 
+# ---- Jaeger トレースの HTML 出力 ----------------------------------------------
+# Jaeger の UI をブラウザで開けない環境 (ポートを公開できない、別ネットワークにいる等)
+# でもトレースを確認できるよう、取得したトレースを単体で開ける HTML へ書き出す。
+# 出力物は外部リソースを一切参照しないため、別端末へコピーしてダブルクリックするだけで
+# 開ける (file:// でも動くよう、データは JSON ファイルではなく JS へ埋め込む)。
+TRACE_REPORT_DIR=""               # --trace-report-dir。空なら --report-dir 配下 → 一時ディレクトリ
+TRACE_REPORT_DIR_SET="false"
+TRACE_REPORT_FORMAT="single"      # single: .htm 1 ファイル / files: html + css + js
+TRACE_REPORT_LIMIT="50"           # サービスごとに取得するトレース数
+TRACE_REPORT_LOOKBACK="6h"        # 取得範囲 (Jaeger Query API の lookback)
+TRACE_REPORT_OUTPUT=""            # 直近に出力したパス
+
 # ---- ALB ターゲットグループのヘルスチェック偽装 --------------------------------
 # ECS/Fargate では、コンテナ自身の healthcheck (タスク定義の healthCheck。コンテナ内で
 # curl を実行する) とは別に、ALB がターゲットへ★コンテナの外から★定期的に要求を投げ、
@@ -1896,6 +1908,24 @@ CloudWatch Agent (cwagent) のログ送信検証:
                            ロググループの自動作成を行わない (既定。存在しない場合は
                            NG として報告するだけにする)
 
+Jaeger トレースの HTML 出力 (--keep-container-mode logs の操作):
+  (Jaeger UI をブラウザで開けない環境向けに、取得したトレースを単体で開ける
+   HTML へ書き出す。出力物は外部リソースを参照しないため、別端末へコピーして
+   ダブルクリックするだけでブラウザで開ける。frontend / backend のコンテナ内で
+   curl などを実行して発生したトレースも、Jaeger に登録されていれば含まれる)
+  --trace-report-dir DIR   Jaeger トレース HTML の出力先ディレクトリ。
+                           未指定時は --report-dir 配下、--report-dir も無い場合は
+                           一時ディレクトリへ出力し、そのパスを画面へ表示する
+  --trace-report-format single|files
+                           single (既定): 1 つの .htm へ HTML・CSS・JS・データを
+                           まとめて出力する (コピーが 1 ファイルで済む)。
+                           files: index.html / trace-report.css / trace-report.js /
+                           trace-data.js をディレクトリへ出力する
+  --trace-report-limit N   サービスごとに取得するトレース数 (既定: 50)
+  --trace-report-lookback D
+                           取得範囲。Jaeger Query API の lookback へ渡す
+                           (例: 30m / 6h / 2d。既定: 6h)
+
 URL 応答確認:
   --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
                            (単独指定でもコンテナを起動して確認する)
@@ -2075,6 +2105,10 @@ while [ $# -gt 0 ]; do
     --cwagent-required)    CWAGENT_REQUIRED="true"; shift ;;
     --cwagent-create-log-group)    CWAGENT_CREATE_LOG_GROUP="true"; shift ;;
     --no-cwagent-create-log-group) CWAGENT_CREATE_LOG_GROUP="false"; shift ;;
+    --trace-report-dir)    need_value "$1" $#; TRACE_REPORT_DIR="$2"; TRACE_REPORT_DIR_SET="true"; shift 2 ;;
+    --trace-report-format) need_value "$1" $#; TRACE_REPORT_FORMAT="$2"; shift 2 ;;
+    --trace-report-limit)  need_value "$1" $#; TRACE_REPORT_LIMIT="$2"; shift 2 ;;
+    --trace-report-lookback) need_value "$1" $#; TRACE_REPORT_LOOKBACK="$2"; shift 2 ;;
     --verify-url)          need_value "$1" $#; VERIFY_URL="$2"; shift 2 ;;
     --expect-status)       need_value "$1" $#; EXPECT_STATUS="$2"; shift 2 ;;
     --url-method)          need_value "$1" $#; URL_METHOD="$2"; shift 2 ;;
@@ -2210,6 +2244,24 @@ if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
     err "--cert-check-text と --no-cert-check-text は同時に指定できません。"
     exit 2
   fi
+fi
+# Jaeger トレース HTML 出力の指定値。誤りは対話操作の途中ではなく起動時に弾く。
+case "$TRACE_REPORT_FORMAT" in
+  single|files) ;;
+  *)
+    err "--trace-report-format には single または files を指定してください: $TRACE_REPORT_FORMAT"
+    exit 2
+    ;;
+esac
+validate_positive_integer "$TRACE_REPORT_LIMIT" "--trace-report-limit" || exit 2
+if ! printf '%s' "$TRACE_REPORT_LOOKBACK" | grep -qE '^[0-9]+(ns|us|ms|s|m|h|d)$'; then
+  err "--trace-report-lookback には 30m / 6h / 2d のような期間を指定してください: $TRACE_REPORT_LOOKBACK"
+  exit 2
+fi
+if [ "$TRACE_REPORT_DIR_SET" = "true" ] \
+    && { [ -z "$TRACE_REPORT_DIR" ] || [ "$TRACE_REPORT_DIR" = "-" ]; }; then
+  err "--trace-report-dir にはディレクトリのパスを指定してください: $TRACE_REPORT_DIR"
+  exit 2
 fi
 validate_positive_integer "$DEPLOY_EXCEPTION_MAX" "--deploy-exception-limit" || exit 2
 if [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
@@ -13710,10 +13762,17 @@ PY
     "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 1 "$services_json"
 }
 
-# Jaeger Query API の応答から、トレース、スパン、親子関係、リソース属性、
-# スパン属性、イベントを人間が追いやすい形式へ整形する。
+# Jaeger Query API の応答を、X-Ray コンソールで確認する項目へ寄せて整形する。
+# X-Ray へ送っていない構成でも「X-Ray で何が見えるはずか」を同じ形で確認できるよう、
+# awsxray exporter と同じ規則でセグメント / サブセグメント、fault・error・throttle、
+# X-Ray 形式のトレース ID、注釈 (annotation) とメタデータの区別を再現する。
+# 第 3 引数に indexed_attributes、第 4 引数に index_all_attributes、
+# 第 5 引数に送信先の判定、第 6 引数に Jaeger UI の URL、
+# 第 7 引数に X-Ray のリージョンを渡す。
 render_jaeger_trace_report() {
   local traces_json="$1" selected_trace_service="$2"
+  local indexed_attributes="${3:-}" index_all="${4:-false}" destination="${5:-}"
+  local jaeger_url="${6:-}" xray_region="${7:-}"
   local program
 
   program="$(cat <<'PY'
@@ -13757,6 +13816,10 @@ def tags_as_pairs(tags):
     return pairs
 
 
+def tags_as_map(tags):
+    return {key: value for key, value in tags_as_pairs(tags)}
+
+
 # スパンの時刻も JST 表記へ統一する (Jaeger の元値は UTC のマイクロ秒 epoch)。
 JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
 
@@ -13778,11 +13841,168 @@ def millis(value):
         return clean_value("duration", value)
 
 
-def span_is_error(span):
-    values = {key: value for key, value in tags_as_pairs(span.get("tags"))}
-    error_value = values.get("error")
-    status = str(values.get("otel.status_code") or values.get("status.code") or "").upper()
-    return error_value is True or str(error_value).lower() == "true" or status == "ERROR"
+def age_text(start_micros):
+    try:
+        delta = datetime.datetime.now(JST).timestamp() - float(start_micros) / 1_000_000.0
+    except Exception:
+        return "-"
+    if delta < 0:
+        return "0秒前"
+    if delta < 60:
+        return f"{int(delta)}秒前"
+    if delta < 3600:
+        return f"{int(delta // 60)}分前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}時間前"
+    return f"{int(delta // 86400)}日前"
+
+
+# ---- X-Ray の表現へ寄せるための変換 ----------------------------------------
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def xray_trace_id(trace_id):
+    """OTel の 128bit トレース ID を X-Ray 形式 (1-<epoch>-<残り 24 桁>) にする。
+    awsxray exporter が実際に行う変換と同じ。"""
+    text = str(trace_id or "").strip().lower()
+    if len(text) == 16:
+        text = "0" * 16 + text
+    if not HEX32.match(text):
+        return ""
+    return f"1-{text[:8]}-{text[8:]}"
+
+
+def xray_trace_epoch(trace_id):
+    text = str(trace_id or "").strip().lower()
+    if len(text) == 16:
+        text = "0" * 16 + text
+    if not HEX32.match(text):
+        return None
+    try:
+        return int(text[:8], 16)
+    except ValueError:
+        return None
+
+
+def first_of(values, *keys):
+    for key in keys:
+        if key in values and values[key] not in (None, ""):
+            return values[key]
+    return None
+
+
+def http_facts(values):
+    method = first_of(values, "http.request.method", "http.method")
+    url = first_of(values, "url.full", "http.url")
+    if not url:
+        path = first_of(values, "url.path", "http.target", "http.route")
+        host = first_of(values, "server.address", "http.host", "net.host.name")
+        if path or host:
+            url = f"{host or ''}{path or ''}"
+    status = first_of(values, "http.response.status_code", "http.status_code")
+    client = first_of(values, "client.address", "http.client_ip", "net.peer.ip",
+                      "net.sock.peer.addr")
+    agent = first_of(values, "user_agent.original", "http.user_agent")
+    length = first_of(values, "http.response.body.size", "http.response_content_length")
+    return method, url, status, client, agent, length
+
+
+def status_number(status):
+    try:
+        return int(str(status))
+    except (TypeError, ValueError):
+        return 0
+
+
+def xray_status(values):
+    """X-Ray の error (4xx) / throttle (429) / fault (5xx) 判定を再現する。"""
+    code = status_number(first_of(values, "http.response.status_code", "http.status_code"))
+    otel_status = str(first_of(values, "otel.status_code", "status.code") or "").upper()
+    error = fault = throttle = False
+    if code == 429:
+        throttle = True
+    elif 400 <= code < 500:
+        error = True
+    elif code >= 500:
+        fault = True
+    flag = values.get("error")
+    if flag is True or str(flag).lower() == "true":
+        error = True
+    if otel_status == "ERROR" and not (error or fault or throttle):
+        fault = True
+    return error, fault, throttle, code
+
+
+def xray_origin(resource_values):
+    platform = str(resource_values.get("cloud.platform") or "")
+    if platform == "aws_ecs" or any(key.startswith("aws.ecs.") for key in resource_values):
+        launch = str(resource_values.get("aws.ecs.launchtype") or "").lower()
+        if launch == "fargate":
+            return "AWS::ECS::Container (Fargate)"
+        return "AWS::ECS::Container"
+    if platform == "aws_eks":
+        return "AWS::EKS::Container"
+    if platform == "aws_lambda":
+        return "AWS::Lambda::Function"
+    if platform == "aws_ec2":
+        return "AWS::EC2::Instance"
+    if platform == "aws_elastic_beanstalk":
+        return "AWS::ElasticBeanstalk::Environment"
+    return ""
+
+
+def xray_namespace(values):
+    if str(values.get("rpc.system") or "") == "aws-api":
+        return "aws"
+    if any(key.startswith("aws.") for key in values):
+        return "aws"
+    for key in ("db.system", "peer.service", "server.address", "http.url", "url.full",
+                "net.peer.name", "messaging.system"):
+        if values.get(key):
+            return "remote"
+    return ""
+
+
+def span_kind(values):
+    return str(first_of(values, "span.kind", "otel.span.kind") or "").lower()
+
+
+ANNOTATION_KEY = re.compile(r"[^A-Za-z0-9_]")
+
+
+def annotation_key(key):
+    """X-Ray の注釈キーは英数と _ だけ。awsxray exporter は他の文字を置き換える。"""
+    return ANNOTATION_KEY.sub("_", str(key))
+
+
+AWS_SECTION_KEYS = (
+    ("aws.ecs.cluster.arn", "cluster_arn"),
+    ("aws.ecs.task.arn", "task_arn"),
+    ("aws.ecs.task.family", "task_family"),
+    ("aws.ecs.task.revision", "task_revision"),
+    ("aws.ecs.container.name", "container_name"),
+    ("aws.ecs.service.name", "service_name"),
+    ("aws.ecs.launchtype", "launch_type"),
+    ("cloud.account.id", "account_id"),
+    ("cloud.region", "region"),
+    ("cloud.availability_zone", "availability_zone"),
+    ("host.id", "instance_id"),
+)
+
+
+document, = load_json_documents(["Jaeger トレース"])
+selected_service = sys.argv[1]
+indexed_attributes = [item for item in (sys.argv[2] if len(sys.argv) > 2 else "").split(",") if item]
+index_all = (sys.argv[3] if len(sys.argv) > 3 else "false") == "true"
+destination = sys.argv[4] if len(sys.argv) > 4 else ""
+jaeger_url = (sys.argv[5] if len(sys.argv) > 5 else "").rstrip("/")
+xray_region = sys.argv[6] if len(sys.argv) > 6 else ""
+
+traces = document.get("data", []) if isinstance(document, dict) else []
+if not isinstance(traces, list):
+    print("[ERROR] Jaeger トレース応答の data が配列ではありません。", file=sys.stderr)
+    raise SystemExit(2)
+traces = [trace for trace in traces if isinstance(trace, dict)]
 
 
 def trace_start(trace):
@@ -13794,18 +14014,14 @@ def trace_start(trace):
     return min(starts) if starts else 0
 
 
-document, = load_json_documents(["Jaeger トレース"])
-selected_service = sys.argv[1]
-traces = document.get("data", []) if isinstance(document, dict) else []
-if not isinstance(traces, list):
-    print("[ERROR] Jaeger トレース応答の data が配列ではありません。", file=sys.stderr)
-    raise SystemExit(2)
-traces = [trace for trace in traces if isinstance(trace, dict)]
 traces.sort(key=trace_start, reverse=True)
 
 print("")
-print("════════════ X-Ray 代替 Jaeger トレースレポート ════════════")
+print("════════ X-Ray 相当ビュー (Compose 内 Jaeger のトレース) ════════")
 print(f"検索サービス: {clean_value('service', selected_service)}")
+if destination:
+    print(f"送信先の判定: {destination}")
+print("表示内容は X-Ray コンソール (トレース一覧 / セグメント / 注釈) に合わせています。")
 print(f"取得トレース: {len(traces)} 件")
 if not traces:
     print("  Jaeger にトレースがありません。アプリへリクエストを送り、")
@@ -13813,114 +14029,325 @@ if not traces:
     print("════════════════════════════════════════════════════════════")
     raise SystemExit(0)
 
-for trace_index, trace in enumerate(traces, 1):
-    trace_id = str(trace.get("traceID") or "(unknown)")
+
+# ---- 事前計算 ---------------------------------------------------------------
+def analyze(trace):
     spans = [span for span in trace.get("spans", []) if isinstance(span, dict)]
     spans.sort(key=lambda span: span.get("startTime") or 0)
     processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
-    services = sorted(
-        {
-            str(process.get("serviceName"))
-            for process in processes.values()
-            if isinstance(process, dict) and process.get("serviceName")
-        }
-    )
-    starts = [
-        span.get("startTime")
-        for span in spans
-        if isinstance(span.get("startTime"), (int, float))
-    ]
-    ends = [
-        span.get("startTime") + span.get("duration")
-        for span in spans
-        if isinstance(span.get("startTime"), (int, float))
-        and isinstance(span.get("duration"), (int, float))
-    ]
-    start = min(starts) if starts else 0
-    duration = max(ends) - start if start and ends else 0
-    error_count = sum(1 for span in spans if span_is_error(span))
-
-    print("")
-    print(f"[Trace {trace_index}] traceID={clean_value('traceID', trace_id, 80)}")
-    print(f"  開始={micros_to_time(start)}, 所要時間={millis(duration)}, "
-          f"spans={len(spans)}, errorSpans={error_count}")
-    print(f"  services={', '.join(clean_value('service', name, 120) for name in services) or '(unknown)'}")
-
-    if processes:
-        print("  [リソース]")
-        for process_id, process in sorted(processes.items()):
-            if not isinstance(process, dict):
-                continue
-            service_name = clean_value("service", process.get("serviceName") or "(unknown)", 120)
-            print(f"    {clean_value('processID', process_id, 80)}: service.name={service_name}")
-            process_tags = tags_as_pairs(process.get("tags"))
-            for key, value in process_tags[:20]:
-                print(f"      {clean_value('key', key, 120)}={clean_value(key, value)}")
-            if len(process_tags) > 20:
-                print(f"      ... {len(process_tags) - 20} 属性を省略")
-
-    print("  [スパン]")
-    for span_index, span in enumerate(spans[:50], 1):
-        process = processes.get(span.get("processID"), {})
-        service_name = (
-            process.get("serviceName")
-            if isinstance(process, dict)
-            else "(unknown)"
-        )
-        references = span.get("references") if isinstance(span.get("references"), list) else []
-        parent_refs = []
-        for reference in references:
+    span_by_id = {str(span.get("spanID")): span for span in spans}
+    parent_of = {}
+    children = {}
+    roots = []
+    for span in spans:
+        parent_id = ""
+        for reference in span.get("references") if isinstance(span.get("references"), list) else []:
             if not isinstance(reference, dict):
                 continue
-            parent_refs.append(
-                f"{reference.get('refType', 'REF')}:{reference.get('spanID', '?')}"
-            )
-        relative_start = 0
-        if start and isinstance(span.get("startTime"), (int, float)):
-            relative_start = span.get("startTime") - start
-        error_marker = " ERROR" if span_is_error(span) else ""
-        print(
-            f"    {span_index}. [{clean_value('service', service_name, 100)}] "
-            f"{clean_value('operationName', span.get('operationName') or '(unknown)', 180)}"
-            f"{error_marker}"
-        )
-        print(
-            f"       spanID={clean_value('spanID', span.get('spanID') or '?', 80)}, "
-            f"parent={clean_value('parent', ','.join(parent_refs) or '(root)', 180)}, "
-            f"offset={millis(relative_start)}, duration={millis(span.get('duration') or 0)}"
-        )
-        span_tags = tags_as_pairs(span.get("tags"))
-        if span_tags:
-            print("       attributes:")
-            for key, value in span_tags[:30]:
-                print(f"         {clean_value('key', key, 140)}={clean_value(key, value)}")
-            if len(span_tags) > 30:
-                print(f"         ... {len(span_tags) - 30} 属性を省略")
+            candidate = str(reference.get("spanID") or "")
+            if candidate and candidate in span_by_id:
+                parent_id = candidate
+                break
+        parent_of[str(span.get("spanID"))] = parent_id
+        if parent_id:
+            children.setdefault(parent_id, []).append(span)
+        else:
+            roots.append(span)
+    return spans, processes, span_by_id, parent_of, children, roots
 
-        span_logs = span.get("logs") if isinstance(span.get("logs"), list) else []
-        if span_logs:
-            print("       events:")
-            for event in span_logs[:10]:
+
+def resource_values(processes, span):
+    process = processes.get(span.get("processID"))
+    if not isinstance(process, dict):
+        return {}, "(unknown)"
+    return tags_as_map(process.get("tags")), str(process.get("serviceName") or "(unknown)")
+
+
+def is_segment(span, parent_id, values):
+    if not parent_id:
+        return True
+    return span_kind(values) in ("server", "consumer")
+
+
+def xray_name(span, service_name, values, segment):
+    if segment:
+        return service_name
+    remote = first_of(values, "peer.service", "server.address", "net.peer.name",
+                      "db.namespace", "db.name")
+    if remote:
+        return str(remote)
+    return str(span.get("operationName") or "(unknown)")
+
+
+# ---- トレース一覧 (X-Ray コンソールの Traces 表) ----------------------------
+print("")
+print("[トレース一覧] X-Ray コンソールの Traces 表に相当")
+print("  #  X-Ray Trace ID                          経過      Method 応答  応答時間      URL")
+summaries = []
+for index, trace in enumerate(traces, 1):
+    spans, processes, span_by_id, parent_of, children, roots = analyze(trace)
+    starts = [span.get("startTime") for span in spans
+              if isinstance(span.get("startTime"), (int, float))]
+    ends = [span.get("startTime") + span.get("duration") for span in spans
+            if isinstance(span.get("startTime"), (int, float))
+            and isinstance(span.get("duration"), (int, float))]
+    start = min(starts) if starts else 0
+    duration = (max(ends) - start) if (start and ends) else 0
+    root = roots[0] if roots else (spans[0] if spans else {})
+    root_values = tags_as_map(root.get("tags")) if root else {}
+    method, url, status, client, agent, length = http_facts(root_values)
+    error, fault, throttle, code = xray_status(root_values)
+    marks = []
+    if fault:
+        marks.append("Fault")
+    if error:
+        marks.append("Error")
+    if throttle:
+        marks.append("Throttle")
+    trace_id = str(trace.get("traceID") or "")
+    converted = xray_trace_id(trace_id)
+    summaries.append({
+        "index": index, "trace": trace, "start": start, "duration": duration,
+        "root": root, "marks": marks, "xray_id": converted, "trace_id": trace_id,
+        "method": method, "url": url, "code": code, "client": client, "agent": agent,
+    })
+    print("  {0:<2} {1:<39} {2:<9} {3:<6} {4:<5} {5:<13} {6}".format(
+        index,
+        converted or "(変換不可)",
+        age_text(start),
+        clean_value("method", method or "-", 6),
+        str(code or "-"),
+        millis(duration),
+        clean_value("url", url or "-", 60),
+    ))
+    if marks:
+        print(f"     └ X-Ray の判定: {' / '.join(marks)}")
+
+# ---- トレースごとの詳細 -----------------------------------------------------
+for summary in summaries:
+    trace = summary["trace"]
+    spans, processes, span_by_id, parent_of, children, roots = analyze(trace)
+    start = summary["start"]
+    trace_id = summary["trace_id"]
+
+    services = sorted({
+        str(process.get("serviceName"))
+        for process in processes.values()
+        if isinstance(process, dict) and process.get("serviceName")
+    })
+    error_spans = sum(1 for span in spans
+                      if any(xray_status(tags_as_map(span.get("tags")))[:3]))
+
+    print("")
+    print(f"[Trace {summary['index']}] X-Ray Trace ID: {summary['xray_id'] or '(変換不可)'}")
+    print(f"  Jaeger/OTel の traceID={clean_value('traceID', trace_id, 80)}")
+    if jaeger_url and re.match(r"^[0-9a-fA-F]+$", trace_id or ""):
+        print(f"  Jaeger UI  : {jaeger_url}/trace/{trace_id}")
+    if xray_region and summary["xray_id"]:
+        print(f"  X-Ray 相当 : https://{xray_region}.console.aws.amazon.com/xray/home"
+              f"?region={xray_region}#/traces/{summary['xray_id']}")
+    print(f"  開始={micros_to_time(start)}, 所要時間={millis(summary['duration'])}, "
+          f"spans={len(spans)}, errorSpans={error_spans}")
+    print(f"  services={', '.join(clean_value('service', name, 120) for name in services) or '(unknown)'}")
+
+    epoch = xray_trace_epoch(trace_id)
+    if epoch is not None and start:
+        drift = abs(epoch - start / 1_000_000.0)
+        if drift > 300:
+            print(f"  [注意] トレース ID 先頭 8 桁の時刻 ({datetime.datetime.fromtimestamp(epoch, JST):%Y-%m-%d %H:%M:%S} JST) が")
+            print(f"         スパンの開始時刻と {int(drift)} 秒ずれています。X-Ray は生成から 30 日を超えた")
+            print("         トレース ID を拒否するため、実 X-Ray では取り込まれない可能性があります。")
+
+    # X-Ray のセグメント / サブセグメント階層
+    print("  [セグメント / サブセグメント] X-Ray のトレースマップとタイムラインに相当")
+    segment_count = 0
+    subsegment_count = 0
+    printed = [0]
+
+    def walk(span, depth):
+        global segment_count, subsegment_count
+        span_id = str(span.get("spanID"))
+        values = tags_as_map(span.get("tags"))
+        resources, service_name = resource_values(processes, span)
+        segment = is_segment(span, parent_of.get(span_id, ""), values)
+        if segment:
+            segment_count += 1
+        else:
+            subsegment_count += 1
+        label = "Segment   " if segment else "Subsegment"
+        method, url, status, client, agent, length = http_facts(values)
+        error, fault, throttle, code = xray_status(values)
+        marks = []
+        if fault:
+            marks.append("Fault")
+        if error:
+            marks.append("Error")
+        if throttle:
+            marks.append("Throttle")
+        namespace = "" if segment else xray_namespace(values)
+        indent = "    " + "  " * depth
+        if printed[0] < 60:
+            printed[0] += 1
+            print(f"{indent}{label} {clean_value('name', xray_name(span, service_name, values, segment), 90)}"
+                  f"  [{clean_value('service', service_name, 60)}]")
+            detail = [f"duration={millis(span.get('duration') or 0)}"]
+            if start and isinstance(span.get("startTime"), (int, float)):
+                detail.append(f"offset={millis(span.get('startTime') - start)}")
+            if code:
+                detail.append(f"http.status={code}")
+            if namespace:
+                detail.append(f"namespace={namespace}")
+            detail.append(f"状態={'/'.join(marks) if marks else 'OK'}")
+            print(f"{indent}  {' '.join(detail)}")
+            print(f"{indent}  操作={clean_value('operationName', span.get('operationName') or '(unknown)', 120)}"
+                  f" spanID={clean_value('spanID', span_id, 40)}")
+            if method or url:
+                print(f"{indent}  http: method={clean_value('method', method or '-', 10)}"
+                      f" url={clean_value('url', url or '-', 120)}")
+            if client or agent:
+                print(f"{indent}  http: client_ip={clean_value('client', client or '-', 60)}"
+                      f" user_agent={clean_value('user_agent', agent or '-', 60)}")
+            db_system = values.get("db.system")
+            if db_system:
+                statement = first_of(values, "db.query.text", "db.statement")
+                print(f"{indent}  sql: database_type={clean_value('db.system', db_system, 40)}"
+                      f" database={clean_value('db', first_of(values, 'db.namespace', 'db.name') or '-', 60)}")
+                print(f"{indent}       sanitized_query={clean_value('db.statement', statement or '-', 160)}")
+            for event in span.get("logs") if isinstance(span.get("logs"), list) else []:
                 if not isinstance(event, dict):
                     continue
-                print(f"         - {micros_to_time(event.get('timestamp'))}")
-                fields = tags_as_pairs(event.get("fields"))
-                for key, value in fields[:20]:
-                    print(f"             {clean_value('key', key, 140)}={clean_value(key, value)}")
-                if len(fields) > 20:
-                    print(f"             ... {len(fields) - 20} フィールドを省略")
-            if len(span_logs) > 10:
-                print(f"         ... {len(span_logs) - 10} イベントを省略")
-    if len(spans) > 50:
-        print(f"    ... {len(spans) - 50} スパンを省略")
+                fields = tags_as_map(event.get("fields"))
+                if str(fields.get("event") or "") != "exception" and not fields.get("exception.type"):
+                    continue
+                print(f"{indent}  cause (X-Ray の例外): "
+                      f"{clean_value('exception.type', fields.get('exception.type') or '-', 80)}: "
+                      f"{clean_value('exception.message', fields.get('exception.message') or '-', 160)}")
+        for child in sorted(children.get(span_id, []), key=lambda s: s.get("startTime") or 0):
+            walk(child, depth + 1)
 
+    for root in roots or spans[:1]:
+        walk(root, 0)
+    if printed[0] >= 60:
+        print(f"    ... 残りのスパンを省略 (全 {len(spans)} スパン)")
+    print(f"    セグメント {segment_count} 件 / サブセグメント {subsegment_count} 件"
+          " (X-Ray はセグメント単位で課金・保存されます)")
+
+    # 注釈 / メタデータ / AWS セクション
+    all_values = {}
+    for span in spans:
+        resources, _ = resource_values(processes, span)
+        all_values.update(resources)
+        all_values.update(tags_as_map(span.get("tags")))
+
+    print("  [Annotations] X-Ray のフィルタ式で検索できる属性 (indexed_attributes)")
+    print("            ※ 以下はトレース内の全スパン・リソース属性をまとめたものです。")
+    annotations = []
+    for key in sorted(all_values):
+        if index_all or key in indexed_attributes:
+            annotations.append(key)
+    if not annotations:
+        print("    (なし) indexed_attributes が未指定のため、X-Ray では検索できません。")
+    else:
+        for key in annotations:
+            print(f"    {clean_value('key', key, 80)}={clean_value(key, all_values[key], 120)}"
+                  f"   (X-Ray 上のキー: {annotation_key(key)})")
+
+    aws_section = [(field, all_values[key]) for key, field in AWS_SECTION_KEYS if key in all_values]
+    print("  [AWS] X-Ray のセグメント詳細に出る AWS セクション相当")
+    if not aws_section:
+        print("    (なし) resourcedetection の ecs 検出器が効いていないと空になります。")
+    else:
+        for field, value in aws_section:
+            print(f"    {field}={clean_value(field, value, 160)}")
+
+    print("  [Metadata] 注釈にならない属性 (X-Ray では検索できず、詳細画面でのみ見える)")
+    metadata_keys = [key for key in sorted(all_values) if key not in annotations]
+    for key in metadata_keys[:40]:
+        print(f"    {clean_value('key', key, 80)}={clean_value(key, all_values[key], 120)}")
+    if len(metadata_keys) > 40:
+        print(f"    ... {len(metadata_keys) - 40} 属性を省略")
+
+    origin = ""
+    for span in spans:
+        resources, _ = resource_values(processes, span)
+        origin = xray_origin(resources) or origin
+    print(f"  [Origin] {origin or '(なし。X-Ray ではリソース種別が付きません)'}")
+
+# ---- サービスマップ相当 -----------------------------------------------------
+print("")
+print("[サービスマップ相当] X-Ray のサービスマップに現れるノードとエッジ")
+nodes = {}
+edges = {}
+for summary in summaries:
+    trace = summary["trace"]
+    spans, processes, span_by_id, parent_of, children, roots = analyze(trace)
+    for span in spans:
+        values = tags_as_map(span.get("tags"))
+        _, service_name = resource_values(processes, span)
+        error, fault, throttle, code = xray_status(values)
+        node = nodes.setdefault(service_name, {"count": 0, "error": 0, "fault": 0,
+                                               "throttle": 0, "duration": 0.0})
+        node["count"] += 1
+        node["error"] += 1 if error else 0
+        node["fault"] += 1 if fault else 0
+        node["throttle"] += 1 if throttle else 0
+        try:
+            node["duration"] += float(span.get("duration") or 0)
+        except (TypeError, ValueError):
+            pass
+        parent_id = parent_of.get(str(span.get("spanID")), "")
+        if parent_id and parent_id in span_by_id:
+            _, parent_service = resource_values(processes, span_by_id[parent_id])
+            if parent_service != service_name:
+                key = (parent_service, service_name)
+                edge = edges.setdefault(key, {"count": 0, "error": 0})
+                edge["count"] += 1
+                edge["error"] += 1 if (error or fault) else 0
+
+for name in sorted(nodes):
+    node = nodes[name]
+    average = node["duration"] / node["count"] / 1000.0 if node["count"] else 0.0
+    print(f"  ノード {clean_value('service', name, 60)}: spans={node['count']} "
+          f"fault={node['fault']} error={node['error']} throttle={node['throttle']} "
+          f"平均={average:.3f} ms")
+for (caller, callee) in sorted(edges):
+    edge = edges[(caller, callee)]
+    print(f"  エッジ {clean_value('service', caller, 40)} -> {clean_value('service', callee, 40)}: "
+          f"{edge['count']} 呼び出し / エラー {edge['error']} 件")
+
+# ---- X-Ray で同じものを探すための情報 ---------------------------------------
+print("")
+print("[X-Ray フィルタ式の例] 実 X-Ray へ切り替えたときに同じトレースを探す式")
+first = summaries[0]
+print(f"  service(\"{clean_value('service', selected_service, 60)}\")")
+if first["code"]:
+    print(f"  service(\"{clean_value('service', selected_service, 60)}\") AND http.status = {first['code']}")
+print("  fault = true            (5xx / 例外のトレースだけを抽出)")
+print("  error = true            (4xx のトレースだけを抽出)")
+print("  throttle = true         (429 のトレースだけを抽出)")
+if indexed_attributes:
+    print(f"  annotation.{annotation_key(indexed_attributes[0])} = \"...\"    (注釈での絞り込み)")
+else:
+    print("  annotation.<キー> = \"...\"  (indexed_attributes を設定しないと使えません)")
+
+print("")
+print("[Jaeger と X-Ray の対応]")
+print("  Jaeger のトレース          → X-Ray のトレース (ID は上の変換後の値)")
+print("  Jaeger のルート/サーバスパン → X-Ray のセグメント")
+print("  Jaeger の子スパン          → X-Ray のサブセグメント")
+print("  Jaeger のタグ (indexed)    → X-Ray の注釈 (annotation。フィルタ式で検索可能)")
+print("  Jaeger のタグ (その他)     → X-Ray のメタデータ (検索不可)")
+print("  Jaeger のログ (exception)  → X-Ray の cause / 例外スタック")
+print("  Jaeger にないもの          : X-Ray のサンプリングルール、Insights、")
+print("                               サービスマップの集計値 (上は今回の取得分だけの集計)")
 print("")
 print("════════════════════════════════════════════════════════════")
 PY
 )"
-  run_observability_python \
+  run_observability_python_program \
     "${OBSERVABILITY_PYTHON_JSON_LOADER}${program}" 1 "$traces_json" \
-    "$selected_trace_service"
+    "$selected_trace_service" "$indexed_attributes" "$index_all" "$destination" \
+    "$jaeger_url" "$xray_region"
 }
 
 # OTel Collector (adot-collector / otel) の稼働確認。
@@ -14046,6 +14473,2872 @@ verify_otel_collector_health() {
   return 1
 }
 
+# ---- ADOT Collector (OTel Collector) の設定と送信先の確認 --------------------
+# 「設定ファイルに書いてある」ことと「実際に効いている」ことは別物のため、
+# service.pipelines から参照されているコンポーネントだけを「有効」として扱い、
+# 定義はあるがどのパイプラインからも参照されていないものは「無効 (未参照)」として
+# 区別する。あわせて、トレースの送信先が
+#   - 実 AWS X-Ray            : awsxray exporter
+#   - Compose 内の X-Ray 偽装 : Jaeger への otlp / otlphttp exporter
+#   - コレクタのログ出力だけ  : debug / logging exporter
+# のどれなのかを、設定・Compose の定義・実行時の証跡 (内部テレメトリとログ) の
+# 3 方向から判定する。
+
+# 設定チェックのレコード区切り (cwagent 診断と同じく US を使う)。
+OTEL_STAGE_SEPARATOR=$'\037'
+# OTel Collector の内部テレメトリ (Prometheus 形式) の既定の待受ポート。
+# exporter ごとの送信件数 (otelcol_exporter_sent_spans) が取れる唯一の一次情報。
+OTEL_INTERNAL_METRICS_PORT="8888"
+# --config が無いときに探す既定の設定パス。ADOT / 上流 Collector の双方を含む。
+OTEL_CONFIG_DEFAULT_PATHS="/etc/otel/config.yaml /etc/otel/config.yml /etc/ecs/ecs-default-config.yaml /etc/ecs/otel-config.yaml /opt/aws/aws-otel-collector/etc/config.yaml /etc/otelcol/config.yaml /etc/otelcol-contrib/config.yaml /etc/otel-agent-config.yaml"
+# 設定本文を環境変数で注入する経路 (ECS では SSM の値を AOT_CONFIG_CONTENT へ入れる)。
+OTEL_CONFIG_ENV_NAMES="AOT_CONFIG_CONTENT OTEL_CONFIG_CONTENT"
+
+# otel_resolve_collector_config が設定する値。
+OTEL_CONFIG_TEXT=""
+OTEL_CONFIG_PATH=""
+OTEL_CONFIG_SOURCE=""
+OTEL_CONFIG_HOST_PATH=""
+OTEL_CONFIG_ENV_NAME=""
+OTEL_CONFIG_MULTIPLE=""
+OTEL_CONFIG_RECORDS=""
+OTEL_METRICS_URL=""
+# render_otel_collector_config_report が設定する値。
+# トレース確認 (Jaeger) 側でも「どこへ送っているか」を再掲するため共有する。
+OTEL_DESTINATION_SUMMARY=""
+OTEL_DESTINATION_CLASSES=""
+OTEL_INDEXED_ATTRIBUTES=""
+OTEL_INDEX_ALL_ATTRIBUTES=""
+OTEL_XRAY_REGION=""
+OTEL_CONFIG_CHECK_NG=""
+OTEL_CONFIG_CHECK_WARN=""
+
+# 大きな Python プログラムを実行する。run_observability_python は -c でプログラムを
+# 渡すが、コマンドライン長には上限があり (Windows は約 32KB)、設定解析やレポート整形の
+# ように長いプログラムは渡せない。プログラムだけを一時ファイルへ書き出して実行し、
+# データは従来どおり標準入力の NUL 区切りで渡す (機微情報をファイルへ出さないため)。
+# 使い方: run_observability_python_program "<プログラム>" <JSON 個数> [JSON...] [引数...]
+run_observability_python_program() {
+  local program="$1" document_count="$2"
+  shift 2
+  local program_file="" status=0 index
+  local -a documents=()
+
+  while [ "$document_count" -gt 0 ]; do
+    documents+=("$1")
+    shift
+    document_count=$((document_count - 1))
+  done
+  if ! program_file="$(mktemp 2>/dev/null)"; then
+    err "可観測性ヘルパーの一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  printf '%s\n' "$program" > "$program_file"
+  {
+    for index in "${!documents[@]}"; do
+      [ "$index" -eq 0 ] || printf '\000'
+      printf '%s' "${documents[$index]}"
+    done
+  } | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" "$program_file" "$@" || status=$?
+  rm -f -- "$program_file"
+  return "$status"
+}
+
+# コンテナ内のファイルを docker cp でホストへ取り出して標準出力へ出す。
+# adot-collector のような distroless イメージにはシェルも cat も無いため、
+# docker exec ではなく docker cp を使う (停止中のコンテナでも読める)。
+read_container_file_via_cp() {
+  local container_ref="$1" path="$2" tmp_dir status=0
+  if ! tmp_dir="$(mktemp -d 2>/dev/null)"; then
+    return 1
+  fi
+  if ! docker cp "${container_ref}:${path}" "${tmp_dir}/container-file" >/dev/null 2>&1; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  if [ ! -f "${tmp_dir}/container-file" ]; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  cat "${tmp_dir}/container-file" || status=$?
+  rm -rf -- "$tmp_dir"
+  return "$status"
+}
+
+# コンテナの argv (ENTRYPOINT + CMD) を 1 行 1 引数で返す。
+# 偽 docker の inspect は書式文字列の部分一致で分岐するため、他の書式と
+# 取り違えられないよう otel-argv: の目印を付けて問い合わせる。
+otel_collector_argv() {
+  docker inspect \
+      -f '{{range .Config.Entrypoint}}otel-argv:{{println .}}{{end}}{{range .Config.Cmd}}otel-argv:{{println .}}{{end}}' \
+      "$1" 2>/dev/null \
+    | sed -n 's/^otel-argv://p'
+}
+
+# コンテナの環境変数を「1 変数 = 開始行 + 本文 + 終了行」で返す。
+# AOT_CONFIG_CONTENT のように改行を含む値があるため、1 行 1 変数では読めない。
+otel_container_env_records() {
+  docker inspect \
+    -f '{{range .Config.Env}}otel-env-begin:{{.}}{{"\n"}}otel-env-end:{{"\n"}}{{end}}' \
+    "$1" 2>/dev/null
+}
+
+# 環境変数を 1 つ取り出す (改行を含む値もそのまま返す)。
+otel_container_env_value() {
+  local container_id="$1" name="$2"
+  otel_container_env_records "$container_id" | awk -v name="$name" '
+    BEGIN { collecting = 0; prefix = "otel-env-begin:"; target = name "=" }
+    $0 == "otel-env-end:" { if (collecting) exit; next }
+    index($0, prefix) == 1 {
+      line = substr($0, length(prefix) + 1)
+      if (index(line, target) == 1) {
+        collecting = 1
+        print substr(line, length(target) + 1)
+      }
+      next
+    }
+    collecting { print }
+  '
+}
+
+# 環境変数の一覧を "NAME=値" で返す (値の 1 行目だけ。走査用)。
+otel_container_env_pairs() {
+  otel_container_env_records "$1" | awk '
+    BEGIN { prefix = "otel-env-begin:" }
+    index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }
+  '
+}
+
+# 設定ファイルのコンテナ内パスから、bind mount 元のホストパスを割り出す。
+otel_lookup_config_host_path() {
+  local container_id="$1" path="$2"
+  local mount_type mount_source mount_target mount_rw
+
+  OTEL_CONFIG_HOST_PATH=""
+  while IFS='|' read -r mount_type mount_source mount_target mount_rw; do
+    [ -n "$mount_target" ] || continue
+    if [ "$mount_target" = "$path" ]; then
+      OTEL_CONFIG_HOST_PATH="$mount_source"
+      return 0
+    fi
+    case "$path" in
+      "$mount_target"/*)
+        OTEL_CONFIG_HOST_PATH="${mount_source}/${path#"$mount_target"/}"
+        return 0
+        ;;
+    esac
+  done < <(container_mount_rows "$container_id")
+  return 1
+}
+
+# コンテナ内のパスから設定本文を取得する。
+# コンテナ内 (実際に効いている中身) を優先し、取り出せない場合だけ
+# bind mount 元のホストファイルへフォールバックする。
+otel_fetch_config_from_path() {
+  local container_id="$1" path="$2" text=""
+
+  if text="$(read_container_file_via_cp "$container_id" "$path")" && [ -n "$text" ]; then
+    OTEL_CONFIG_TEXT="$text"
+    OTEL_CONFIG_PATH="$path"
+    OTEL_CONFIG_SOURCE="コンテナ内の ${path} (docker cp で取得)"
+    otel_lookup_config_host_path "$container_id" "$path" || true
+    return 0
+  fi
+  if otel_lookup_config_host_path "$container_id" "$path" \
+      && [ -n "$OTEL_CONFIG_HOST_PATH" ] && [ -f "$OTEL_CONFIG_HOST_PATH" ]; then
+    if text="$(cat "$OTEL_CONFIG_HOST_PATH" 2>/dev/null)" && [ -n "$text" ]; then
+      OTEL_CONFIG_TEXT="$text"
+      OTEL_CONFIG_PATH="$path"
+      OTEL_CONFIG_SOURCE="ホスト側のマウント元 ${OTEL_CONFIG_HOST_PATH} (コンテナからは取り出せず)"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# 実際に効いている設定を突き止める。探索順:
+#   1) argv の --config (file:/ 付き URI、env:VAR、yaml: インラインを解釈する)
+#   2) 設定本文を注入する環境変数 (AOT_CONFIG_CONTENT / OTEL_CONFIG_CONTENT)
+#   3) 既定の設定パス
+otel_resolve_collector_config() {
+  local container_id="$1"
+  local arg next_is_config="false" candidate path env_name value
+  local -a argv=() candidates=()
+
+  OTEL_CONFIG_TEXT=""
+  OTEL_CONFIG_PATH=""
+  OTEL_CONFIG_SOURCE=""
+  OTEL_CONFIG_HOST_PATH=""
+  OTEL_CONFIG_ENV_NAME=""
+  OTEL_CONFIG_MULTIPLE=""
+
+  mapfile -t argv < <(otel_collector_argv "$container_id")
+  for arg in ${argv[@]+"${argv[@]}"}; do
+    if [ "$next_is_config" = "true" ]; then
+      candidates+=("$arg")
+      next_is_config="false"
+      continue
+    fi
+    case "$arg" in
+      --config=*)      candidates+=("${arg#--config=}") ;;
+      --config-file=*) candidates+=("${arg#--config-file=}") ;;
+      --config|--config-file) next_is_config="true" ;;
+    esac
+  done
+  if [ ${#candidates[@]} -gt 1 ]; then
+    OTEL_CONFIG_MULTIPLE="${candidates[*]}"
+  fi
+
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    case "$candidate" in
+      env:*)
+        env_name="${candidate#env:}"
+        if value="$(otel_container_env_value "$container_id" "$env_name")" \
+            && [ -n "$value" ]; then
+          OTEL_CONFIG_TEXT="$value"
+          OTEL_CONFIG_ENV_NAME="$env_name"
+          OTEL_CONFIG_SOURCE="環境変数 ${env_name} (--config=env:${env_name} で注入)"
+          return 0
+        fi
+        ;;
+      yaml:*)
+        OTEL_CONFIG_TEXT="${candidate#yaml:}"
+        OTEL_CONFIG_SOURCE="--config=yaml: によるインライン指定"
+        return 0
+        ;;
+      file:*)
+        path="${candidate#file:}"
+        otel_fetch_config_from_path "$container_id" "$path" && return 0
+        ;;
+      *)
+        otel_fetch_config_from_path "$container_id" "$candidate" && return 0
+        ;;
+    esac
+  done
+
+  for env_name in $OTEL_CONFIG_ENV_NAMES; do
+    if value="$(otel_container_env_value "$container_id" "$env_name")" \
+        && [ -n "$value" ]; then
+      OTEL_CONFIG_TEXT="$value"
+      OTEL_CONFIG_ENV_NAME="$env_name"
+      OTEL_CONFIG_SOURCE="環境変数 ${env_name} (ECS では SSM パラメータの値をここへ注入する)"
+      return 0
+    fi
+  done
+
+  for path in $OTEL_CONFIG_DEFAULT_PATHS; do
+    if otel_fetch_config_from_path "$container_id" "$path"; then
+      OTEL_CONFIG_SOURCE="${OTEL_CONFIG_SOURCE} / --config の指定が無いため既定パスを探索"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Collector の内部テレメトリ (Prometheus 形式) の URL をホスト側から見た形で返す。
+otel_metrics_url() {
+  local container_id="$1" address="$2" port
+
+  [ -n "$address" ] || address="0.0.0.0:${OTEL_INTERNAL_METRICS_PORT}"
+  port="${address##*:}"
+  printf '%s' "$port" | grep -qE '^[0-9]+$' || port="$OTEL_INTERNAL_METRICS_PORT"
+  resolve_healthcheck_url_for_host "$container_id" "http://127.0.0.1:${port}/metrics"
+}
+
+# Collector の内部テレメトリを取得する。exporter ごとの送信済みスパン数が分かるため、
+# 「どちらへ実際に送ったか」の決定的な証拠になる。
+# ポートを公開していない構成では取得できない (チェックでは未確認として扱う)。
+otel_fetch_internal_metrics() {
+  local url="$1"
+
+  [ -n "$url" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" "$url" 2>/dev/null
+}
+
+# 起動中の Compose サービスから、Collector へスパンを送る設定 (OTLP の送信先) を集める。
+# "サービス<US>変数名<US>値" を 1 行ずつ返す。
+otel_collect_sender_endpoints() {
+  local collector_service="$1" service pair name value
+  local -a service_ids=()
+
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    [ "$service" = "$collector_service" ] && continue
+    service_ids=()
+    mapfile -t service_ids < <(compose_container_ids "$service")
+    [ ${#service_ids[@]} -gt 0 ] || continue
+    while IFS= read -r pair; do
+      name="${pair%%=*}"
+      value="${pair#*=}"
+      [ "$value" = "$pair" ] && value=""
+      case "$name" in
+        OTEL_EXPORTER_OTLP_ENDPOINT|OTEL_EXPORTER_OTLP_TRACES_ENDPOINT|OTEL_EXPORTER_OTLP_PROTOCOL|OTEL_EXPORTER_OTLP_TRACES_PROTOCOL|OTEL_TRACES_EXPORTER|OTEL_SERVICE_NAME|AWS_XRAY_DAEMON_ADDRESS)
+          printf '%s%s%s%s%s\n' \
+            "$service" "$OTEL_STAGE_SEPARATOR" "$name" "$OTEL_STAGE_SEPARATOR" "$value"
+          ;;
+      esac
+    done < <(otel_container_env_pairs "${service_ids[0]}")
+  done < <(compose_started_services)
+}
+
+# 設定本文・確認コンテキスト・内部テレメトリ・Collector ログの 4 つを受け取り、
+# 照合に必要な項目だけを US 区切りのレコードとして返す。
+# レコード種別:
+#   meta      <キー> <値>
+#   pipeline  <名前> <receivers> <processors> <exporters>
+#   comp      <セクション> <名前> <有効(true/false)> <種別> <補足>
+#   recv      <名前> <プロトコル> <エンドポイント> <ポート> <補足>
+#   dest      <exporter> <区分> <エンドポイント> <リージョン> <説明>
+#   sender    <サービス> <変数> <値> <判定>
+#   metric    <ラベル> <値>
+#   evidence  <区分> <行>
+#   sum       <キー> <値>
+#   check     <判定> <項目> <詳細>
+otel_collector_config_facts() {
+  local config_text="$1" context_text="$2" metrics_text="$3" logs_text="$4"
+  local program
+
+  program="$(cat <<'PY'
+import json
+import re
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+SEP = "\x1f"
+
+
+def load_text_documents(count):
+    """標準入力の NUL 区切りテキストを、指定個数だけ UTF-8 で読み出す。"""
+    chunks = sys.stdin.buffer.read().split(b"\0")
+    documents = []
+    for index in range(count):
+        chunk = chunks[index] if index < len(chunks) else b""
+        documents.append(chunk.decode("utf-8", "replace"))
+    return documents
+
+
+def out(*fields):
+    # レコードは 1 行 1 件で読ませるため、値の改行は空白へ畳む。
+    cleaned = []
+    for field in fields:
+        text = "" if field is None else str(field)
+        cleaned.append(text.replace("\r", " ").replace("\n", " "))
+    print(SEP.join(cleaned))
+
+
+# ---- YAML の読み取り --------------------------------------------------------
+# PyYAML があればそれを使う。RHEL の platform-python など PyYAML が無い環境でも
+# Collector 設定を読めるよう、必要な範囲だけの簡易パーサーを用意する。
+def _strip_comment(line):
+    result = []
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            result.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(line):
+                result.append(line[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in ('"', "'"):
+            quote = char
+            result.append(char)
+        elif char == "#" and (not result or result[-1] in (" ", "\t")):
+            break
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result).rstrip()
+
+
+def _split_flow(text):
+    items = []
+    depth = 0
+    quote = None
+    current = []
+    for char in text:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in ('"', "'"):
+            quote = char
+            current.append(char)
+            continue
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        if char == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    if "".join(current).strip():
+        items.append("".join(current))
+    return [item.strip() for item in items]
+
+
+def _scalar(text):
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        body = text[1:-1]
+        if text[0] == '"':
+            body = body.replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            body = body.replace("''", "'")
+        return body
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        return [_scalar(item) for item in _split_flow(inner)] if inner else []
+    if text.startswith("{") and text.endswith("}"):
+        mapping = {}
+        for item in _split_flow(text[1:-1]):
+            key, sep, value = item.partition(":")
+            if sep:
+                mapping[str(_scalar(key))] = _scalar(value)
+        return mapping
+    lowered = text.lower()
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if lowered in ("null", "~"):
+        return None
+    for converter in (int, float):
+        try:
+            return converter(text)
+        except ValueError:
+            pass
+    return text
+
+
+def _is_key_line(content):
+    return re.match(r"^[^\s\[{\"'][^:]*:(\s|$)", content) is not None
+
+
+def _parse_block(lines, index, indent):
+    if index >= len(lines) or lines[index][0] < indent:
+        return None, index
+    current = lines[index][0]
+    if lines[index][1] == "-" or lines[index][1].startswith("- "):
+        items = []
+        while index < len(lines) and lines[index][0] == current \
+                and (lines[index][1] == "-" or lines[index][1].startswith("- ")):
+            content = lines[index][1][1:].strip()
+            index += 1
+            if not content:
+                value, index = _parse_block(lines, index, current + 1)
+                items.append(value)
+            elif _is_key_line(content):
+                # "- key: value" は、その要素自体をマップとして読み直す。
+                nested = [(current + 2, content)]
+                while index < len(lines) and lines[index][0] > current:
+                    nested.append(lines[index])
+                    index += 1
+                value, _ = _parse_block(nested, 0, current + 2)
+                items.append(value)
+            else:
+                items.append(_scalar(content))
+        return items, index
+    mapping = {}
+    while index < len(lines) and lines[index][0] == current:
+        content = lines[index][1]
+        if content == "-" or content.startswith("- "):
+            break
+        key, sep, rest = content.partition(":")
+        if not sep:
+            index += 1
+            continue
+        key = str(_scalar(key))
+        rest = rest.strip()
+        index += 1
+        if rest:
+            mapping[key] = _scalar(rest)
+        else:
+            value, index = _parse_block(lines, index, current + 1)
+            mapping[key] = value
+    return mapping, index
+
+
+def parse_simple_yaml(text):
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw.lstrip().startswith("#"):
+            continue
+        stripped = _strip_comment(raw)
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        lines.append((indent, stripped.strip()))
+    value, _ = _parse_block(lines, 0, 0)
+    return value
+
+
+def load_yaml(text):
+    try:
+        import yaml
+    except Exception:
+        yaml = None
+    if yaml is not None:
+        try:
+            return yaml.safe_load(text)
+        except Exception:
+            pass
+    return parse_simple_yaml(text)
+
+
+def split_endpoint(endpoint):
+    """URL または host:port を (scheme, host, port) へ分解する。"""
+    text = str(endpoint or "").strip()
+    scheme = ""
+    if "://" in text:
+        scheme, _, text = text.partition("://")
+    text = text.split("/")[0]
+    if text.startswith("["):
+        host, _, rest = text.partition("]")
+        host = host[1:]
+        port = rest[1:] if rest.startswith(":") else ""
+    elif ":" in text:
+        host, _, port = text.rpartition(":")
+    else:
+        host, port = text, ""
+    return scheme, host, port
+
+
+def as_list(value):
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+config_text, context_text, metrics_text, logs_text = load_text_documents(4)
+
+meta = {}
+env = {}
+services = {}
+senders = []
+networks = []
+for line in context_text.splitlines():
+    if not line:
+        continue
+    parts = line.split(SEP)
+    kind = parts[0]
+    if kind == "meta" and len(parts) >= 3:
+        meta[parts[1]] = parts[2]
+    elif kind == "env" and len(parts) >= 3:
+        env[parts[1]] = parts[2]
+    elif kind == "service" and len(parts) >= 4:
+        services[parts[1]] = {"running": parts[2] == "true", "container": parts[3]}
+    elif kind == "sender" and len(parts) >= 4:
+        senders.append({"service": parts[1], "name": parts[2], "value": parts[3]})
+    elif kind == "network" and len(parts) >= 2:
+        networks.append(parts[1])
+
+collector_service = meta.get("collector_service", "")
+collector_container = meta.get("collector_container", "")
+local_hosts = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}
+container_names = {info.get("container", ""): name for name, info in services.items()}
+
+checks = []
+
+
+def check(verdict, label, detail=""):
+    checks.append((verdict, label, detail))
+
+
+config = load_yaml(config_text)
+if not isinstance(config, dict):
+    check("NG", "設定ファイルの解析",
+          "設定の最上位が YAML のマップではありません。Collector は起動できません。")
+    for verdict, label, detail in checks:
+        out("check", verdict, label, detail)
+    out("sum", "destination", "判定不能 (設定を解析できません)")
+    out("sum", "destination_classes", "")
+    raise SystemExit(0)
+
+SECTION_KEYS = ("receivers", "processors", "exporters", "extensions", "connectors")
+defined = {key: as_dict(config.get(key)) for key in SECTION_KEYS}
+service_block = as_dict(config.get("service"))
+pipelines_block = as_dict(service_block.get("pipelines"))
+telemetry = as_dict(service_block.get("telemetry"))
+
+used = {key: [] for key in SECTION_KEYS}
+pipelines = []
+for pipeline_name in sorted(pipelines_block):
+    pipeline = as_dict(pipelines_block.get(pipeline_name))
+    entry = {"name": str(pipeline_name)}
+    for key in ("receivers", "processors", "exporters"):
+        values = as_list(pipeline.get(key))
+        entry[key] = values
+        for value in values:
+            if value not in used[key]:
+                used[key].append(value)
+    pipelines.append(entry)
+    out("pipeline", entry["name"], ", ".join(entry["receivers"]) or "(なし)",
+        ", ".join(entry["processors"]) or "(なし)", ", ".join(entry["exporters"]) or "(なし)")
+
+enabled_extensions = as_list(service_block.get("extensions"))
+used["extensions"] = list(enabled_extensions)
+
+traces_pipelines = [p for p in pipelines
+                    if p["name"] == "traces" or p["name"].startswith("traces/")]
+traces_exporters = []
+traces_receivers = []
+traces_processors = []
+for pipeline in traces_pipelines:
+    traces_exporters.extend(x for x in pipeline["exporters"] if x not in traces_exporters)
+    traces_receivers.extend(x for x in pipeline["receivers"] if x not in traces_receivers)
+    traces_processors.extend(x for x in pipeline["processors"] if x not in traces_processors)
+
+
+def component_detail(section, name, raw):
+    settings = as_dict(raw)
+    kind = str(name).split("/")[0]
+    bits = []
+    if section == "receivers" and kind == "otlp":
+        protocols = as_dict(settings.get("protocols"))
+        for protocol in ("grpc", "http"):
+            if protocol in protocols:
+                block = as_dict(protocols.get(protocol))
+                bits.append("%s=%s" % (protocol, block.get("endpoint") or "(既定値)"))
+    elif section == "processors" and kind == "memory_limiter":
+        bits.append("limit_percentage=%s" % settings.get("limit_percentage", "(既定値)"))
+    elif section == "processors" and kind == "batch":
+        bits.append("timeout=%s" % settings.get("timeout", "(既定値)"))
+        bits.append("send_batch_size=%s" % settings.get("send_batch_size", "(既定値)"))
+    elif section == "processors" and kind == "resourcedetection":
+        bits.append("detectors=[%s]" % ", ".join(as_list(settings.get("detectors"))))
+    elif section == "exporters":
+        if settings.get("endpoint"):
+            bits.append("endpoint=%s" % settings.get("endpoint"))
+        if settings.get("region"):
+            bits.append("region=%s" % settings.get("region"))
+        if kind in ("debug", "logging"):
+            bits.append("verbosity=%s" % settings.get("verbosity", "(既定値)"))
+    elif section == "extensions" and settings.get("endpoint"):
+        bits.append("endpoint=%s" % settings.get("endpoint"))
+    return " / ".join(str(bit) for bit in bits)
+
+
+for section in SECTION_KEYS:
+    for name in sorted(defined[section]):
+        enabled = "true" if name in used[section] else "false"
+        out("comp", section, name, enabled, str(name).split("/")[0],
+            component_detail(section, name, defined[section].get(name)))
+
+# ---- receiver の待受 --------------------------------------------------------
+receiver_ports = []
+receiver_notes = []
+for name in traces_receivers:
+    settings = as_dict(defined["receivers"].get(name))
+    kind = str(name).split("/")[0]
+    if kind != "otlp":
+        out("recv", name, "-", "(otlp 以外のため待受は解析しません)", "", "")
+        continue
+    protocols = as_dict(settings.get("protocols"))
+    if not protocols:
+        out("recv", name, "-", "(protocols の指定なし)", "", "")
+        receiver_notes.append((name, "", "", ""))
+        continue
+    for protocol in ("grpc", "http"):
+        if protocol not in protocols:
+            continue
+        block = as_dict(protocols.get(protocol))
+        endpoint = str(block.get("endpoint") or "")
+        _, host, port = split_endpoint(endpoint)
+        if not endpoint:
+            default_port = "4317" if protocol == "grpc" else "4318"
+            out("recv", name, protocol, "(endpoint 未指定)", default_port,
+                "既定値。Collector v0.104 以降の既定は localhost です")
+            receiver_notes.append((name, protocol, "", default_port))
+            if default_port not in receiver_ports:
+                receiver_ports.append(default_port)
+            continue
+        out("recv", name, protocol, endpoint, port, "")
+        receiver_notes.append((name, protocol, host, port))
+        if port and port not in receiver_ports:
+            receiver_ports.append(port)
+
+# ---- 送信先 (exporter) の判定 ----------------------------------------------
+AWS_HOST = re.compile(r"(?i)(^|\.)amazonaws\.com$")
+JAEGER_HINT = re.compile(r"(?i)jaeger")
+CREDENTIAL_ENVS = (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_SHARED_CREDENTIALS_FILE",
+)
+CLASS_LABELS = {
+    "aws": "実 AWS X-Ray",
+    "aws-mock": "X-Ray API 互換の別エンドポイント",
+    "compose": "Compose 内サービス (X-Ray 偽装)",
+    "self": "コンテナ自身 (localhost)",
+    "external": "Compose 外のホスト",
+    "log": "コレクタのログ出力のみ",
+    "file": "ファイル出力のみ",
+    "unknown": "判定不能",
+}
+
+
+def resolve_compose_target(host):
+    if host in services:
+        return host
+    if host in container_names:
+        return container_names[host]
+    return ""
+
+
+def classify_exporter(name):
+    settings = as_dict(defined["exporters"].get(name))
+    kind = str(name).split("/")[0]
+    endpoint = str(settings.get("endpoint") or "")
+    region = str(settings.get("region") or "")
+    if kind in ("debug", "logging"):
+        return "log", "", "", "受信したスパンをコレクタのログへ出すだけで、外部へは送りません"
+    if kind in ("file", "otlpjsonfile"):
+        return "file", str(settings.get("path") or ""), "", "ファイルへ書き出すだけで、外部へは送りません"
+    if kind.startswith("awsxray"):
+        if not region:
+            region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or ""
+        if endpoint:
+            _, host, _ = split_endpoint(endpoint)
+            if host and not AWS_HOST.search(host):
+                return ("aws-mock", endpoint, region,
+                        "X-Ray API 互換の別エンドポイント (%s) へ送ります" % host)
+        return ("aws", endpoint or "xray.%s.amazonaws.com" % (region or "<region>"), region,
+                "AWS X-Ray の PutTraceSegments API へ送ります (実 AWS への送信)")
+    if kind in ("awsemf", "awscloudwatchlogs", "awss3", "prometheusremotewrite"):
+        return ("aws", endpoint, region or env.get("AWS_REGION", ""),
+                "AWS のサービスへ送ります (トレース用の exporter ではありません)")
+    scheme, host, port = split_endpoint(endpoint)
+    target = resolve_compose_target(host)
+    if target:
+        label = "Compose サービス '%s' の %s へ送ります" % (target, endpoint)
+        if JAEGER_HINT.search(target):
+            label = "Compose 内 Jaeger ('%s') へ送ります。X-Ray コンソールの代替であり、実 AWS X-Ray へは送りません" % target
+        return "compose", endpoint, "", label
+    if host in local_hosts:
+        return "self", endpoint, "", "コンテナ自身の %s へ送ります" % endpoint
+    if host and AWS_HOST.search(host):
+        return "aws", endpoint, region, "AWS のエンドポイント (%s) へ送ります" % host
+    if not host:
+        return "unknown", endpoint, "", "endpoint を特定できません"
+    return "external", endpoint, "", "Compose 外のホスト (%s) へ送ります" % host
+
+
+destination_classes = []
+exporter_classes = {}
+for name in traces_exporters:
+    if name not in defined["exporters"]:
+        out("dest", name, "unknown", "", "", "exporters セクションに定義がありません")
+        exporter_classes[name] = "unknown"
+        continue
+    css, endpoint, region, detail = classify_exporter(name)
+    exporter_classes[name] = css
+    out("dest", name, css, endpoint, region, "%s: %s" % (CLASS_LABELS.get(css, css), detail))
+    if css not in destination_classes:
+        destination_classes.append(css)
+
+sending_classes = [c for c in destination_classes if c not in ("log", "file")]
+if not traces_pipelines:
+    summary = "判定不能 (traces パイプラインがありません)"
+elif not sending_classes:
+    summary = "外部への送信なし (debug / file exporter だけが有効です)"
+elif "aws" in sending_classes and "compose" in sending_classes:
+    summary = "実 AWS X-Ray と Compose 内 Jaeger の両方へ送っています"
+elif "aws" in sending_classes:
+    summary = "実 AWS X-Ray へ送っています (Compose 内 Jaeger へは送っていません)"
+elif "compose" in sending_classes:
+    summary = "Compose 内 Jaeger (X-Ray 偽装) へ送っています (実 AWS X-Ray へは送っていません)"
+else:
+    summary = "、".join(CLASS_LABELS.get(c, c) for c in sending_classes) + " へ送っています"
+out("sum", "destination", summary)
+out("sum", "destination_classes", ",".join(destination_classes))
+# X-Ray コンソールの URL を組み立てるために、送信先リージョンも返す。
+xray_region = ""
+for name in traces_exporters:
+    if exporter_classes.get(name) != "aws":
+        continue
+    settings = as_dict(defined["exporters"].get(name))
+    xray_region = str(settings.get("region") or env.get("AWS_REGION")
+                      or env.get("AWS_DEFAULT_REGION") or "")
+    if xray_region:
+        break
+out("sum", "xray_region", xray_region)
+
+# ---- X-Ray の注釈 (indexed_attributes) --------------------------------------
+indexed_attributes = []
+index_all = "false"
+xray_exporters = [name for name in traces_exporters
+                  if str(name).split("/")[0].startswith("awsxray")]
+for name in xray_exporters:
+    settings = as_dict(defined["exporters"].get(name))
+    for attribute in as_list(settings.get("indexed_attributes")):
+        if attribute not in indexed_attributes:
+            indexed_attributes.append(attribute)
+    if settings.get("index_all_attributes"):
+        index_all = "true"
+for attribute in indexed_attributes:
+    out("index", attribute)
+out("sum", "indexed_attributes", ",".join(indexed_attributes))
+out("sum", "index_all_attributes", index_all)
+
+# ---- チェック ---------------------------------------------------------------
+if not pipelines:
+    check("NG", "パイプラインの定義", "service.pipelines がありません。何も処理されません。")
+elif not traces_pipelines:
+    check("NG", "traces パイプライン",
+          "traces パイプラインがありません。受信したスパンはどこへも送られません。")
+else:
+    names = ", ".join(p["name"] for p in traces_pipelines)
+    if not traces_receivers:
+        check("NG", "traces パイプライン", "%s に receivers がありません。" % names)
+    elif not traces_exporters:
+        check("NG", "traces パイプライン", "%s に exporters がありません。" % names)
+    else:
+        check("OK", "traces パイプライン",
+              "%s: receivers=[%s] processors=[%s] exporters=[%s]"
+              % (names, ", ".join(traces_receivers), ", ".join(traces_processors),
+                 ", ".join(traces_exporters)))
+
+missing = []
+for pipeline in pipelines:
+    for key in ("receivers", "processors", "exporters"):
+        for name in pipeline[key]:
+            if name not in defined[key]:
+                missing.append("%s.%s の %s" % (pipeline["name"], key, name))
+for name in enabled_extensions:
+    if name not in defined["extensions"]:
+        missing.append("service.extensions の %s" % name)
+if missing:
+    check("NG", "参照先の定義",
+          "パイプラインが参照しているのに定義がないコンポーネント: %s。"
+          "Collector は起動時に失敗します。" % ", ".join(missing))
+else:
+    check("OK", "参照先の定義", "パイプラインが参照するコンポーネントはすべて定義されています。")
+
+unused = []
+for section in SECTION_KEYS:
+    for name in sorted(defined[section]):
+        if name not in used[section]:
+            unused.append("%s.%s" % (section, name))
+if unused:
+    check("WARN", "未参照の定義",
+          "定義はありますが、どのパイプライン (extensions は service.extensions) からも"
+          "参照されていないため無効です: %s" % ", ".join(unused))
+else:
+    check("OK", "未参照の定義", "定義したコンポーネントはすべて有効 (参照済み) です。")
+
+if traces_pipelines:
+    limiter = [i for i, name in enumerate(traces_processors)
+               if str(name).split("/")[0] == "memory_limiter"]
+    if not limiter:
+        check("WARN", "memory_limiter",
+              "traces パイプラインに memory_limiter がありません。"
+              "急な流入で Collector が OOM で落ちる可能性があります。")
+    elif limiter[0] != 0:
+        check("WARN", "memory_limiter",
+              "memory_limiter が %d 番目にあります。公式構成では必ず processors の"
+              "先頭に置きます (前段の処理でメモリを使い切るため)。" % (limiter[0] + 1))
+    else:
+        check("OK", "memory_limiter", "processors の先頭にあります。")
+    batch = [i for i, name in enumerate(traces_processors)
+             if str(name).split("/")[0] == "batch"]
+    if batch and batch[0] != len(traces_processors) - 1:
+        check("INFO", "batch の位置",
+              "batch が最後ではありません。属性を書き換える processor は batch より前に"
+              "置くのが一般的です。")
+
+for name, protocol, host, port in receiver_notes:
+    label = "receiver の待受 (%s%s)" % (name, "/" + protocol if protocol else "")
+    if not protocol:
+        check("WARN", label, "protocols が空のため待受アドレスを判定できません。")
+    elif not host:
+        check("WARN", label,
+              "endpoint を明示していません。Collector v0.104 以降は既定が localhost:%s に"
+              "変わったため、別コンテナのアプリからスパンが届かなくなります。"
+              "0.0.0.0:%s を明示してください。" % (port, port))
+    elif host in ("127.0.0.1", "localhost", "::1"):
+        check("NG", label,
+              "%s で待ち受けているため、コンテナ内からしか届きません。別コンテナの"
+              "アプリから送る構成では 0.0.0.0:%s にする必要があります。" % (host, port))
+    else:
+        check("OK", label, "%s:%s で待ち受けています (別コンテナから到達できます)。" % (host, port))
+
+endpoint_senders = [s for s in senders if s["name"].endswith("_ENDPOINT")]
+protocol_by_service = {}
+for sender in senders:
+    if sender["name"].endswith("_PROTOCOL"):
+        protocol_by_service[sender["service"]] = sender["value"]
+if not endpoint_senders:
+    check("未確認", "送信元アプリとの整合",
+          "起動中のサービスに OTEL_EXPORTER_OTLP_ENDPOINT が見つかりませんでした。"
+          "JVM の -Dotel.exporter.otlp.endpoint で指定している場合は環境変数に現れません。")
+for sender in endpoint_senders:
+    scheme, host, port = split_endpoint(sender["value"])
+    label = "送信元 %s の %s" % (sender["service"], sender["name"])
+    target = resolve_compose_target(host)
+    if target and target != collector_service:
+        check("WARN", label,
+              "%s は Collector (%s) ではなく '%s' を指しています。"
+              % (sender["value"], collector_service, target))
+        out("sender", sender["service"], sender["name"], sender["value"], "別サービス宛て")
+        continue
+    if not target and host not in local_hosts:
+        check("WARN", label,
+              "%s の宛先 '%s' は Compose のサービス名として解決できません。" % (sender["value"], host))
+        out("sender", sender["service"], sender["name"], sender["value"], "宛先不明")
+        continue
+    if not port:
+        check("WARN", label, "%s にポートがありません。" % sender["value"])
+        out("sender", sender["service"], sender["name"], sender["value"], "ポート未指定")
+        continue
+    if receiver_ports and port not in receiver_ports:
+        check("NG", label,
+              "%s へ送っていますが、Collector が待ち受けているのは %s だけです。"
+              "スパンは Collector に届きません。"
+              % (sender["value"], " / ".join(receiver_ports)))
+        out("sender", sender["service"], sender["name"], sender["value"], "待受ポート不一致")
+        continue
+    protocol = protocol_by_service.get(sender["service"], "")
+    expected = "grpc" if port == "4317" else ("http/protobuf" if port == "4318" else "")
+    if protocol and expected and protocol != expected \
+            and not (protocol.startswith("http") and expected.startswith("http")):
+        check("WARN", label,
+              "ポート %s は %s 用ですが、OTEL_EXPORTER_OTLP_PROTOCOL は %s です。"
+              % (port, expected, protocol))
+        out("sender", sender["service"], sender["name"], sender["value"], "プロトコル不一致")
+        continue
+    check("OK", label, "%s は Collector の待受と一致しています。" % sender["value"])
+    out("sender", sender["service"], sender["name"], sender["value"], "一致")
+
+for name in traces_exporters:
+    css = exporter_classes.get(name, "unknown")
+    settings = as_dict(defined["exporters"].get(name))
+    kind = str(name).split("/")[0]
+    label = "送信先 %s" % name
+    endpoint = str(settings.get("endpoint") or "")
+    scheme, host, port = split_endpoint(endpoint)
+    if css == "compose":
+        target = resolve_compose_target(host)
+        info = services.get(target, {})
+        if not info.get("running"):
+            check("NG", label,
+                  "送信先の Compose サービス '%s' が起動していません。送信は失敗します。" % target)
+            continue
+        if kind == "otlphttp" and port == "4317":
+            check("NG", label,
+                  "otlphttp (HTTP) なのに %s は gRPC の待受ポートです。4318 を指定してください。"
+                  % endpoint)
+            continue
+        if kind == "otlp" and port == "4318":
+            check("NG", label,
+                  "otlp (gRPC) なのに %s は HTTP の待受ポートです。4317 を指定するか、"
+                  "exporter を otlphttp にしてください。" % endpoint)
+            continue
+        if not scheme and kind == "otlphttp":
+            check("WARN", label,
+                  "otlphttp の endpoint には http:// または https:// を含めてください: %s" % endpoint)
+            continue
+        check("OK", label,
+              "Compose 内の '%s' (%s) へ送ります。X-Ray コンソールの代わりに Jaeger UI で"
+              "確認する構成です。" % (target, endpoint))
+    elif css in ("aws", "aws-mock"):
+        region = str(settings.get("region") or env.get("AWS_REGION")
+                     or env.get("AWS_DEFAULT_REGION") or "")
+        credential = [item for item in CREDENTIAL_ENVS if env.get(item)]
+        if css == "aws" and not region:
+            check("NG", label,
+                  "region も AWS_REGION も無いため、X-Ray への送信先リージョンを決められません。")
+        elif css == "aws" and not credential:
+            check("NG", label,
+                  "実 AWS X-Ray へ送る設定ですが、コンテナに AWS 認証情報 (環境変数・タスクロール) が"
+                  "見当たりません。ローカル実行では送信が失敗し、スパンは失われます。")
+        elif css == "aws":
+            check("OK", label,
+                  "実 AWS X-Ray (region=%s) へ送ります。認証情報: %s。"
+                  "Compose 内 Jaeger には現れません。" % (region, ", ".join(credential)))
+        else:
+            check("WARN", label,
+                  "X-Ray API 互換の別エンドポイント (%s) へ送ります。実 AWS X-Ray ではありません。"
+                  % endpoint)
+    elif css == "log":
+        check("INFO", label,
+              "コレクタのログへ出すだけの exporter です (docker compose logs %s で確認)。"
+              % (collector_service or "adot-collector"))
+    elif css == "external":
+        check("WARN", label, "Compose 外のホスト (%s) へ送ります。" % host)
+    elif css == "unknown":
+        check("NG", label, "exporters セクションに定義がないため、Collector は起動できません。")
+
+if xray_exporters:
+    if index_all == "true":
+        check("WARN", "X-Ray の注釈 (indexed_attributes)",
+              "index_all_attributes: true は全属性を注釈にするため、X-Ray のコストが増えます。"
+              "必要な属性だけ indexed_attributes へ列挙する構成が推奨です。")
+    elif not indexed_attributes:
+        check("WARN", "X-Ray の注釈 (indexed_attributes)",
+              "indexed_attributes が空です。X-Ray コンソールのフィルタ式で検索できる注釈が"
+              "作られず、属性はすべてメタデータ (検索不可) になります。")
+    else:
+        check("OK", "X-Ray の注釈 (indexed_attributes)",
+              "注釈になる属性: %s" % ", ".join(indexed_attributes))
+else:
+    check("INFO", "X-Ray の注釈 (indexed_attributes)",
+          "この設定に awsxray exporter が無いため、注釈 (annotation) は作られません。"
+          "ECS 用設定 (awsxray exporter) 側の indexed_attributes を確認してください。")
+
+for name in traces_processors:
+    if str(name).split("/")[0] != "resourcedetection":
+        continue
+    detectors = as_list(as_dict(defined["processors"].get(name)).get("detectors"))
+    label = "resourcedetection (%s)" % name
+    if "ecs" in detectors and not env.get("ECS_CONTAINER_METADATA_URI_V4"):
+        check("WARN", label,
+              "ecs 検出器が有効ですが ECS_CONTAINER_METADATA_URI_V4 がありません。"
+              "検出はタイムアウトし、aws.ecs.* 属性 (X-Ray の AWS セクション) が付きません。")
+    elif "ecs" in detectors:
+        check("OK", label,
+              "ecs 検出器が有効で、ECS_CONTAINER_METADATA_URI_V4 も設定されています "
+              "(検出器: %s)。" % ", ".join(detectors))
+    else:
+        check("INFO", label, "検出器: %s" % (", ".join(detectors) or "(未指定)"))
+
+health_names = [name for name in enabled_extensions
+                if str(name).split("/")[0] == "health_check"]
+if not health_names:
+    check("WARN", "health_check 拡張",
+          "service.extensions に health_check がありません。コンテナ内で healthcheck を"
+          "実行できない場合の代替確認 (HTTP) ができません。")
+else:
+    for name in health_names:
+        endpoint = str(as_dict(defined["extensions"].get(name)).get("endpoint") or "")
+        _, host, port = split_endpoint(endpoint)
+        if host in ("127.0.0.1", "localhost", "::1"):
+            check("WARN", "health_check 拡張",
+                  "%s で待ち受けているため、ホストや別コンテナからは確認できません。" % endpoint)
+        else:
+            check("OK", "health_check 拡張",
+                  "%s で待ち受けています。" % (endpoint or "(既定値 0.0.0.0:13133)"))
+
+logs_level = str(as_dict(telemetry.get("logs")).get("level") or "info")
+metrics_address = str(as_dict(telemetry.get("metrics")).get("address") or "")
+out("meta", "telemetry_logs_level", logs_level)
+out("meta", "telemetry_metrics_address", metrics_address or "(既定値 0.0.0.0:8888)")
+
+# ---- 実行時の証跡: 内部テレメトリ -------------------------------------------
+METRIC_LINE = re.compile(
+    r"^(otelcol_(?:exporter_(?:sent|send_failed|enqueue_failed)_spans"
+    r"|receiver_(?:accepted|refused)_spans))(?:_total)?\{([^}]*)\}\s+([0-9.eE+-]+)"
+)
+metric_totals = {}
+for line in metrics_text.splitlines():
+    matched = METRIC_LINE.match(line.strip())
+    if not matched:
+        continue
+    name, labels, value = matched.group(1), matched.group(2), matched.group(3)
+    label_map = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+    key = label_map.get("exporter") or label_map.get("receiver") or "(不明)"
+    try:
+        number = float(value)
+    except ValueError:
+        continue
+    metric_totals[(name, key)] = metric_totals.get((name, key), 0.0) + number
+
+if metric_totals:
+    for (name, key), value in sorted(metric_totals.items()):
+        out("metric", "%s{%s}" % (name, key), "%g" % value)
+    sent = {key: value for (name, key), value in metric_totals.items()
+            if name == "otelcol_exporter_sent_spans"}
+    failed = {key: value for (name, key), value in metric_totals.items()
+              if name == "otelcol_exporter_send_failed_spans"}
+    accepted = sum(value for (name, key), value in metric_totals.items()
+                   if name == "otelcol_receiver_accepted_spans")
+    if accepted > 0:
+        check("OK", "実行時の受信 (内部テレメトリ)",
+              "receiver が受け取ったスパン: %g 件。" % accepted)
+    else:
+        check("WARN", "実行時の受信 (内部テレメトリ)",
+              "receiver が受け取ったスパンは 0 件です。アプリ側が送っていない可能性があります。")
+    for name in traces_exporters:
+        if exporter_classes.get(name) in ("log", "file"):
+            # ログ出力・ファイル出力は「送信」ではないため送達件数の判定から外す。
+            continue
+        sent_value = sent.get(name, 0.0)
+        failed_value = failed.get(name, 0.0)
+        if failed_value > 0:
+            check("NG", "実行時の送信 (%s)" % name,
+                  "送信成功 %g 件 / 送信失敗 %g 件。送信先へ届いていません。"
+                  % (sent_value, failed_value))
+        elif sent_value > 0:
+            check("OK", "実行時の送信 (%s)" % name,
+                  "%g 件のスパンを送信済み (%s)。"
+                  % (sent_value, CLASS_LABELS.get(exporter_classes.get(name, ""), "")))
+        else:
+            check("WARN", "実行時の送信 (%s)" % name, "送信済みスパンが 0 件です。")
+else:
+    check("未確認", "実行時の送信 (内部テレメトリ)",
+          "Collector の内部テレメトリ (%s) を取得できませんでした。compose.yml で "
+          "8888 番ポートを公開すると、exporter ごとの送信件数を確認できます。"
+          % meta.get("metrics_url", "http://<collector>:8888/metrics"))
+
+# ---- 実行時の証跡: ログ -----------------------------------------------------
+LOG_PATTERNS = (
+    ("送信失敗", re.compile(r"(?i)(Exporting failed|Permanent error|Dropping data|"
+                            r"connection refused|no such host|context deadline exceeded)")),
+    ("認証エラー", re.compile(r"(?i)(NoCredentialProviders|AccessDenied|"
+                              r"UnrecognizedClientException|InvalidSignature|ExpiredToken)")),
+    ("スパン受信", re.compile(r"(?i)(TracesExporter|resource spans|[\s]spans[:=])")),
+)
+evidence_count = 0
+for line in logs_text.splitlines():
+    text = line.strip()
+    if not text:
+        continue
+    for label, pattern in LOG_PATTERNS:
+        if pattern.search(text):
+            if evidence_count < 12:
+                out("evidence", label, text[:400])
+                evidence_count += 1
+            if label == "送信失敗":
+                check("NG", "Collector ログ",
+                      "送信失敗を示すログがあります: %s" % text[:200])
+            elif label == "認証エラー":
+                check("NG", "Collector ログ",
+                      "AWS 認証に失敗しています: %s" % text[:200])
+            break
+
+seen = set()
+deduped = []
+for verdict, label, detail in checks:
+    key = (verdict, label, detail)
+    if key in seen:
+        continue
+    seen.add(key)
+    deduped.append((verdict, label, detail))
+for verdict, label, detail in deduped:
+    out("check", verdict, label, detail)
+PY
+)"
+  run_observability_python_program "$program" 4 \
+    "$config_text" "$context_text" "$metrics_text" "$logs_text"
+}
+
+# 設定チェックに必要な材料 (設定本文・確認コンテキスト・内部テレメトリ・ログ) を集め、
+# 解析結果のレコードを OTEL_CONFIG_RECORDS へ入れる。
+otel_collect_config_records() {
+  local collector_service="$1" collector_id="$2"
+  local context="" metrics="" logs="" pair name value service running container_name
+  local collector_name=""
+  local -a service_ids=()
+
+  OTEL_CONFIG_RECORDS=""
+  OTEL_METRICS_URL=""
+  # 取得に失敗したときに前回の判定が残らないよう、共有する値もここで初期化する。
+  OTEL_DESTINATION_SUMMARY=""
+  OTEL_DESTINATION_CLASSES=""
+  OTEL_INDEXED_ATTRIBUTES=""
+  OTEL_INDEX_ALL_ATTRIBUTES=""
+  OTEL_XRAY_REGION=""
+  if ! otel_resolve_collector_config "$collector_id"; then
+    err "ADOT Collector の設定ファイルを取得できませんでした (service=${collector_service})。"
+    diag "  確認方法: docker cp ${collector_service}:/etc/otel/config.yaml ./adot-config.yaml"
+    diag "  ECS のように環境変数 (AOT_CONFIG_CONTENT) で注入している場合は、"
+    diag "  docker inspect ${collector_service} の Config.Env を確認してください。"
+    return 1
+  fi
+
+  collector_name="$(normalize_container_name \
+    "$(docker inspect -f '{{.Name}}' "$collector_id" 2>/dev/null || printf '%s' "$collector_id")")"
+  context+="meta${OTEL_STAGE_SEPARATOR}collector_service${OTEL_STAGE_SEPARATOR}${collector_service}"$'\n'
+  context+="meta${OTEL_STAGE_SEPARATOR}collector_container${OTEL_STAGE_SEPARATOR}${collector_name}"$'\n'
+  context+="meta${OTEL_STAGE_SEPARATOR}config_path${OTEL_STAGE_SEPARATOR}${OTEL_CONFIG_PATH}"$'\n'
+  context+="meta${OTEL_STAGE_SEPARATOR}config_source${OTEL_STAGE_SEPARATOR}${OTEL_CONFIG_SOURCE}"$'\n'
+
+  # Collector 自身の環境変数 (リージョン・認証情報・ECS メタデータの有無を見る)。
+  while IFS= read -r pair; do
+    name="${pair%%=*}"
+    value="${pair#*=}"
+    [ "$value" = "$pair" ] && value=""
+    case "$name" in
+      AWS_*|ECS_CONTAINER_METADATA_URI*|OTEL_*)
+        context+="env${OTEL_STAGE_SEPARATOR}${name}${OTEL_STAGE_SEPARATOR}${value}"$'\n'
+        ;;
+    esac
+  done < <(otel_container_env_pairs "$collector_id")
+
+  # Compose のサービス一覧 (送信先ホスト名の解決と起動状態の確認に使う)。
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    service_ids=()
+    mapfile -t service_ids < <(compose_container_ids "$service")
+    if [ ${#service_ids[@]} -gt 0 ]; then
+      running="true"
+      container_name="$(normalize_container_name \
+        "$(docker inspect -f '{{.Name}}' "${service_ids[0]}" 2>/dev/null || printf '%s' "$service")")"
+    else
+      running="false"
+      container_name=""
+    fi
+    context+="service${OTEL_STAGE_SEPARATOR}${service}${OTEL_STAGE_SEPARATOR}${running}${OTEL_STAGE_SEPARATOR}${container_name}"$'\n'
+  done < <(compose_started_services)
+
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    context+="sender${OTEL_STAGE_SEPARATOR}${pair}"$'\n'
+  done < <(otel_collect_sender_endpoints "$collector_service")
+
+  OTEL_METRICS_URL="$(otel_metrics_url "$collector_id" "" || true)"
+  metrics="$(otel_fetch_internal_metrics "$OTEL_METRICS_URL" || true)"
+  context+="meta${OTEL_STAGE_SEPARATOR}metrics_url${OTEL_STAGE_SEPARATOR}${OTEL_METRICS_URL}"$'\n'
+
+  if logs="$(compose_logs "$collector_service" 2>/dev/null)"; then
+    logs="$(printf '%s\n' "$logs" | strip_ansi_codes | tail -n 400)"
+  else
+    logs=""
+  fi
+
+  OTEL_CONFIG_RECORDS="$(
+    otel_collector_config_facts "$OTEL_CONFIG_TEXT" "$context" "$metrics" "$logs"
+  )" || return 1
+  return 0
+}
+
+# 解析結果のレコードを人が読む形へ整形する。
+#   mode=full    : 設定内容・送信先・チェック結果をすべて表示する
+#   mode=summary : 送信先の判定と総合判定だけを表示する (トレース確認の冒頭で使う)
+render_otel_collector_config_report() {
+  local records="$1" mode="${2:-full}"
+  local kind f1 f2 f3 f4 f5 line
+  local ng_count=0 warn_count=0 unknown_count=0 ok_count=0
+  local destination="" destination_classes="" telemetry_logs="" telemetry_metrics=""
+  local -a pipeline_rows=() comp_rows=() recv_rows=() dest_rows=() sender_rows=()
+  local -a index_rows=() metric_rows=() evidence_rows=() check_rows=()
+
+  while IFS="$OTEL_STAGE_SEPARATOR" read -r kind f1 f2 f3 f4 f5; do
+    [ -n "$kind" ] || continue
+    case "$kind" in
+      meta)
+        case "$f1" in
+          telemetry_logs_level)      telemetry_logs="$f2" ;;
+          telemetry_metrics_address) telemetry_metrics="$f2" ;;
+        esac
+        ;;
+      sum)
+        case "$f1" in
+          destination)          destination="$f2" ;;
+          destination_classes)  destination_classes="$f2" ;;
+          indexed_attributes)   OTEL_INDEXED_ATTRIBUTES="$f2" ;;
+          index_all_attributes) OTEL_INDEX_ALL_ATTRIBUTES="$f2" ;;
+          xray_region)          OTEL_XRAY_REGION="$f2" ;;
+        esac
+        ;;
+      pipeline) pipeline_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}${OTEL_STAGE_SEPARATOR}${f4}") ;;
+      comp)     comp_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}${OTEL_STAGE_SEPARATOR}${f4}${OTEL_STAGE_SEPARATOR}${f5}") ;;
+      recv)     recv_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}${OTEL_STAGE_SEPARATOR}${f4}${OTEL_STAGE_SEPARATOR}${f5}") ;;
+      dest)     dest_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}${OTEL_STAGE_SEPARATOR}${f4}${OTEL_STAGE_SEPARATOR}${f5}") ;;
+      sender)   sender_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}${OTEL_STAGE_SEPARATOR}${f4}") ;;
+      index)    index_rows+=("$f1") ;;
+      metric)   metric_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}") ;;
+      evidence) evidence_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}") ;;
+      check)
+        check_rows+=("${f1}${OTEL_STAGE_SEPARATOR}${f2}${OTEL_STAGE_SEPARATOR}${f3}")
+        case "$f1" in
+          NG)     ng_count=$(( ng_count + 1 )) ;;
+          WARN)   warn_count=$(( warn_count + 1 )) ;;
+          未確認) unknown_count=$(( unknown_count + 1 )) ;;
+          OK)     ok_count=$(( ok_count + 1 )) ;;
+        esac
+        ;;
+    esac
+  done <<< "$records"
+
+  OTEL_DESTINATION_SUMMARY="$destination"
+  OTEL_DESTINATION_CLASSES="$destination_classes"
+  OTEL_CONFIG_CHECK_NG="$ng_count"
+  OTEL_CONFIG_CHECK_WARN="$warn_count"
+
+  if [ "$mode" = "summary" ]; then
+    printf '[送信先の判定] %s\n' "${destination:-判定できませんでした}"
+    printf '[設定チェック] OK %s 件 / NG %s 件 / WARN %s 件 / 未確認 %s 件'  \
+      "$ok_count" "$ng_count" "$warn_count" "$unknown_count"
+    printf ' (詳細はサービス操作メニューの「ADOT Collector の設定チェック」で確認できます)\n'
+    if [ "$ng_count" -gt 0 ]; then
+      while IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3; do
+        [ "$f1" = "NG" ] || continue
+        printf '  [NG] %s: %s\n' "$f2" "$f3"
+      done < <(printf '%s\n' ${check_rows[@]+"${check_rows[@]}"})
+    fi
+    return 0
+  fi
+
+  printf '\n'
+  printf '════════════ ADOT Collector 設定チェック ════════════\n'
+  printf '設定の取得元  : %s\n' "${OTEL_CONFIG_SOURCE:-(不明)}"
+  if [ -n "$OTEL_CONFIG_HOST_PATH" ]; then
+    printf 'マウント元    : %s\n' "$OTEL_CONFIG_HOST_PATH"
+  fi
+  if [ -n "$OTEL_CONFIG_MULTIPLE" ]; then
+    printf '複数の --config: %s (先に読めたものを解析しています)\n' "$OTEL_CONFIG_MULTIPLE"
+  fi
+  printf 'ログレベル    : %s / 内部テレメトリ: %s\n' \
+    "${telemetry_logs:-(不明)}" "${telemetry_metrics:-(不明)}"
+
+  printf '\n[有効なパイプライン] service.pipelines に書かれたものだけが動きます\n'
+  if [ ${#pipeline_rows[@]} -eq 0 ]; then
+    printf '  (パイプラインがありません)\n'
+  else
+    for line in ${pipeline_rows[@]+"${pipeline_rows[@]}"}; do
+      IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 f4 <<< "$line"
+      printf '  %s:\n' "$f1"
+      printf '    receivers  : %s\n' "$f2"
+      printf '    processors : %s\n' "$f3"
+      printf '    exporters  : %s\n' "$f4"
+    done
+  fi
+
+  printf '\n[コンポーネントの有効・無効] 定義があってもパイプライン未参照なら効きません\n'
+  for line in ${comp_rows[@]+"${comp_rows[@]}"}; do
+    IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 f4 f5 <<< "$line"
+    if [ "$f3" = "true" ]; then
+      printf '  [有効] %-12s %-26s %s\n' "$f1" "$f2" "$f5"
+    else
+      printf '  [無効] %-12s %-26s %s\n' "$f1" "$f2" "(どのパイプラインからも参照されていません)"
+    fi
+  done
+
+  printf '\n[受信 (receivers) の待受アドレス]\n'
+  if [ ${#recv_rows[@]} -eq 0 ]; then
+    printf '  (traces パイプラインに receiver がありません)\n'
+  else
+    for line in ${recv_rows[@]+"${recv_rows[@]}"}; do
+      IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 f4 f5 <<< "$line"
+      printf '  %s/%s: %s%s\n' "$f1" "$f2" "$f3" \
+        "$([ -n "$f5" ] && printf ' (%s)' "$f5")"
+    done
+  fi
+  if [ ${#sender_rows[@]} -gt 0 ]; then
+    printf '  [送信元アプリの設定]\n'
+    for line in ${sender_rows[@]+"${sender_rows[@]}"}; do
+      IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 f4 <<< "$line"
+      printf '    %s: %s=%s -> %s\n' "$f1" "$f2" "$f3" "$f4"
+    done
+  fi
+
+  printf '\n[送信先の判定] トレースが実際に向かう先\n'
+  printf '  結論: %s\n' "${destination:-判定できませんでした}"
+  for line in ${dest_rows[@]+"${dest_rows[@]}"}; do
+    IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 f4 f5 <<< "$line"
+    printf '  - exporter=%s\n' "$f1"
+    printf '      区分     : %s\n' "$f2"
+    [ -n "$f3" ] && printf '      endpoint : %s\n' "$f3"
+    [ -n "$f4" ] && printf '      region   : %s\n' "$f4"
+    printf '      説明     : %s\n' "$f5"
+  done
+
+  printf '\n[X-Ray の注釈 (indexed_attributes)] X-Ray でフィルタ検索できる属性\n'
+  if [ ${#index_rows[@]} -eq 0 ]; then
+    printf '  (指定なし。X-Ray では全属性がメタデータ扱いになり、フィルタ式で検索できません)\n'
+  else
+    for line in ${index_rows[@]+"${index_rows[@]}"}; do
+      printf '  - %s\n' "$line"
+    done
+  fi
+  if [ "$OTEL_INDEX_ALL_ATTRIBUTES" = "true" ]; then
+    printf '  index_all_attributes: true (全属性が注釈になります)\n'
+  fi
+
+  if [ ${#metric_rows[@]} -gt 0 ]; then
+    printf '\n[内部テレメトリ] exporter ごとの実送信件数\n'
+    for line in ${metric_rows[@]+"${metric_rows[@]}"}; do
+      IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 <<< "$line"
+      printf '  %-56s %s\n' "$f1" "$f2"
+    done
+  fi
+
+  if [ ${#evidence_rows[@]} -gt 0 ]; then
+    printf '\n[Collector ログの証跡]\n'
+    for line in ${evidence_rows[@]+"${evidence_rows[@]}"}; do
+      IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 <<< "$line"
+      printf '  (%s) %s\n' "$f1" "$f2"
+    done
+  fi
+
+  printf '\n[チェック結果]\n'
+  for line in ${check_rows[@]+"${check_rows[@]}"}; do
+    IFS="$OTEL_STAGE_SEPARATOR" read -r f1 f2 f3 <<< "$line"
+    printf '  [%s] %s\n' "$f1" "$f2"
+    [ -n "$f3" ] && printf '        %s\n' "$f3"
+  done
+
+  printf '\n'
+  if [ "$ng_count" -gt 0 ]; then
+    printf '総合判定: NG %s 件 / WARN %s 件 / 未確認 %s 件 / OK %s 件 — 上の [NG] を修正してください\n' \
+      "$ng_count" "$warn_count" "$unknown_count" "$ok_count"
+  elif [ "$warn_count" -gt 0 ]; then
+    printf '総合判定: NG なし (WARN %s 件 / 未確認 %s 件 / OK %s 件)\n' \
+      "$warn_count" "$unknown_count" "$ok_count"
+  else
+    printf '総合判定: 確認できた項目はすべて OK (%s 件 / 未確認 %s 件)\n' \
+      "$ok_count" "$unknown_count"
+  fi
+  printf '════════════════════════════════════════════════════════════\n'
+  return 0
+}
+
+# 実際に効いている設定ファイルの本文を表示する。値に見えるトークン類は伏せる。
+otel_print_config_body() {
+  local limit="${1:-300}" total
+
+  [ -n "$OTEL_CONFIG_TEXT" ] || return 0
+  total="$(printf '%s\n' "$OTEL_CONFIG_TEXT" | wc -l | tr -d ' ')"
+  printf '\n[設定ファイルの本文] %s\n' "${OTEL_CONFIG_PATH:-${OTEL_CONFIG_ENV_NAME:-(取得元不明)}}"
+  printf '%s\n' "$OTEL_CONFIG_TEXT" \
+    | sed -E 's/^([[:space:]]*[^:#]*(token|password|passwd|secret|authorization|credential|api[_-]?key)[^:]*:[[:space:]]*)[^[:space:]].*$/\1[REDACTED]/I' \
+    | head -n "$limit" \
+    | sed 's/^/  | /'
+  if [ "$total" -gt "$limit" ] 2>/dev/null; then
+    printf '  | ... 残り %s 行を省略\n' "$(( total - limit ))"
+  fi
+}
+
+# 対象サービスから OTel Collector のサービス名を決める。
+# jaeger を選んだ場合は、同じ Compose で動いている Collector を探す。
+otel_resolve_collector_service() {
+  local selected_service="$1"
+  case "$selected_service" in
+    otel|adot-collector) printf '%s\n' "$selected_service" ;;
+    *) find_first_running_compose_service adot-collector otel || return 1 ;;
+  esac
+}
+
+# サービス操作メニューの「ADOT Collector の設定チェック」。
+run_adot_collector_config_helper() {
+  local selected_service="$1" collector_service="" collector_id=""
+  local -a collector_ids=()
+
+  resolve_observability_python || return 1
+  if ! collector_service="$(otel_resolve_collector_service "$selected_service")"; then
+    err "実行中の OTel Collector サービス (adot-collector / otel) が見つかりません。"
+    return 1
+  fi
+  mapfile -t collector_ids < <(compose_container_ids "$collector_service")
+  if [ ${#collector_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${collector_service}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  collector_id="${collector_ids[0]}"
+
+  diag ""
+  diag "ADOT Collector (${collector_service}) で有効になっている設定と送信先を確認します。"
+  if ! otel_collect_config_records "$collector_service" "$collector_id"; then
+    return 1
+  fi
+  render_otel_collector_config_report "$OTEL_CONFIG_RECORDS" "full" >&2 || return 1
+  otel_print_config_body 300 >&2
+  diag ""
+  diag "設定本文・トレース属性には機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+  return 0
+}
+
+# ---- Jaeger トレースの HTML 出力 ----------------------------------------------
+# Jaeger の UI をブラウザで開けない環境でもトレースを確認できるよう、取得した
+# トレースを単体で開ける HTML (と CSS / JS) へ書き出す。出力物は外部リソースを
+# 一切参照しないため、別端末へコピーしてダブルクリックするだけで開ける。
+# file:// では fetch でのローカル JSON 読み込みが遮断されるため、データは JSON
+# ファイルではなく JS ファイル (グローバル変数への代入) として出す。
+
+# 出力先を決める。--trace-report-dir > --report-dir 配下 > 一時ディレクトリ。
+# 対話中は何度でも出力できるため、既存があれば連番を足して前回を上書きしない。
+resolve_trace_report_path() {
+  local base_dir candidate counter=1 name
+
+  if [ "$TRACE_REPORT_DIR_SET" = "true" ]; then
+    base_dir="$TRACE_REPORT_DIR"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base_dir="$BUILD_REPORT_DIR"
+  else
+    base_dir="${TMPDIR:-/tmp}"
+  fi
+  base_dir="${base_dir%/}"
+  name="build_and_verify_${RUN_TIMESTAMP}_jaeger_traces"
+  if [ "$TRACE_REPORT_FORMAT" = "files" ]; then
+    candidate="${base_dir}/${name}"
+  else
+    candidate="${base_dir}/${name}.htm"
+  fi
+  while [ -e "$candidate" ]; do
+    if [ "$TRACE_REPORT_FORMAT" = "files" ]; then
+      candidate="${base_dir}/${name}_${counter}"
+    else
+      candidate="${base_dir}/${name}_${counter}.htm"
+    fi
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 取得したトレースを HTML へ整形して書き出す。
+# 標準入力へ渡す文書の並び:
+#   0        : Jaeger のサービス一覧 JSON
+#   1        : 実際にトレースを取得できたサービス名 (改行区切り)
+#   2        : ADOT Collector 設定チェックのレコード (空でもよい)
+#   3 以降   : サービスごとのトレース JSON (1 と同じ並び)
+# 出力は "書き出したパス<US>バイト数" の行 (1 行目が入口のファイル)。
+render_jaeger_trace_html() {
+  local out_path="$1" out_format="$2" jaeger_url="$3" destination="$4"
+  local indexed="$5" index_all="$6" xray_region="$7" compose_file="$8"
+  local generated_at="$9" lookback="${10}" limit="${11}" document_count="${12}"
+  shift 12
+  local program
+
+  program="$(cat <<'PY'
+import datetime
+import json
+import os
+import re
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+SEP = "\x1f"
+
+
+def load_documents(count):
+    """標準入力の NUL 区切りテキストを、指定個数だけ UTF-8 で読み出す。"""
+    chunks = sys.stdin.buffer.read().split(b"\0")
+    documents = []
+    for index in range(count):
+        chunk = chunks[index] if index < len(chunks) else b""
+        documents.append(chunk.decode("utf-8", "replace"))
+    return documents
+
+
+# ---- 機微情報の伏せ字 (画面表示と同じ規則) ----------------------------------
+SENSITIVE_KEY = re.compile(
+    r"(?i)(password|passwd|pwd|secret|token|authorization|cookie|api[._-]?key|credential)"
+)
+SENSITIVE_TEXT = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|authorization|cookie|api[_-]?key|credential)"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+
+
+def clean_value(key, value, limit=400):
+    if SENSITIVE_KEY.search(str(key)):
+        return "[REDACTED]"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    elif value is None:
+        text = ""
+    else:
+        text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = SENSITIVE_TEXT.sub(
+        lambda match: "%s%s[REDACTED]" % (match.group(1), match.group(2)), text
+    )
+    return text if len(text) <= limit else text[:limit] + "...(省略)"
+
+
+def tags_as_pairs(tags):
+    pairs = []
+    for tag in tags if isinstance(tags, list) else []:
+        if isinstance(tag, dict):
+            pairs.append((str(tag.get("key") or ""), tag.get("value")))
+    return pairs
+
+
+def tags_as_map(tags):
+    return dict(tags_as_pairs(tags))
+
+
+JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
+
+
+def micros_to_text(value):
+    try:
+        stamp = float(value) / 1000000.0
+        return datetime.datetime.fromtimestamp(stamp, JST).isoformat(
+            timespec="milliseconds").replace("+09:00", " JST")
+    except Exception:
+        return ""
+
+
+def millis_text(value):
+    try:
+        return "%.3f ms" % (float(value) / 1000.0)
+    except Exception:
+        return "-"
+
+
+def age_text(start_micros, now_seconds):
+    try:
+        delta = now_seconds - float(start_micros) / 1000000.0
+    except Exception:
+        return "-"
+    if delta < 0:
+        return "0秒前"
+    if delta < 60:
+        return "%d秒前" % int(delta)
+    if delta < 3600:
+        return "%d分前" % int(delta // 60)
+    if delta < 86400:
+        return "%d時間前" % int(delta // 3600)
+    return "%d日前" % int(delta // 86400)
+
+
+# ---- X-Ray の表現へ寄せる変換 (awsxray exporter と同じ規則) -----------------
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+HEXONLY = re.compile(r"^[0-9a-fA-F]+$")
+ANNOTATION_KEY = re.compile(r"[^A-Za-z0-9_]")
+
+
+def xray_trace_id(trace_id):
+    text = str(trace_id or "").strip().lower()
+    if len(text) == 16:
+        text = "0" * 16 + text
+    if not HEX32.match(text):
+        return ""
+    return "1-%s-%s" % (text[:8], text[8:])
+
+
+def annotation_key(key):
+    return ANNOTATION_KEY.sub("_", str(key))
+
+
+def first_of(values, *keys):
+    for key in keys:
+        if key in values and values[key] not in (None, ""):
+            return values[key]
+    return None
+
+
+def http_facts(values):
+    method = first_of(values, "http.request.method", "http.method")
+    url = first_of(values, "url.full", "http.url")
+    if not url:
+        path = first_of(values, "url.path", "http.target", "http.route")
+        host = first_of(values, "server.address", "http.host", "net.host.name")
+        if path or host:
+            url = "%s%s" % (host or "", path or "")
+    status = first_of(values, "http.response.status_code", "http.status_code")
+    client = first_of(values, "client.address", "http.client_ip", "net.peer.ip",
+                      "net.sock.peer.addr")
+    agent = first_of(values, "user_agent.original", "http.user_agent")
+    return method, url, status, client, agent
+
+
+def status_number(status):
+    try:
+        return int(str(status))
+    except (TypeError, ValueError):
+        return 0
+
+
+def xray_status(values):
+    code = status_number(first_of(values, "http.response.status_code", "http.status_code"))
+    otel_status = str(first_of(values, "otel.status_code", "status.code") or "").upper()
+    error = fault = throttle = False
+    if code == 429:
+        throttle = True
+    elif 400 <= code < 500:
+        error = True
+    elif code >= 500:
+        fault = True
+    flag = values.get("error")
+    if flag is True or str(flag).lower() == "true":
+        error = True
+    if otel_status == "ERROR" and not (error or fault or throttle):
+        fault = True
+    return error, fault, throttle, code
+
+
+def status_marks(values):
+    error, fault, throttle, code = xray_status(values)
+    marks = []
+    if fault:
+        marks.append("Fault")
+    if error:
+        marks.append("Error")
+    if throttle:
+        marks.append("Throttle")
+    return marks, code
+
+
+def xray_origin(resources):
+    platform = str(resources.get("cloud.platform") or "")
+    if platform == "aws_ecs" or any(key.startswith("aws.ecs.") for key in resources):
+        if str(resources.get("aws.ecs.launchtype") or "").lower() == "fargate":
+            return "AWS::ECS::Container (Fargate)"
+        return "AWS::ECS::Container"
+    if platform == "aws_eks":
+        return "AWS::EKS::Container"
+    if platform == "aws_lambda":
+        return "AWS::Lambda::Function"
+    if platform == "aws_ec2":
+        return "AWS::EC2::Instance"
+    return ""
+
+
+def xray_namespace(values):
+    if str(values.get("rpc.system") or "") == "aws-api":
+        return "aws"
+    if any(key.startswith("aws.") for key in values):
+        return "aws"
+    for key in ("db.system", "peer.service", "server.address", "http.url", "url.full",
+                "net.peer.name", "messaging.system"):
+        if values.get(key):
+            return "remote"
+    return ""
+
+
+def span_kind(values):
+    return str(first_of(values, "span.kind", "otel.span.kind") or "").lower()
+
+
+AWS_SECTION_KEYS = (
+    ("aws.ecs.cluster.arn", "cluster_arn"),
+    ("aws.ecs.task.arn", "task_arn"),
+    ("aws.ecs.task.family", "task_family"),
+    ("aws.ecs.task.revision", "task_revision"),
+    ("aws.ecs.container.name", "container_name"),
+    ("aws.ecs.service.name", "service_name"),
+    ("aws.ecs.launchtype", "launch_type"),
+    ("cloud.account.id", "account_id"),
+    ("cloud.region", "region"),
+    ("cloud.availability_zone", "availability_zone"),
+    ("host.id", "instance_id"),
+)
+
+MAX_SPANS_PER_TRACE = 500
+MAX_ATTRIBUTES_PER_SPAN = 60
+
+
+# ---- 入力 -------------------------------------------------------------------
+out_path = sys.argv[1]
+out_format = sys.argv[2] if len(sys.argv) > 2 else "single"
+jaeger_url = (sys.argv[3] if len(sys.argv) > 3 else "").rstrip("/")
+destination = sys.argv[4] if len(sys.argv) > 4 else ""
+indexed_attributes = [item for item in (sys.argv[5] if len(sys.argv) > 5 else "").split(",") if item]
+index_all = (sys.argv[6] if len(sys.argv) > 6 else "false") == "true"
+xray_region = sys.argv[7] if len(sys.argv) > 7 else ""
+compose_file = sys.argv[8] if len(sys.argv) > 8 else ""
+generated_at = sys.argv[9] if len(sys.argv) > 9 else ""
+lookback = sys.argv[10] if len(sys.argv) > 10 else ""
+limit = sys.argv[11] if len(sys.argv) > 11 else ""
+document_count = int(sys.argv[12]) if len(sys.argv) > 12 else 3
+
+documents = load_documents(document_count)
+services_raw = documents[0] if documents else "{}"
+fetched_text = documents[1] if len(documents) > 1 else ""
+checks_text = documents[2] if len(documents) > 2 else ""
+trace_documents = documents[3:]
+
+try:
+    services_document = json.loads(services_raw) if services_raw.strip() else {}
+except Exception:
+    services_document = {}
+all_services = [str(name) for name in (services_document.get("data") or [])
+                if isinstance(name, str)]
+fetched_services = [line for line in fetched_text.splitlines() if line]
+
+checks = []
+destinations = []
+for line in checks_text.splitlines():
+    if not line:
+        continue
+    parts = line.split(SEP)
+    if parts[0] == "check" and len(parts) >= 4:
+        checks.append({"verdict": parts[1], "label": parts[2], "detail": parts[3]})
+    elif parts[0] == "dest" and len(parts) >= 6:
+        destinations.append({"exporter": parts[1], "kind": parts[2],
+                             "endpoint": parts[3], "region": parts[4], "detail": parts[5]})
+
+now_seconds = datetime.datetime.now(JST).timestamp()
+
+
+# ---- トレースの取り込み (サービスをまたいで重複を除く) ----------------------
+raw_traces = {}
+for index, service_name in enumerate(fetched_services):
+    if index >= len(trace_documents):
+        break
+    try:
+        document = json.loads(trace_documents[index]) if trace_documents[index].strip() else {}
+    except Exception:
+        continue
+    for trace in (document.get("data") or []):
+        if not isinstance(trace, dict):
+            continue
+        trace_id = str(trace.get("traceID") or "")
+        if not trace_id:
+            continue
+        previous = raw_traces.get(trace_id)
+        # 同じトレースが複数サービスから返るため、スパン数が多い方 (欠けの少ない方) を残す。
+        if previous is None or len(trace.get("spans") or []) > len(previous.get("spans") or []):
+            raw_traces[trace_id] = trace
+
+
+def build_trace(trace):
+    spans = [span for span in (trace.get("spans") or []) if isinstance(span, dict)]
+    spans.sort(key=lambda span: span.get("startTime") or 0)
+    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
+    span_by_id = {str(span.get("spanID")): span for span in spans}
+
+    parent_of = {}
+    children = {}
+    roots = []
+    for span in spans:
+        parent_id = ""
+        for reference in (span.get("references") or []):
+            if not isinstance(reference, dict):
+                continue
+            candidate = str(reference.get("spanID") or "")
+            if candidate and candidate in span_by_id:
+                parent_id = candidate
+                break
+        parent_of[str(span.get("spanID"))] = parent_id
+        if parent_id:
+            children.setdefault(parent_id, []).append(span)
+        else:
+            roots.append(span)
+
+    starts = [span.get("startTime") for span in spans
+              if isinstance(span.get("startTime"), (int, float))]
+    ends = [span.get("startTime") + span.get("duration") for span in spans
+            if isinstance(span.get("startTime"), (int, float))
+            and isinstance(span.get("duration"), (int, float))]
+    start = min(starts) if starts else 0
+    total = (max(ends) - start) if (start and ends) else 0
+    span_total = float(total) if total else 1.0
+
+    def resource_of(span):
+        process = processes.get(span.get("processID"))
+        if not isinstance(process, dict):
+            return {}, "(unknown)"
+        return tags_as_map(process.get("tags")), str(process.get("serviceName") or "(unknown)")
+
+    merged = {}
+    for span in spans:
+        resources, _ = resource_of(span)
+        merged.update(resources)
+        merged.update(tags_as_map(span.get("tags")))
+
+    rows = []
+    error_count = 0
+
+    def walk(span, depth):
+        nonlocal error_count
+        if len(rows) >= MAX_SPANS_PER_TRACE:
+            return
+        span_id = str(span.get("spanID"))
+        values = tags_as_map(span.get("tags"))
+        resources, service_name = resource_of(span)
+        is_segment = (not parent_of.get(span_id)) or span_kind(values) in ("server", "consumer")
+        marks, code = status_marks(values)
+        if marks:
+            error_count += 1
+        offset = 0
+        if start and isinstance(span.get("startTime"), (int, float)):
+            offset = span.get("startTime") - start
+        duration = span.get("duration") if isinstance(span.get("duration"), (int, float)) else 0
+        method, url, status, client, agent = http_facts(values)
+        remote = first_of(values, "peer.service", "server.address", "net.peer.name",
+                          "db.namespace", "db.name")
+        name = service_name if is_segment else (str(remote) if remote
+                                                else str(span.get("operationName") or ""))
+        exceptions = []
+        for event in (span.get("logs") or []):
+            if not isinstance(event, dict):
+                continue
+            fields = tags_as_map(event.get("fields"))
+            if str(fields.get("event") or "") != "exception" and not fields.get("exception.type"):
+                continue
+            exceptions.append({
+                "time": micros_to_text(event.get("timestamp")),
+                "type": clean_value("exception.type", fields.get("exception.type") or "-", 120),
+                "message": clean_value("exception.message", fields.get("exception.message") or "-", 400),
+                "stack": clean_value("exception.stacktrace", fields.get("exception.stacktrace") or "", 2000),
+            })
+        attributes = []
+        for key, value in sorted(tags_as_pairs(span.get("tags")))[:MAX_ATTRIBUTES_PER_SPAN]:
+            attributes.append({"key": clean_value("key", key, 120),
+                               "value": clean_value(key, value)})
+        sql = None
+        if values.get("db.system"):
+            sql = {
+                "database_type": clean_value("db.system", values.get("db.system"), 60),
+                "database": clean_value("db", first_of(values, "db.namespace", "db.name") or "-", 80),
+                "sanitized_query": clean_value(
+                    "db.statement", first_of(values, "db.query.text", "db.statement") or "-", 600),
+            }
+        rows.append({
+            "id": span_id,
+            "depth": depth,
+            "kind": "Segment" if is_segment else "Subsegment",
+            "name": clean_value("name", name or "(unknown)", 140),
+            "service": clean_value("service", service_name, 80),
+            "operation": clean_value("operationName", span.get("operationName") or "(unknown)", 200),
+            "namespace": "" if is_segment else xray_namespace(values),
+            "offset": offset,
+            "offset_text": millis_text(offset),
+            "duration": duration,
+            "duration_text": millis_text(duration),
+            "offset_pct": round(min(100.0, max(0.0, offset / span_total * 100.0)), 3),
+            "width_pct": round(min(100.0, max(0.4, duration / span_total * 100.0)), 3),
+            "status": code,
+            "marks": marks,
+            "http": {
+                "method": clean_value("method", method or "", 20),
+                "url": clean_value("url", url or "", 300),
+                "client": clean_value("client", client or "", 80),
+                "agent": clean_value("user_agent", agent or "", 200),
+            },
+            "sql": sql,
+            "exceptions": exceptions,
+            "attributes": attributes,
+        })
+        for child in sorted(children.get(span_id, []), key=lambda item: item.get("startTime") or 0):
+            walk(child, depth + 1)
+
+    for root in (roots or spans[:1]):
+        walk(root, 0)
+
+    root_span = roots[0] if roots else (spans[0] if spans else {})
+    root_values = tags_as_map(root_span.get("tags")) if root_span else {}
+    method, url, status, client, agent = http_facts(root_values)
+    marks, code = status_marks(root_values)
+
+    annotations = []
+    metadata = []
+    for key in sorted(merged):
+        entry = {"key": clean_value("key", key, 120),
+                 "value": clean_value(key, merged[key])}
+        if index_all or key in indexed_attributes:
+            entry["xray_key"] = annotation_key(key)
+            annotations.append(entry)
+        else:
+            metadata.append(entry)
+
+    aws_section = [{"field": field, "value": clean_value(field, merged[key], 300)}
+                   for key, field in AWS_SECTION_KEYS if key in merged]
+
+    origin = ""
+    for span in spans:
+        resources, _ = resource_of(span)
+        origin = xray_origin(resources) or origin
+
+    services = sorted({str(process.get("serviceName"))
+                       for process in processes.values()
+                       if isinstance(process, dict) and process.get("serviceName")})
+
+    trace_id = str(trace.get("traceID") or "")
+    converted = xray_trace_id(trace_id)
+
+    # 画面の絞り込みは JS 側で 1 文字列との部分一致にするため、検索対象をここで作る。
+    search_parts = [trace_id, converted, str(url or ""), str(method or "")]
+    search_parts.extend(services)
+    for row in rows:
+        search_parts.append(row["operation"])
+        search_parts.append(row["name"])
+        search_parts.append(row["service"])
+    for entry in annotations + metadata:
+        search_parts.append(entry["key"])
+        search_parts.append(entry["value"])
+    search_index = " ".join(part for part in search_parts if part).lower()[:20000]
+
+    return {
+        "search": search_index,
+        "trace_id": trace_id,
+        "xray_id": converted,
+        "start": start,
+        "start_text": micros_to_text(start),
+        "age_text": age_text(start, now_seconds),
+        "duration": total,
+        "duration_text": millis_text(total),
+        "span_count": len(spans),
+        "shown_span_count": len(rows),
+        "error_count": error_count,
+        "services": [clean_value("service", name, 80) for name in services],
+        "method": clean_value("method", method or "", 20),
+        "url": clean_value("url", url or "", 300),
+        "status": code,
+        "client": clean_value("client", client or "", 80),
+        "agent": clean_value("user_agent", agent or "", 200),
+        "marks": marks,
+        "origin": origin,
+        "jaeger_link": ("%s/trace/%s" % (jaeger_url, trace_id)
+                        if jaeger_url and HEXONLY.match(trace_id or "") else ""),
+        "xray_link": ("https://%s.console.aws.amazon.com/xray/home?region=%s#/traces/%s"
+                      % (xray_region, xray_region, converted) if xray_region and converted else ""),
+        "annotations": annotations,
+        "metadata": metadata,
+        "aws": aws_section,
+        "spans": rows,
+    }
+
+
+traces = [build_trace(trace) for trace in raw_traces.values()]
+traces.sort(key=lambda item: item.get("start") or 0, reverse=True)
+
+# ---- サービスマップ相当 -----------------------------------------------------
+nodes = {}
+edges = {}
+for trace in raw_traces.values():
+    spans = [span for span in (trace.get("spans") or []) if isinstance(span, dict)]
+    processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
+    span_by_id = {str(span.get("spanID")): span for span in spans}
+
+    def service_of(span):
+        process = processes.get(span.get("processID"))
+        if isinstance(process, dict) and process.get("serviceName"):
+            return str(process.get("serviceName"))
+        return "(unknown)"
+
+    for span in spans:
+        values = tags_as_map(span.get("tags"))
+        name = service_of(span)
+        marks, _ = status_marks(values)
+        node = nodes.setdefault(name, {"name": name, "spans": 0, "fault": 0, "error": 0,
+                                       "throttle": 0, "duration": 0.0})
+        node["spans"] += 1
+        node["fault"] += 1 if "Fault" in marks else 0
+        node["error"] += 1 if "Error" in marks else 0
+        node["throttle"] += 1 if "Throttle" in marks else 0
+        try:
+            node["duration"] += float(span.get("duration") or 0)
+        except (TypeError, ValueError):
+            pass
+        parent_id = ""
+        for reference in (span.get("references") or []):
+            if isinstance(reference, dict) and str(reference.get("spanID") or "") in span_by_id:
+                parent_id = str(reference.get("spanID"))
+                break
+        if parent_id:
+            caller = service_of(span_by_id[parent_id])
+            if caller != name:
+                edge = edges.setdefault((caller, name), {"caller": caller, "callee": name,
+                                                         "count": 0, "error": 0})
+                edge["count"] += 1
+                edge["error"] += 1 if marks else 0
+
+node_rows = []
+for name in sorted(nodes):
+    node = nodes[name]
+    average = node["duration"] / node["spans"] / 1000.0 if node["spans"] else 0.0
+    node_rows.append({"name": clean_value("service", name, 80), "spans": node["spans"],
+                      "fault": node["fault"], "error": node["error"],
+                      "throttle": node["throttle"], "average_text": "%.3f ms" % average})
+edge_rows = [{"caller": clean_value("service", key[0], 80),
+              "callee": clean_value("service", key[1], 80),
+              "count": value["count"], "error": value["error"]}
+             for key, value in sorted(edges.items())]
+
+payload = {
+    "meta": {
+        "generated_at": generated_at,
+        "jaeger_url": jaeger_url,
+        "destination": destination,
+        "compose_file": compose_file,
+        "lookback": lookback,
+        "limit": limit,
+        "xray_region": xray_region,
+        "indexed_attributes": indexed_attributes,
+        "index_all": index_all,
+        "all_services": all_services,
+        "fetched_services": fetched_services,
+        "trace_count": len(traces),
+        "span_count": sum(trace["span_count"] for trace in traces),
+    },
+    "checks": checks,
+    "destinations": destinations,
+    "traces": traces,
+    "service_map": {"nodes": node_rows, "edges": edge_rows},
+}
+
+
+# ---- 出力 (外部リソースを一切参照しない。file:// でそのまま開ける) ----------
+CSS = """
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --border: #d7dce3;
+  --text: #1b1f24;
+  --muted: #5b6673;
+  --accent: #1f6feb;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --ng: #cf222e;
+  --bar: #6aa9ff;
+  --bar-error: #ff8a8a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --panel: #1c2229;
+    --border: #303a45;
+    --text: #e6edf3;
+    --muted: #9aa7b4;
+    --accent: #6aa9ff;
+    --ok: #4ac26b;
+    --warn: #d4a72c;
+    --ng: #ff7b72;
+    --bar: #2f5f9e;
+    --bar-error: #8b3a3a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 0 0 48px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Meiryo UI", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+header {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+}
+header h1 { margin: 0 0 4px; font-size: 18px; }
+header p { margin: 0; color: var(--muted); font-size: 13px; }
+main { padding: 0 24px; }
+section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 16px 0;
+  padding: 16px;
+}
+section > h2 { margin: 0 0 12px; font-size: 15px; }
+section > h3 { margin: 16px 0 8px; font-size: 14px; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+.kv th { width: 190px; }
+.scroll { overflow-x: auto; }
+code, .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; word-break: break-all; }
+.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.controls label { color: var(--muted); font-size: 13px; }
+.controls input[type="search"], .controls select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.controls input[type="search"] { min-width: 260px; }
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.badge-ok { color: var(--ok); border-color: var(--ok); }
+.badge-warn { color: var(--warn); border-color: var(--warn); }
+.badge-ng { color: var(--ng); border-color: var(--ng); }
+.badge-info { color: var(--muted); }
+.trace-row { cursor: pointer; }
+.trace-row:hover { background: rgba(127, 127, 127, 0.12); }
+.trace-row.selected { background: rgba(31, 111, 235, 0.16); }
+.muted { color: var(--muted); }
+.nowrap { white-space: nowrap; }
+.span-row { border-bottom: 1px solid var(--border); padding: 8px 0; }
+.span-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.span-kind {
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.span-kind.segment { color: var(--accent); border-color: var(--accent); }
+.span-name { font-weight: 600; }
+.timeline { background: rgba(127, 127, 127, 0.16); border-radius: 3px; height: 10px; margin: 4px 0; position: relative; }
+.timeline > span { position: absolute; top: 0; height: 10px; border-radius: 3px; background: var(--bar); }
+.timeline > span.error { background: var(--bar-error); }
+.span-detail { margin: 4px 0 0 16px; }
+.span-detail table { width: auto; min-width: 60%; }
+details { margin-top: 4px; }
+summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+a { color: var(--accent); }
+.empty { color: var(--muted); padding: 12px 0; }
+.count { color: var(--muted); font-size: 13px; margin-left: auto; }
+.exception { border-left: 3px solid var(--ng); padding-left: 8px; margin: 4px 0; }
+.exception pre { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; }
+.notice {
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: rgba(154, 103, 0, 0.08);
+  padding: 10px 14px;
+  margin: 12px 24px 0;
+  font-size: 13px;
+}
+.notice strong { color: var(--warn); }
+"""
+
+JS = """
+(function () {
+  "use strict";
+  var data = window.TRACE_DATA || {};
+  var meta = data.meta || {};
+  var traces = data.traces || [];
+  var state = { query: "", service: "", errorsOnly: false, selected: null };
+
+  function byId(id) { return document.getElementById(id); }
+
+  function make(tag, cls, value) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (value !== undefined && value !== null && value !== "") {
+      node.textContent = String(value);
+    }
+    return node;
+  }
+
+  function addRow(parent, label, value) {
+    if (value === undefined || value === null || value === "") { return; }
+    var tr = make("tr");
+    tr.appendChild(make("th", null, label));
+    tr.appendChild(make("td", null, value));
+    parent.appendChild(tr);
+  }
+
+  function addLinkRow(parent, label, url) {
+    if (!url) { return; }
+    var tr = make("tr");
+    tr.appendChild(make("th", null, label));
+    var td = make("td");
+    var link = make("a", null, url);
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    td.appendChild(link);
+    tr.appendChild(td);
+    parent.appendChild(tr);
+  }
+
+  function marksNode(marks) {
+    var wrap = make("span");
+    if (!marks || !marks.length) {
+      wrap.appendChild(make("span", "badge badge-ok", "OK"));
+      return wrap;
+    }
+    for (var i = 0; i < marks.length; i += 1) {
+      wrap.appendChild(make("span", "badge badge-ng", marks[i]));
+    }
+    return wrap;
+  }
+
+  function verdictClass(verdict) {
+    if (verdict === "OK") { return "badge badge-ok"; }
+    if (verdict === "NG") { return "badge badge-ng"; }
+    if (verdict === "WARN") { return "badge badge-warn"; }
+    return "badge badge-info";
+  }
+
+  function renderMeta() {
+    var table = byId("meta-table");
+    addRow(table, "出力日時", meta.generated_at);
+    addRow(table, "送信先の判定", meta.destination);
+    addRow(table, "Jaeger Query API", meta.jaeger_url);
+    addRow(table, "compose ファイル", meta.compose_file);
+    addRow(table, "取得範囲", (meta.lookback || "") + " / サービスごと最大 " + (meta.limit || "") + " トレース");
+    addRow(table, "取得結果", (meta.trace_count || 0) + " トレース / " + (meta.span_count || 0) + " スパン");
+    addRow(table, "Jaeger のサービス", (meta.all_services || []).join(", "));
+    addRow(table, "X-Ray の注釈 (indexed_attributes)",
+      meta.index_all ? "index_all_attributes: true (全属性)"
+        : ((meta.indexed_attributes || []).join(", ") || "(指定なし。X-Ray では全属性がメタデータ扱い)"));
+    addRow(table, "X-Ray のリージョン", meta.xray_region);
+
+    var checks = data.checks || [];
+    var box = byId("checks");
+    if (!checks.length) {
+      box.appendChild(make("p", "empty", "Collector の設定チェック結果はありません。"));
+      return;
+    }
+    var list = make("table");
+    for (var i = 0; i < checks.length; i += 1) {
+      var tr = make("tr");
+      var head = make("th");
+      head.appendChild(make("span", verdictClass(checks[i].verdict), checks[i].verdict));
+      tr.appendChild(head);
+      var td = make("td");
+      td.appendChild(make("div", null, checks[i].label));
+      if (checks[i].detail) { td.appendChild(make("div", "muted", checks[i].detail)); }
+      tr.appendChild(td);
+      list.appendChild(tr);
+    }
+    box.appendChild(list);
+  }
+
+  function matches(trace) {
+    if (state.errorsOnly && !(trace.marks && trace.marks.length)) { return false; }
+    if (state.service && (trace.services || []).indexOf(state.service) < 0) { return false; }
+    if (!state.query) { return true; }
+    return (trace.search || "").indexOf(state.query) >= 0;
+  }
+
+  function renderList() {
+    var body = byId("trace-body");
+    body.textContent = "";
+    var shown = 0;
+    for (var i = 0; i < traces.length; i += 1) {
+      var trace = traces[i];
+      if (!matches(trace)) { continue; }
+      shown += 1;
+      var tr = make("tr", "trace-row");
+      if (state.selected === trace.trace_id) { tr.className += " selected"; }
+      tr.appendChild(make("td", "mono", trace.xray_id || trace.trace_id));
+      tr.appendChild(make("td", "nowrap", trace.start_text));
+      tr.appendChild(make("td", "nowrap", trace.age_text));
+      tr.appendChild(make("td", "nowrap", trace.method || "-"));
+      tr.appendChild(make("td", "nowrap", trace.status || "-"));
+      tr.appendChild(make("td", "nowrap", trace.duration_text));
+      tr.appendChild(make("td", null, trace.span_count));
+      tr.appendChild(make("td", null, (trace.services || []).join(", ")));
+      tr.appendChild(make("td", null, trace.url || "-"));
+      var mark = make("td", "nowrap");
+      mark.appendChild(marksNode(trace.marks));
+      tr.appendChild(mark);
+      (function (id) {
+        tr.addEventListener("click", function () { select(id); });
+      }(trace.trace_id));
+      body.appendChild(tr);
+    }
+    byId("trace-count").textContent = shown + " / " + traces.length + " トレースを表示";
+    if (!shown) {
+      var tr2 = make("tr");
+      var td2 = make("td", "empty", "条件に一致するトレースがありません。");
+      td2.colSpan = 10;
+      tr2.appendChild(td2);
+      body.appendChild(tr2);
+    }
+  }
+
+  function spanNode(span) {
+    var wrap = make("div", "span-row");
+    wrap.style.marginLeft = (span.depth * 18) + "px";
+
+    var head = make("div", "span-head");
+    head.appendChild(make("span", "span-kind" + (span.kind === "Segment" ? " segment" : ""), span.kind));
+    head.appendChild(make("span", "span-name", span.name));
+    head.appendChild(make("span", "muted", "[" + span.service + "]"));
+    if (span.namespace) { head.appendChild(make("span", "badge badge-info", "namespace=" + span.namespace)); }
+    if (span.status) { head.appendChild(make("span", "badge badge-info", "http.status=" + span.status)); }
+    head.appendChild(marksNode(span.marks));
+    wrap.appendChild(head);
+
+    var bar = make("div", "timeline");
+    var fill = make("span", (span.marks && span.marks.length) ? "error" : null);
+    fill.style.left = span.offset_pct + "%";
+    fill.style.width = span.width_pct + "%";
+    bar.appendChild(fill);
+    wrap.appendChild(bar);
+
+    wrap.appendChild(make("div", "muted mono",
+      "offset=" + span.offset_text + "  duration=" + span.duration_text +
+      "  spanID=" + span.id + "  操作=" + span.operation));
+
+    var detail = make("div", "span-detail");
+    var table = make("table", "kv");
+    if (span.http) {
+      addRow(table, "http.method", span.http.method);
+      addRow(table, "http.url", span.http.url);
+      addRow(table, "http.client_ip", span.http.client);
+      addRow(table, "http.user_agent", span.http.agent);
+    }
+    if (span.sql) {
+      addRow(table, "sql.database_type", span.sql.database_type);
+      addRow(table, "sql.database", span.sql.database);
+      addRow(table, "sql.sanitized_query", span.sql.sanitized_query);
+    }
+    if (table.childNodes.length) { detail.appendChild(table); }
+
+    for (var i = 0; i < (span.exceptions || []).length; i += 1) {
+      var exception = span.exceptions[i];
+      var box = make("div", "exception");
+      box.appendChild(make("div", null, "cause: " + exception.type + ": " + exception.message));
+      if (exception.stack) { box.appendChild(make("pre", null, exception.stack)); }
+      detail.appendChild(box);
+    }
+
+    if ((span.attributes || []).length) {
+      var details = make("details");
+      details.appendChild(make("summary", null, "スパン属性 " + span.attributes.length + " 件"));
+      var attrTable = make("table", "kv");
+      for (var j = 0; j < span.attributes.length; j += 1) {
+        addRow(attrTable, span.attributes[j].key, span.attributes[j].value);
+      }
+      details.appendChild(attrTable);
+      detail.appendChild(details);
+    }
+    wrap.appendChild(detail);
+    return wrap;
+  }
+
+  function renderDetail() {
+    var box = byId("trace-detail");
+    box.textContent = "";
+    var trace = null;
+    for (var i = 0; i < traces.length; i += 1) {
+      if (traces[i].trace_id === state.selected) { trace = traces[i]; break; }
+    }
+    if (!trace) {
+      box.appendChild(make("p", "empty", "上の一覧からトレースを選ぶと、X-Ray のセグメント / サブセグメント相当の内訳を表示します。"));
+      return;
+    }
+
+    var table = make("table", "kv");
+    addRow(table, "X-Ray Trace ID", trace.xray_id || "(変換不可)");
+    addRow(table, "Jaeger/OTel traceID", trace.trace_id);
+    addRow(table, "開始", trace.start_text);
+    addRow(table, "所要時間", trace.duration_text);
+    addRow(table, "スパン数", trace.span_count + (trace.shown_span_count < trace.span_count
+      ? " (表示は " + trace.shown_span_count + " 件まで)" : ""));
+    addRow(table, "エラースパン", trace.error_count);
+    addRow(table, "サービス", (trace.services || []).join(", "));
+    addRow(table, "Method / Status", (trace.method || "-") + " / " + (trace.status || "-"));
+    addRow(table, "URL", trace.url);
+    addRow(table, "Client IP", trace.client);
+    addRow(table, "User-Agent", trace.agent);
+    addRow(table, "Origin", trace.origin || "(なし)");
+    addLinkRow(table, "Jaeger UI で開く", trace.jaeger_link);
+    addLinkRow(table, "X-Ray コンソールで開く", trace.xray_link);
+    box.appendChild(table);
+
+    box.appendChild(make("h3", null, "セグメント / サブセグメント (X-Ray のタイムライン相当)"));
+    var spans = make("div");
+    for (var s = 0; s < (trace.spans || []).length; s += 1) {
+      spans.appendChild(spanNode(trace.spans[s]));
+    }
+    box.appendChild(spans);
+
+    box.appendChild(make("h3", null, "Annotations (X-Ray のフィルタ式で検索できる属性)"));
+    if (!(trace.annotations || []).length) {
+      box.appendChild(make("p", "empty", "(なし) indexed_attributes が未指定のため、X-Ray では検索できません。"));
+    } else {
+      var annotationTable = make("table", "kv");
+      for (var a = 0; a < trace.annotations.length; a += 1) {
+        addRow(annotationTable,
+          trace.annotations[a].key + " (X-Ray: " + trace.annotations[a].xray_key + ")",
+          trace.annotations[a].value);
+      }
+      box.appendChild(annotationTable);
+    }
+
+    box.appendChild(make("h3", null, "AWS (X-Ray のセグメント詳細の AWS セクション相当)"));
+    if (!(trace.aws || []).length) {
+      box.appendChild(make("p", "empty", "(なし) resourcedetection の ecs 検出器が効いていないと空になります。"));
+    } else {
+      var awsTable = make("table", "kv");
+      for (var w = 0; w < trace.aws.length; w += 1) {
+        addRow(awsTable, trace.aws[w].field, trace.aws[w].value);
+      }
+      box.appendChild(awsTable);
+    }
+
+    var metaDetails = make("details");
+    metaDetails.appendChild(make("summary", null,
+      "Metadata (注釈にならない属性 " + (trace.metadata || []).length + " 件。X-Ray では検索できません)"));
+    var metaTable = make("table", "kv");
+    for (var m = 0; m < (trace.metadata || []).length; m += 1) {
+      addRow(metaTable, trace.metadata[m].key, trace.metadata[m].value);
+    }
+    metaDetails.appendChild(metaTable);
+    box.appendChild(metaDetails);
+  }
+
+  function select(traceId) {
+    state.selected = traceId;
+    renderList();
+    renderDetail();
+    var detail = byId("trace-detail");
+    if (detail && detail.scrollIntoView) { detail.scrollIntoView({ behavior: "smooth", block: "start" }); }
+  }
+
+  function renderServiceMap() {
+    var map = data.service_map || { nodes: [], edges: [] };
+    var nodeBody = byId("node-body");
+    for (var i = 0; i < map.nodes.length; i += 1) {
+      var node = map.nodes[i];
+      var tr = make("tr");
+      tr.appendChild(make("td", null, node.name));
+      tr.appendChild(make("td", null, node.spans));
+      tr.appendChild(make("td", null, node.fault));
+      tr.appendChild(make("td", null, node.error));
+      tr.appendChild(make("td", null, node.throttle));
+      tr.appendChild(make("td", "nowrap", node.average_text));
+      nodeBody.appendChild(tr);
+    }
+    var edgeBody = byId("edge-body");
+    for (var j = 0; j < map.edges.length; j += 1) {
+      var edge = map.edges[j];
+      var etr = make("tr");
+      etr.appendChild(make("td", null, edge.caller + " → " + edge.callee));
+      etr.appendChild(make("td", null, edge.count));
+      etr.appendChild(make("td", null, edge.error));
+      edgeBody.appendChild(etr);
+    }
+    if (!map.nodes.length) {
+      byId("service-map").appendChild(make("p", "empty", "サービスマップに出せるスパンがありません。"));
+    }
+  }
+
+  function renderFilters() {
+    var select = byId("service-filter");
+    var names = {};
+    for (var i = 0; i < traces.length; i += 1) {
+      for (var j = 0; j < (traces[i].services || []).length; j += 1) {
+        names[traces[i].services[j]] = true;
+      }
+    }
+    var sorted = Object.keys(names).sort();
+    for (var k = 0; k < sorted.length; k += 1) {
+      var option = make("option", null, sorted[k]);
+      option.value = sorted[k];
+      select.appendChild(option);
+    }
+    select.addEventListener("change", function () {
+      state.service = select.value;
+      renderList();
+    });
+    var search = byId("search");
+    search.addEventListener("input", function () {
+      state.query = search.value.toLowerCase();
+      renderList();
+    });
+    var errors = byId("errors-only");
+    errors.addEventListener("change", function () {
+      state.errorsOnly = errors.checked;
+      renderList();
+    });
+  }
+
+  renderMeta();
+  renderFilters();
+  renderList();
+  renderDetail();
+  renderServiceMap();
+}());
+"""
+
+HEAD = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jaeger トレースレポート (X-Ray 相当ビュー)</title>
+"""
+
+BODY = """</head>
+<body>
+<header>
+<h1>Jaeger トレースレポート (X-Ray 相当ビュー)</h1>
+<p>Compose 内の X-Ray 偽装 Jaeger から取得したトレースを、X-Ray コンソールで確認する項目に寄せてまとめたものです。
+このファイルは外部のサーバーやネットワークを一切参照しないため、別端末へコピーしてそのまま開けます。</p>
+</header>
+<div class="notice">
+<strong>取り扱い注意:</strong>
+このファイルにはアプリケーションのトレース (URL・SQL・リクエスト属性) がそのまま含まれます。
+パスワード・トークンらしい<em>キー</em>の値と、<code>token=...</code> のような<em>キー=値</em>の形は
+<code>[REDACTED]</code> にしていますが、SQL 文の中に直接埋め込まれた値のように、
+機械的に判定できない形の秘密情報は伏せられません。
+受け渡し前に内容を確認し、共有範囲に注意してください。
+</div>
+<main>
+<section>
+<h2>概要</h2>
+<div class="scroll"><table class="kv" id="meta-table"></table></div>
+<h3>ADOT Collector の設定チェック</h3>
+<div class="scroll" id="checks"></div>
+</section>
+
+<section>
+<h2>トレース一覧 (X-Ray コンソールの Traces 表に相当)</h2>
+<div class="controls">
+<label>検索 <input type="search" id="search" placeholder="トレース ID / URL / 操作名 / 属性値"></label>
+<label>サービス <select id="service-filter"><option value="">すべて</option></select></label>
+<label><input type="checkbox" id="errors-only"> エラー (Fault / Error / Throttle) のみ</label>
+<span class="count" id="trace-count"></span>
+</div>
+<div class="scroll">
+<table>
+<thead><tr>
+<th>X-Ray Trace ID</th><th>開始</th><th>経過</th><th>Method</th><th>応答</th>
+<th>応答時間</th><th>スパン</th><th>サービス</th><th>URL</th><th>判定</th>
+</tr></thead>
+<tbody id="trace-body"></tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>トレースの内訳</h2>
+<div id="trace-detail"></div>
+</section>
+
+<section id="service-map">
+<h2>サービスマップ相当</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>ノード</th><th>スパン</th><th>Fault</th><th>Error</th><th>Throttle</th><th>平均</th></tr></thead>
+<tbody id="node-body"></tbody>
+</table>
+</div>
+<h3>エッジ (呼び出し元 → 呼び出し先)</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>エッジ</th><th>呼び出し</th><th>エラー</th></tr></thead>
+<tbody id="edge-body"></tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Jaeger と X-Ray の対応</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>この画面 / Jaeger</th><th>X-Ray での呼び方</th></tr></thead>
+<tbody>
+<tr><td>Jaeger のトレース</td><td>X-Ray のトレース (ID は 1-&lt;先頭8桁&gt;-&lt;残り24桁&gt; へ変換した値)</td></tr>
+<tr><td>ルートスパン / span.kind=server</td><td>セグメント</td></tr>
+<tr><td>子スパン</td><td>サブセグメント</td></tr>
+<tr><td>indexed_attributes のタグ</td><td>注釈 (annotation。フィルタ式で検索できる)</td></tr>
+<tr><td>その他のタグ</td><td>メタデータ (検索できない)</td></tr>
+<tr><td>exception イベント</td><td>cause / 例外スタック</td></tr>
+<tr><td>4xx / 429 / 5xx</td><td>Error / Throttle / Fault</td></tr>
+</tbody>
+</table>
+</div>
+<p class="muted">X-Ray のサンプリングルール、Insights、サービスマップの集計値はこのレポートには含まれません
+(サービスマップ相当は今回取得したトレースだけの集計です)。トレース属性には業務データが含まれ得るため、
+共有時の取り扱いに注意してください (パスワード・トークン等を示す値は [REDACTED] にしています)。</p>
+</section>
+</main>
+"""
+
+TAIL = """</body>
+</html>
+"""
+
+
+def js_payload(value):
+    """JSON を <script> の中でも安全に置けるようエスケープする。
+    構造文字に < > & は現れないため、文字列値の中だけが置き換わる。"""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return (text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+
+
+data_js = "window.TRACE_DATA = " + js_payload(payload) + ";\n"
+written = []
+
+
+def harden(path, mode):
+    """業務データを含み得るため、他ユーザーからは読めない権限にする
+    (Windows では効かないが、失敗しても出力は続ける)。"""
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
+if out_format == "files":
+    target_dir = out_path
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as exc:
+        print("[ERROR] 出力先ディレクトリを作成できません: %s (%s)" % (target_dir, exc), file=sys.stderr)
+        raise SystemExit(1)
+    harden(target_dir, 0o700)
+
+    def joined(name):
+        # Windows でも表示と参照が / で揃うようにする (os.path.join だと \\ が混ざる)。
+        return target_dir.rstrip("/\\") + "/" + name
+
+    # 入口の index.html を先に出す (呼び出し側は 1 行目を案内に使う)。
+    parts = [
+        (joined("index.html"),
+         HEAD
+         + '<link rel="stylesheet" href="trace-report.css">\n'
+         + BODY
+         + '<script src="trace-data.js"></script>\n'
+         + '<script src="trace-report.js"></script>\n'
+         + TAIL),
+        (joined("trace-report.css"), CSS),
+        (joined("trace-report.js"), JS),
+        (joined("trace-data.js"), data_js),
+    ]
+    for path, content in parts:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        harden(path, 0o600)
+        written.append(path)
+else:
+    document = (HEAD
+                + "<style>\n" + CSS + "</style>\n"
+                + BODY
+                + "<script>\n" + data_js + "</script>\n"
+                + "<script>\n" + JS + "</script>\n"
+                + TAIL)
+    parent = os.path.dirname(out_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as exc:
+            print("[ERROR] 出力先ディレクトリを作成できません: %s (%s)" % (parent, exc), file=sys.stderr)
+            raise SystemExit(1)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(document)
+    harden(out_path, 0o600)
+    written.append(out_path)
+
+for path in written:
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    print("%s%s%d" % (path, SEP, size))
+PY
+)"
+  run_observability_python_program "$program" "$document_count" "$@" \
+    "$out_path" "$out_format" "$jaeger_url" "$destination" "$indexed" "$index_all" \
+    "$xray_region" "$compose_file" "$generated_at" "$lookback" "$limit" "$document_count"
+}
+
+# サービス操作メニューの「Jaeger トレースを HTML へ出力」。
+# Jaeger に登録されている全サービスのトレースを集めるため、frontend / backend の
+# bash から curl を実行して発生したトレースも (Jaeger に届いていれば) 含まれる。
+run_jaeger_trace_html_export() {
+  local selected_service="$1" collector_service="" collector_id="" checks=""
+  local jaeger_service="jaeger" services_json services_text service traces_json
+  local out_path out_lines path size fetched_text=""
+  local -a collector_ids=() fetched=() trace_docs=() documents=()
+
+  require_observability_tools || return 1
+
+  # 送信先の判定と注釈 (indexed_attributes) は Collector の設定から取る。
+  # 取得できなくても HTML の出力は続ける (トレースの確認自体は行えるため)。
+  if collector_service="$(otel_resolve_collector_service "$selected_service")"; then
+    mapfile -t collector_ids < <(compose_container_ids "$collector_service")
+    if [ ${#collector_ids[@]} -gt 0 ]; then
+      collector_id="${collector_ids[0]}"
+      if otel_collect_config_records "$collector_service" "$collector_id"; then
+        diag ""
+        diag "[ADOT Collector の設定チェック (要点)]"
+        render_otel_collector_config_report "$OTEL_CONFIG_RECORDS" "summary" >&2 || true
+        checks="$OTEL_CONFIG_RECORDS"
+      fi
+    fi
+  fi
+
+  resolve_compose_service_http_endpoint "$jaeger_service" "16686" || return 1
+  diag ""
+  diag "Jaeger のトレースを HTML へ書き出します (取得範囲: ${TRACE_REPORT_LOOKBACK}, サービスごと最大 ${TRACE_REPORT_LIMIT} トレース)。"
+  if ! services_json="$(observability_http_get "${OBSERVABILITY_HTTP_BASE_URL}/api/services")"; then
+    err "Jaeger Query API からサービス一覧を取得できませんでした。"
+    return 1
+  fi
+  if ! services_text="$(extract_jaeger_services "$services_json")"; then
+    return 1
+  fi
+
+  # 1 サービスずつ取得する (Jaeger Query API は service 指定が必須)。
+  # 同じトレースが複数サービスから返るが、重複は HTML 生成側で取り除く。
+  while IFS= read -r service; do
+    [ -n "$service" ] || continue
+    if ! traces_json="$(
+      curl -sS --noproxy '*' --max-time "$URL_TIMEOUT" --get \
+        --data-urlencode "service=${service}" \
+        --data-urlencode "limit=${TRACE_REPORT_LIMIT}" \
+        --data-urlencode "lookback=${TRACE_REPORT_LOOKBACK}" \
+        "${OBSERVABILITY_HTTP_BASE_URL}/api/traces"
+    )"; then
+      warn "サービス '${service}' のトレースを取得できませんでした。HTML からは除きます。"
+      continue
+    fi
+    fetched+=("$service")
+    trace_docs+=("$traces_json")
+    diag "  取得: ${service}"
+  done <<< "$services_text"
+
+  if [ ${#fetched[@]} -eq 0 ]; then
+    warn "Jaeger にトレースサービスが登録されていません。アプリへリクエストを送ってから再実行してください。"
+    warn "設定チェックの結果だけを含む HTML を出力します。"
+  else
+    fetched_text="$(printf '%s\n' "${fetched[@]}")"
+  fi
+
+  documents=("$services_json" "$fetched_text" "$checks")
+  documents+=(${trace_docs[@]+"${trace_docs[@]}"})
+
+  out_path="$(resolve_trace_report_path)"
+  if ! out_lines="$(
+    render_jaeger_trace_html "$out_path" "$TRACE_REPORT_FORMAT" \
+      "$OBSERVABILITY_HTTP_BASE_URL" "$OTEL_DESTINATION_SUMMARY" \
+      "$OTEL_INDEXED_ATTRIBUTES" "$OTEL_INDEX_ALL_ATTRIBUTES" "$OTEL_XRAY_REGION" \
+      "$COMPOSE_FILE" "$(now_display_time)" "$TRACE_REPORT_LOOKBACK" "$TRACE_REPORT_LIMIT" \
+      "${#documents[@]}" "${documents[@]}"
+  )"; then
+    err "Jaeger トレースの HTML を出力できませんでした。"
+    return 1
+  fi
+
+  TRACE_REPORT_OUTPUT=""
+  diag ""
+  diag "[出力したファイル]"
+  while IFS="$OTEL_STAGE_SEPARATOR" read -r path size; do
+    [ -n "$path" ] || continue
+    [ -z "$TRACE_REPORT_OUTPUT" ] && TRACE_REPORT_OUTPUT="$path"
+    diag "  ${path} (${size} バイト)"
+  done <<< "$out_lines"
+
+  if [ -z "$TRACE_REPORT_OUTPUT" ]; then
+    err "Jaeger トレースの HTML の出力先を確認できませんでした。"
+    return 1
+  fi
+  log "Jaeger トレースを HTML へ出力しました: ${TRACE_REPORT_OUTPUT}"
+  if [ "$TRACE_REPORT_FORMAT" = "files" ]; then
+    diag "  ディレクトリごと別端末へコピーし、index.html をダブルクリックすると開けます。"
+    diag "  (index.html は同じディレクトリの css / js を相対パスで読むため、まとめてコピーしてください)"
+  else
+    diag "  この 1 ファイルを別端末へコピーし、ダブルクリックすると開けます。"
+  fi
+  diag "  外部のサーバー・CDN を参照しないため、ネットワークに繋がっていない端末でも表示できます。"
+  diag "  トレース属性には業務データが含まれ得るため、受け渡しの取り扱いに注意してください。"
+  return 0
+}
+
 run_otel_jaeger_trace_helper() {
   local selected_service="$1" collector_service="" collector_id=""
   local jaeger_service="jaeger" services_json services_text selected_trace_service traces_json
@@ -14082,6 +17375,14 @@ run_otel_jaeger_trace_helper() {
           warn "今回の起動以降の Collector ログにスパン受信を示す行が見つかりません。"
         fi
       fi
+
+      # Jaeger を見る前に「実 AWS X-Ray と Compose 内 Jaeger のどちらへ送っているか」を示す。
+      # 送信先が Jaeger でなければ、Jaeger にトレースが無いのは設定どおりの結果になる。
+      if otel_collect_config_records "$collector_service" "$collector_id"; then
+        diag ""
+        diag "[ADOT Collector の設定チェック (要点)]"
+        render_otel_collector_config_report "$OTEL_CONFIG_RECORDS" "summary" >&2 || true
+      fi
     fi
   else
     warn "実行中の OTel Collector サービス (adot-collector / otel) を見つけられないため、Jaeger 側だけを確認します。"
@@ -14092,6 +17393,18 @@ run_otel_jaeger_trace_helper() {
   diag "OTel Collector → X-Ray 偽装 Jaeger のトレース送達を確認します。"
   diag "Jaeger Query API: ${OBSERVABILITY_HTTP_BASE_URL}"
   diag "注意: これは Compose 内 Jaeger への送達確認であり、実 AWS X-Ray への送信確認ではありません。"
+  case "$OTEL_DESTINATION_CLASSES" in
+    *aws*)
+      warn "この Collector は実 AWS X-Ray へも送っています。Jaeger に現れないトレースは X-Ray コンソール側で確認してください。"
+      ;;
+  esac
+  case "$OTEL_DESTINATION_CLASSES" in
+    *compose*) ;;
+    "")        ;;
+    *)
+      warn "この Collector は Compose 内 Jaeger へ送る設定になっていません。Jaeger にトレースが出ないのは設定どおりの結果です。"
+      ;;
+  esac
   if ! services_json="$(observability_http_get "${OBSERVABILITY_HTTP_BASE_URL}/api/services")"; then
     err "Jaeger Query API からサービス一覧を取得できませんでした。"
     return 1
@@ -14149,7 +17462,9 @@ run_otel_jaeger_trace_helper() {
     err "Jaeger Query API からトレースを取得できませんでした: ${selected_trace_service}"
     return 1
   fi
-  if ! render_jaeger_trace_report "$traces_json" "$selected_trace_service" >&2; then
+  if ! render_jaeger_trace_report "$traces_json" "$selected_trace_service" \
+      "$OTEL_INDEXED_ATTRIBUTES" "$OTEL_INDEX_ALL_ATTRIBUTES" "$OTEL_DESTINATION_SUMMARY" \
+      "$OBSERVABILITY_HTTP_BASE_URL" "$OTEL_XRAY_REGION" >&2; then
     err "Jaeger トレースレポートを生成できませんでした。"
     return 1
   fi
@@ -14178,7 +17493,7 @@ pause_compose_service_actions() {
 run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
   local mysql_action=0 observability_action=0 cert_check_action=0
-  local alb_healthcheck_action=0
+  local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -14198,6 +17513,14 @@ run_interactive_compose_service_actions() {
   if compose_service_supports_alb_healthcheck "$service_name"; then
     max_action=$(( max_action + 1 ))
     alb_healthcheck_action="$max_action"
+  fi
+  # ADOT Collector の設定チェックも最後に採番し、既存操作の番号を変えない。
+  if [ "$helper_kind" = "xray" ]; then
+    max_action=$(( max_action + 1 ))
+    otel_config_action="$max_action"
+    # Jaeger トレースの HTML 出力も同様に、末尾へ採番する。
+    max_action=$(( max_action + 1 ))
+    trace_html_action="$max_action"
   fi
   while :; do
     diag ""
@@ -14221,6 +17544,12 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$alb_healthcheck_action" -gt 0 ]; then
       diag "  ${alb_healthcheck_action}) ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
+    fi
+    if [ "$otel_config_action" -gt 0 ]; then
+      diag "  ${otel_config_action}) ADOT Collector の設定チェック (有効な設定 / 送信先 / 判定)"
+    fi
+    if [ "$trace_html_action" -gt 0 ]; then
+      diag "  ${trace_html_action}) Jaeger トレースを HTML へ出力 (別端末のブラウザで確認)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -14279,6 +17608,16 @@ run_interactive_compose_service_actions() {
         elif [ "$alb_healthcheck_action" -gt 0 ] && [ "$action" = "$alb_healthcheck_action" ]; then
           if ! run_interactive_compose_alb_healthcheck "$service_name"; then
             warn "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$otel_config_action" -gt 0 ] && [ "$action" = "$otel_config_action" ]; then
+          if ! run_adot_collector_config_helper "$service_name"; then
+            warn "ADOT Collector の設定チェックに失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$trace_html_action" -gt 0 ] && [ "$action" = "$trace_html_action" ]; then
+          if ! run_jaeger_trace_html_export "$service_name"; then
+            warn "Jaeger トレースの HTML 出力に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
         else

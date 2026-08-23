@@ -1,0 +1,85 @@
+{
+  "data": [
+    {
+      "traceID": "66b11111111111119876543210fedcba",
+      "spans": [
+        {
+          "traceID": "66b11111111111119876543210fedcba",
+          "spanID": "aaaaaaaaaaaaaaaa",
+          "operationName": "POST /orders",
+          "references": [],
+          "startTime": 1784538100000000,
+          "duration": 310000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "server"},
+            {"key": "http.request.method", "type": "string", "value": "POST"},
+            {"key": "url.path", "type": "string", "value": "/orders"},
+            {"key": "http.response.status_code", "type": "int64", "value": 500},
+            {"key": "client.address", "type": "string", "value": "172.20.0.9"},
+            {"key": "user_agent.original", "type": "string", "value": "curl/8.4.0"},
+            {"key": "otel.status_code", "type": "string", "value": "ERROR"}
+          ],
+          "logs": [
+            {
+              "timestamp": 1784538100300000,
+              "fields": [
+                {"key": "event", "type": "string", "value": "exception"},
+                {"key": "exception.type", "type": "string", "value": "java.sql.SQLException"},
+                {"key": "exception.message", "type": "string", "value": "Lock wait timeout exceeded"},
+                {"key": "exception.stacktrace", "type": "string", "value": "java.sql.SQLException: Lock wait timeout exceeded\n\tat com.example.OrderRepository.save(OrderRepository.java:88)"}
+              ]
+            }
+          ],
+          "processID": "p1"
+        },
+        {
+          "traceID": "66b11111111111119876543210fedcba",
+          "spanID": "bbbbbbbbbbbbbbbb",
+          "operationName": "INSERT orders",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "66b11111111111119876543210fedcba",
+              "spanID": "aaaaaaaaaaaaaaaa"
+            }
+          ],
+          "startTime": 1784538100020000,
+          "duration": 280000,
+          "tags": [
+            {"key": "span.kind", "type": "string", "value": "client"},
+            {"key": "db.system", "type": "string", "value": "mysql"},
+            {"key": "db.namespace", "type": "string", "value": "appdb"},
+            {"key": "db.statement", "type": "string", "value": "INSERT INTO orders (id, token) VALUES (?, dummy-secret)"},
+            {"key": "error", "type": "bool", "value": true}
+          ],
+          "logs": [],
+          "processID": "p2"
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "myapp-front",
+          "tags": [
+            {"key": "service.namespace", "type": "string", "value": "myapp"},
+            {"key": "deployment.environment", "type": "string", "value": "local"},
+            {"key": "cloud.platform", "type": "string", "value": "aws_ecs"},
+            {"key": "aws.ecs.task.family", "type": "string", "value": "myapp-front-local"},
+            {"key": "aws.ecs.container.name", "type": "string", "value": "app-front"}
+          ]
+        },
+        "p2": {
+          "serviceName": "myapp-back",
+          "tags": [
+            {"key": "service.namespace", "type": "string", "value": "myapp"},
+            {"key": "deployment.environment", "type": "string", "value": "local"}
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 1,
+  "limit": 5,
+  "offset": 0,
+  "errors": null
+}

@@ -2037,6 +2037,8 @@ otel_helper_output="$TEST_TMP/keep-mode-otel-helper.out"
 export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
 export FAKE_JAEGER_SERVICES_FILE="$TEST_DIR/fixtures/jaeger-services.json"
 export FAKE_JAEGER_TRACES_FILE="$TEST_DIR/fixtures/jaeger-traces.json"
+# ADOT Collector は distroless のため、設定は docker cp で取り出す。
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-local.yaml"
 if ! printf '2\n3\n\n4\ninvalid\n1\n\n0\n0\n' | (
   cd "$REPO_ROOT"
   bash ./build_and_verify.sh \
@@ -2048,11 +2050,13 @@ if ! printf '2\n3\n\n4\ninvalid\n1\n\n0\n0\n' | (
     --directory-tree-depth 1 \
     --suppress-removed-logs
 ) >"$otel_helper_output" 2>&1; then
-  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+    FAKE_ADOT_CONFIG_FILE
   cat "$otel_helper_output" >&2
   fail "OTel Jaeger trace helper returned a non-zero status"
 fi
-unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+  FAKE_ADOT_CONFIG_FILE
 
 assert_contains "$otel_helper_output" "4) X-Ray 偽装 Jaeger のトレースを確認 (サービス / トレース / スパン)"
 assert_contains "$otel_helper_output" "[healthcheck 実行ファイル]"
@@ -2070,8 +2074,23 @@ assert_contains "$otel_helper_output" "検索サービス: myapp-front"
 assert_contains "$otel_helper_output" "取得トレース: 1 件"
 assert_contains "$otel_helper_output" "traceID=66a00000000000001234567890abcdef"
 assert_contains "$otel_helper_output" "services=myapp-back, myapp-front"
-assert_contains "$otel_helper_output" "[myapp-front] GET /orders"
-assert_contains "$otel_helper_output" "[myapp-back] SELECT orders"
+# 送信先の判定 (実 AWS X-Ray か、Compose 内 Jaeger か) をトレース確認の冒頭で示す。
+assert_contains "$otel_helper_output" "[ADOT Collector の設定チェック (要点)]"
+assert_contains "$otel_helper_output" \
+  "[送信先の判定] Compose 内 Jaeger (X-Ray 偽装) へ送っています (実 AWS X-Ray へは送っていません)"
+# X-Ray コンソール相当の表示 (トレース ID の変換、セグメント / サブセグメント、
+# 注釈とメタデータの区別、サービスマップ)。
+assert_contains "$otel_helper_output" "X-Ray 相当ビュー (Compose 内 Jaeger のトレース)"
+assert_contains "$otel_helper_output" "X-Ray Trace ID: 1-66a00000-000000001234567890abcdef"
+assert_contains "$otel_helper_output" "[トレース一覧] X-Ray コンソールの Traces 表に相当"
+assert_contains "$otel_helper_output" \
+  "Jaeger UI  : http://127.0.0.1:16686/trace/66a00000000000001234567890abcdef"
+assert_contains "$otel_helper_output" "操作=GET /orders"
+assert_contains "$otel_helper_output" "操作=SELECT orders"
+assert_contains "$otel_helper_output" "セグメント 1 件 / サブセグメント 2 件"
+assert_contains "$otel_helper_output" "エッジ myapp-front -> myapp-back: 1 呼び出し / エラー 0 件"
+assert_contains "$otel_helper_output" "sanitized_query=SELECT * FROM orders WHERE token=[REDACTED]"
+assert_contains "$otel_helper_output" "[Metadata] 注釈にならない属性"
 assert_contains "$otel_helper_output" "db.system=mysql"
 assert_contains "$otel_helper_output" "http.request.header.authorization=[REDACTED]"
 assert_contains "$otel_helper_output" "SELECT * FROM orders WHERE token=[REDACTED]"
@@ -2184,6 +2203,259 @@ assert_contains "$otel_manual_output" \
   "  docker run --rm --network container:adot-collector curlimages/curl:latest -sS -i http://127.0.0.1:13133/"
 assert_contains "$otel_manual_output" "  curl -sS -i http://127.0.0.1:13133/"
 assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# ADOT Collector の設定チェック: 有効な設定・送信先・チェック結果を表示できるか。
+# ローカル構成 (Jaeger へ送る = X-Ray 偽装) で、未参照の定義と送信元ポートの
+# 食い違いを検出できることを確かめる。
+otel_config_output="$TEST_TMP/keep-mode-otel-config-check.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_BODY='{"data":[]}'
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-local.yaml"
+if ! printf '2\n5\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$otel_config_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_CONFIG_FILE
+  cat "$otel_config_output" >&2
+  fail "ADOT collector config check scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_CONFIG_FILE
+
+assert_contains "$otel_config_output" \
+  "5) ADOT Collector の設定チェック (有効な設定 / 送信先 / 判定)"
+assert_contains "$otel_config_output" "════════════ ADOT Collector 設定チェック ════════════"
+assert_contains "$otel_config_output" \
+  "設定の取得元  : コンテナ内の /etc/otel/config.yaml (docker cp で取得)"
+assert_contains "$otel_config_output" "[有効なパイプライン] service.pipelines に書かれたものだけが動きます"
+assert_contains "$otel_config_output" "    exporters  : debug, otlphttp/jaeger"
+# 定義はあるがパイプラインから参照されていないものは「無効」として区別する。
+assert_contains "$otel_config_output" \
+  "参照されていないため無効です: extensions.pprof"
+assert_contains "$otel_config_output" \
+  "  結論: Compose 内 Jaeger (X-Ray 偽装) へ送っています (実 AWS X-Ray へは送っていません)"
+assert_contains "$otel_config_output" \
+  "Compose 内 Jaeger ('jaeger') へ送ります。X-Ray コンソールの代替であり、実 AWS X-Ray へは送りません"
+# 送信元アプリの OTLP ポートと Collector の待受ポートの食い違いを検出する。
+assert_contains "$otel_config_output" \
+  "http://adot-collector:4317 へ送っていますが、Collector が待ち受けているのは 4318 だけです。"
+assert_contains "$otel_config_output" "0.0.0.0:4318 で待ち受けています (別コンテナから到達できます)。"
+assert_contains "$otel_config_output" "[設定ファイルの本文] /etc/otel/config.yaml"
+assert_contains "$otel_config_output" "上の [NG] を修正してください"
+assert_contains "$FAKE_DOCKER_CALLS" "cp cid-adot-collector:/etc/otel/config.yaml"
+assert_contains "$FAKE_CURL_CALLS" "http://172.20.0.2:8888/metrics"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 実 AWS X-Ray へ送る設定 (ECS 用) をローカルへ持ち込んだ場合。送信先が AWS で
+# あること、認証情報が無いこと、内部テレメトリ上も送信に失敗していることを示す。
+otel_xray_output="$TEST_TMP/keep-mode-otel-config-xray.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_FILE="$TEST_DIR/fixtures/jaeger-services.json"
+export FAKE_JAEGER_TRACES_FILE="$TEST_DIR/fixtures/jaeger-traces.json"
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-xray.yaml"
+export FAKE_OTEL_METRICS_BODY='otelcol_receiver_accepted_spans{receiver="otlp"} 12
+otelcol_exporter_sent_spans{exporter="awsxray"} 0
+otelcol_exporter_send_failed_spans{exporter="awsxray"} 12'
+if ! printf '2\n5\n\n4\n1\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$otel_xray_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+    FAKE_ADOT_CONFIG_FILE FAKE_OTEL_METRICS_BODY
+  cat "$otel_xray_output" >&2
+  fail "ADOT collector X-Ray destination scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+  FAKE_ADOT_CONFIG_FILE FAKE_OTEL_METRICS_BODY
+
+assert_contains "$otel_xray_output" \
+  "  結論: 実 AWS X-Ray へ送っています (Compose 内 Jaeger へは送っていません)"
+assert_contains "$otel_xray_output" "      区分     : aws"
+assert_contains "$otel_xray_output" "      endpoint : xray.ap-northeast-1.amazonaws.com"
+assert_contains "$otel_xray_output" \
+  "実 AWS X-Ray へ送る設定ですが、コンテナに AWS 認証情報 (環境変数・タスクロール) が見当たりません。"
+assert_contains "$otel_xray_output" "送信成功 0 件 / 送信失敗 12 件。送信先へ届いていません。"
+assert_contains "$otel_xray_output" "receiver が受け取ったスパン: 12 件。"
+assert_contains "$otel_xray_output" \
+  "注釈になる属性: service.namespace, deployment.environment, aws.ecs.service.name, aws.ecs.task.family"
+# トレース確認の側でも、Jaeger へは送っていないことを警告する。
+assert_contains "$otel_xray_output" \
+  "この Collector は実 AWS X-Ray へも送っています。"
+assert_contains "$otel_xray_output" \
+  "この Collector は Compose 内 Jaeger へ送る設定になっていません。Jaeger にトレースが出ないのは設定どおりの結果です。"
+# indexed_attributes に挙げた属性が、トレース側では X-Ray の注釈として表示される。
+assert_contains "$otel_xray_output" \
+  "deployment.environment=local   (X-Ray 上のキー: deployment_environment)"
+assert_contains "$otel_xray_output" \
+  "service.namespace=myapp   (X-Ray 上のキー: service_namespace)"
+# 同じトレースを実 X-Ray コンソールで開くための URL を、設定のリージョンから組み立てる。
+assert_contains "$otel_xray_output" \
+  "X-Ray 相当 : https://ap-northeast-1.console.aws.amazon.com/xray/home?region=ap-northeast-1#/traces/1-66a00000-000000001234567890abcdef"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# Jaeger トレースの HTML 出力 (1 ファイル形式)。
+# Jaeger UI を開けない環境向けに、別端末へコピーしてダブルクリックで開ける
+# 単体の .htm を作れること、外部リソースを参照しないことを確認する。
+trace_html_output="$TEST_TMP/keep-mode-trace-html.out"
+trace_html_dir="$TEST_TMP/trace-report-single"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_FILE="$TEST_DIR/fixtures/jaeger-services.json"
+export FAKE_JAEGER_TRACES_FILE="$TEST_DIR/fixtures/jaeger-traces.json"
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-local.yaml"
+if ! printf '2\n6\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --trace-report-dir "$trace_html_dir" \
+    --suppress-removed-logs
+) >"$trace_html_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+    FAKE_ADOT_CONFIG_FILE
+  cat "$trace_html_output" >&2
+  fail "Jaeger trace HTML export scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+  FAKE_ADOT_CONFIG_FILE
+
+assert_contains "$trace_html_output" "6) Jaeger トレースを HTML へ出力 (別端末のブラウザで確認)"
+assert_contains "$trace_html_output" "Jaeger のトレースを HTML へ書き出します"
+assert_contains "$trace_html_output" "  取得: myapp-front"
+assert_contains "$trace_html_output" "  取得: myapp-back"
+assert_contains "$trace_html_output" "この 1 ファイルを別端末へコピーし、ダブルクリックすると開けます。"
+assert_contains "$trace_html_output" \
+  "外部のサーバー・CDN を参照しないため、ネットワークに繋がっていない端末でも表示できます。"
+# サービスごとに Jaeger Query API を叩いていること (bash から curl した分も拾えるように、
+# 選択サービスだけでなく Jaeger に登録された全サービスを取得する)。
+assert_contains "$FAKE_CURL_CALLS" "--data-urlencode service=myapp-front"
+assert_contains "$FAKE_CURL_CALLS" "--data-urlencode service=myapp-back"
+assert_contains "$FAKE_CURL_CALLS" "--data-urlencode lookback=6h"
+
+trace_html_single=()
+for trace_html_path in "$trace_html_dir"/*.htm; do
+  [ -f "$trace_html_path" ] && trace_html_single+=("$trace_html_path")
+done
+[ ${#trace_html_single[@]} -eq 1 ] \
+  || fail "expected exactly one .htm in $trace_html_dir, found ${#trace_html_single[@]}"
+assert_contains "${trace_html_single[0]}" "<!DOCTYPE html>"
+assert_contains "${trace_html_single[0]}" "window.TRACE_DATA = {"
+assert_contains "${trace_html_single[0]}" "1-66a00000-000000001234567890abcdef"
+assert_contains "${trace_html_single[0]}" "Jaeger トレースレポート (X-Ray 相当ビュー)"
+assert_contains "${trace_html_single[0]}" "取り扱い注意:"
+# 1 ファイル形式は外部ファイル・外部サーバーを一切参照しない。
+assert_not_contains "${trace_html_single[0]}" "<script src="
+assert_not_contains "${trace_html_single[0]}" "<link rel=\"stylesheet\""
+# 画面表示と同じく、機微情報を示す属性は伏せ字にする。
+assert_not_contains "${trace_html_single[0]}" "dummy-secret"
+assert_contains "${trace_html_single[0]}" "[REDACTED]"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 同じ内容を html + css + js のファイル群としても出力できること。
+# エラー (5xx・例外) のトレースを X-Ray の Fault / cause として持てるかも確認する。
+trace_files_output="$TEST_TMP/keep-mode-trace-html-files.out"
+trace_files_dir="$TEST_TMP/trace-report-files"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_FILE="$TEST_DIR/fixtures/jaeger-services.json"
+export FAKE_JAEGER_TRACES_FILE="$TEST_DIR/fixtures/jaeger-traces-error.json"
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-xray.yaml"
+if ! printf '2\n6\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --trace-report-dir "$trace_files_dir" \
+    --trace-report-format files \
+    --trace-report-limit 20 \
+    --trace-report-lookback 30m \
+    --suppress-removed-logs
+) >"$trace_files_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+    FAKE_ADOT_CONFIG_FILE
+  cat "$trace_files_output" >&2
+  fail "Jaeger trace HTML files export scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_FILE FAKE_JAEGER_TRACES_FILE \
+  FAKE_ADOT_CONFIG_FILE
+
+assert_contains "$trace_files_output" \
+  "ディレクトリごと別端末へコピーし、index.html をダブルクリックすると開けます。"
+assert_contains "$FAKE_CURL_CALLS" "--data-urlencode lookback=30m"
+assert_contains "$FAKE_CURL_CALLS" "--data-urlencode limit=20"
+
+trace_files_index=""
+for trace_html_path in "$trace_files_dir"/*/index.html; do
+  [ -f "$trace_html_path" ] && trace_files_index="$trace_html_path"
+done
+[ -n "$trace_files_index" ] || fail "index.html was not written under $trace_files_dir"
+trace_files_base="$(dirname "$trace_files_index")"
+for trace_html_asset in trace-report.css trace-report.js trace-data.js; do
+  [ -f "${trace_files_base}/${trace_html_asset}" ] \
+    || fail "expected ${trace_html_asset} in ${trace_files_base}"
+done
+# index.html は同じディレクトリの css / js を相対パスで読む (file:// で開けるように)。
+assert_contains "$trace_files_index" "<link rel=\"stylesheet\" href=\"trace-report.css\">"
+assert_contains "$trace_files_index" "<script src=\"trace-data.js\"></script>"
+assert_contains "$trace_files_index" "<script src=\"trace-report.js\"></script>"
+assert_not_contains "$trace_files_index" "http://"
+assert_not_contains "$trace_files_index" "https://"
+# 5xx と例外は X-Ray と同じく Fault / cause として持つ。
+assert_contains "${trace_files_base}/trace-data.js" "1-66b11111-111111119876543210fedcba"
+assert_contains "${trace_files_base}/trace-data.js" "Fault"
+assert_contains "${trace_files_base}/trace-data.js" "java.sql.SQLException"
+assert_contains "${trace_files_base}/trace-data.js" "AWS::ECS::Container"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 指定値の検証。誤った指定は対話へ入る前に弾く。
+trace_format_output="$TEST_TMP/trace-report-format-invalid.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --trace-report-format zip --compose-service app
+) >"$trace_format_output" 2>&1; then
+  cat "$trace_format_output" >&2
+  fail "--trace-report-format zip should have failed"
+fi
+assert_contains "$trace_format_output" \
+  "--trace-report-format には single または files を指定してください: zip"
+
+trace_lookback_output="$TEST_TMP/trace-report-lookback-invalid.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --trace-report-lookback yesterday --compose-service app
+) >"$trace_lookback_output" 2>&1; then
+  cat "$trace_lookback_output" >&2
+  fail "--trace-report-lookback yesterday should have failed"
+fi
+assert_contains "$trace_lookback_output" \
+  "--trace-report-lookback には 30m / 6h / 2d のような期間を指定してください: yesterday"
 
 http_get_output="$TEST_TMP/keep-mode-http-get.out"
 : > "$FAKE_DOCKER_CALLS"

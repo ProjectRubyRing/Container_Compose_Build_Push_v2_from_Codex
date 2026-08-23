@@ -195,7 +195,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
 | `--remove-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。この実行が行うすべての `compose down` に `--volumes` を付け、Compose プロジェクトの名前付きボリュームも毎回削除する | `false` |
 | `--keep-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。対話操作の終了後の後始末でもボリュームを削除しない (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する | `false` |
@@ -2290,16 +2290,26 @@ MD5 / SHA-1 署名・RSA 2048 bit 未満といった**その証明書自体の�
   内のイベントを照合します。設定したグループ／ストリームごとの送信件数と、最新20件の
   イベント本文をコンソールへ表示します。
 - `otel` / `adot-collector` / `jaeger`: Collectorのヘルスチェックとdebug exporterログから
-  アプリケーションからのスパン受信を確認し、Jaeger Query APIからトレースサービスを
-  番号選択します。選択サービスについて直近1時間・最大5トレースを取得し、trace ID、
-  開始時刻、所要時間、サービス、スパン親子関係、リソース属性、スパン属性、イベントを
-  コンソールへ表示します。参照先ComposeではOTel Collectorのサービス名は
-  `adot-collector`です。`otel`も別Composeでの互換サービス名として認識します。
+  アプリケーションからのスパン受信を確認し、続けて**送信先の判定**（実AWS X-Rayか、
+  Compose内のX-Ray偽装Jaegerか）を表示してから、Jaeger Query APIのトレースサービスを
+  番号選択します。選択サービスについて直近1時間・最大5トレースを取得し、
+  **X-Rayコンソールで確認する項目に寄せた形式**で表示します（後述）。参照先Composeでは
+  OTel Collectorのサービス名は`adot-collector`です。`otel`も別Composeでの互換サービス名
+  として認識します。
   Collectorのヘルスチェックは、composeサービスに設定された`healthcheck`定義を最優先で
   実行し、`/bin/sh`を持たないイメージでは「シェル無しの直接実行 → 同梱`/healthcheck`
   バイナリ → `health_check`拡張のエンドポイント (既定 13133/tcp) へホストからHTTP確認」の
   順にフォールバックします。すべて実行できない場合は、`docker inspect`で記録済みの
   health状態を表示したうえで、手元で実行すべきコマンドを案内します。
+- `otel` / `adot-collector` / `jaeger`: **ADOT Collectorの設定チェック**を
+  **最後の操作番号**として追加します（既存操作の番号は変わりません）。詳細は
+  [ADOT Collector の設定チェックと送信先の判定](#adot-collector-の設定チェックと送信先の判定)
+  を参照してください。
+- `otel` / `adot-collector` / `jaeger`: **JaegerトレースのHTML出力**をさらに次の操作番号
+  として追加します。JaegerのUIをブラウザで開けない環境でも、別端末へコピーして開ける
+  HTMLを書き出せます。詳細は
+  [Jaeger トレースを HTML へ出力して別端末で見る](#jaeger-トレースを-html-へ出力して別端末で見る)
+  を参照してください。
 
 CloudWatch Logsモックは実ログストレージではなく、受信要求を成功応答するWireMockです。
 したがってヘルパーの`OK`は、`cwagent`設定とrequest journal内の`PutLogEvents`送信先・
@@ -2311,6 +2321,136 @@ Jaegerへの到達確認であり、実AWS CloudWatch LogsまたはX-Rayへの�
 認証ヘッダーは出力せず、パスワードやトークンを示す属性値は伏せ字にします。ただしログ本文や
 トレースには業務データが含まれる可能性があるため、画面出力と`--log-dir`の取り扱いには
 引き続き注意してください。
+
+### ADOT Collector の設定チェックと送信先の判定
+
+「Jaeger にトレースが出ない」ときの原因は、アプリ・Collector・Jaeger のどこかに
+散らばっています。とくに紛らわしいのが次の 2 つで、どちらも**設定ファイルを眺めるだけでは
+気付けません**。
+
+- **設定に書いてあるのに効いていない**: OTel Collector は `receivers` / `processors` /
+  `exporters` / `extensions` に定義しただけでは動かず、`service.pipelines`（拡張は
+  `service.extensions`）から**参照されたものだけが有効**になります。定義したまま参照を
+  書き忘れたコンポーネントは、エラーも警告も出さずに黙って無効になります。
+- **送信先がそもそも Jaeger ではない**: ECS 用設定（`awsxray` exporter）をローカルへ
+  持ち込むと、トレースは実 AWS X-Ray へ向かいます。ローカルには認証情報が無いため送信は
+  失敗し、Jaeger 側は「送っているのに何も出ない」状態になります。
+
+サービス操作メニューの `ADOT Collector の設定チェック` は、この 2 点を含めて次を表示します。
+
+| 表示 | 内容 |
+|------|------|
+| 設定の取得元 | コンテナ内のパス（`docker cp` で取得）、bind mount 元、`AOT_CONFIG_CONTENT` などの環境変数注入のどれか |
+| 有効なパイプライン | `service.pipelines` の `receivers` / `processors` / `exporters` |
+| コンポーネントの有効・無効 | 定義済みの各コンポーネントを `[有効]` / `[無効]`（未参照）で区別 |
+| 受信の待受アドレス | `otlp` receiver の `grpc` / `http` エンドポイントと、起動中サービスの `OTEL_EXPORTER_OTLP_ENDPOINT` との突き合わせ |
+| **送信先の判定** | exporter ごとに「実 AWS X-Ray」「Compose 内サービス（X-Ray 偽装）」「コレクタのログ出力のみ」等を判定し、結論を 1 行で表示 |
+| X-Ray の注釈 | `awsxray` の `indexed_attributes`（X-Ray のフィルタ式で検索できる属性） |
+| 内部テレメトリ | `otelcol_exporter_sent_spans` / `otelcol_exporter_send_failed_spans` を exporter 別に表示 |
+| Collector ログの証跡 | スパン受信・送信失敗・AWS 認証エラーを示す行 |
+| チェック結果 | 各項目を `OK` / `NG` / `WARN` / `INFO` / `未確認` で判定し、末尾に総合判定 |
+| 設定ファイルの本文 | 実際に効いている設定（トークン類の値は `[REDACTED]`） |
+
+チェック結果には次のような判定が含まれます。
+
+- `traces` パイプラインの有無、`receivers` / `exporters` の欠落（**NG**: 何も送られない）
+- パイプラインが参照しているのに定義が無いコンポーネント（**NG**: Collector が起動できない）
+- 定義があるのにどこからも参照されていないコンポーネント（**WARN**: 無効）
+- `memory_limiter` が `processors` の先頭にあるか（**WARN**: OOM 対策の推奨構成）
+- receiver が `127.0.0.1` で待ち受けていないか、`endpoint` を省略していないか
+  （**NG / WARN**: Collector v0.104 以降は既定が `localhost` になり、別コンテナから届かない）
+- 送信元アプリの OTLP ポートと receiver の待受ポートの食い違い（**NG**: スパンが届かない）
+- `otlphttp` exporter に gRPC のポート `4317` を指定していないか（**NG**: 逆も同様）
+- 送信先の Compose サービスが起動しているか（**NG**）
+- 実 AWS X-Ray へ送る設定で、リージョンや AWS 認証情報が無い（**NG**: 送信が失敗する）
+- `resourcedetection` の `ecs` 検出器が有効なのに `ECS_CONTAINER_METADATA_URI_V4` が無い
+  （**WARN**: `aws.ecs.*` 属性 = X-Ray の AWS セクションが付かない）
+- 内部テレメトリ上の送信失敗（**NG**）と AWS 認証エラーのログ（**NG**）
+
+内部テレメトリ（既定 8888/tcp）はホストへ公開していない構成では取得できず、その場合は
+`未確認` として「公開すれば exporter ごとの送信件数を確認できる」旨を案内します。
+
+送信先の判定は `X-Ray 偽装 Jaeger のトレースを確認` の冒頭にも要点として表示され、
+実 AWS X-Ray へ送っている場合や、Compose 内 Jaeger へ送る設定になっていない場合は
+警告します。「Jaeger にトレースが出ない」のが**設定どおりの結果**なのか、
+**設定の誤り**なのかをその場で切り分けられます。
+
+### Jaeger のトレースを X-Ray の項目で確認する
+
+`X-Ray 偽装 Jaeger のトレースを確認` は、Jaeger Query API の応答を
+**X-Ray コンソールで確認する項目に寄せて**表示します。ローカルで見た内容と、デプロイ後に
+X-Ray コンソールで見る内容を対応付けられるようにするためで、変換規則は `awsxray`
+exporter と同じものを再現しています。
+
+| 表示 | X-Ray での対応 |
+|------|----------------|
+| トレース一覧 | X-Ray の Traces 表（X-Ray 形式のトレース ID、経過時間、Method、応答コード、応答時間、URL） |
+| X-Ray Trace ID | OTel の 128bit トレース ID を `1-<先頭8桁>-<残り24桁>` へ変換した値。X-Ray コンソールでそのまま検索できる |
+| セグメント / サブセグメント | ルートスパンと `span.kind=server` / `consumer` をセグメント、それ以外をサブセグメントとして階層表示 |
+| 状態 | `Fault`（5xx・例外）/ `Error`（4xx）/ `Throttle`（429）の判定 |
+| namespace | サブセグメントの `aws` / `remote` |
+| http | method / url / status / client_ip / user_agent |
+| sql | `database_type` / `database` / `sanitized_query` |
+| cause | スパンイベントの `exception.*` から作られる例外情報 |
+| Annotations | `indexed_attributes` に挙げた属性（X-Ray のフィルタ式で検索できる。`.` を `_` に置き換えた X-Ray 上のキーも併記） |
+| Metadata | 注釈にならない属性（X-Ray では検索できず、詳細画面でのみ見える） |
+| AWS | `aws.ecs.*` / `cloud.*` から作られる X-Ray の AWS セクション（cluster_arn、task_arn 等） |
+| Origin | `AWS::ECS::Container` などのリソース種別 |
+| サービスマップ相当 | ノード（サービス別の spans / fault / error / throttle / 平均時間）とエッジ（呼び出し元 → 呼び出し先） |
+| X-Ray フィルタ式の例 | `service("...")`、`fault = true`、`annotation.<キー> = "..."` など |
+| トレースを開く URL | Jaeger UI の該当トレース (`http://<host>:16686/trace/<traceID>`) と、`awsxray` exporter のリージョンが判っている場合は X-Ray コンソールの同じトレース (`https://<region>.console.aws.amazon.com/xray/home?region=<region>#/traces/<X-Ray Trace ID>`) |
+
+注釈になる属性は、設定チェックで読み取った `awsxray` exporter の `indexed_attributes` を
+使います。`awsxray` exporter が無いローカル構成では「注釈は作られない（X-Ray では
+全属性がメタデータ扱いで検索できない）」と表示するため、ECS 用設定側で
+`indexed_attributes` を用意すべきかどうかをローカルで判断できます。
+
+トレース ID 先頭 8 桁の時刻がスパンの開始時刻と大きくずれている場合は警告します。
+X-Ray は生成から 30 日を超えたトレース ID を受け付けないため、実 X-Ray へ切り替えたときに
+取り込まれない可能性があるからです。
+
+### Jaeger トレースを HTML へ出力して別端末で見る
+
+Jaeger UI（`16686/tcp`）をブラウザで開けない状況は珍しくありません。ポートを公開できない、
+検証環境が別ネットワークにある、手元の端末から到達できない、といった場合です。
+サービス操作メニューの `Jaeger トレースを HTML へ出力` は、そこまでに Jaeger へ登録された
+トレースを**単体で開ける HTML** に書き出します。出力物は外部のサーバー・CDN・フォントを
+一切参照しないため、**別端末へコピーしてダブルクリックするだけ**でブラウザに表示できます
+（ネットワークに繋がっていない端末でも表示できます）。
+
+取得対象は**選択したサービスだけではなく、Jaeger に登録されている全サービス**です。
+そのため、`bash 接続`（操作 `2`）で frontend / backend のコンテナに入って `curl` を叩いた
+ときに発生したトレースも、Jaeger へ届いていれば同じ HTML に含まれます。
+
+| パラメータ | 内容 |
+|------------|------|
+| `--trace-report-dir DIR` | 出力先ディレクトリ。未指定時は `--report-dir` 配下、それも無ければ一時ディレクトリへ出力し、パスを画面に表示します |
+| `--trace-report-format single\|files` | `single`（既定）は **`.htm` 1 ファイル**に HTML・CSS・JS・データをすべて埋め込みます。`files` は `index.html` / `trace-report.css` / `trace-report.js` / `trace-data.js` をディレクトリへ出力します |
+| `--trace-report-limit N` | サービスごとに取得するトレース数（既定: 50） |
+| `--trace-report-lookback D` | 取得範囲。`30m` / `6h` / `2d` のように指定します（既定: `6h`） |
+
+`files` 形式は `index.html` が同じディレクトリの CSS / JS を相対パスで読むため、
+**ディレクトリごと**コピーしてください。`single` 形式は 1 ファイルだけ渡せば済みます。
+`file://` ではローカル JSON の読み込み（`fetch`）がブラウザに遮断されるため、データは
+JSON ファイルではなく JS ファイルとして埋め込んでいます。
+
+HTML の中身は画面表示と同じ **X-Ray 相当ビュー**で、次を含みます。
+
+- 概要（出力日時、送信先の判定、取得範囲、Jaeger のサービス、`indexed_attributes`）と
+  **ADOT Collector の設定チェック結果**（OK / NG / WARN の一覧）
+- トレース一覧（X-Ray 形式のトレース ID、開始時刻、経過、Method、応答コード、応答時間、
+  スパン数、サービス、URL、Fault / Error / Throttle の判定）
+- **検索・絞り込み**（トレース ID / URL / 操作名 / 属性値の部分一致、サービス別、エラーのみ）
+- トレースを選ぶと、セグメント / サブセグメントの階層と**所要時間のタイムライン**、
+  http・sql・cause（例外）、Annotations と Metadata の区別、AWS セクション、Origin、
+  Jaeger UI と X-Ray コンソールへのリンク
+- サービスマップ相当（ノードとエッジ）と、Jaeger と X-Ray の対応表
+
+> **取り扱いの注意**: 出力した HTML にはトレースの URL・SQL・リクエスト属性がそのまま
+> 含まれます。パスワードやトークンらしい**キー**の値と、`token=...` のような**キー=値**の形は
+> `[REDACTED]` にしますが、SQL 文へ直接埋め込まれた値のように機械的に判定できない形の
+> 秘密情報は伏せられません（画面表示と同じ規則です）。この注意書きは出力した HTML の
+> 先頭にも表示されます。受け渡し前に内容を確認してください。
 
 ### ALB ヘルスチェック確認（ステータスコード / 成功失敗判定）
 

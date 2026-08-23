@@ -420,6 +420,8 @@ arg_takes_value() {
     --deploy-exception-excel|--deploy-exception-text|--deploy-exception-limit) return 0 ;;
     --readonly-analysis-excel|--readonly-analysis-text) return 0 ;;
     --cert-check-text) return 0 ;;
+    --trace-report-dir|--trace-report-format) return 0 ;;
+    --trace-report-limit|--trace-report-lookback) return 0 ;;
     --cwagent-service|--cwagent-config-dir|--cwagent-delivery-target) return 0 ;;
     --cwagent-delivery-timeout|--cwagent-delivery-interval) return 0 ;;
     --cwagent-mock-service|--cwagent-mock-port) return 0 ;;

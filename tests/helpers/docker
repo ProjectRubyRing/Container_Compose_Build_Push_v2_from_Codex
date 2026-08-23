@@ -341,6 +341,17 @@ if [ "${1:-}" = "port" ] && [ "${2:-}" = "cid-adot-collector" ] && [ "${3:-}" = 
   exit 0
 fi
 
+# OTel Collector の内部テレメトリ (8888/tcp)。既定では未公開の状態を再現し、
+# FAKE_OTEL_METRICS_PORT_MAPPING を指定したときだけ公開ポートを返す。
+if [ "${1:-}" = "port" ] && [ "${3:-}" = "8888/tcp" ]; then
+  if [ -n "${FAKE_OTEL_METRICS_PORT_MAPPING:-}" ]; then
+    printf '%s\n' "$FAKE_OTEL_METRICS_PORT_MAPPING"
+    exit 0
+  fi
+  printf "Error: No public port '8888/tcp' published for %s\n" "${2:-}" >&2
+  exit 1
+fi
+
 if [ "${1:-}" = "system" ] && [ "${2:-}" = "df" ]; then
   if is_cleaned; then
     printf 'Images|0 B\n'
@@ -467,8 +478,10 @@ if [ "${1:-}" = "cp" ]; then
   fake_cp_src="${2:-}"
   fake_cp_dst="${3:-}"
   case "$fake_cp_src" in
-    cid-image-probe:*) fake_cp_file="${FAKE_IMAGE_ARTIFACT_FILE:-}" ;;
-    *)                 fake_cp_file="${FAKE_CONTAINER_ARTIFACT_FILE:-}" ;;
+    cid-image-probe:*)     fake_cp_file="${FAKE_IMAGE_ARTIFACT_FILE:-}" ;;
+    # ADOT Collector の設定ファイルは distroless のため docker cp で取り出す。
+    cid-adot-collector:*)  fake_cp_file="${FAKE_ADOT_CONFIG_FILE:-}" ;;
+    *)                     fake_cp_file="${FAKE_CONTAINER_ARTIFACT_FILE:-}" ;;
   esac
   if [ -z "$fake_cp_file" ] || [ ! -f "$fake_cp_file" ]; then
     printf 'Error response from daemon: Could not find the file %s\n' "$fake_cp_src" >&2
@@ -617,6 +630,40 @@ fi
 
 if [ "${1:-}" = "inspect" ]; then
   case "$*" in
+    # ADOT Collector の設定チェック: ENTRYPOINT + CMD を 1 行 1 引数で返す。
+    # 実装側は otel-argv: の目印付きで問い合わせるので、.Config.Entrypoint の
+    # 分岐に吸い込まれないよう、必ずここで先に拾う。
+    *"otel-argv:"*)
+      if [ -n "${FAKE_OTEL_ARGV:-}" ]; then
+        while IFS= read -r fake_otel_arg; do
+          [ -n "$fake_otel_arg" ] || continue
+          printf 'otel-argv:%s\n' "$fake_otel_arg"
+        done <<< "$FAKE_OTEL_ARGV"
+      else
+        printf 'otel-argv:/awscollector\n'
+        printf 'otel-argv:--config=/etc/otel/config.yaml\n'
+      fi
+      ;;
+    # ADOT Collector の設定チェック: 環境変数を「開始行 + 本文 + 終了行」で返す。
+    # .Config.Env の分岐より前に置く必要がある。
+    *"otel-env-begin:"*)
+      case "$*" in
+        *"cid-adot-collector"*)
+          fake_otel_env="${FAKE_OTEL_COLLECTOR_ENV:-ECS_CONTAINER_METADATA_URI_V4=http://ecs-metadata-mock:8080/v4/task
+PATH=/usr/bin}"
+          ;;
+        *)
+          fake_otel_env="${FAKE_OTEL_SENDER_ENV:-OTEL_EXPORTER_OTLP_ENDPOINT=http://adot-collector:4317
+OTEL_SERVICE_NAME=orders-app
+PATH=/usr/bin}"
+          ;;
+      esac
+      while IFS= read -r fake_otel_line; do
+        [ -n "$fake_otel_line" ] || continue
+        printf 'otel-env-begin:%s\n' "$fake_otel_line"
+        printf 'otel-env-end:\n'
+      done <<< "$fake_otel_env"
+      ;;
     # ALB ヘルスチェック偽装サービスの状態行 (起動状態|自身の health|連続失敗|再起動回数|起動時刻)。
     # .State.Health.Status を含むため、後段の分岐より先に拾う必要がある。
     *".State.StartedAt"*)

@@ -1,0 +1,43 @@
+# ECS 用の ADOT Collector 設定 (実 AWS X-Ray へ送る)。
+# ローカルへそのまま持ち込むと、認証情報が無いため送信に失敗する状態を再現する。
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+  resourcedetection/ecs:
+    detectors: [env, ecs]
+    timeout: 2s
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  awsxray:
+    region: ap-northeast-1
+    indexed_attributes:
+      - service.namespace
+      - deployment.environment
+      - aws.ecs.service.name
+      - aws.ecs.task.family
+    index_all_attributes: false
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, batch]
+      exporters: [awsxray]
+  telemetry:
+    logs:
+      level: info

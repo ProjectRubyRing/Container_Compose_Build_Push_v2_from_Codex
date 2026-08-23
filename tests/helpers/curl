@@ -85,6 +85,19 @@ case "$request_url" in
     printf '{"status":"Server available"}\n'
     exit 0
     ;;
+  */metrics)
+    # OTel Collector の内部テレメトリ。既定では未公開ポートへの接続失敗を再現する。
+    if [ -n "${FAKE_OTEL_METRICS_FILE:-}" ]; then
+      cat "$FAKE_OTEL_METRICS_FILE"
+      exit 0
+    fi
+    if [ -n "${FAKE_OTEL_METRICS_BODY:-}" ]; then
+      printf '%s\n' "$FAKE_OTEL_METRICS_BODY"
+      exit 0
+    fi
+    printf 'curl: (7) Failed to connect to port 8888\n' >&2
+    exit 7
+    ;;
   */api/services)
     if [ -n "${FAKE_JAEGER_SERVICES_FILE:-}" ]; then
       cat "$FAKE_JAEGER_SERVICES_FILE"

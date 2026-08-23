@@ -1,0 +1,52 @@
+# ローカル compose 用の ADOT Collector 設定 (Jaeger へ送る = X-Ray 偽装)。
+# 参照先 Compose の compose/otel/adot-collector-local.yaml と同じ構成。
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # 定義はあるが service.extensions から参照していない = 無効なコンポーネント。
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+  resourcedetection/ecs:
+    detectors: [env, ecs]
+    timeout: 2s
+    override: false
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: insert
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  debug:
+    verbosity: normal
+  otlphttp/jaeger:
+    endpoint: http://jaeger:4318
+    tls:
+      insecure: true
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, resource, batch]
+      exporters: [debug, otlphttp/jaeger]
+  telemetry:
+    logs:
+      level: info

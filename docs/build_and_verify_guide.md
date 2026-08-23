@@ -1027,11 +1027,43 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | healthcheck 調査 | 設定・実行履歴・実際の通信確認を表示 (機微情報はマスク) | — |
 | MySQL 実行 | MySQL サーバーで SQL を対話実行 | MySQL クライアント |
 | CloudWatch Logs 送達診断 | `cwagent` / `cloudwatch-logs-mock` への偽装送達を確認 | `curl` + Python 3 |
-| X-Ray トレース診断 | `otel` / `adot-collector` / `jaeger` への偽装トレースを確認 | `curl` + Python 3 |
+| X-Ray トレース診断 | `otel` / `adot-collector` / `jaeger` への偽装トレースを、**X-Ray コンソールの項目 (X-Ray 形式のトレース ID / セグメント・サブセグメント / 注釈・メタデータ / サービスマップ) に寄せて**確認。トレースごとに Jaeger UI と X-Ray コンソールの URL も表示 | `curl` + Python 3 |
+| ADOT Collector 設定チェック | 実際に効いている Collector 設定を `docker cp` で取り出し、**有効なコンポーネント**(パイプラインから参照されているもの) と**送信先** (実 AWS X-Ray か Compose 内 Jaeger か) を判定して OK / NG / WARN を表示 | Python 3 (内部テレメトリの確認には `curl`) |
+| Jaeger トレースの HTML 出力 | Jaeger に登録された**全サービス**のトレースを取得し、外部リソースを参照しない HTML (または html + css + js) へ書き出す。別端末へコピーしてダブルクリックすればブラウザで開ける | `curl` + Python 3 |
 | 証明書チェック | 受領した自己証明書 (`cacert.crt`) の素性 (種別・X.509 バージョン・トラストアンカー可否・全項目) を確定させたうえで、自己証明書を取り込んだコンテナ (front / back 等) から HTTPS の REST API (`secure-api` / ALB 等) へ接続できるかを確認し、結果をテキストへも出力 | コンテナ内の `curl` + `keytool` (種別の判定には `openssl`) |
 | ALB ヘルスチェック確認 | ALB ヘルスチェック偽装サービス (`alb-healthcheck`) の状態を確認し、そこから ALB と同じヘルスチェックを実行して**ステータスコードと成功失敗判定**を表示 | 偽装サービスが起動しており、選択サービスがそのターゲットであること |
 
-証明書チェックと ALB ヘルスチェック確認は常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
+証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェックは常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
+
+ADOT Collector 設定チェックの表示条件と内容は次のとおりです。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | 選択サービスが `otel` / `adot-collector` / `jaeger` のいずれかで、Collector が起動していること |
+| 設定の取得 | `--config` (`file:` / `env:` / `yaml:` の URI 形式も解釈) → 設定注入用の環境変数 (`AOT_CONFIG_CONTENT` 等) → 既定パス の順に探し、`docker cp` で取り出す (distroless でシェルが無くても読める)。取り出せない場合は bind mount 元のホストファイルを読む |
+| 有効・無効の判定 | `service.pipelines` (拡張は `service.extensions`) から参照されているコンポーネントだけを「有効」とし、定義のみで未参照のものは「無効」として区別する |
+| 送信先の判定 | exporter の種別と `endpoint` から「実 AWS X-Ray」「Compose 内サービス (X-Ray 偽装)」「コレクタのログ出力のみ」「ファイル出力のみ」「Compose 外のホスト」を判定する |
+| 実行時の裏取り | Collector の内部テレメトリ (既定 8888/tcp) の `otelcol_exporter_sent_spans` / `otelcol_exporter_send_failed_spans` と、Collector ログの送信失敗・AWS 認証エラー |
+| 主な NG 判定 | `traces` パイプラインや receivers / exporters の欠落、参照先コンポーネントの定義漏れ、receiver が `127.0.0.1` 待受、送信元アプリの OTLP ポートと receiver 待受ポートの不一致、`otlphttp` に gRPC ポート (4317) を指定、送信先 Compose サービスが未起動、実 AWS X-Ray 宛てでリージョン・認証情報が無い、内部テレメトリ上の送信失敗 |
+| 主な WARN 判定 | 未参照の定義、`memory_limiter` が `processors` の先頭にない、receiver の `endpoint` 未指定 (v0.104 以降は既定が `localhost`)、`ecs` 検出器が有効なのに `ECS_CONTAINER_METADATA_URI_V4` が無い、`indexed_attributes` が空 (X-Ray で注釈検索ができない) |
+| 出力 | 設定の取得元、有効なパイプライン、コンポーネントの有効・無効、受信の待受と送信元の突き合わせ、送信先の判定、X-Ray の注釈、内部テレメトリ、ログの証跡、チェック結果、総合判定、設定ファイル本文 (トークン類は `[REDACTED]`) |
+
+送信先の判定は X-Ray トレース診断の冒頭にも要点として表示されます。実 AWS X-Ray へ送っている場合や、
+Compose 内 Jaeger へ送る設定になっていない場合は警告するため、「Jaeger にトレースが出ない」のが
+設定どおりの結果なのか設定の誤りなのかを切り分けられます。
+
+Jaeger トレースの HTML 出力の内容は次のとおりです。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | 選択サービスが `otel` / `adot-collector` / `jaeger` のいずれかで、Compose 内の `jaeger` へ到達できること |
+| 取得対象 | Jaeger に登録された**全サービス**のトレース (選択サービスに限らない)。`bash 接続` で frontend / backend から `curl` を実行して発生したトレースも、Jaeger へ届いていれば含まれる。同じトレースが複数サービスから返るため、スパン数の多い方を残して重複を除く |
+| 出力先 | `--trace-report-dir` > `--report-dir` 配下 > 一時ディレクトリ。既存があれば連番を足し、前回の出力を上書きしない |
+| 出力形式 | `--trace-report-format single` (既定) は `.htm` 1 ファイルへ HTML・CSS・JS・データを埋め込む。`files` は `index.html` / `trace-report.css` / `trace-report.js` / `trace-data.js` をディレクトリへ出力する (相対パスで読むためディレクトリごとコピーする) |
+| 取得範囲 | `--trace-report-lookback` (既定 `6h`) と `--trace-report-limit` (既定 50。サービスごと) |
+| 内容 | 概要と設定チェック結果、トレース一覧 (X-Ray 形式のトレース ID / 応答コード / 応答時間 / Fault・Error・Throttle)、検索と絞り込み、セグメント / サブセグメントの階層とタイムライン、http・sql・cause、Annotations と Metadata、AWS セクション、Origin、サービスマップ相当、Jaeger UI と X-Ray コンソールへのリンク |
+| 外部参照 | 一切なし。CDN・フォント・API を参照しないため、オフラインの端末でも開ける。`file://` では `fetch` が遮断されるため、データは JSON ファイルではなく JS ファイルへ埋め込む |
+| 機微情報 | 画面表示と同じ規則で伏せ字にする (キーが機微な属性と `key=value` 形式)。SQL 文へ直接埋め込まれた値のように機械的に判定できないものは伏せられないため、その旨を出力 HTML の先頭にも表示する |
 表示条件と検出内容は次のとおりで、選択後の入力は一切ありません。
 
 | 項目 | 内容 |
