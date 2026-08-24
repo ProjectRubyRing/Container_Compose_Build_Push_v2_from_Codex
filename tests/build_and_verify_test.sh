@@ -2373,6 +2373,52 @@ assert_not_contains "${trace_html_single[0]}" "dummy-secret"
 assert_contains "${trace_html_single[0]}" "[REDACTED]"
 assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
 
+# Jaeger にトレースサービスが 1 件も無いとき、Jaeger Query API は data を配列ではなく
+# null で返す。これを配列と同じ扱いにできないと HTML 出力が
+# 「data が配列ではありません」で失敗するため、設定チェックだけの HTML を出せることを確認する。
+trace_html_null_output="$TEST_TMP/keep-mode-trace-html-null-data.out"
+trace_html_null_dir="$TEST_TMP/trace-report-null-data"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app adot-collector jaeger"
+export FAKE_JAEGER_SERVICES_BODY='{"data":null,"total":0,"limit":0,"offset":0,"errors":null}'
+export FAKE_ADOT_CONFIG_FILE="$TEST_DIR/fixtures/otel/adot-collector-local.yaml"
+if ! printf '2\n6\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,adot-collector,jaeger \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --trace-report-dir "$trace_html_null_dir" \
+    --suppress-removed-logs
+) >"$trace_html_null_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_CONFIG_FILE
+  cat "$trace_html_null_output" >&2
+  fail "null Jaeger service list scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JAEGER_SERVICES_BODY FAKE_ADOT_CONFIG_FILE
+
+assert_not_contains "$trace_html_null_output" \
+  "Jaeger サービス一覧の data が配列ではありません。"
+assert_not_contains "$trace_html_null_output" "Jaeger トレースの HTML を出力できませんでした。"
+assert_contains "$trace_html_null_output" \
+  "Jaeger にトレースサービスが登録されていません。"
+assert_contains "$trace_html_null_output" "設定チェックの結果だけを含む HTML を出力します。"
+assert_contains "$trace_html_null_output" "Jaeger トレースを HTML へ出力しました: "
+
+trace_html_null_files=()
+for trace_html_path in "$trace_html_null_dir"/*.htm; do
+  [ -f "$trace_html_path" ] && trace_html_null_files+=("$trace_html_path")
+done
+[ ${#trace_html_null_files[@]} -eq 1 ] \
+  || fail "expected exactly one .htm in $trace_html_null_dir, found ${#trace_html_null_files[@]}"
+assert_contains "${trace_html_null_files[0]}" "<!DOCTYPE html>"
+assert_contains "${trace_html_null_files[0]}" "window.TRACE_DATA = {"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
 # 同じ内容を html + css + js のファイル群としても出力できること。
 # エラー (5xx・例外) のトレースを X-Ray の Fault / cause として持てるかも確認する。
 trace_files_output="$TEST_TMP/keep-mode-trace-html-files.out"
