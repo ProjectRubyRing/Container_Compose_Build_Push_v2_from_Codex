@@ -13749,7 +13749,11 @@ import sys
 
 document, = load_json_documents(["Jaeger サービス一覧"])
 
-services = document.get("data", []) if isinstance(document, dict) else []
+services = document.get("data") if isinstance(document, dict) else []
+# Jaeger Query API は登録サービスが 0 件のとき data を null で返す (Go の nil スライス)。
+# 空配列と同じ扱いにしないと、トレース未送信の状態でエラー終了してしまう。
+if services is None:
+    services = []
 if not isinstance(services, list):
     print("[ERROR] Jaeger サービス一覧の data が配列ではありません。", file=sys.stderr)
     raise SystemExit(2)
@@ -13998,7 +14002,10 @@ destination = sys.argv[4] if len(sys.argv) > 4 else ""
 jaeger_url = (sys.argv[5] if len(sys.argv) > 5 else "").rstrip("/")
 xray_region = sys.argv[6] if len(sys.argv) > 6 else ""
 
-traces = document.get("data", []) if isinstance(document, dict) else []
+traces = document.get("data") if isinstance(document, dict) else []
+# サービス一覧と同じく、該当トレースが 0 件のときは data が null で返る。
+if traces is None:
+    traces = []
 if not isinstance(traces, list):
     print("[ERROR] Jaeger トレース応答の data が配列ではありません。", file=sys.stderr)
     raise SystemExit(2)
@@ -14008,7 +14015,7 @@ traces = [trace for trace in traces if isinstance(trace, dict)]
 def trace_start(trace):
     starts = [
         span.get("startTime")
-        for span in trace.get("spans", [])
+        for span in (trace.get("spans") or [])
         if isinstance(span, dict) and isinstance(span.get("startTime"), (int, float))
     ]
     return min(starts) if starts else 0
@@ -14032,7 +14039,7 @@ if not traces:
 
 # ---- 事前計算 ---------------------------------------------------------------
 def analyze(trace):
-    spans = [span for span in trace.get("spans", []) if isinstance(span, dict)]
+    spans = [span for span in (trace.get("spans") or []) if isinstance(span, dict)]
     spans.sort(key=lambda span: span.get("startTime") or 0)
     processes = trace.get("processes") if isinstance(trace.get("processes"), dict) else {}
     span_by_id = {str(span.get("spanID")): span for span in spans}
