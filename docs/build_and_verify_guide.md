@@ -548,6 +548,8 @@ compose down (削除)
 | `--no-undertow-analysis` | フラグ | `false` | 不可 | Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない |
 | `--cert-check-text FILE` | ファイルパス | (なし) | 不可 | 証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先。`--no-cert-check-text` とは排他 |
 | `--no-cert-check-text` | フラグ | `false` | 不可 | 証明書チェック結果のテキスト出力を行わない (画面表示だけにする) |
+| `--jboss-module-list-text FILE` | ファイルパス | (なし) | 不可 | JBoss モジュール一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先。`--no-jboss-module-list-text` とは排他 |
+| `--no-jboss-module-list-text` | フラグ | `false` | 不可 | JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) |
 
 ### 4.8 終了時のクリーンアップ
 
@@ -948,7 +950,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -1032,8 +1034,9 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | Jaeger トレースの HTML 出力 | Jaeger に登録された**全サービス**のトレースを取得し、外部リソースを参照しない HTML (または html + css + js) へ書き出す。別端末へコピーしてダブルクリックすればブラウザで開ける | `curl` + Python 3 |
 | 証明書チェック | 受領した自己証明書 (`cacert.crt`) の素性 (種別・X.509 バージョン・トラストアンカー可否・全項目) を確定させたうえで、自己証明書を取り込んだコンテナ (front / back 等) から HTTPS の REST API (`secure-api` / ALB 等) へ接続できるかを確認し、結果をテキストへも出力 | コンテナ内の `curl` + `keytool` (種別の判定には `openssl`) |
 | ALB ヘルスチェック確認 | ALB ヘルスチェック偽装サービス (`alb-healthcheck`) の状態を確認し、そこから ALB と同じヘルスチェックを実行して**ステータスコードと成功失敗判定**を表示 | 偽装サービスが起動しており、選択サービスがそのターゲットであること |
+| JBoss モジュール一覧 | `$JBOSS_HOME/bin/jboss-cli.sh -c` で管理インターフェースへ接続し、`/core-service=module-loading:module-info` が `success` となった (= ロードされ認識されている) モジュール名・スロットと **jar ファイル名**を表示し、同じ内容をテキストへも出力 | コンテナ内に `jboss-cli.sh` と `modules` があること (frontend / backend の JBoss EAP) |
 
-証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェックは常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
+証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧は常に**最後の操作番号**へ追加されるため、既存操作の番号は変わりません。
 
 ADOT Collector 設定チェックの表示条件と内容は次のとおりです。
 
@@ -1190,6 +1193,34 @@ ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でもも�
 
 偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
 `ALB_HEALTHCHECK_SERVICE` (既定 `alb-healthcheck`) を合わせてください。
+
+#### JBoss モジュール一覧 (`module-loading:module-info`)
+
+`modules` 配下に `module.xml` が置いてあることと、**サーバーがそのモジュールをロードできること**は
+別物です。依存モジュールの欠落・`module.xml` の記述誤り・`resource-root` が指す jar の置き忘れが
+あると、ディレクトリは存在するのにモジュールは解決できず、デプロイ時に
+`ClassNotFoundException` / `NoClassDefFoundError` になります。
+
+この操作は `$JBOSS_HOME/bin/jboss-cli.sh -c` で管理インターフェースへ接続し、
+`/core-service=module-loading:module-info` の `outcome` で「実際に認識されているか」を確かめます。
+選択後の入力は一切ありません。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | コンテナ内に `jboss-cli.sh` (`--jboss-cli-path` の指定 → `$JBOSS_HOME/bin/jboss-cli.sh`) と `modules` ディレクトリがあること。frontend / backend の AP サーバーだけが該当し、`mysql` / `jaeger` などには出ない |
+| `JBOSS_HOME` の検出 | 環境変数 `JBOSS_HOME` / `JBOSS_EAP_HOME` → 既定の候補 (`/opt/jboss-eap` / `/opt/eap` / `/opt/jboss` / `/opt/wildfly` ほか) の順に、`bin` と `modules` を持つディレクトリを探す |
+| 接続確認 | 先に `:read-attribute(name=server-state)` を実行し、接続できない場合はそこで `判定: 実行不能` として CLI の出力を添える (AP サーバー停止中・管理インターフェース無効の切り分け) |
+| モジュールの列挙 | `/core-service=module-loading:read-attribute(name=module-roots)` で得たモジュールルート配下の `module.xml` から求める。JBoss Modules はディレクトリ構造がモジュール名そのものなので、`system/layers/<レイヤ>/` と `system/add-ons/<アドオン>/` を除いた相対パスを `.` 区切りにし、最後の階層をスロットとして扱う |
+| 判定 | 各モジュールへ `module-info(name=<モジュール名>)` (スロットが `main` 以外なら `<モジュール名>:<スロット>`) を実行し、`outcome => "success"` を「認識されている」とみなす |
+| 実行のしかた | モジュールごとに `jboss-cli.sh` を起動すると JVM 起動の分だけ時間がかかるため、全モジュール分を 1 本の CLI スクリプトへまとめて 1 回の接続で流す。1 件の失敗で中断されないよう `try` / `catch` で囲み、`try` を解釈できない CLI では標準入力から流し直す |
+| jar ファイル名 | `module.xml` の `<resource-root path="...">` と、モジュールディレクトリ内の実ファイル (`*.jar`) の**両方**から集めて重複を除く (どちらか一方だけでは定義漏れ・置き忘れに気付けない) |
+| 出力 | `0.` 実行環境 (JBOSS_HOME / jboss-cli.sh / サーバー状態 / module-roots / module.xml 件数) / `1.` 認識されているモジュール一覧 (モジュール名:スロット・`module.xml` のパス・jar ファイル名) / `2.` 認識されなかったモジュール (先頭 200 件) / `3.` 認識されているモジュールの jar ファイル一覧 / `4.` TSV (モジュール名・スロット・jar) / 結果 |
+| ファイル出力 | 画面と同じ内容を `--jboss-module-list-text` → `--report-dir` 配下の `build_and_verify_<日時>_jboss_modules_<サービス名>.txt` → 一時ディレクトリ の順に決めたパスへ出力し、そのパスを画面へ表示する (`--no-jboss-module-list-text` で抑制)。繰り返し実行時は連番を足して上書きしない |
+| 画面表示 | 一覧そのものを画面で読めるよう、表示上限を 1 MiB まで広げている (超過分はテキストファイルを参照する) |
+| 終了扱い | `判定: NG` (`success` が 0 件) は診断結果としてそのまま操作選択へ戻る。接続できない / モジュールを検出できない場合のみヘルパー失敗として扱う |
+
+`4.` の TSV は表計算ソフトへそのまま貼り付けられるため、**前回ビルドのイメージとの差分比較**
+(モジュールが増えた・jar のバージョンが変わった) にも使えます。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 
@@ -1738,6 +1769,9 @@ RUN --mount=type=secret,id=cacerts \
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.xlsx` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 読み取り専用ファイルシステム分析の Excel ブック |
 | `--report-dir/build_and_verify_<日時>_readonly_filesystem.txt` | `--report-dir` 指定時 (コンテナ未起動の実行を含む) | 同じ内容のテキスト版 (全ディレクトリの判定・根拠・参考知識) |
 | `--readonly-analysis-excel` / `--readonly-analysis-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--report-dir/build_and_verify_<日時>_cert_check_<サービス名>.txt` | `--keep-container-mode logs` で証明書チェックを実行したとき (`--no-cert-check-text` で抑制) | 証明書チェックの結果 (受領した自己証明書の詳細と HTTPS 接続の結果) |
+| `--report-dir/build_and_verify_<日時>_jboss_modules_<サービス名>.txt` | `--keep-container-mode logs` で JBoss モジュール一覧を実行したとき (`--no-jboss-module-list-text` で抑制) | `module-info` が `success` となったモジュール名・スロット・jar ファイル名の一覧と TSV |
+| `--cert-check-text` / `--jboss-module-list-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
 
 全量レポートのセクション構成は次のとおりです。
 
@@ -2656,6 +2690,8 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `--readonly-analysis-text と --no-readonly-analysis は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
 | `--readonly-analysis-excel と --readonly-analysis-text に同じパスは指定できません` | 両方へ同じパスを指定した (exit 2) | 別々のパスにする |
 | `--cert-check-text と --no-cert-check-text は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `--jboss-module-list-text と --no-jboss-module-list-text は同時に指定できません` | 排他違反 (exit 2) | どちらか一方にする |
+| `jboss-cli.sh で管理インターフェースへ接続できないか、モジュールを検出できませんでした` | AP サーバー停止中 / 管理インターフェース無効 / `JBOSS_HOME` を検出できない | ログで AP サーバーの起動を確認する。`--jboss-cli-path` で `jboss-cli.sh` のパスを明示する |
 | `[NG] コンテナ内に設定ファイルがありません` | マウントが効いていない (ディレクトリが作られた・パス違い) | 表示された設定ディレクトリの内容と `compose.yml` の `volumes` を突き合わせる |
 | `[NG] ホスト側の … とコンテナ内の … の内容が一致しません` | 設定ファイルを編集したがコンテナを作り直していない | `docker compose up -d --force-recreate <cwagent>` で作り直す |
 | `[NG] … 秒待っても送達を確認できない送信先があります` | 収集対象ファイルへ誰も書いていない、送信先が listen していない、認証・権限不足など | 表示された cwagent の警告・エラーログを確認し、`--cwagent-delivery-timeout` を `force_flush_interval` より十分長くして再実行 |
