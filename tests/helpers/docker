@@ -277,6 +277,7 @@ if [ "${1:-}" = "compose" ]; then
           aurora84) printf 'cid-mysql84\n' ;;
           nohealth) printf 'cid-nohealth\n' ;;
           tlsapp) printf 'cid-tlsapp\n' ;;
+          eapapp) printf 'cid-eapapp\n' ;;
           # ALB ヘルスチェック偽装サービスは、FAKE_COMPOSE_PS_SERVICES へ
           # 含めたときだけ「起動している」ものとして扱う (未導入の構成を再現する)。
           alb-healthcheck)
@@ -749,6 +750,7 @@ PATH=/usr/bin}"
         *"cid-mysql84"*) printf '/aurora-mysql-8.4\n' ;;
         *"cid-nohealth"*) printf '/no-healthcheck\n' ;;
         *"cid-tlsapp"*) printf '/app-front\n' ;;
+        *"cid-eapapp"*) printf '/app-eap\n' ;;
         *"cid-alb-healthcheck"*) printf '/alb-healthcheck\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
@@ -1243,6 +1245,69 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
       printf '\n=== 結果 ===\n'
       printf '  PASS=6  FAIL=0  WARN=0  SKIP=0\n'
       printf '判定: OK — 検出したトラストストアの証明書で HTTPS 接続できています。\n'
+      exit 0
+      ;;
+  esac
+fi
+
+# JBoss モジュール一覧の対象判定。jboss-cli.sh と modules を持つコンテナだけ成功させる。
+# ここで拾わないと、汎用 exec ハンドラが成功を返して全サービスへ操作が出てしまう。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"jboss-module-list-probe"* ]]; then
+  [ "${2:-}" = "cid-eapapp" ] && exit 0
+  exit 1
+fi
+
+# JBoss モジュール一覧の本体。コンテナ内スクリプトの出力と終了コードを模擬する。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"jboss-module-list-report"* ]]; then
+  case "${FAKE_JBOSS_MODULE_LIST_RESULT:-ok}" in
+    unavailable)
+      printf '\n=== 0. 実行環境 ===\n'
+      printf '     JBOSS_HOME      : /opt/jboss-eap\n'
+      printf '     jboss-cli.sh    : /opt/jboss-eap/bin/jboss-cli.sh\n'
+      printf '     接続            : 失敗 (jboss-cli.sh -c / exit=1)\n'
+      printf '\njboss-cli.sh -c で管理インターフェースへ接続できませんでした。\n'
+      exit 2
+      ;;
+    ng)
+      printf '\n=== 1. 認識されているモジュール一覧 (module-info = success) ===\n'
+      printf '     module-info が success となるモジュールはありませんでした。\n'
+      printf '\n=== 結果 ===\n'
+      printf '  認識 (module-info = success): 0\n'
+      printf '判定: NG — module-info が success となるモジュールがありません。\n'
+      exit 1
+      ;;
+    *)
+      printf '\n=== 0. 実行環境 ===\n'
+      printf '     JBOSS_HOME      : /opt/jboss-eap\n'
+      printf '     jboss-cli.sh    : /opt/jboss-eap/bin/jboss-cli.sh\n'
+      printf '     接続            : 成功 (jboss-cli.sh -c)\n'
+      printf '     サーバー状態    : running\n'
+      printf '     module-roots    : /opt/jboss-eap/modules \n'
+      printf '     module.xml      : 3 件 (モジュール候補)\n'
+      printf '\n=== 1. 認識されているモジュール一覧 (module-info = success) ===\n'
+      printf '[   1] org.jboss.logging:main\n'
+      printf '         module.xml : /opt/jboss-eap/modules/system/layers/base/org/jboss/logging/main/module.xml\n'
+      printf '         jar        : jboss-logging-3.5.3.Final-redhat-00001.jar\n'
+      printf '[   2] com.mysql.jdbc:main\n'
+      printf '         module.xml : /opt/jboss-eap/modules/com/mysql/jdbc/main/module.xml\n'
+      printf '         jar        : mysql-connector-j-8.4.0.jar\n'
+      printf '\n=== 2. 認識されなかったモジュール (module-info = failed) ===\n'
+      printf '[   1] com.example.broken:main\n'
+      printf '         module.xml : /opt/jboss-eap/modules/com/example/broken/main/module.xml\n'
+      printf '\n=== 3. 認識されているモジュールの jar ファイル一覧 ===\n'
+      printf '[   1] jboss-logging-3.5.3.Final-redhat-00001.jar\n'
+      printf '[   2] mysql-connector-j-8.4.0.jar\n'
+      printf '\n=== 4. TSV (モジュール名<TAB>スロット<TAB>jar ファイル名) ===\n'
+      printf 'org.jboss.logging\tmain\tjboss-logging-3.5.3.Final-redhat-00001.jar\n'
+      printf 'com.mysql.jdbc\tmain\tmysql-connector-j-8.4.0.jar\n'
+      printf '\n=== 結果 ===\n'
+      printf '  モジュール候補 (module.xml) : 3\n'
+      printf '  認識 (module-info = success): 2\n'
+      printf '  未認識 (module-info = failed): 1\n'
+      printf '  認識されている jar          : 2\n'
+      printf '判定: OK — 2 件のモジュールがロードされ、サーバーに認識されています。\n'
       exit 0
       ;;
   esac

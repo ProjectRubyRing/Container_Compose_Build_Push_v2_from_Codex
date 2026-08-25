@@ -791,6 +791,21 @@ CERT_CHECK_TEXT_SET="false"       # 出力先が明示指定されたか
 CERT_CHECK_TEXT_ENABLED="true"    # false (--no-cert-check-text): テキストを出力しない
 CERT_CHECK_TEXT_OUTPUT=""         # 直近に出力したテキストのパス
 
+# ---- JBoss モジュール一覧 (module-info) のテキスト出力 -----------------------
+# frontend / backend のような JBoss EAP コンテナでは、デプロイした WAR が参照する
+# モジュールが「本当にサーバーへ認識されているか」を、$JBOSS_HOME/bin/jboss-cli.sh -c
+# で管理インターフェースへ接続し /core-service=module-loading:module-info の
+# outcome で確かめられる。ディレクトリに module.xml があるだけでは
+# 「置いてある」ことしか分からず、依存の解決に失敗したモジュールは
+# module-info が failed となるため、この確認でしか切り分けられない。
+# 画面は流れてしまい、モジュール名と jar ファイル名は前回のイメージとの
+# 突き合わせに使いたくなるため、同じ内容をテキストへも残す。
+# 出力先は --jboss-module-list-text > --report-dir 配下 > 一時ディレクトリ の順。
+JBOSS_MODULE_LIST_TEXT=""             # テキストの出力先。空なら自動命名する
+JBOSS_MODULE_LIST_TEXT_SET="false"    # 出力先が明示指定されたか
+JBOSS_MODULE_LIST_TEXT_ENABLED="true" # false (--no-jboss-module-list-text): 出力しない
+JBOSS_MODULE_LIST_TEXT_OUTPUT=""      # 直近に出力したテキストのパス
+
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
 # 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
@@ -1536,7 +1551,19 @@ JBoss マスターパスワードの伝搬検証:
                                     サービス自身で「ALB ヘルスチェック確認」も
                                     選択でき、ALB から見たステータスコード・
                                     成功失敗判定・initial/healthy/unhealthy を
-                                    確認する
+                                    確認する。
+                                    jboss-cli.sh と modules を持つコンテナ
+                                    (frontend / backend の JBoss EAP) では
+                                    「JBoss モジュール一覧」も選択でき、
+                                    $JBOSS_HOME/bin/jboss-cli.sh -c で接続して
+                                    /core-service=module-loading:module-info を
+                                    全モジュールへ実行し、outcome が success と
+                                    なった (= ロードされ認識されている)
+                                    モジュール名・スロットと、その jar
+                                    ファイル名を画面へ表示し、同じ内容を
+                                    テキストファイルへも出力する
+                                    (--jboss-module-list-text /
+                                     --no-jboss-module-list-text)
                                     (bash 接続先には /bin/bash が必要)
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
@@ -1666,6 +1693,20 @@ JBoss マスターパスワードの伝搬検証:
                            そのパスを画面へ表示する。同じサービスを繰り返し
                            確認したときは連番を足し、前回の結果を上書きしない
   --no-cert-check-text     証明書チェック結果のテキスト出力を行わない
+                           (画面表示だけにする)
+  --jboss-module-list-text FILE
+                           JBoss モジュール一覧 (--keep-container-mode logs の操作)
+                           の結果を FILE へ出力する。$JBOSS_HOME/bin/jboss-cli.sh -c
+                           で接続し、module-loading の module-info が success と
+                           なったモジュール名・スロット・jar ファイル名を、画面と
+                           同じ内容で残す。
+                           未指定時は --report-dir 配下の
+                           DIR/build_and_verify_<日時>_jboss_modules_<サービス名>.txt、
+                           --report-dir も無い場合は一時ディレクトリへ出力し、
+                           そのパスを画面へ表示する。同じサービスを繰り返し
+                           確認したときは連番を足し、前回の結果を上書きしない
+  --no-jboss-module-list-text
+                           JBoss モジュール一覧のテキスト出力を行わない
                            (画面表示だけにする)
 
 WAR デプロイ時の Java 例外解析:
@@ -2075,6 +2116,10 @@ while [ $# -gt 0 ]; do
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
     --cert-check-text)     need_value "$1" $#; CERT_CHECK_TEXT="$2"; CERT_CHECK_TEXT_SET="true"; shift 2 ;;
     --no-cert-check-text)  CERT_CHECK_TEXT_ENABLED="false"; shift ;;
+    --jboss-module-list-text)
+                           need_value "$1" $#; JBOSS_MODULE_LIST_TEXT="$2"; JBOSS_MODULE_LIST_TEXT_SET="true"; shift 2 ;;
+    --no-jboss-module-list-text)
+                           JBOSS_MODULE_LIST_TEXT_ENABLED="false"; shift ;;
     --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
     --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
     --deploy-exception-excel) need_value "$1" $#; DEPLOY_EXCEPTION_EXCEL="$2"; DEPLOY_EXCEPTION_EXCEL_SET="true"; shift 2 ;;
@@ -2242,6 +2287,16 @@ if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
   fi
   if [ "$CERT_CHECK_TEXT_ENABLED" != "true" ]; then
     err "--cert-check-text と --no-cert-check-text は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$JBOSS_MODULE_LIST_TEXT_SET" = "true" ]; then
+  if [ -z "$JBOSS_MODULE_LIST_TEXT" ] || [ "$JBOSS_MODULE_LIST_TEXT" = "-" ]; then
+    err "--jboss-module-list-text にはファイルパスを指定してください: $JBOSS_MODULE_LIST_TEXT"
+    exit 2
+  fi
+  if [ "$JBOSS_MODULE_LIST_TEXT_ENABLED" != "true" ]; then
+    err "--jboss-module-list-text と --no-jboss-module-list-text は同時に指定できません。"
     exit 2
   fi
 fi
@@ -9059,9 +9114,11 @@ redact_healthcheck_text() {
 }
 
 # healthcheck の手動再実行や HTTP 補助プローブの出力を、端末を圧迫しない範囲で表示する。
+# 第 3 引数で表示上限のバイト数を変えられる (未指定は 32768)。モジュール一覧のように
+# 「一覧そのものを画面で読みたい」出力では、呼び出し側が上限を広げて使う。
 print_healthcheck_capture() {
-  local capture_file="$1" empty_message="$2"
-  local byte_count display_limit=32768
+  local capture_file="$1" empty_message="$2" display_limit="${3:-32768}"
+  local byte_count
 
   if [ ! -s "$capture_file" ]; then
     diag "$empty_message"
@@ -9074,7 +9131,7 @@ print_healthcheck_capture() {
   if [ "$byte_count" -gt "$display_limit" ]; then
     head -c "$display_limit" "$capture_file" | redact_healthcheck_text >&2
     printf '\n' >&2
-    diag "... healthcheck 診断出力を ${display_limit}/${byte_count} bytes で省略しました。"
+    diag "... 出力を ${display_limit}/${byte_count} bytes で省略しました (全量はテキストファイルを参照してください)。"
   else
     redact_healthcheck_text < "$capture_file" >&2
     printf '\n' >&2
@@ -11820,6 +11877,481 @@ CERT_CHECK_SCRIPT
       ;;
   esac
   diag "接続先やトラストストアの内容には機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
+# ---- JBoss モジュール一覧 (module-loading:module-info) ------------------------
+# frontend / backend のような JBoss EAP コンテナで、$JBOSS_HOME/bin/jboss-cli.sh -c
+# により管理インターフェースへ接続し、/core-service=module-loading:module-info を
+# 全モジュールへ実行して「サーバーが実際にロードできたモジュール」を一覧化する。
+#
+# modules 配下に module.xml があることと、そのモジュールをサーバーがロードできる
+# ことは別物で、依存モジュールの欠落・module.xml の誤り・resource-root の jar が
+# 無い、といった状態では module-info が failed を返す。デプロイした WAR が
+# jboss-deployment-structure.xml や Dependencies で参照しているモジュールが
+# この一覧に出るかどうかで、ClassNotFoundException / NoClassDefFoundError の
+# 原因がモジュール側にあるのかアプリ側にあるのかを切り分けられる。
+#
+# 対象サービスの判定は「コンテナ内に jboss-cli.sh と modules がある」ことで行う。
+# frontend / backend の AP サーバーだけが該当し、mysql / jaeger などには出さない。
+compose_service_supports_jboss_module_list() {
+  local service_name="$1" container_id
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  container_id="${container_ids[0]}"
+  docker exec "$container_id" /bin/sh -c '
+    # jboss-module-list-probe: jboss-cli.sh と modules ディレクトリがそろっているか
+    jml_hint="$1"
+    shift
+    if [ -n "$jml_hint" ] && [ -f "$jml_hint" ]; then
+      exit 0
+    fi
+    for jml_candidate in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+      [ -n "$jml_candidate" ] || continue
+      if [ -f "$jml_candidate/bin/jboss-cli.sh" ] && [ -d "$jml_candidate/modules" ]; then
+        exit 0
+      fi
+    done
+    exit 1
+  ' _ "$JBOSS_CLI_PATH" "${JBOSS_HOME_CANDIDATES[@]}" >/dev/null 2>&1
+}
+
+# モジュール一覧テキストの出力先を決める。
+#   --jboss-module-list-text の明示指定 > --report-dir 配下 > 一時ディレクトリ
+# 対話中は同じサービスを何度でも確認できるため、既存ファイルがあれば連番を足し、
+# 直前の結果を上書きしない (モジュールを足しながらの比較ができるようにする)。
+resolve_jboss_module_list_path() {
+  local service_name="$1"
+  local safe_name base dir_part base_name prefix extension candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ "$JBOSS_MODULE_LIST_TEXT_SET" = "true" ]; then
+    base="$JBOSS_MODULE_LIST_TEXT"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_jboss_modules_${safe_name}.txt"
+  else
+    # 出力先の指定が無くても、モジュール一覧は後から突き合わせたくなる情報なので
+    # 一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_jboss_modules_${safe_name}.txt"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  base_name="$(basename -- "$base")"
+  case "$base_name" in
+    ?*.*) prefix="${base_name%.*}"; extension=".${base_name##*.}" ;;
+    *)    prefix="$base_name";      extension="" ;;
+  esac
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 画面へ出したものと同じ内容を、どの構成に対する結果かが分かる見出しを付けて残す。
+write_jboss_module_list_text() {
+  local path="$1" service_name="$2" container_name="$3" capture_file="$4" verdict="$5"
+  local dir_path
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "JBoss モジュール一覧の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "JBoss モジュール一覧のテキストを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf 'JBoss モジュール一覧 (build_and_verify.sh)\n'
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf 'Compose サービス : %s\n' "$service_name"
+    printf 'コンテナ         : %s\n' "$container_name"
+    printf 'compose ファイル : %s\n' "$COMPOSE_FILE"
+    printf '判定             : %s\n' "$verdict"
+    printf '取得方法         : $JBOSS_HOME/bin/jboss-cli.sh -c で管理インターフェースへ\n'
+    printf '                   接続し、modules 配下の module.xml から求めた各モジュールへ\n'
+    printf '                   /core-service=module-loading:module-info を実行して、\n'
+    printf '                   outcome が success のものを「認識されている」とみなす\n'
+    printf '記載内容         : 0. 実行環境 / 1. 認識されているモジュール一覧 /\n'
+    printf '                   2. 認識されなかったモジュール / 3. jar ファイル一覧 /\n'
+    printf '                   4. TSV (モジュール名<TAB>スロット<TAB>jar)\n'
+    printf '===================================================================\n'
+    redact_healthcheck_text < "$capture_file"
+  } >> "$path" 2>/dev/null || {
+    warn "JBoss モジュール一覧のテキストを出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
+# コンテナ内で jboss-cli.sh -c を実行し、module-info が success となるモジュールを
+# 一覧化して画面とテキストへ出す。追加のパラメータ入力は不要
+# (JBOSS_HOME・jboss-cli.sh・モジュールルートはすべてコンテナ内から検出する)。
+run_interactive_compose_jboss_module_list() {
+  local service_name="$1" container_id container_name module_list_script
+  local capture_file="" exec_status=0 verdict_text="" text_path=""
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  module_list_script="$(cat <<'JBOSS_MODULE_LIST_SCRIPT'
+set -u
+# jboss-module-list-report: JBoss EAP が実際にロードできるモジュールを一覧化する。
+#   $1      = --jboss-cli-path の指定 (空文字可)
+#   $2 以降 = JBOSS_HOME の候補
+# 手順
+#   1. JBOSS_HOME と jboss-cli.sh を検出する
+#   2. jboss-cli.sh -c で管理インターフェースへ接続できるかを確かめる
+#   3. /core-service=module-loading:read-attribute(name=module-roots) で
+#      モジュールルートを取得し、その配下の module.xml からモジュール名を求める
+#      (JBoss Modules はディレクトリ構造がモジュール名そのものになる。
+#       system/layers/<レイヤ>/ と system/add-ons/<アドオン>/ は名前に含めない)
+#   4. 各モジュールへ module-info を実行し、outcome = success を「認識されている」
+#      とみなす。1 件の失敗でスクリプトが止まらないよう try / catch で囲む
+#   5. モジュール名・スロット・module.xml・jar ファイル名を一覧化する
+# 終了コード: 0 = 1 件以上を認識 / 1 = 1 件も認識できず / 2 = 実行不能
+JML_TAB="$(printf '\t')"
+
+jml_cli_hint="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+for jml_tool in find awk sort sed; do
+  if ! command -v "$jml_tool" >/dev/null 2>&1; then
+    printf 'モジュール一覧の作成に必要なコマンドがコンテナにありません: %s\n' "$jml_tool"
+    exit 2
+  fi
+done
+
+jml_home=""
+for jml_candidate in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+  [ -n "$jml_candidate" ] || continue
+  if [ -d "$jml_candidate/bin" ] && [ -d "$jml_candidate/modules" ]; then
+    jml_home="$jml_candidate"
+    break
+  fi
+done
+if [ -z "$jml_home" ]; then
+  printf 'JBOSS_HOME を検出できませんでした (bin と modules を持つディレクトリが見つかりません)。\n'
+  exit 2
+fi
+
+jml_cli=""
+if [ -n "$jml_cli_hint" ] && [ -f "$jml_cli_hint" ]; then
+  jml_cli="$jml_cli_hint"
+elif [ -f "$jml_home/bin/jboss-cli.sh" ]; then
+  jml_cli="$jml_home/bin/jboss-cli.sh"
+fi
+if [ -z "$jml_cli" ]; then
+  printf 'jboss-cli.sh が見つかりません: %s/bin/jboss-cli.sh\n' "$jml_home"
+  exit 2
+fi
+
+# 読み取り専用ルートファイルシステムでも動くよう、書ける場所を順に探す。
+jml_tmp=""
+for jml_base in "${TMPDIR:-}" /tmp "$jml_home/standalone/tmp" "$jml_home/standalone/data" .; do
+  [ -n "$jml_base" ] || continue
+  [ -d "$jml_base" ] || continue
+  if mkdir -p "$jml_base/jboss-module-list.$$" 2>/dev/null; then
+    jml_tmp="$jml_base/jboss-module-list.$$"
+    break
+  fi
+done
+if [ -z "$jml_tmp" ]; then
+  printf 'モジュール一覧の作業ディレクトリを作成できる場所がありません (書き込み可能な一時領域が必要です)。\n'
+  exit 2
+fi
+trap 'rm -rf -- "$jml_tmp"' EXIT INT TERM
+
+printf '\n=== 0. 実行環境 ===\n'
+printf '     JBOSS_HOME      : %s\n' "$jml_home"
+printf '     jboss-cli.sh    : %s\n' "$jml_cli"
+
+# ---- 2. 管理インターフェースへ接続できるか ----------------------------------
+jml_probe_status=0
+jml_probe="$("$jml_cli" -c --commands=':read-attribute(name=server-state)' 2>&1)" || jml_probe_status=$?
+if [ "$jml_probe_status" -ne 0 ]; then
+  printf '     接続            : 失敗 (jboss-cli.sh -c / exit=%s)\n' "$jml_probe_status"
+  printf '\njboss-cli.sh -c で管理インターフェースへ接続できませんでした。\n'
+  printf 'AP サーバーが起動しているか、管理インターフェース (既定 9990) が有効かを確認してください。\n'
+  printf '%s\n' "$jml_probe" | sed 's/^/     /' | head -n 40
+  exit 2
+fi
+jml_state="$(printf '%s\n' "$jml_probe" | sed -n 's/.*"result" => "\([^"]*\)".*/\1/p' | head -n 1)"
+printf '     接続            : 成功 (jboss-cli.sh -c)\n'
+printf '     サーバー状態    : %s\n' "${jml_state:-(不明)}"
+
+# ---- 3. モジュールルートと module.xml ---------------------------------------
+jml_roots="$("$jml_cli" -c --commands='/core-service=module-loading:read-attribute(name=module-roots)' 2>/dev/null \
+  | grep -o '"/[^"]*"' | tr -d '"' | sort -u)"
+if [ -z "$jml_roots" ]; then
+  jml_roots="$jml_home/modules"
+fi
+printf '     module-roots    : %s\n' "$(printf '%s' "$jml_roots" | tr '\n' ' ')"
+
+: > "$jml_tmp/modules.tsv"
+for jml_root in $jml_roots; do
+  [ -d "$jml_root" ] || continue
+  find "$jml_root" -name module.xml -type f 2>/dev/null | while IFS= read -r jml_xml; do
+    jml_rel="${jml_xml#"$jml_root"/}"
+    jml_dir="${jml_rel%/module.xml}"
+    # system/layers/<レイヤ>/ と system/add-ons/<アドオン>/ はモジュール名に含めない。
+    case "$jml_dir" in
+      system/layers/*/*/*)  jml_dir="${jml_dir#system/layers/}";  jml_dir="${jml_dir#*/}" ;;
+      system/add-ons/*/*/*) jml_dir="${jml_dir#system/add-ons/}"; jml_dir="${jml_dir#*/}" ;;
+    esac
+    case "$jml_dir" in
+      */*) ;;
+      *) continue ;;
+    esac
+    jml_slot="${jml_dir##*/}"
+    jml_name="$(printf '%s' "${jml_dir%/*}" | tr '/' '.')"
+    jml_moddir="${jml_xml%/module.xml}"
+    # jar は module.xml の resource-root と、モジュールディレクトリの実ファイルの
+    # 両方から集める (どちらか一方だけでは、定義漏れ・置き忘れに気付けない)。
+    jml_jars="$(
+      {
+        sed -n 's/.*<resource-root[^>]*path="\([^"]*\)".*/\1/p' "$jml_xml" 2>/dev/null
+        find "$jml_moddir" -maxdepth 1 -type f -name '*.jar' 2>/dev/null
+      } | sed 's#^.*/##' | grep -i '\.jar$' | sort -u | tr '\n' ' '
+    )"
+    jml_jars="${jml_jars% }"
+    printf '%s\t%s\t%s\t%s\n' "$jml_name" "$jml_slot" "$jml_xml" "$jml_jars" >> "$jml_tmp/modules.tsv"
+  done
+done
+
+sort -t"$JML_TAB" -k1,2 -u "$jml_tmp/modules.tsv" > "$jml_tmp/modules-sorted.tsv" 2>/dev/null \
+  || sort -u "$jml_tmp/modules.tsv" > "$jml_tmp/modules-sorted.tsv"
+jml_total="$(awk 'END { print NR + 0 }' "$jml_tmp/modules-sorted.tsv")"
+printf '     module.xml      : %s 件 (モジュール候補)\n' "$jml_total"
+if [ "$jml_total" -eq 0 ]; then
+  printf '\nモジュールルートに module.xml が 1 件も見つかりませんでした: %s\n' "$jml_roots"
+  exit 2
+fi
+
+# ---- 4. module-info をまとめて実行する --------------------------------------
+# 1 モジュールずつ jboss-cli.sh を起動すると JVM 起動の分だけ時間がかかるため、
+# 1 本のスクリプトへまとめて 1 回の接続で流す。1 件でも失敗するとスクリプトが
+# 中断される実装があるため、try / catch で各モジュールを囲む。
+jml_build_commands() {
+  # $1 = 出力先 / $2 = try/catch を使うか (yes/no)
+  jml_out="$1"
+  jml_use_try="$2"
+  : > "$jml_out"
+  while IFS="$JML_TAB" read -r jml_n jml_s jml_x jml_j; do
+    [ -n "$jml_n" ] || continue
+    if [ "$jml_s" = "main" ]; then
+      jml_arg="$jml_n"
+    else
+      jml_arg="$jml_n:$jml_s"
+    fi
+    printf 'echo @@JML@@ %s %s\n' "$jml_n" "$jml_s" >> "$jml_out"
+    if [ "$jml_use_try" = "yes" ]; then
+      printf 'try\n' >> "$jml_out"
+      printf '/core-service=module-loading:module-info(name="%s")\n' "$jml_arg" >> "$jml_out"
+      printf 'catch\n' >> "$jml_out"
+      printf 'echo @@JMLNG@@\n' >> "$jml_out"
+      printf 'end-try\n' >> "$jml_out"
+    else
+      printf '/core-service=module-loading:module-info(name="%s")\n' "$jml_arg" >> "$jml_out"
+    fi
+  done < "$jml_tmp/modules-sorted.tsv"
+}
+
+jml_parse_status() {
+  # jboss-cli の出力から「マーカー行の次に success が出たか」で判定する。
+  awk '
+    function flush(   parts) {
+      if (cur == "") return
+      split(cur, parts, " ")
+      printf "%s\t%s\t%s\n", parts[1], parts[2], (ok ? "OK" : "NG")
+    }
+    {
+      pos = index($0, "@@JML@@")
+      if (pos > 0) {
+        flush()
+        cur = substr($0, pos + 7)
+        sub(/^[ \t]+/, "", cur)
+        sub(/[ \t\r]+$/, "", cur)
+        ok = 0
+        next
+      }
+      if (cur != "" && index($0, "\"outcome\" => \"success\"") > 0) { ok = 1 }
+    }
+    END { flush() }
+  ' "$1"
+}
+
+jml_build_commands "$jml_tmp/commands.cli" yes
+jml_run_status=0
+"$jml_cli" -c --file="$jml_tmp/commands.cli" > "$jml_tmp/cli.out" 2>&1 || jml_run_status=$?
+jml_parse_status "$jml_tmp/cli.out" > "$jml_tmp/status.tsv"
+
+# try / catch を解釈できない CLI では 1 件も判定できない。その場合は try を外し、
+# 標準入力から流し直す (対話セッションと同じ扱いになり、失敗しても続行できる)。
+if [ ! -s "$jml_tmp/status.tsv" ]; then
+  jml_build_commands "$jml_tmp/commands-plain.cli" no
+  "$jml_cli" -c < "$jml_tmp/commands-plain.cli" > "$jml_tmp/cli.out" 2>&1 || jml_run_status=$?
+  jml_parse_status "$jml_tmp/cli.out" > "$jml_tmp/status.tsv"
+fi
+
+if [ ! -s "$jml_tmp/status.tsv" ]; then
+  printf '\nmodule-info の実行結果を 1 件も読み取れませんでした (jboss-cli.sh exit=%s)。\n' "$jml_run_status"
+  sed 's/^/     /' "$jml_tmp/cli.out" | head -n 40
+  exit 2
+fi
+
+# 判定結果 (name/slot/OK|NG) と、module.xml・jar の情報を突き合わせる。
+awk -F"$JML_TAB" '
+  NR == FNR { st[$1 "\t" $2] = $3; next }
+  {
+    key = $1 "\t" $2
+    printf "%s\t%s\t%s\t%s\t%s\n", (key in st ? st[key] : "UNKNOWN"), $1, $2, $3, $4
+  }
+' "$jml_tmp/status.tsv" "$jml_tmp/modules-sorted.tsv" > "$jml_tmp/joined.tsv"
+
+# ---- 5. 一覧を出す -----------------------------------------------------------
+printf '\n=== 1. 認識されているモジュール一覧 (module-info = success) ===\n'
+jml_ok=0
+while IFS="$JML_TAB" read -r jml_st jml_n jml_s jml_x jml_j; do
+  [ "$jml_st" = "OK" ] || continue
+  jml_ok=$((jml_ok + 1))
+  printf '[%4d] %s:%s\n' "$jml_ok" "$jml_n" "$jml_s"
+  printf '         module.xml : %s\n' "$jml_x"
+  if [ -n "$jml_j" ]; then
+    printf '         jar        : %s\n' "$jml_j"
+  else
+    printf '         jar        : (jar なし。ディレクトリ参照またはエイリアス定義)\n'
+  fi
+done < "$jml_tmp/joined.tsv"
+if [ "$jml_ok" -eq 0 ]; then
+  printf '     module-info が success となるモジュールはありませんでした。\n'
+fi
+
+printf '\n=== 2. 認識されなかったモジュール (module-info = failed) ===\n'
+jml_ng=0
+while IFS="$JML_TAB" read -r jml_st jml_n jml_s jml_x jml_j; do
+  [ "$jml_st" = "OK" ] && continue
+  jml_ng=$((jml_ng + 1))
+  if [ "$jml_ng" -le 200 ]; then
+    printf '[%4d] %s:%s\n' "$jml_ng" "$jml_n" "$jml_s"
+    printf '         module.xml : %s\n' "$jml_x"
+  fi
+done < "$jml_tmp/joined.tsv"
+if [ "$jml_ng" -eq 0 ]; then
+  printf '     ありません (module.xml のあるモジュールはすべてロードできています)。\n'
+elif [ "$jml_ng" -gt 200 ]; then
+  printf '     ... 以降 %s 件は省略しました。\n' "$((jml_ng - 200))"
+fi
+
+printf '\n=== 3. 認識されているモジュールの jar ファイル一覧 ===\n'
+awk -F"$JML_TAB" '
+  $1 == "OK" {
+    n = split($5, arr, " ")
+    for (i = 1; i <= n; i++) if (arr[i] != "") print arr[i]
+  }
+' "$jml_tmp/joined.tsv" | sort -u > "$jml_tmp/jars.txt"
+jml_jar_count="$(awk 'END { print NR + 0 }' "$jml_tmp/jars.txt")"
+if [ "$jml_jar_count" -eq 0 ]; then
+  printf '     jar ファイルはありませんでした。\n'
+else
+  awk '{ printf "[%4d] %s\n", NR, $0 }' "$jml_tmp/jars.txt"
+fi
+
+printf '\n=== 4. TSV (モジュール名<TAB>スロット<TAB>jar ファイル名) ===\n'
+printf '     ※ 表計算ソフトへの貼り付けや、前回ビルドとの差分比較に使えます。\n'
+awk -F"$JML_TAB" '$1 == "OK" { printf "%s\t%s\t%s\n", $2, $3, $5 }' "$jml_tmp/joined.tsv"
+
+printf '\n=== 結果 ===\n'
+printf '  モジュール候補 (module.xml) : %s\n' "$jml_total"
+printf '  認識 (module-info = success): %s\n' "$jml_ok"
+printf '  未認識 (module-info = failed): %s\n' "$jml_ng"
+printf '  認識されている jar          : %s\n' "$jml_jar_count"
+if [ "$jml_ok" -eq 0 ]; then
+  printf '判定: NG — module-info が success となるモジュールがありません。\n'
+  exit 1
+fi
+printf '判定: OK — %s 件のモジュールがロードされ、サーバーに認識されています。\n' "$jml_ok"
+exit 0
+JBOSS_MODULE_LIST_SCRIPT
+)"
+
+  diag ""
+  diag "════════════ JBoss モジュール一覧 (module-info) ════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "\$JBOSS_HOME/bin/jboss-cli.sh -c で管理インターフェースへ接続し、modules 配下の"
+  diag "module.xml から求めたモジュールへ /core-service=module-loading:module-info を"
+  diag "実行して、outcome が success のモジュール名と jar ファイル名を一覧化します"
+  diag "(追加の入力は不要)。"
+  diag "モジュール数に比例して時間がかかるため、完了まで数十秒〜数分かかることがあります。"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "JBoss モジュール一覧の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  docker exec "$container_id" /bin/sh -c "$module_list_script" \
+    _ "$JBOSS_CLI_PATH" "${JBOSS_HOME_CANDIDATES[@]}" \
+    > "$capture_file" 2>&1 || exec_status=$?
+  # 一覧そのものを画面で読めるようにするため、表示上限を広げる (全量はテキストへ残す)。
+  print_healthcheck_capture "$capture_file" "(JBoss モジュール一覧の出力がありません)" 1048576
+
+  case "$exec_status" in
+    0) verdict_text="OK (module-info が success となるモジュールを一覧化しました)" ;;
+    1) verdict_text="NG (module-info が success となるモジュールがありません)" ;;
+    2) verdict_text="実行不能 (jboss-cli.sh での接続またはモジュール検出ができませんでした)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 実行不能・エラーで終わった場合も、そこまでに出た内容は残す。
+  if [ "$JBOSS_MODULE_LIST_TEXT_ENABLED" = "true" ]; then
+    text_path="$(resolve_jboss_module_list_path "$service_name")"
+    if [ -n "$text_path" ] \
+        && write_jboss_module_list_text "$text_path" "$service_name" "$container_name" \
+             "$capture_file" "$verdict_text"; then
+      JBOSS_MODULE_LIST_TEXT_OUTPUT="$text_path"
+      diag "JBoss モジュール一覧のテキスト : ${text_path}"
+      if [ "$JBOSS_MODULE_LIST_TEXT_SET" != "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+        diag "  (--report-dir または --jboss-module-list-text を指定すると出力先を変えられます)"
+      fi
+    fi
+  else
+    diag "JBoss モジュール一覧のテキスト : 出力しません (--no-jboss-module-list-text)"
+  fi
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "JBoss モジュール一覧 : OK"
+      ;;
+    1)
+      diag "JBoss モジュール一覧 : NG (module-info が success となるモジュールがありません)"
+      ;;
+    2)
+      warn "jboss-cli.sh で管理インターフェースへ接続できないか、モジュールを検出できませんでした。"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' で JBoss モジュール一覧を取得できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
   diag "════════════════════════════════════════════════"
   return 0
 }
@@ -17501,6 +18033,7 @@ run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
   local mysql_action=0 observability_action=0 cert_check_action=0
   local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
+  local jboss_module_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -17528,6 +18061,11 @@ run_interactive_compose_service_actions() {
     # Jaeger トレースの HTML 出力も同様に、末尾へ採番する。
     max_action=$(( max_action + 1 ))
     trace_html_action="$max_action"
+  fi
+  # JBoss モジュール一覧 (frontend / backend の AP サーバー) も末尾へ採番する。
+  if compose_service_supports_jboss_module_list "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    jboss_module_action="$max_action"
   fi
   while :; do
     diag ""
@@ -17557,6 +18095,9 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$trace_html_action" -gt 0 ]; then
       diag "  ${trace_html_action}) Jaeger トレースを HTML へ出力 (別端末のブラウザで確認)"
+    fi
+    if [ "$jboss_module_action" -gt 0 ]; then
+      diag "  ${jboss_module_action}) JBoss モジュール一覧 (jboss-cli.sh -c の module-info で認識済みのモジュール名 / jar を出力)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -17625,6 +18166,11 @@ run_interactive_compose_service_actions() {
         elif [ "$trace_html_action" -gt 0 ] && [ "$action" = "$trace_html_action" ]; then
           if ! run_jaeger_trace_html_export "$service_name"; then
             warn "Jaeger トレースの HTML 出力に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$jboss_module_action" -gt 0 ] && [ "$action" = "$jboss_module_action" ]; then
+          if ! run_interactive_compose_jboss_module_list "$service_name"; then
+            warn "JBoss モジュール一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
         else
@@ -17700,7 +18246,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

@@ -195,7 +195,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
 | `--remove-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。この実行が行うすべての `compose down` に `--volumes` を付け、Compose プロジェクトの名前付きボリュームも毎回削除する | `false` |
 | `--keep-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。対話操作の終了後の後始末でもボリュームを削除しない (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する | `false` |
@@ -241,6 +241,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-undertow-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない | `false` |
 | `--cert-check-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。受領した自己証明書の詳細と HTTPS 接続の結果を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-cert-check-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック結果のテキスト出力を行わない (画面表示だけにする) | `false` |
+| `--jboss-module-list-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。`module-info` が `success` となったモジュール名・スロット・jar ファイル名を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
+| `--no-jboss-module-list-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -2026,7 +2028,8 @@ CloudWatch Logs には届きません。
   `1` で今回の起動以降のログ表示、`2` で対象コンテナの対話式 `/bin/bash` 接続を
   選べます。`3` では Docker healthcheck の設定・実行履歴・通信内容を確認できます。
   さらに、コンテナの設定に応じて MySQL 接続・送達診断・証明書チェック・ALB ヘルスチェック
-  確認（ステータスコード / 成功失敗判定）が追加されます。
+  確認（ステータスコード / 成功失敗判定）・JBoss モジュール一覧（`module-info` が `success`
+  となったモジュール名と jar ファイル名）が追加されます。
   bash セッション内では `cd` で移動しながら任意のコマンドを実行でき、
   bash 終了後は同じサービスの操作選択へ戻ります。同一サービスに複数コンテナがある場合は
   警告を表示して先頭の実行中コンテナへ接続します。ログ表示後も Enter キーで操作選択へ
@@ -2495,6 +2498,53 @@ ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でもも�
 ホスト側に Python は不要です（CLI のパスとインタプリタはコンテナ内で解決します）。
 偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
 `ALB_HEALTHCHECK_SERVICE`（既定 `alb-healthcheck`）を合わせてください。
+
+### JBoss モジュール一覧（`module-loading` の `module-info`）
+
+`$JBOSS_HOME/modules` 配下に `module.xml` が置いてあることと、**JBoss EAP がそのモジュールを
+ロードできること**は別物です。依存モジュールの欠落、`module.xml` の記述誤り、`resource-root`
+が指す jar の置き忘れがあると、ディレクトリは存在するのにモジュールは解決されず、デプロイ時に
+`ClassNotFoundException` / `NoClassDefFoundError` になります。
+
+`logs` モードでは、コンテナ内に `jboss-cli.sh` と `modules` があるサービス（frontend /
+backend の JBoss EAP）に `JBoss モジュール一覧` が**最後の操作番号**として追加されます。
+既存操作の番号は変わりません。選択後の入力は不要です。
+
+選択すると `$JBOSS_HOME/bin/jboss-cli.sh -c` で管理インターフェースへ接続し、次を実行します。
+
+1. `:read-attribute(name=server-state)` で接続できることを確かめる
+   （接続できない場合はここで `判定: 実行不能` とし、CLI の出力を添えます）
+2. `/core-service=module-loading:read-attribute(name=module-roots)` でモジュールルートを取得し、
+   その配下の `module.xml` からモジュール名とスロットを求める
+   （JBoss Modules はディレクトリ構造がモジュール名そのものです。`system/layers/<レイヤ>/` と
+   `system/add-ons/<アドオン>/` は名前に含めません）
+3. 各モジュールへ `/core-service=module-loading:module-info(name=<モジュール名>)` を実行し、
+   `outcome => "success"` のものを「ロードされ、認識されているモジュール」とみなす
+   （全モジュール分を 1 本の CLI スクリプトへまとめ、1 回の接続で流します。1 件の失敗で
+   中断されないよう `try` / `catch` で囲みます）
+
+表示・出力する内容は次のとおりです。**モジュール名だけでなく jar ファイル名も対象**で、
+jar は `module.xml` の `<resource-root path="...">` とモジュールディレクトリ内の実ファイルの
+両方から集めます。
+
+| セクション | 内容 |
+|------------|------|
+| `0. 実行環境` | `JBOSS_HOME` / `jboss-cli.sh` のパス / 接続結果 / サーバー状態 / `module-roots` / `module.xml` の件数 |
+| `1. 認識されているモジュール一覧` | `モジュール名:スロット`、`module.xml` のパス、jar ファイル名 |
+| `2. 認識されなかったモジュール` | `module-info` が失敗したモジュール（先頭 200 件） |
+| `3. jar ファイル一覧` | 認識されているモジュールの jar を重複なく列挙 |
+| `4. TSV` | `モジュール名<TAB>スロット<TAB>jar ファイル名`（表計算ソフトへの貼り付け・前回ビルドとの差分比較用） |
+
+画面と**同じ内容をテキストファイルへも出力**します。出力先は
+`--jboss-module-list-text FILE` → `--report-dir` 配下の
+`build_and_verify_<日時>_jboss_modules_<サービス名>.txt` → 一時ディレクトリ、の順に決まり、
+実際のパスを画面へ表示します。同じサービスを繰り返し確認した場合は連番を付けるため、
+モジュールを足しながらの比較ができます。出力を止めるには `--no-jboss-module-list-text` を
+指定します。
+
+`success` が 0 件のときは `判定: NG` として診断結果を表示したまま操作選択へ戻ります。
+`jboss-cli.sh` で接続できない、またはモジュールを検出できない場合だけヘルパーの失敗として
+扱います。
 
 HTTP モードでは、`WFLYUT0021` からコンテキストルート、`WFLYUT0006` から
 コンテナ側 HTTP リスナーポートを取得します。コンテキストルートが複数ある場合は

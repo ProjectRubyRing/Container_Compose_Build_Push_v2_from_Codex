@@ -50,7 +50,8 @@ assert_matches() {
 # 全量レポート (build_and_verify_<日時>.txt) だけを DIR から取り出し、REPORT_FILES へ入れる。
 # 同じディレクトリには読み取り専用ファイルシステム分析のテキスト
 # (build_and_verify_<日時>_readonly_filesystem.txt)、証明書チェックの
-# テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt) も出力される
+# テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt)、JBoss
+# モジュール一覧 (build_and_verify_<日時>_jboss_modules_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
 # この関数を使う。Java 例外解析のテキスト (_java_exceptions.txt) は
 # --deploy-exception-text 指定時にしか作られないが、除外は残しておく。
@@ -61,6 +62,7 @@ collect_report_files() {
     case "$path" in
       *_java_exceptions.txt|*_readonly_filesystem.txt|*_undertow_virtual_host.txt) continue ;;
       *_cert_check_*.txt) continue ;;
+      *_jboss_modules_*.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -1813,6 +1815,203 @@ if (
 fi
 assert_contains "$cert_check_conflict_output" \
   "--cert-check-text と --no-cert-check-text は同時に指定できません。"
+
+# --- JBoss モジュール一覧 (module-loading:module-info) ------------------------
+# jboss-cli.sh と modules を持つコンテナ (frontend / backend の JBoss EAP) だけで
+# 操作が増え、既存操作の番号は変わらないこと。
+jboss_modules_output="$TEST_TMP/keep-mode-jboss-modules.out"
+jboss_modules_reports="$TEST_TMP/jboss-modules-reports"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app eapapp"
+if ! printf '2\n4\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,eapapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$jboss_modules_reports" \
+    --suppress-removed-logs
+) >"$jboss_modules_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$jboss_modules_output" >&2
+  fail "JBoss module list helper returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$jboss_modules_output" \
+  "  4) JBoss モジュール一覧 (jboss-cli.sh -c の module-info で認識済みのモジュール名 / jar を出力)"
+assert_contains "$jboss_modules_output" "Compose サービス : eapapp"
+assert_contains "$jboss_modules_output" "コンテナ         : app-eap"
+assert_contains "$jboss_modules_output" \
+  "=== 1. 認識されているモジュール一覧 (module-info = success) ==="
+# モジュール名だけでなく jar ファイル名も一覧の対象であること。
+assert_contains "$jboss_modules_output" "[   1] org.jboss.logging:main"
+assert_contains "$jboss_modules_output" "jboss-logging-3.5.3.Final-redhat-00001.jar"
+assert_contains "$jboss_modules_output" "=== 3. 認識されているモジュールの jar ファイル一覧 ==="
+assert_contains "$jboss_modules_output" "JBoss モジュール一覧 : OK"
+# jboss-cli.sh を持たないサービスには操作を出さない (番号は 0-3 のまま)。
+assert_contains "$jboss_modules_output" "Compose サービス 'app' で実行する操作を選択してください:"
+assert_not_contains "$jboss_modules_output" "0 から 4 の番号を入力してください。"
+
+# 画面と同じ内容がテキストファイルへ残ること (--report-dir 配下へサービス名付きで自動命名)。
+jboss_modules_text="${jboss_modules_reports}"/build_and_verify_*_jboss_modules_eapapp.txt
+jboss_modules_text="$(ls -1 ${jboss_modules_text} 2>/dev/null | head -n 1)"
+[ -n "$jboss_modules_text" ] && [ -s "$jboss_modules_text" ] \
+  || fail "JBoss module list text was not written under $jboss_modules_reports"
+assert_contains "$jboss_modules_output" "JBoss モジュール一覧のテキスト : ${jboss_modules_text}"
+assert_contains "$jboss_modules_text" "JBoss モジュール一覧 (build_and_verify.sh)"
+assert_contains "$jboss_modules_text" "Compose サービス : eapapp"
+assert_contains "$jboss_modules_text" \
+  "判定             : OK (module-info が success となるモジュールを一覧化しました)"
+assert_contains "$jboss_modules_text" "[   2] com.mysql.jdbc:main"
+assert_contains "$jboss_modules_text" "mysql-connector-j-8.4.0.jar"
+assert_contains "$jboss_modules_text" \
+  "=== 4. TSV (モジュール名<TAB>スロット<TAB>jar ファイル名) ==="
+
+# 全量レポートの件数はモジュール一覧テキストの分だけ増えないこと。
+collect_report_files "$jboss_modules_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected a single build report next to the JBoss module list text"
+
+# module-info が 1 件も success にならない構成は NG として扱い、操作自体は成功させる。
+jboss_modules_ng_output="$TEST_TMP/keep-mode-jboss-modules-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+export FAKE_JBOSS_MODULE_LIST_RESULT="ng"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$jboss_modules_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_MODULE_LIST_RESULT
+  cat "$jboss_modules_ng_output" >&2
+  fail "NG JBoss module list did not return to the service action menu"
+fi
+unset FAKE_JBOSS_MODULE_LIST_RESULT
+
+assert_contains "$jboss_modules_ng_output" \
+  "JBoss モジュール一覧 : NG (module-info が success となるモジュールがありません)"
+assert_not_contains "$jboss_modules_ng_output" \
+  "JBoss モジュール一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$jboss_modules_ng_output" \
+  "Compose サービス 'eapapp' で実行する操作を選択してください:" 2
+
+# jboss-cli.sh -c で接続できない場合は実行不能として扱い、そこまでの内容は残す。
+jboss_modules_unavailable_output="$TEST_TMP/keep-mode-jboss-modules-unavailable.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_JBOSS_MODULE_LIST_RESULT="unavailable"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$jboss_modules_unavailable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_MODULE_LIST_RESULT
+  cat "$jboss_modules_unavailable_output" >&2
+  fail "unavailable JBoss module list did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_MODULE_LIST_RESULT
+
+assert_contains "$jboss_modules_unavailable_output" \
+  "jboss-cli.sh で管理インターフェースへ接続できないか、モジュールを検出できませんでした。"
+assert_contains "$jboss_modules_unavailable_output" \
+  "JBoss モジュール一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$jboss_modules_unavailable_output" "JBoss モジュール一覧のテキスト : "
+assert_contains "$jboss_modules_unavailable_output" \
+  "  (--report-dir または --jboss-module-list-text を指定すると出力先を変えられます)"
+jboss_modules_fallback_text="$(sed -n 's/^JBoss モジュール一覧のテキスト : //p' \
+  "$jboss_modules_unavailable_output" | head -n 1)"
+[ -n "$jboss_modules_fallback_text" ] && [ -s "$jboss_modules_fallback_text" ] \
+  || fail "JBoss module list text was not written to the temporary directory fallback"
+case "$jboss_modules_fallback_text" in
+  "$TEST_TMP"/*) ;;
+  *) fail "JBoss module list text fallback ignored TMPDIR: $jboss_modules_fallback_text" ;;
+esac
+assert_contains "$jboss_modules_fallback_text" \
+  "判定             : 実行不能 (jboss-cli.sh での接続またはモジュール検出ができませんでした)"
+
+# --jboss-module-list-text で出力先を明示でき、--no-jboss-module-list-text で止められること。
+jboss_modules_text_opt_output="$TEST_TMP/keep-mode-jboss-modules-text-opt.out"
+jboss_modules_text_opt="$TEST_TMP/jboss-modules-explicit/modules.txt"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --jboss-module-list-text "$jboss_modules_text_opt" \
+    --suppress-removed-logs
+) >"$jboss_modules_text_opt_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$jboss_modules_text_opt_output" >&2
+  fail "explicit --jboss-module-list-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$jboss_modules_text_opt_output" \
+  "JBoss モジュール一覧のテキスト : ${jboss_modules_text_opt}"
+[ -s "$jboss_modules_text_opt" ] \
+  || fail "--jboss-module-list-text did not create $jboss_modules_text_opt"
+assert_contains "$jboss_modules_text_opt" \
+  "=== 1. 認識されているモジュール一覧 (module-info = success) ==="
+
+jboss_modules_no_text_output="$TEST_TMP/keep-mode-jboss-modules-no-text.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --no-jboss-module-list-text \
+    --suppress-removed-logs
+) >"$jboss_modules_no_text_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$jboss_modules_no_text_output" >&2
+  fail "--no-jboss-module-list-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$jboss_modules_no_text_output" \
+  "JBoss モジュール一覧のテキスト : 出力しません (--no-jboss-module-list-text)"
+assert_contains "$jboss_modules_no_text_output" \
+  "=== 1. 認識されているモジュール一覧 (module-info = success) ==="
+
+# 出力先を指定しつつ出力を止める指定は、意味が矛盾するため受け付けない。
+jboss_modules_conflict_output="$TEST_TMP/jboss-modules-option-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --jboss-module-list-text "$TEST_TMP/never-written-modules.txt" \
+    --no-jboss-module-list-text \
+    --dry-run
+) >"$jboss_modules_conflict_output" 2>&1; then
+  cat "$jboss_modules_conflict_output" >&2
+  fail "--jboss-module-list-text with --no-jboss-module-list-text should be rejected"
+fi
+assert_contains "$jboss_modules_conflict_output" \
+  "--jboss-module-list-text と --no-jboss-module-list-text は同時に指定できません。"
 
 # --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された
