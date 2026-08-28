@@ -176,6 +176,8 @@
 | `--deploy-exception-text FILE` | ファイルパス | (なし) | Java 例外解析のテキスト出力先。**指定したときだけ出力**する |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 詳細分析を行う例外の最大件数 |
 | `--no-deploy-exception-analysis` | フラグ | `false` | Java 例外の解析とファイル出力を行わない |
+| `--readonly-analysis-display` | フラグ | `false` (非表示) | 読み取り専用ファイルシステム分析の結果を画面へ表示する |
+| `--no-readonly-analysis-display` | フラグ | — | 画面表示を行わない (既定と同じ) |
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 読み取り専用ファイルシステム分析の Excel 出力先 |
 | `--readonly-analysis-text FILE` | ファイルパス | (なし) | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他 |
 | `--no-readonly-analysis` | フラグ | `false` | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |

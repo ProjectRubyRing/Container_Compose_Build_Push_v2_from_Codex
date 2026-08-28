@@ -56,7 +56,7 @@
 | 12 | JBoss マスターパスワードの伝搬検証 (取得元 → 実行時の値) | `--verify-jboss-password` |
 | 13 | CloudWatch Agent (cwagent) の設定ファイルチェックとコンテナ内設定の照合 (送達レポートは `--cwagent-delivery-report` 指定時のみ) | (`compose.yml` に `cwagent` があれば自動) |
 | 14 | WAR デプロイ時 Java 例外エラー解析 (原因分析・対処提案の Excel / テキスト出力) | (起動確認時に自動。結果は全量レポート `[10]` へ。**画面表示は `--deploy-exception-display` 指定時のみ**、**Excel 出力は `--deploy-exception-excel` 指定時のみ**、**テキスト出力は `--deploy-exception-text` 指定時のみ**) |
-| 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
+| 15 | 読み取り専用ファイルシステム (`read_only`) の書き込み先分析 (Dockerfile のビルド時と `entrypoint.sh` などの実行時を分けた、tmpfs / バインドマウントの要否判定と Excel / テキスト出力) | (既定で自動。無効化は `--no-readonly-analysis`。**画面表示は `--readonly-analysis-display` 指定時のみ**。ファイル出力は `--report-dir` / `--readonly-analysis-excel` / `--readonly-analysis-text` 指定時) |
 | 16 | JBoss EAP Undertow バーチャルホスト (`default-host`) の分析 (`Host` ヘッダーごとの振り分け判定、`default-host` の利用状況、`Host` ヘッダーを差し替えた実リクエストによる確認) | (起動確認時に既定で自動。無効化は `--no-undertow-analysis`。テキスト出力は `--report-dir` / `--undertow-analysis-text` 指定時) |
 | 17 | コピーしたファイル (WAR など) の取り込み検証 (差し替えたファイルが本当にコンテナへ届いているかを SHA-256 で照合し、届いていなければエラー終了) | (**既定では行わない**。`--verify-copy-artifact` で有効化。`--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` を指定した場合も有効になる) |
 | 18 | 後始末でのボリューム削除 (デプロイ先を覆っているボリュームを残さない) | (対話操作をすべて終えた実行では既定で `compose down -v`。常に削除は `--remove-volumes`、残すのは `--keep-volumes`) |
@@ -129,7 +129,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | cwagent 送信検証 | `verify_cwagent_config_definition` / `verify_cwagent_log_delivery` / `cwagent_config_facts` / `cwagent_verify_endpoint_override` / `cwagent_verify_log_source_mounts` | `compose.yml` と設定 JSON の静的照合、起動後のロググループへの送達確認 |
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
 | Java 例外解析 | `analyze_war_deploy_exceptions` / `deploy_exception_output_requested` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `show_war_deploy_exception_outputs` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、出力先の要否判定、画面表示 (`--deploy-exception-display` 指定時) と Excel / テキスト出力 |
-| 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_dockerfile_facts` / `readonly_parse_dockerfile` / `readonly_shell_write_targets` / `readonly_scan_context_script` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `readonly_collect_container_scripts` / `show_readonly_filesystem_analysis` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、`Dockerfile` からのビルド時の書き込み先の収集、起動スクリプトからの実行時の書き込み先の収集、コンテナの書き込み状況の収集、判定結果の表示と Excel / テキスト出力 |
+| 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_dockerfile_facts` / `readonly_parse_dockerfile` / `readonly_shell_write_targets` / `readonly_scan_context_script` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `readonly_collect_container_scripts` / `show_readonly_filesystem_analysis` / `show_readonly_analysis_outputs` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、`Dockerfile` からのビルド時の書き込み先の収集、起動スクリプトからの実行時の書き込み先の収集、コンテナの書き込み状況の収集、判定結果の表示 (`--readonly-analysis-display` 指定時) と Excel / テキスト出力 |
 | レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` / `append_readonly_analysis_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
@@ -225,7 +225,7 @@ flowchart TD
     AA2 --> AA3[OpenTelemetry 環境変数・JVM パラメータ一覧を表示]
     AA3 --> AA4[伝搬検証 4-7: standalone.xml / CredentialStore<br/>→ 全段の判定を出力]
     AA4 --> AA5[WAR デプロイ時 Java 例外解析<br/>スタックトレース抽出 → 原因分析 → レポート/Excel 出力<br/>画面表示は --deploy-exception-display 指定時のみ]
-    AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + Dockerfile ビルド時 + 起動スクリプト/実行状況 実行時<br/>→ tmpfs / マウントの要否判定 → Excel 出力]
+    AA5 --> AA6[読み取り専用ファイルシステム分析<br/>compose.yml + Dockerfile ビルド時 + 起動スクリプト/実行状況 実行時<br/>→ tmpfs / マウントの要否判定 → レポート/Excel 出力<br/>画面表示は --readonly-analysis-display 指定時のみ]
     AA6 --> AB[EXIT: レポート保存 → Docker クリーンアップ → compose down →<br/>対話操作を終えていれば 未使用リソースの完全クリア → 一時ファイル削除 →<br/>各ディレクトリのディスク空き容量を一覧表示]
     AB --> Z2[完了 exit 0]
 ```
@@ -536,6 +536,8 @@ compose down (削除)
 | `--deploy-exception-text FILE` | ファイルパス | (なし。**指定時のみ出力**) | 不可 | 同じ内容のテキスト出力先。`--report-dir` を指定しただけでは出力しない。`--no-deploy-exception-analysis` とは排他。Excel と同じパスは不可 |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 不可 | 詳細分析を行う例外の最大件数 |
 | `--no-deploy-exception-analysis` | フラグ | `false` | 不可 | Java 例外の解析とファイル出力を行わない |
+| `--readonly-analysis-display` | フラグ | `false` (非表示) | 不可 | 読み取り専用ファイルシステム分析の結果を画面へ表示する。既定では表示しない (結果は全量レポート `[11]` と Excel / テキストに残る)。`--no-readonly-analysis` とは排他 |
+| `--no-readonly-analysis-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--readonly-analysis-display` を打ち消す) |
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 不可 | 読み取り専用ファイルシステム分析の Excel 出力先。`--no-readonly-analysis` とは排他 |
 | `--readonly-analysis-text FILE` | ファイルパス | (なし) | 不可 | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他。Excel と同じパスは不可 |
 | `--no-readonly-analysis` | フラグ | `false` | 不可 | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |
@@ -1745,6 +1747,7 @@ RUN --mount=type=secret,id=cacerts \
 (ディレクトリツリーと JBoss デプロイ構造は --directory-tree 指定時のみ)
 (WAR デプロイ時 Java 例外解析 → 読み取り専用ファイルシステムの書き込み先分析)
 (Java 例外解析の画面表示は --deploy-exception-display 指定時のみ)
+(読み取り専用ファイルシステム分析の画面表示は --readonly-analysis-display 指定時のみ)
 ```
 
 エラー終了時は、後始末の中で SIGTERM 送出後の終了ログも続けて表示します。
@@ -1787,7 +1790,7 @@ RUN --mount=type=secret,id=cacerts \
 | `[8] CloudWatch Logs 送信検証 (cwagent)` | `cwagent` サービス定義時、設定ファイルチェックと送信状況チェックの段ごとの判定 (送達の段は `--cwagent-delivery-report` 未指定なら「情報」) | 設定ファイルチェックのみ記録し、送達は「未確認」 |
 | `[9] Compose サービス別ログ (全サービス・全行)` | 失敗時のみ全サービスのログ全文 (`[9-1]`, `[9-2]` … と採番)。SIGTERM 送出後の終了処理ログまで含む | 定義済みサービスを見出しとして記録 |
 | `[10] WAR デプロイ時 Java 例外解析` | デプロイ処理で投げられた Java 例外の分析結果 (全文)、`ログ取得状況`、出力した Excel ブック / テキストのパス。**画面表示 (`--deploy-exception-display`) の有無にかかわらず記録する** | **解析は必ず実行**。ログを取得できない場合も「未評価」として結果を記録 |
-| `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`、出力した Excel ブック / テキストのパス | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
+| `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`、出力した Excel ブック / テキストのパス。**画面表示 (`--readonly-analysis-display`) の有無にかかわらず記録する** | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
 | `[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析` | `subsystem` の既定値、`server` とリスナー、バーチャルホストと受け付けるホスト名、`Host` ヘッダーごとの振り分け、実リクエストによる確認、要確認 | 「未取得」として理由を記録 |
 | `[13] コピーしたファイル (--copy-file) の取り込み検証` | コピー元の SHA-256 / サイズ、コンテナ内で見つかったパスと一致・不一致、不一致時の原因診断 (覆っているマウント / イメージ側との突き合わせ)、判定 (OK / NG)。`--verify-copy-artifact` を指定していない実行では `未実施 (--verify-copy-artifact 未指定)` と記録 | 「コンテナを起動していません」と記録 |
 
@@ -2253,7 +2256,10 @@ Excel もテキストも自動命名は行いません。解析結果そのも�
 
 この分析は、`compose.yml` の設定・`Dockerfile` の内容・実際に動いたコンテナの
 状態・ソフトウェア別の知識を突き合わせ、ディレクトリごとに「書き込むのに
-書き込み先が無い」状態を判定します。`read_only` を使っていない構成でも、
+書き込み先が無い」状態を判定します。結果の**画面表示だけは既定では行わず**、
+`--readonly-analysis-display` を指定したときに出します
+(ディレクトリごとの理由と対処を含めると数十行になり、ビルドの成否や
+動作確認の結果を画面から押し流してしまうため)。`read_only` を使っていない構成でも、
 **書き込みが発生するディレクトリを洗い出し、有効化するなら `tmpfs` と
 バインドマウントのどちらを割り当てるべきか**を出力します。
 
@@ -2367,8 +2373,8 @@ Excel もテキストも自動命名は行いません。解析結果そのも�
 
 | 出力先 | 内容 |
 | --- | --- |
-| 画面 | 要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧、`compose.yml` の設定例) |
-| 全量レポート `[11]` | 画面と同じ要約と、出力ファイルのパス・情報の取得状況 |
+| 画面 | 要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧、`compose.yml` の設定例)。**`--readonly-analysis-display` 指定時のみ**。抑止時も、書き出した Excel / テキストのパスは 1 行で知らせる |
+| 全量レポート `[11]` | 同じ要約と、出力ファイルのパス・情報の取得状況。**画面表示の有無にかかわらず記録する** |
 | Excel (`..._readonly_filesystem.xlsx`) | 概要 / サービス別判定 / ディレクトリ判定 / ビルド時/実行時の書き込み / 判定の根拠 / 書き込み実績 / 推奨 compose 設定 / 参考: 書き込み先の知識 の 8 シート |
 | テキスト (`..._readonly_filesystem.txt`) | Excel と同じ内容。全ディレクトリの判定・根拠・参考知識を含む |
 
@@ -2384,6 +2390,7 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | 前提ツール | Python 3 (`python3` / `python` / `/usr/libexec/platform-python` のいずれか)。Excel は標準ライブラリだけで生成するため `openpyxl` などは不要 |
 | Python 3 が無い場合 | 分析をスキップし `[WARN]` を出す。ビルドの成否は変えない |
 | 終了コードへの影響 | **なし**。`要対応` を検出しても終了コードは変わらない |
+| 画面表示 | 既定では行わない。`--readonly-analysis-display` 指定時のみ (`--no-readonly-analysis-display` で打ち消せる)。分析とファイル出力は指定が無くても行う |
 | `--dry-run` | 分析しない (全量レポート `[11]` へ理由を記録) |
 | コンテナ未起動 (ビルドのみ / ビルド失敗) | **分析する**。`compose.yml` と `Dockerfile` の定義だけで判定し、実行状況からの根拠が無いことを `情報の取得状況` へ明記する。起動スクリプトはビルドコンテキスト側の実体だけを読む |
 | `compose up` 失敗・起動確認失敗 | **分析する**。停止済みコンテナでもマウント定義と書き込み層の情報は取得できるため、分かる範囲を残す |
@@ -2435,7 +2442,7 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 | --- | --- | --- |
 | `0` | 正常終了 | ビルド (と指定した確認) がすべて成功 |
 | `1` | 実行時エラー | 必須コマンド不足、AWS 未認証、SSM 取得失敗、コピー失敗、コピー先が通常ファイルでない、`--copy-file-no-overwrite` 指定時にコピー先へ同名ファイルが存在、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、コンテナ起動失敗、起動確認失敗 (タイムアウト・失敗パターン検出・途中停止)、URL 応答確認失敗、対話操作失敗、対話操作の終了後の完全クリーンアップ失敗 (docker-usage-check.sh が見つからない・失敗した)、レポート保存失敗、Docker クリーンアップ未承認、`--cwagent-required` 指定時の cwagent 検証 NG、コピーしたファイルの取り込み検証 NG (コンテナ内の中身がコピー元と一致しない / `--copy-artifact-required` 指定時に未検出) |
-| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--usage-check-script` のパスを読み取れない、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、`--readonly-analysis-excel` が `.xlsx` でない、`--readonly-analysis-excel` と `--readonly-analysis-text` が同一パス、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正、`--copy-artifact-path` / `--copy-artifact-search-dir` が絶対パスでない、`--remove-volumes` と `--keep-volumes` の同時指定 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、数値が 1 未満 (ビルド監視の各値は 0 未満か非数値)、`--keep-container-mode` の不正値、`--usage-check-script` のパスを読み取れない、`--jboss-http-port` / `--cwagent-mock-port` の範囲外、`--cwagent-delivery-target` の不正値、`--cwagent-config-dir` が絶対パスでない、`--deploy-exception-excel` が `.xlsx` でない、`--deploy-exception-excel` と `--deploy-exception-text` が同一パス、`--readonly-analysis-excel` が `.xlsx` でない、`--readonly-analysis-excel` と `--readonly-analysis-text` が同一パス、`--readonly-analysis-display` と `--no-readonly-analysis` の同時指定、オプションの排他違反、`--startup-service` が `--compose-service` に含まれない、起動対象が `base` のみ、`--copy-file` の書式不正、`--copy-artifact-path` / `--copy-artifact-search-dir` が絶対パスでない、`--remove-volumes` と `--keep-volumes` の同時指定 |
 
 本処理が失敗している場合は、後始末の結果にかかわらず**元の終了コードが優先**されます。
 
@@ -2604,7 +2611,13 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
     --readonly-analysis-excel ./reports/readonly.xlsx \
     --readonly-analysis-text ./reports/readonly.txt
 
-# 17-7) 読み取り専用ファイルシステムの分析を行わない
+# 17-7) 読み取り専用ファイルシステム分析の結果を画面でも読む
+#       既定では画面へ出さず、全量レポート [11] と Excel / テキストへ残すだけ
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --readonly-analysis-display
+
+# 17-8) 読み取り専用ファイルシステムの分析を行わない
 ./build_and_verify.sh --verify-startup --no-readonly-analysis
 
 # 18) ビルドが exporting layers から進まないときの調査

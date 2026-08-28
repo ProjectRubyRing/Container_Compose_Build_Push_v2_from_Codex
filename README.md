@@ -86,7 +86,7 @@ xlsx は標準ライブラリだけで組み立てます)。
 **読み取り専用ファイルシステム (`read_only`) の書き込み先分析** (Dockerfile の
 ビルド時の書き込みと `entrypoint.sh` などの実行時の書き込みを分けて集計し、
 tmpfs やバインドマウントを割り当てるべきディレクトリを判定して、Excel ブックと
-テキストファイルにも出力)、
+テキストファイルにも出力。画面表示は `--readonly-analysis-display` の指定時のみ)、
 **JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 **CloudWatch Agent (cwagent) のログ送信検証** (設定ファイルのチェックと、
 `--cwagent-delivery-report` 指定時の設定済みロググループへの送達確認)、
@@ -229,6 +229,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を指定する。**指定したときだけ出力**し、`--report-dir` だけでは出力しない | (出力しない) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
 | `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
+| `--readonly-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) の書き込み先分析の結果を画面へ表示する。既定では表示せず、全量レポート `[11]` と Excel / テキストにだけ残す | `false` (非表示) |
+| `--no-readonly-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--readonly-analysis-display` を打ち消す) | `true` (既定) |
 | `--readonly-analysis-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) 分析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
 | `--readonly-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--no-readonly-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない | `false` |
@@ -1615,7 +1617,9 @@ Excel もテキストも自動命名を行いません。同じ内容が全量�
 原因が `read_only` にあるとは気付きにくいのが実情です。
 
 `build_and_verify.sh` は**専用オプションなしに**この分析を毎回実行し、
-ディレクトリごとに「書き込むのに書き込み先が無い」状態を判定します。
+ディレクトリごとに「書き込むのに書き込み先が無い」状態を判定します
+(結果の画面表示だけは既定では行わず、`--readonly-analysis-display` を指定した
+ときに出します)。
 `read_only` を使っていない構成でも、**書き込みが発生するディレクトリを洗い出し、
 有効化するなら `tmpfs` とバインドマウントのどちらを割り当てるべきか**を出力します。
 
@@ -1723,8 +1727,12 @@ services:
 | 推奨 compose 設定 | サービスごとの `compose.yml` 設定例 |
 | 参考: 書き込み先の知識 | ソフトウェア別の書き込み先一覧 (用途 / 書き込む内容 / 推奨 / 永続の要否 / `tmpfs` 可否) |
 
-画面と全量レポート `[11]` には要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧)
+全量レポート `[11]` には要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧)
 を出力し、全件と参考知識はテキスト / Excel に残します。
+**画面表示は既定では行いません。**要約を画面でも読むときは
+`--readonly-analysis-display` を指定します (分析結果はディレクトリごとの理由と対処を
+含むため数十行になり、ビルドの成否や動作確認の結果を画面から押し流してしまうため)。
+画面表示を抑止していても、書き出した Excel / テキストのパスは 1 行で知らせます。
 
 ```bash
 # 既定。分析は毎回実行され、--report-dir があれば Excel とテキストも出力される
@@ -1736,6 +1744,11 @@ services:
 ./build_and_verify.sh --verify-startup \
     --readonly-analysis-excel ./reports/readonly.xlsx \
     --readonly-analysis-text ./reports/readonly.txt
+
+# 分析結果を画面でも読む (既定では画面へ出さない)
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --readonly-analysis-display
 
 # 分析を行わない
 ./build_and_verify.sh --verify-startup --no-readonly-analysis

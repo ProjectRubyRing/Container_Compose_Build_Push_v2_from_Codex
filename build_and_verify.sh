@@ -88,10 +88,12 @@
 #                          焼き込み済みのため read_only でも問題にならず、
 #                          「ビルド時のみ」として対象から外す。entrypoint.sh など
 #                          起動のたびに走るスクリプトの書き込み先は、実際に失敗する
-#                          場所として「要対応」に挙げる。結果は画面・全量
-#                          レポートに加え、Excel ブック
+#                          場所として「要対応」に挙げる。結果は全量レポートに加え、
+#                          Excel ブック
 #                          (build_and_verify_<日時>_readonly_filesystem.xlsx) と
 #                          テキスト (同 _readonly_filesystem.txt) へも出力する。
+#                          画面表示は既定では行わず、--readonly-analysis-display を
+#                          指定したときだけ出す (ビルド結果を埋もれさせない)。
 #                          既定で有効。--no-readonly-analysis で無効化できる。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
@@ -865,7 +867,13 @@ DEPLOY_EXCEPTION_SERVICE_MARKER=$'\037'
 #       MySQL / nginx / Tomcat 等)
 # read_only が未設定・false のサービスについても、書き込みが発生するディレクトリを
 # 洗い出し、read_only を有効化するときに必要な設定を提示する。
+#
+# 分析結果はディレクトリごとの理由・対処まで含むため数十行になり、ビルドの成否や
+# 動作確認の結果を画面から押し流してしまう。そのため画面表示は既定で行わず、
+# --readonly-analysis-display を指定したときだけ出す (Java 例外解析と同じ考え方)。
+# 分析そのものと、全量レポート・Excel・テキストへの出力は指定が無くても行う。
 READONLY_ANALYSIS="true"            # false (--no-readonly-analysis): 分析を行わない
+READONLY_ANALYSIS_DISPLAY="false"   # true (--readonly-analysis-display): 分析結果を画面へ表示する
 READONLY_ANALYSIS_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名
 READONLY_ANALYSIS_EXCEL_SET="false" # 出力先が明示指定されたか
 READONLY_ANALYSIS_TEXT=""           # テキストの出力先。空なら --report-dir 配下へ自動命名
@@ -1766,7 +1774,8 @@ WAR デプロイ時の Java 例外解析:
                              SECRET / HEADERS 等) は [REDACTED] で表示する
 
 読み取り専用ファイルシステム (read_only) の書き込み先分析:
-  (オプション指定不要。既定で毎回分析する)
+  (オプション指定不要。既定で毎回分析するが、画面表示は
+   --readonly-analysis-display を指定したときだけ行う)
   分析内容               compose.yml の read_only / tmpfs / volumes の指定と、
                          実際に動いたコンテナの状態を突き合わせ、アプリが書き込む
                          ディレクトリに書き込み先が用意されているかを判定する。
@@ -1800,8 +1809,18 @@ WAR デプロイ時の Java 例外解析:
                          deployments、JVM の /tmp、CloudWatch Agent・MySQL・
                          nginx・Tomcat の書き込み先といった、ソフトウェアごとの
                          既知のディレクトリも併せて確認する。
-                         結果は画面と全量レポートへ出力し、不足分を埋めた
-                         compose.yml の設定例も生成する。
+                         結果は全量レポートへ出力し、不足分を埋めた
+                         compose.yml の設定例も生成する
+                         (画面表示は --readonly-analysis-display 指定時のみ)。
+  --readonly-analysis-display
+                         分析結果を画面へ表示する。既定では表示しない
+                         (ディレクトリごとの理由・対処まで含めると数十行になり、
+                         ビルドの成否や動作確認の結果が画面から流れてしまうため)。
+                         指定すると、要対応・要確認・推奨のディレクトリ一覧と
+                         compose.yml の設定例、総合判定を画面へ出す
+  --no-readonly-analysis-display
+                         画面表示を行わない (既定と同じ。
+                         --readonly-analysis-display を打ち消す)
   --readonly-analysis-excel FILE
                          分析結果を Excel ブック (.xlsx) として FILE へ出力する。
                          --report-dir 指定時は未指定でも
@@ -2126,6 +2145,8 @@ while [ $# -gt 0 ]; do
     --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
     --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
     --no-deploy-exception-analysis) DEPLOY_EXCEPTION_ANALYSIS="false"; shift ;;
+    --readonly-analysis-display)    READONLY_ANALYSIS_DISPLAY="true"; shift ;;
+    --no-readonly-analysis-display) READONLY_ANALYSIS_DISPLAY="false"; shift ;;
     --readonly-analysis-excel) need_value "$1" $#; READONLY_ANALYSIS_EXCEL="$2"; READONLY_ANALYSIS_EXCEL_SET="true"; shift 2 ;;
     --readonly-analysis-text)  need_value "$1" $#; READONLY_ANALYSIS_TEXT="$2"; READONLY_ANALYSIS_TEXT_SET="true"; shift 2 ;;
     --no-readonly-analysis)    READONLY_ANALYSIS="false"; shift ;;
@@ -2358,6 +2379,11 @@ if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] && [ "$DEPLOY_EXCEPTION_TEXT_SET" 
 fi
 
 # ---- 読み取り専用ファイルシステム分析の出力先の検証 --------------------------
+# 分析そのものを止めておきながら画面表示を求める指定は、結果が出ないため矛盾する。
+if [ "$READONLY_ANALYSIS_DISPLAY" = "true" ] && [ "$READONLY_ANALYSIS" != "true" ]; then
+  err "--readonly-analysis-display と --no-readonly-analysis は同時に指定できません。"
+  exit 2
+fi
 if [ "$READONLY_ANALYSIS_EXCEL_SET" = "true" ]; then
   if [ -z "$READONLY_ANALYSIS_EXCEL" ] || [ "$READONLY_ANALYSIS_EXCEL" = "-" ]; then
     err "--readonly-analysis-excel にはファイルパスを指定してください: $READONLY_ANALYSIS_EXCEL"
@@ -26919,7 +26945,15 @@ analyze_readonly_filesystem() {
 
 # 分析結果を画面へ出す。要約は「要対応・要確認・推奨」のディレクトリだけを載せた
 # 短い形になっているため、判定にかかわらずそのまま表示する。
+#
+# 既定 (--readonly-analysis-display なし) では画面表示を行わない。分析結果は
+# 全量レポートの [11] と Excel / テキストへ残るため、ビルド結果の画面は素のままに
+# する。ただしファイルを実際に書き出した場合は、その置き場所だけ 1 行で知らせる。
 show_readonly_filesystem_analysis() {
+  if [ "$READONLY_ANALYSIS_DISPLAY" != "true" ]; then
+    show_readonly_analysis_outputs
+    return 0
+  fi
   if [ -s "$READONLY_ANALYSIS_DIGEST_FILE" ]; then
     diag ""
     cat -- "$READONLY_ANALYSIS_DIGEST_FILE" >&2
@@ -26934,6 +26968,13 @@ show_readonly_filesystem_analysis() {
     log "読み取り専用ファイルシステム分析: ${READONLY_VERDICT}"
   fi
   log "  対象 ${READONLY_SERVICES} サービス (うち read_only 有効 ${READONLY_ENABLED_SERVICES})、検出ディレクトリ ${READONLY_TOTAL} 件 (要対応 ${READONLY_ACTION} / 要確認 ${READONLY_CHECK} / 推奨 ${READONLY_RECOMMEND} / OK ${READONLY_OK} / ビルド時のみ ${READONLY_BUILD_ONLY})"
+  show_readonly_analysis_outputs
+  return 0
+}
+
+# 出力したファイルの置き場所だけを知らせる。画面表示を抑止していても、実際に
+# 書き出したファイルは伝える (出力したのに場所が分からない状態を作らないため)。
+show_readonly_analysis_outputs() {
   if [ -n "$READONLY_ANALYSIS_EXCEL_FILE" ]; then
     log "読み取り専用ファイルシステム分析の Excel ブックを出力しました: $READONLY_ANALYSIS_EXCEL_FILE"
   fi
@@ -28291,6 +28332,7 @@ write_build_report() {
     printf '                 --deploy-exception-text FILE を指定したときだけ出力する)\n'
     printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
     printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
+    printf '                (画面表示は --readonly-analysis-display を指定したときだけ行う)\n'
     printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
     printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
     printf '                コピーしたファイルの取り込み検証は [13] に記載\n'

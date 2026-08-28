@@ -4631,6 +4631,7 @@ if ! (
     --directory-tree-depth 1 \
     --suppress-startup-logs \
     --suppress-removed-logs \
+    --readonly-analysis-display \
     --report-dir "$TEST_TMP/readonly-missing-reports"
 ) >"$readonly_missing_output" 2>&1; then
   cat "$readonly_missing_output" >&2
@@ -4719,6 +4720,56 @@ else
     "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
 fi
 
+# --- 既定 (--readonly-analysis-display なし) では画面へ出さないこと ---
+# 分析そのものは行い、全量レポート・Excel・テキストへは同じ内容を残す。
+# 画面に残すのは、書き出したファイルの置き場所だけ。
+readonly_quiet_output="$TEST_TMP/readonly-quiet.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-missing.yml" \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-startup-logs \
+    --suppress-removed-logs \
+    --report-dir "$TEST_TMP/readonly-quiet-reports"
+) >"$readonly_quiet_output" 2>&1; then
+  cat "$readonly_quiet_output" >&2
+  fail "readonly filesystem analysis (default display) returned a non-zero status"
+fi
+if grep -Fq "書き込み先分析をスキップしました: Python 3 が見つかりません" "$readonly_quiet_output"; then
+  printf 'SKIP: readonly filesystem analysis display assertions (Python 3 is unavailable)\n'
+else
+  # 分析本文も総合判定も画面には出さない
+  assert_not_contains "$readonly_quiet_output" \
+    "読み取り専用ルートファイルシステム (read_only) の書き込み先分析"
+  assert_not_contains "$readonly_quiet_output" "[要対応] /opt/jboss-eap/standalone/tmp"
+  assert_not_contains "$readonly_quiet_output" \
+    "読み取り専用ファイルシステム分析: 書き込み先が用意されていないディレクトリを"
+  assert_not_contains "$readonly_quiet_output" "compose.yml の設定例 (不足しているディレクトリのみ):"
+  # 書き出したファイルの置き場所だけは知らせる
+  assert_contains "$readonly_quiet_output" \
+    "読み取り専用ファイルシステム分析の Excel ブックを出力しました:"
+  assert_contains "$readonly_quiet_output" \
+    "読み取り専用ファイルシステム分析のテキストを出力しました:"
+  # 分析結果そのものは、画面表示の有無にかかわらずファイルへ残す
+  readonly_quiet_texts=("$TEST_TMP/readonly-quiet-reports"/build_and_verify_*_readonly_filesystem.txt)
+  [ -f "${readonly_quiet_texts[0]}" ] \
+    || fail "readonly filesystem analysis text was not created without --readonly-analysis-display"
+  assert_contains "${readonly_quiet_texts[0]}" "[要対応] /opt/jboss-eap/standalone/tmp"
+  collect_report_files "$TEST_TMP/readonly-quiet-reports"
+  readonly_quiet_reports=("${REPORT_FILES[@]}")
+  [ -f "${readonly_quiet_reports[0]}" ] \
+    || fail "report was not created without --readonly-analysis-display"
+  assert_contains "${readonly_quiet_reports[0]}" \
+    "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
+  assert_contains "${readonly_quiet_reports[0]}" "[要対応] /opt/jboss-eap/standalone/tmp"
+fi
+
 # --- read_only: true で tmpfs / ボリュームを揃えた構成 (問題なし) ---
 readonly_ok_output="$TEST_TMP/readonly-ok.out"
 : > "$FAKE_DOCKER_CALLS"
@@ -4747,7 +4798,8 @@ if ! (
     --env-list-limit 1 \
     --directory-tree-depth 1 \
     --suppress-startup-logs \
-    --suppress-removed-logs
+    --suppress-removed-logs \
+    --readonly-analysis-display
 ) >"$readonly_ok_output" 2>&1; then
   cat "$readonly_ok_output" >&2
   fail "readonly filesystem analysis (sufficient settings) returned a non-zero status"
@@ -4784,6 +4836,7 @@ if ! (
     --directory-tree-depth 1 \
     --suppress-startup-logs \
     --suppress-removed-logs \
+    --readonly-analysis-display \
     --readonly-analysis-text "$TEST_TMP/readonly-writable.txt" \
     --readonly-analysis-excel "$TEST_TMP/readonly-writable.xlsx"
 ) >"$readonly_writable_output" 2>&1; then
@@ -4866,6 +4919,37 @@ if (
 fi
 assert_contains "$readonly_conflict_output" \
   "--readonly-analysis-text と --no-readonly-analysis は同時に指定できません。"
+
+readonly_display_conflict_output="$TEST_TMP/readonly-display-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --readonly-analysis-display \
+    --no-readonly-analysis
+) >"$readonly_display_conflict_output" 2>&1; then
+  cat "$readonly_display_conflict_output" >&2
+  fail "--readonly-analysis-display accepted --no-readonly-analysis"
+fi
+assert_contains "$readonly_display_conflict_output" \
+  "--readonly-analysis-display と --no-readonly-analysis は同時に指定できません。"
+
+# --no-readonly-analysis-display は --readonly-analysis-display を打ち消すため、
+# 併用しても排他エラーにはならず、画面表示も行わない (既定と同じ)。
+readonly_display_off_output="$TEST_TMP/readonly-display-off.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-missing.yml" \
+    --compose-service app \
+    --suppress-removed-logs \
+    --readonly-analysis-display \
+    --no-readonly-analysis-display
+) >"$readonly_display_off_output" 2>&1; then
+  cat "$readonly_display_off_output" >&2
+  fail "--no-readonly-analysis-display did not cancel --readonly-analysis-display"
+fi
+assert_not_contains "$readonly_display_off_output" \
+  "読み取り専用ルートファイルシステム (read_only) の書き込み先分析"
 
 unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
 
