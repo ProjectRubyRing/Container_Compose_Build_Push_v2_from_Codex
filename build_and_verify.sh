@@ -614,6 +614,15 @@ CWAGENT_DELIVERY_INTERVAL="5"     # 送達確認のポーリング間隔 (秒)
 # 収集対象ごとの結果表示) は、実 CloudWatch Logs / 偽装サービスへ実際に問い合わせるうえ
 # ビルド時間も延ばすため、既定では行わず --cwagent-delivery-report 指定時だけ実行する。
 CWAGENT_DELIVERY_REPORT="false"   # true: 送達を待ち合わせて送達レポートを表示する
+# 起動後 (ビルド・デプロイ後) に画面へ出す 3 つの出力
+#   - CloudWatch Agent の送信状況チェック (見出しと対象の一覧)
+#   - cwagent の警告・エラー (エージェント自身のログ抜粋)
+#   - cwagent のログ送信検証 (段ごとの判定一覧と総合判定)
+# は行数が多く、コンテナ起動ログや後続の分析を押し流してしまうため、既定では画面へ
+# 出さず、--cwagent-verify-display を指定した実行だけで表示する。検証そのものは既定でも
+# 行うため、全量レポートの内容と --cwagent-required による終了コードは変わらない。
+CWAGENT_VERIFY_DISPLAY="false"    # true (--cwagent-verify-display): 起動後の検証結果を画面へ表示する
+CWAGENT_VERIFY_DISPLAY_NOTIFIED="false"  # 画面表示を省略した旨を既に伝えたか (重複表示の抑止)
 CWAGENT_MOCK_SERVICE=""           # 偽装 CloudWatch Logs の Compose サービス名 (空なら endpoint_override から解決)
 CWAGENT_MOCK_PORT=""              # 偽装 CloudWatch Logs のコンテナ側ポート (空なら endpoint_override から解決)
 CWAGENT_REQUIRED="false"          # true: 検証 NG を終了コード 1 として扱う
@@ -954,11 +963,15 @@ READONLY_PROBE_BASE_DIRS=(
 # 片方だけ変えると「WAR が載ったホストと受け皿が食い違い、特定の Host ヘッダーの
 # ときだけ 404 になる」状態が起きる。分析ではこの 2 つを必ず分けて出力する。
 #
-# 分析は既定で毎回行い、画面と (--report-dir 指定時は) テキストの両方へ出す。
+# 分析は既定で毎回行うが、画面へは出さない。この分析はダイアログ (Compose サービスの
+# 選択と操作) を終えた直後に走るため、既定で画面へ出すと操作結果が長い分析結果に
+# 押し流されてしまう。画面へ出すのは --undertow-analysis-display を指定した実行だけと
+# し、テキスト (--report-dir 指定時) と全量レポートの [12] へは従来どおり出力する。
 # --no-undertow-analysis で分析ごと、--no-undertow-analysis-display / -text で
 # 出力先ごとに抑制できる。
 UNDERTOW_ANALYSIS="true"              # false (--no-undertow-analysis): 分析を行わない
-UNDERTOW_ANALYSIS_DISPLAY="true"      # false (--no-undertow-analysis-display): 画面へ出さない
+UNDERTOW_ANALYSIS_DISPLAY="false"     # true (--undertow-analysis-display): 画面へ出す
+UNDERTOW_ANALYSIS_DISPLAY_SET="false" # 画面表示の指定が明示されたか (矛盾指定の判定用)
 UNDERTOW_ANALYSIS_TEXT_ENABLED="true" # false (--no-undertow-analysis-text): テキストへ出さない
 UNDERTOW_ANALYSIS_TEXT=""             # テキストの出力先。空なら --report-dir 配下へ自動命名
 UNDERTOW_ANALYSIS_TEXT_SET="false"    # 出力先が明示指定されたか
@@ -1064,11 +1077,106 @@ UNDERTOW_XML_AWK_END
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # 表示する時刻はすべて JST。UTC と読み違えないよう、必ずタイムゾーン名を併記する。
 now_display_time() { printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$DISPLAY_TZ_LABEL"; }
-log()  { printf '[%s] %s\n'  "$(now_display_time)" "$*"; }
-warn() { printf '[%s] [WARN] %s\n'  "$(now_display_time)" "$*" >&2; }
-err()  { printf '[%s] [ERROR] %s\n' "$(now_display_time)" "$*" >&2; }
+
+# ---- 画面ログの色分け -------------------------------------------------------
+# ビルド・デプロイを終えてから Compose サービスの選択ダイアログが出るまでの間に
+# 画面へ出すログは、コンテナ起動ログとまったく同じ配色で意味別に色分けする。
+#   成功 = 緑 (1;32) / 重要 = シアン (1;36) / 警告 = 黄 (1;33) / エラー = 赤 (1;31)
+# どの語句にも当てはまらない行は「重要」扱いにして、この区間の行が必ずいずれかの
+# 色を持つようにする (起動ログは素の行を残すが、こちらはスクリプト自身の出力なので
+# すべて色を付ける)。
+# 端末へ直接表示するときだけ色を付け、リダイレクト先のファイルへ ANSI シーケンスを
+# 混ぜない。NO_COLOR を優先し、CLICOLOR_FORCE で強制できる点も起動ログと同じ。
+SCREEN_LOG_COLOR_PHASE="false"          # true の間だけ log/warn/err/diag を色分けする
+SCREEN_LOG_COLOR_RED=$'\033[1;31m'
+SCREEN_LOG_COLOR_YELLOW=$'\033[1;33m'
+SCREEN_LOG_COLOR_GREEN=$'\033[1;32m'
+SCREEN_LOG_COLOR_CYAN=$'\033[1;36m'
+SCREEN_LOG_COLOR_RESET=$'\033[0m'
+SCREEN_LOG_COLOR_SELECTED=""            # screen_log_color_for_line の結果 (fork 回避)
+# 行の意味を語句から判定する。判定順は エラー → 警告 → 成功 で、先に当たった方を採る
+# (「失敗しました」を含む行が「完了」で緑にならないようにするため)。
+SCREEN_LOG_ERROR_PATTERN='\[(ERROR|NG)\]|(^|[[:space:]])(ERROR|FATAL|NG)([[:space:]]|$)|失敗|エラー|異常|できませんでした|見つかりません|一致しません'
+SCREEN_LOG_WARN_PATTERN='\[(WARN|WARNING|注意|未確認|情報|DRY-RUN)\]|(^|[[:space:]])(WARN|WARNING)([[:space:]]|$)|警告|注意|要確認|未確認|省略|スキップ|抑制|できません|ありません'
+SCREEN_LOG_SUCCESS_PATTERN='\[OK\]|成功|完了|一致しました|届きました|確認できました|問題ありません|全段 OK'
+
+# 端末への直接表示時だけ色を付ける。$1 は判定するファイル記述子 (既定は標準エラー)。
+# log は標準出力、warn/err/diag は標準エラーへ出すため、記述子ごとに判定する。
+terminal_color_enabled() {
+  local fd="${1:-2}"
+  [ -z "${NO_COLOR+x}" ] || return 1
+  case "${CLICOLOR_FORCE:-0}" in
+    0) ;;
+    *) return 0 ;;
+  esac
+  [ -t "$fd" ] && [ "${TERM:-}" != "dumb" ]
+}
+
+# 1 行に付ける色を SCREEN_LOG_COLOR_SELECTED へ入れる。warn/err は語句によらず
+# 警告・エラーの色で固定する (接頭辞が示す重大度をそのまま色にする)。
+screen_log_color_for_line() {
+  local line="$1" forced="${2:-}"
+  case "$forced" in
+    error) SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_RED"; return 0 ;;
+    warn)  SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_YELLOW"; return 0 ;;
+  esac
+  if [[ "$line" =~ $SCREEN_LOG_ERROR_PATTERN ]]; then
+    SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_RED"
+  elif [[ "$line" =~ $SCREEN_LOG_WARN_PATTERN ]]; then
+    SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_YELLOW"
+  elif [[ "$line" =~ $SCREEN_LOG_SUCCESS_PATTERN ]]; then
+    SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_GREEN"
+  else
+    SCREEN_LOG_COLOR_SELECTED="$SCREEN_LOG_COLOR_CYAN"
+  fi
+}
+
+# 色分けが有効な区間だけ行ごとに色を付けて出力する。無効なら従来どおり素で出す。
+screen_log_emit() {
+  local fd="$1" forced="$2" text="$3" line
+  if [ "$SCREEN_LOG_COLOR_PHASE" != "true" ] || ! terminal_color_enabled "$fd"; then
+    if [ "$fd" = "1" ]; then
+      printf '%s\n' "$text"
+    else
+      printf '%s\n' "$text" >&2
+    fi
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+      # 空行へ色を付けても見えないため、ANSI シーケンスを混ぜずにそのまま出す。
+      if [ "$fd" = "1" ]; then printf '\n'; else printf '\n' >&2; fi
+      continue
+    fi
+    screen_log_color_for_line "$line" "$forced"
+    if [ "$fd" = "1" ]; then
+      printf '%s%s%s\n' "$SCREEN_LOG_COLOR_SELECTED" "$line" "$SCREEN_LOG_COLOR_RESET"
+    else
+      printf '%s%s%s\n' "$SCREEN_LOG_COLOR_SELECTED" "$line" "$SCREEN_LOG_COLOR_RESET" >&2
+    fi
+  done <<< "$text"
+}
+
+# ビルド・デプロイ後の画面ログ色分けを開始する。凡例はコンテナ起動ログと同じ並び。
+begin_screen_log_color_phase() {
+  [ "$SCREEN_LOG_COLOR_PHASE" = "true" ] && return 0
+  SCREEN_LOG_COLOR_PHASE="true"
+  terminal_color_enabled 2 || return 0
+  printf 'ビルド・デプロイ後の画面ログ色分け: %s成功%s / %s重要%s / %s警告%s / %sエラー%s\n' \
+    "$SCREEN_LOG_COLOR_GREEN" "$SCREEN_LOG_COLOR_RESET" \
+    "$SCREEN_LOG_COLOR_CYAN" "$SCREEN_LOG_COLOR_RESET" \
+    "$SCREEN_LOG_COLOR_YELLOW" "$SCREEN_LOG_COLOR_RESET" \
+    "$SCREEN_LOG_COLOR_RED" "$SCREEN_LOG_COLOR_RESET" >&2
+}
+
+# Compose サービスの選択ダイアログへ入る直前で色分けを終える。
+end_screen_log_color_phase() { SCREEN_LOG_COLOR_PHASE="false"; }
+
+log()  { local _m; _m="[$(now_display_time)] $*";         screen_log_emit 1 ""      "$_m"; }
+warn() { local _m; _m="[$(now_display_time)] [WARN] $*";  screen_log_emit 2 warn    "$_m"; }
+err()  { local _m; _m="[$(now_display_time)] [ERROR] $*"; screen_log_emit 2 error   "$_m"; }
 # 診断ガイド等の整形出力用 (タイムスタンプ等の接頭辞を付けず、そのまま表示する)
-diag() { printf '%s\n' "$*" >&2; }
+diag() { screen_log_emit 2 "" "$*"; }
 # dry-run 時は実行内容を表示するだけ、通常時はそのままコマンドを実行する。
 run()  {
   if [ "$DRY_RUN" = "true" ]; then
@@ -1837,7 +1945,9 @@ WAR デプロイ時の Java 例外解析:
   --no-readonly-analysis 読み取り専用ファイルシステムの分析とファイル出力を行わない
 
 JBoss EAP Undertow バーチャルホスト (default-host) の分析:
-  (オプション指定不要。既定で毎回分析し、画面とテキストの両方へ出力する)
+  (オプション指定不要。既定で毎回分析するが、ダイアログ操作直後の画面を長い出力で
+   埋めないよう、画面へは出さずテキストと全量レポートへ出力する。
+   画面へも出すには --undertow-analysis-display を指定する)
   分析内容               起動したコンテナの standalone.xml から undertow subsystem を
                          読み取り、呼び出し元が Host ヘッダーにホスト名を指定して
                          きたとき、どのバーチャルホストが処理するのかを判定する。
@@ -1890,8 +2000,11 @@ JBoss EAP Undertow バーチャルホスト (default-host) の分析:
                          --report-dir 指定時は未指定でも
                          DIR/build_and_verify_<日時>_undertow_virtual_host.txt へ
                          自動出力する。内容は画面表示と同一
+  --undertow-analysis-display
+                         分析結果をダイアログの操作後に画面へも出力する
+                         (既定では画面へ出さない。テキストと全量レポートへは出す)
   --no-undertow-analysis-display
-                         画面への出力だけを抑制する (テキストと全量レポートへは出す)
+                         画面への出力を抑制する (既定。テキストと全量レポートへは出す)
   --no-undertow-analysis-text
                          テキストファイルへの出力だけを抑制する (画面と全量レポート
                          へは出す)
@@ -1920,7 +2033,13 @@ CloudWatch Agent (cwagent) のログ送信検証:
                            - リージョン (agent.region / AWS_REGION) と認証情報が無い
   送信状況のチェック       起動確認後に、実際に起動した cwagent が読み込んだ設定を
                            コンテナから取り出してホスト側と比較し、cwagent の
-                           警告・エラーログも併せて表示する。
+                           警告・エラーログも併せて確認する。
+                           このチェック結果 (「CloudWatch Agent の送信状況チェック」
+                           「cwagent の警告・エラー」「cwagent のログ送信検証」) は
+                           既定では画面へ出さない。画面へ出すには
+                           --cwagent-verify-display を指定する
+                           (検証そのものは既定でも行うため、全量レポートの内容と
+                            --cwagent-required による終了コードは変わらない)。
                            --cwagent-delivery-report を指定した場合は、さらに設定済みの
                            ロググループ / ログストリームへログイベントが届くまで待って
                            確認し、送達レポートを表示する (既定では行わない)。
@@ -1938,6 +2057,11 @@ CloudWatch Agent (cwagent) のログ送信検証:
   --cwagent-service NAME   CloudWatch Agent の Compose サービス名 (既定: cwagent)
   --cwagent-config-dir PATH
                            コンテナ内の設定ディレクトリ (既定: /etc/cwagentconfig)
+  --cwagent-verify-display ビルド・デプロイ後の「CloudWatch Agent の送信状況チェック」
+                           「cwagent の警告・エラー」「cwagent のログ送信検証」を
+                           画面へ表示する (既定では表示しない)
+  --no-cwagent-verify-display
+                           上記 3 つを画面へ表示しない (既定)
   --cwagent-delivery-target auto|mock|aws
                            送信状況の確認先。auto は logs.endpoint_override が
                            あれば mock、無ければ aws を選ぶ (既定: auto)
@@ -2154,7 +2278,8 @@ while [ $# -gt 0 ]; do
     --undertow-probe-path)  need_value "$1" $#; UNDERTOW_PROBE_PATH="$2"; UNDERTOW_PROBE_PATH_SET="true"; shift 2 ;;
     --no-undertow-probe)    UNDERTOW_PROBE="false"; shift ;;
     --undertow-analysis-text) need_value "$1" $#; UNDERTOW_ANALYSIS_TEXT="$2"; UNDERTOW_ANALYSIS_TEXT_SET="true"; shift 2 ;;
-    --no-undertow-analysis-display) UNDERTOW_ANALYSIS_DISPLAY="false"; shift ;;
+    --undertow-analysis-display)    UNDERTOW_ANALYSIS_DISPLAY="true";  UNDERTOW_ANALYSIS_DISPLAY_SET="true"; shift ;;
+    --no-undertow-analysis-display) UNDERTOW_ANALYSIS_DISPLAY="false"; UNDERTOW_ANALYSIS_DISPLAY_SET="true"; shift ;;
     --no-undertow-analysis-text)    UNDERTOW_ANALYSIS_TEXT_ENABLED="false"; shift ;;
     --no-undertow-analysis)         UNDERTOW_ANALYSIS="false"; shift ;;
     --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
@@ -2168,6 +2293,8 @@ while [ $# -gt 0 ]; do
     --cwagent-delivery-interval) need_value "$1" $#; CWAGENT_DELIVERY_INTERVAL="$2"; shift 2 ;;
     --cwagent-mock-service) need_value "$1" $#; CWAGENT_MOCK_SERVICE="$2"; shift 2 ;;
     --cwagent-mock-port)   need_value "$1" $#; CWAGENT_MOCK_PORT="$2"; shift 2 ;;
+    --cwagent-verify-display)    CWAGENT_VERIFY_DISPLAY="true"; shift ;;
+    --no-cwagent-verify-display) CWAGENT_VERIFY_DISPLAY="false"; shift ;;
     --cwagent-required)    CWAGENT_REQUIRED="true"; shift ;;
     --cwagent-create-log-group)    CWAGENT_CREATE_LOG_GROUP="true"; shift ;;
     --no-cwagent-create-log-group) CWAGENT_CREATE_LOG_GROUP="false"; shift ;;
@@ -2436,8 +2563,8 @@ if [ "$UNDERTOW_ANALYSIS_TEXT_SET" = "true" ]; then
   fi
 fi
 if [ "$UNDERTOW_ANALYSIS" != "true" ]; then
-  if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ] || [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
-    err "--no-undertow-analysis と --no-undertow-analysis-display / --no-undertow-analysis-text は同時に指定できません。"
+  if [ "$UNDERTOW_ANALYSIS_DISPLAY_SET" = "true" ] || [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+    err "--no-undertow-analysis と --undertow-analysis-display / --no-undertow-analysis-display / --no-undertow-analysis-text は同時に指定できません。"
     err "  分析ごと行わない場合は --no-undertow-analysis だけを指定してください。"
     exit 2
   fi
@@ -2446,7 +2573,8 @@ if [ "$UNDERTOW_ANALYSIS" != "true" ]; then
     exit 2
   fi
 fi
-if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ] && [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
+if [ "$UNDERTOW_ANALYSIS_DISPLAY_SET" = "true" ] && [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ] \
+    && [ "$UNDERTOW_ANALYSIS_TEXT_ENABLED" != "true" ]; then
   err "--no-undertow-analysis-display と --no-undertow-analysis-text を同時に指定すると出力先が無くなります。"
   err "  分析ごと行わない場合は --no-undertow-analysis を指定してください。"
   exit 2
@@ -6097,14 +6225,7 @@ count_log_lines() {
 
 # 端末への直接表示時だけ色を付ける。NO_COLOR を優先し、リダイレクトされたログへ
 # ANSI シーケンスを混入させない。CLICOLOR_FORCE はテストや明示的な強制表示に使える。
-startup_log_color_enabled() {
-  [ -z "${NO_COLOR+x}" ] || return 1
-  case "${CLICOLOR_FORCE:-0}" in
-    0) ;;
-    *) return 0 ;;
-  esac
-  [ -t 2 ] && [ "${TERM:-}" != "dumb" ]
-}
+startup_log_color_enabled() { terminal_color_enabled 2; }
 
 # JBoss EAP の重要行を意味別に色分けし、その他の行はそのまま表示する。
 print_startup_logs_with_highlights() {
@@ -14077,14 +14198,22 @@ cwagent_show_agent_diagnostics() {
       | grep -Ei '(^|[[:space:]])(E!|W!|ERROR|WARN|failed|denied|timeout|no such file)' \
       | tail -n 20 || true
   )"
-  diag ""
-  diag "[cwagent の警告・エラー（最大 20 行）]"
+  # 画面表示は既定で省略する (--cwagent-verify-display 指定時のみ)。判定の記録は
+  # 表示の有無にかかわらず行い、全量レポートと総合判定へは必ず反映する。
+  if [ "$CWAGENT_VERIFY_DISPLAY" = "true" ]; then
+    diag ""
+    diag "[cwagent の警告・エラー（最大 20 行）]"
+  fi
   if [ -n "$agent_diagnostics" ]; then
-    printf '%s\n' "$agent_diagnostics" | cwagent_redact_text >&2
+    if [ "$CWAGENT_VERIFY_DISPLAY" = "true" ]; then
+      printf '%s\n' "$agent_diagnostics" | cwagent_redact_text >&2
+    fi
     cwagent_record_stage "cwagent の警告・エラーログ" "注意" \
         "$(printf '%s' "$agent_diagnostics" | tail -n 3 | tr '\n' ' ' | cwagent_redact_text | cut -c1-300)"
   else
-    diag "  今回の起動以降に該当する警告・エラーは見つかりませんでした。"
+    if [ "$CWAGENT_VERIFY_DISPLAY" = "true" ]; then
+      diag "  今回の起動以降に該当する警告・エラーは見つかりませんでした。"
+    fi
     cwagent_record_stage "cwagent の警告・エラーログ" "OK" "該当する警告・エラーはありません"
   fi
 }
@@ -14104,7 +14233,7 @@ verify_cwagent_log_delivery() {
       cwagent_record_stage "cwagent コンテナの起動" "未確認" \
           "コンテナを起動していないため送信状況を確認していません。--verify-startup または --verify-url を併用してください"
     fi
-    cwagent_show_stage_results "cwagent のログ送信検証"
+    cwagent_show_delivery_stage_results
     return 0
   fi
   # curl / Python 3 は送達レポートの問い合わせと JSON 整形にだけ使う。レポートを
@@ -14112,7 +14241,7 @@ verify_cwagent_log_delivery() {
   if [ "$CWAGENT_DELIVERY_REPORT" = "true" ] && ! require_observability_tools; then
     cwagent_record_stage "送信状況チェックの前提ツール" "未確認" \
         "curl と Python 3 が利用できないため、送信状況を確認できません"
-    cwagent_show_stage_results "cwagent のログ送信検証"
+    cwagent_show_delivery_stage_results
     return 0
   fi
 
@@ -14127,20 +14256,23 @@ verify_cwagent_log_delivery() {
           "サービス '${CWAGENT_SERVICE}' が実行中ではありません: $(compose_service_container_summary "$CWAGENT_SERVICE")"
       cwagent_show_agent_diagnostics
     fi
-    cwagent_show_stage_results "cwagent のログ送信検証"
+    cwagent_show_delivery_stage_results
     return 0
   fi
   container_id="${container_ids[0]}"
   cwagent_record_stage "cwagent コンテナの起動" "OK" \
       "$(compose_service_container_summary "$CWAGENT_SERVICE")"
 
-  diag ""
-  diag "==================================================================="
-  diag "CloudWatch Agent の送信状況チェック"
-  diag "  サービス      : ${CWAGENT_SERVICE}"
-  diag "  設定ファイル  : ${CWAGENT_CONTAINER_CONFIG_FILE:-(未特定)}"
-  diag "  送信先        : ${CWAGENT_ENDPOINT_OVERRIDE:-実 CloudWatch Logs (region=${CWAGENT_CONFIG_REGION:-$REGION})}"
-  diag "==================================================================="
+  # 送信状況チェックの見出しも既定では出さない (--cwagent-verify-display 指定時のみ)。
+  if [ "$CWAGENT_VERIFY_DISPLAY" = "true" ]; then
+    diag ""
+    diag "==================================================================="
+    diag "CloudWatch Agent の送信状況チェック"
+    diag "  サービス      : ${CWAGENT_SERVICE}"
+    diag "  設定ファイル  : ${CWAGENT_CONTAINER_CONFIG_FILE:-(未特定)}"
+    diag "  送信先        : ${CWAGENT_ENDPOINT_OVERRIDE:-実 CloudWatch Logs (region=${CWAGENT_CONFIG_REGION:-$REGION})}"
+    diag "==================================================================="
+  fi
 
   # 実際にエージェントが読み込んでいる設定を優先し、比較できない場合はホスト側を使う。
   CWAGENT_CONTAINER_CONFIG_JSON=""
@@ -14171,7 +14303,7 @@ verify_cwagent_log_delivery() {
   fi
   cwagent_show_agent_diagnostics
 
-  cwagent_show_stage_results "cwagent のログ送信検証"
+  cwagent_show_delivery_stage_results
   return 0
 }
 
@@ -14206,6 +14338,25 @@ cwagent_show_stage_results() {
   fi
   diag "───────────────────────────────────────────────────────────────────"
   diag ""
+}
+
+# 起動後 (ビルド・デプロイ後) の段一覧を表示する。既定では画面へ出さず、
+# --cwagent-verify-display を指定した実行だけで表示する。表示しない場合も、後続の
+# 呼び出しで積み残しがまとめて出ないよう、表示済みの位置だけは進めておく。
+# ビルド前の設定ファイルチェック (cwagent_show_stage_results の直接呼び出し) は
+# 従来どおり常に表示する。
+cwagent_show_delivery_stage_results() {
+  if [ "$CWAGENT_VERIFY_DISPLAY" = "true" ]; then
+    cwagent_show_stage_results "cwagent のログ送信検証"
+    return 0
+  fi
+  if [ "${#CWAGENT_STAGE_RESULTS[@]}" -gt "$CWAGENT_STAGE_PRINTED_COUNT" ] \
+      && [ "$CWAGENT_VERIFY_DISPLAY_NOTIFIED" != "true" ]; then
+    CWAGENT_VERIFY_DISPLAY_NOTIFIED="true"
+    log "cwagent の送信状況チェック・警告・エラー・ログ送信検証の画面表示を省略しました (表示するには --cwagent-verify-display)。"
+  fi
+  CWAGENT_STAGE_PRINTED_COUNT="${#CWAGENT_STAGE_RESULTS[@]}"
+  return 0
 }
 
 # 検証結果を終了コードへ反映する。既定では警告のみとし、ビルド成否の判定は変えない
@@ -18263,6 +18414,10 @@ run_interactive_compose_service_menu() {
 
 run_keep_container_interaction() {
   [ -n "$KEEP_CONTAINER_MODE" ] || return 0
+  # 選択ダイアログから先はメニューと操作結果の表示になるため、ここで色分けを終える。
+  # ダイアログを出さない実行 (--keep-container-mode 無指定) では、この後に続く
+  # 環境変数一覧や各種分析までビルド・デプロイ後の出力なので、色分けを続ける。
+  end_screen_log_color_phase
   if [ "$DRY_RUN" = "true" ]; then
     case "$KEEP_CONTAINER_MODE" in
       bash)
@@ -28009,12 +28164,21 @@ analyze_undertow_virtual_hosts() {
   return 0
 }
 
-# 分析結果を画面へ出す。--no-undertow-analysis-display 指定時は、テキストと
-# 全量レポートへの出力だけを残して画面表示を省く。
+# 分析結果を画面へ出す。画面表示は既定で行わず (--undertow-analysis-display 指定時のみ)、
+# --no-undertow-analysis-display を明示した場合も同じく省く。いずれの場合もテキストと
+# 全量レポートへの出力は残るため、省いた理由と出力先だけを 1 行で伝える。
 show_undertow_virtual_host_analysis() {
+  local suppress_reason
   if [ "$UNDERTOW_ANALYSIS_DISPLAY" != "true" ]; then
+    if [ "$UNDERTOW_ANALYSIS_DISPLAY_SET" = "true" ]; then
+      suppress_reason="画面表示は --no-undertow-analysis-display により省略"
+    else
+      suppress_reason="画面表示は既定では行いません。表示するには --undertow-analysis-display を指定してください"
+    fi
     if [ -n "$UNDERTOW_ANALYSIS_TEXT_OUTPUT" ]; then
-      log "Undertow バーチャルホスト分析のテキストを出力しました (画面表示は --no-undertow-analysis-display により省略): $UNDERTOW_ANALYSIS_TEXT_OUTPUT"
+      log "Undertow バーチャルホスト分析のテキストを出力しました (${suppress_reason}): $UNDERTOW_ANALYSIS_TEXT_OUTPUT"
+    else
+      log "Undertow バーチャルホスト分析を行いました (${suppress_reason})。"
     fi
     return 0
   fi
@@ -28821,7 +28985,7 @@ if [ "$NEED_CONTAINER" != "true" ]; then
       cwagent_record_stage "ログイベントの送達" "未確認" \
           "コンテナを起動していないため送信状況を確認していません。--verify-startup または --verify-url を併用すると、設定済みのロググループへ実際にログが届くまで確認します"
     fi
-    cwagent_show_stage_results "cwagent のログ送信検証"
+    cwagent_show_delivery_stage_results
     finish_cwagent_verification
   fi
   if [ "$DRY_RUN" = "true" ]; then
@@ -28839,6 +29003,10 @@ pull_required_images
 if ! start_container; then
   exit 1
 fi
+
+# ここから Compose サービスの選択ダイアログに入るまでの画面ログは、コンテナ起動ログと
+# 同じ配色 (成功=緑 / 重要=シアン / 警告=黄 / エラー=赤) で色分けする。
+begin_screen_log_color_phase
 
 # ---- コピーしたファイルの取り込み検証 ---------------------------------------
 # 差し替えたファイル (WAR など) が、今回ビルドしたイメージとコンテナへ実際に

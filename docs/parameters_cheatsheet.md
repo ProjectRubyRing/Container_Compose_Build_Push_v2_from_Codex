@@ -89,6 +89,8 @@
 | `--cwagent-service NAME` | サービス名 | `cwagent` | CloudWatch Agent の Compose サービス名 |
 | `--cwagent-config-dir PATH` | コンテナ内の絶対パス | `/etc/cwagentconfig` | 設定ファイルの注入先ディレクトリ |
 | `--cwagent-delivery-target auto\|mock\|aws` | 列挙 | `auto` | 送達確認先 |
+| `--cwagent-verify-display` | フラグ | `false` | ビルド・デプロイ後の送信状況チェック・警告・エラー・ログ送信検証を画面へ表示する (既定では表示しない) |
+| `--no-cwagent-verify-display` | フラグ | — | 上記 3 つを画面へ表示しない (既定) |
 | `--cwagent-delivery-report` | フラグ | `false` | 送達を待ち合わせて送達レポートを表示する (既定では行わない) |
 | `--no-cwagent-delivery-report` | フラグ | — | 送達レポートを行わない (既定) |
 | `--cwagent-delivery-timeout SEC` | 1 以上の整数 | `60` | 送達を待つ最大秒数 (`--cwagent-delivery-report` 指定時に使用) |
@@ -185,7 +187,8 @@
 | `--undertow-probe-path PATH` | `/` で始まるパス | (`WFLYUT0021` から検出) | `Host` ヘッダーを差し替えた実リクエストの送信先パス |
 | `--no-undertow-probe` | フラグ | `false` | 実リクエストを送らず、`standalone.xml` の解析だけで判定する |
 | `--undertow-analysis-text FILE` | ファイルパス | (なし) | Undertow バーチャルホスト分析のテキスト出力先 (内容は画面表示と同一) |
-| `--no-undertow-analysis-display` | フラグ | `false` | 画面出力だけを抑制する |
+| `--undertow-analysis-display` | フラグ | `false` | 分析結果をダイアログの操作後に画面へも出力する (既定では画面へ出さない) |
+| `--no-undertow-analysis-display` | フラグ | `true` (既定) | 画面出力を抑制する (既定と同じ) |
 | `--no-undertow-analysis-text` | フラグ | `false` | テキスト出力だけを抑制する |
 | `--no-undertow-analysis` | フラグ | `false` | Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない |
 | `--cert-check-text FILE` | ファイルパス | (なし) | 証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先 |

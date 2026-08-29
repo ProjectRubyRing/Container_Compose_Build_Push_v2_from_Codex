@@ -448,6 +448,8 @@ compose down (削除)
 | `--cwagent-service NAME` | サービス名 | `cwagent` | CloudWatch Agent の Compose サービス名 |
 | `--cwagent-config-dir PATH` | コンテナ内の絶対パス | `/etc/cwagentconfig` | 設定ファイルの注入先ディレクトリ |
 | `--cwagent-delivery-target auto\|mock\|aws` | 列挙 | `auto` | 送達確認先。`auto` は `logs.endpoint_override` の有無で判定 |
+| `--cwagent-verify-display` | (フラグ) | `false` | ビルド・デプロイ後の「CloudWatch Agent の送信状況チェック」「cwagent の警告・エラー」「cwagent のログ送信検証」を画面へ表示する (既定では表示しない) |
+| `--no-cwagent-verify-display` | (フラグ) | — | 上記 3 つを画面へ表示しない (既定) |
 | `--cwagent-delivery-report` | (フラグ) | `false` | 送達を待ち合わせて送達レポートを表示する (既定では行わない) |
 | `--no-cwagent-delivery-report` | (フラグ) | — | 送達レポートを行わない (既定) |
 | `--cwagent-delivery-timeout SEC` | 1 以上の整数 | `60` | 送達を待つ最大秒数 (`--cwagent-delivery-report` 指定時に使用) |
@@ -545,7 +547,8 @@ compose down (削除)
 | `--undertow-probe-path PATH` | `/` で始まるパス | (`WFLYUT0021` から検出) | 不可 | `Host` ヘッダーを差し替えた実リクエストの送信先パス。`--no-undertow-analysis` とは排他 |
 | `--no-undertow-probe` | フラグ | `false` | 不可 | 実リクエストを送らず、`standalone.xml` の解析だけで判定する |
 | `--undertow-analysis-text FILE` | ファイルパス | (なし) | 不可 | Undertow バーチャルホスト分析のテキスト出力先 (内容は画面表示と同一)。`--no-undertow-analysis` / `--no-undertow-analysis-text` とは排他 |
-| `--no-undertow-analysis-display` | フラグ | `false` | 不可 | 画面出力だけを抑制する。`--no-undertow-analysis-text` との同時指定は出力先が無くなるため不可 |
+| `--undertow-analysis-display` | フラグ | `false` | 不可 | 分析結果をダイアログの操作後に画面へも出力する (既定では画面へ出さない)。`--no-undertow-analysis` とは排他 |
+| `--no-undertow-analysis-display` | フラグ | `true` (既定) | 不可 | 画面出力を抑制する (既定と同じ。`--undertow-analysis-display` を打ち消す)。`--no-undertow-analysis-text` との同時指定は出力先が無くなるため不可 |
 | `--no-undertow-analysis-text` | フラグ | `false` | 不可 | テキスト出力だけを抑制する。`--no-undertow-analysis-display` との同時指定は不可 |
 | `--no-undertow-analysis` | フラグ | `false` | 不可 | Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない |
 | `--cert-check-text FILE` | ファイルパス | (なし) | 不可 | 証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先。`--no-cert-check-text` とは排他 |
@@ -842,6 +845,28 @@ JBoss EAP 8.1 のメッセージ ID で判定します。
 | シアン (重要) | ドライバー・データソース・デプロイ・リスナー関連の各メッセージ |
 | 黄 (警告) | `WARN` / `WARNING` レベル |
 | 赤 (エラー) | `ERROR` / `FATAL` レベル、`WFLYSRV0026` / `WFLYSRV0056` |
+
+#### ビルド・デプロイ後の画面ログの色分け
+
+コンテナ起動後から、Compose サービスの選択ダイアログに入るまでにスクリプト自身が
+画面へ出すログ (`log` / `warn` / `err` / 診断出力) も、**同じ配色で色分け**します。
+起動ログと違い、この区間の行はすべていずれかの色になります (どの語句にも当たらない
+行は「重要」のシアン)。
+
+| 色 | 対象 |
+| --- | --- |
+| 緑 (成功) | `成功` / `完了` / `[OK]` / `一致しました` / `届きました` / `確認できました` / `問題ありません` / `全段 OK` |
+| シアン (重要) | 上記・下記のいずれにも当たらない行 (見出し・区切り線・件数の報告など) |
+| 黄 (警告) | `warn` の出力、`[WARN]` / `[注意]` / `[未確認]` / `[情報]` / `警告` / `要確認` / `省略` / `スキップ` / `抑制` など |
+| 赤 (エラー) | `err` の出力、`[ERROR]` / `[NG]` / `失敗` / `エラー` / `異常` / `できませんでした` / `見つかりません` など |
+
+判定はエラー → 警告 → 成功の順に行い、先に当たった色を採ります
+(「失敗しました」を含む行が「完了」で緑にならないようにするためです)。
+色を付ける条件は起動ログと同じで、端末へ直接表示する場合だけです
+(`NO_COLOR` 優先、`CLICOLOR_FORCE` で強制、`TERM=dumb` は無効)。
+ダイアログへ入った後 (サービス操作メニューとその結果) は色分けしません。
+`--keep-container-mode` を指定していない実行ではダイアログが出ないため、
+コンテナ起動から実行の最後まで色分けが続きます。
 
 ### 5.3 `--wait-healthy` と依存サービス
 
@@ -2012,6 +2037,13 @@ CloudWatch Agent は既定設定のまま起動してログだけが送信され
 | ロググループの自動作成 | `--cwagent-create-log-group` 指定時のみ。実 CloudWatch Logs 宛ての構成で、設定ファイルの `log_group_name` が存在しなければ作成する (下記) |
 | ログイベントの送達 | `--cwagent-delivery-report` 指定時のみ。設定済みのロググループ / ログストリームへイベントが届くまで待ち合わせる (下記) |
 | cwagent の警告・エラーログ | 常時。`E!` / `W!` / `ERROR` / `WARN` / `failed` / `denied` / `timeout` / `no such file` を含む行を最大 20 行 |
+
+(B) の結果は**既定では画面へ出しません**。「CloudWatch Agent の送信状況チェック」
+「cwagent の警告・エラー」「cwagent のログ送信検証」の 3 つは
+`--cwagent-verify-display` を指定した実行だけで表示し、既定の実行では省いたことと
+表示方法を 1 行だけ知らせます。段の記録・総合判定・全量レポート `[8]`・
+`--cwagent-required` による終了コードは指定の有無で変わりません。
+(A) のビルド前の設定ファイルチェックは対象外で、従来どおり画面へ出ます。
 
 「ロググループの自動作成」と「ログイベントの送達」は、いずれも AWS / 偽装サービスへ
 実際に問い合わせる (前者は書き込みを伴う) ため、**既定では実行しません**。オプションを

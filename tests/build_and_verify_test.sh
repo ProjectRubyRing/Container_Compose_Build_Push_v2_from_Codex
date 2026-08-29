@@ -3400,7 +3400,9 @@ export FAKE_JBOSS_STANDALONE_XML="$TEST_DIR/fixtures/standalone-undertow.xml"
 # default-host へ落ちたリクエストだけ 404 を返し、振り分けの違いを応答で示す。
 export FAKE_UNDERTOW_404_HOSTS="app test-app-1 172.20.0.2 undertow-default-host-check.invalid extra.example.jp"
 
-# --- 既定 (オプション指定なし) で画面とテキストの両方へ出力する ---
+# --- --undertow-analysis-display で画面とテキストの両方へ出力する ---
+# 画面表示は既定では行わないため、分析の中身を確かめるこの実行では明示的に有効化する
+# (既定で画面へ出さないことは後段の undertow-default-quiet で確認する)。
 undertow_output="$TEST_TMP/undertow-default.out"
 undertow_reports="$TEST_TMP/undertow-reports"
 : > "$FAKE_DOCKER_CALLS"
@@ -3412,6 +3414,7 @@ if ! (
     --startup-service app \
     --report-dir "$undertow_reports" \
     --undertow-host-header extra.example.jp,orders.example.jp:8443 \
+    --undertow-analysis-display \
     --suppress-startup-logs \
     --suppress-removed-logs
 ) >"$undertow_output" 2>&1; then
@@ -3505,6 +3508,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --no-undertow-probe \
+    --undertow-analysis-display \
     --suppress-startup-logs \
     --suppress-removed-logs
 ) >"$undertow_mismatch_output" 2>&1; then
@@ -3586,6 +3590,7 @@ if ! (
     --compose-service app \
     --startup-service app \
     --report-dir "$undertow_notext_reports" \
+    --undertow-analysis-display \
     --no-undertow-analysis-text \
     --suppress-startup-logs \
     --suppress-removed-logs
@@ -3597,6 +3602,36 @@ assert_contains "$undertow_notext_output" "[5] default-host 設定の利用状�
 assert_contains "$undertow_notext_output" "テキスト出力は --no-undertow-analysis-text により行いません。"
 [ -z "$(ls "$undertow_notext_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null)" ] \
   || fail "--no-undertow-analysis-text unexpectedly wrote an undertow analysis text file"
+
+# --- 既定 (画面表示の指定なし) では画面へ出さず、テキストと全量レポートへは出すこと ---
+undertow_quiet_output="$TEST_TMP/undertow-default-quiet.out"
+undertow_quiet_reports="$TEST_TMP/undertow-default-quiet-reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --report-dir "$undertow_quiet_reports" \
+    --suppress-startup-logs \
+    --suppress-removed-logs
+) >"$undertow_quiet_output" 2>&1; then
+  cat "$undertow_quiet_output" >&2
+  fail "the default undertow analysis run returned a non-zero status"
+fi
+assert_not_contains "$undertow_quiet_output" "JBoss EAP Undertow バーチャルホスト (default-host) 分析"
+assert_not_contains "$undertow_quiet_output" "[5] default-host 設定の利用状況"
+assert_contains "$undertow_quiet_output" \
+  "画面表示は既定では行いません。表示するには --undertow-analysis-display を指定してください"
+# 分析そのものは行い、テキストと全量レポートへは従来どおり出すこと
+undertow_quiet_text="$(ls "$undertow_quiet_reports"/build_and_verify_*_undertow_virtual_host.txt 2>/dev/null | head -n 1)"
+[ -n "$undertow_quiet_text" ] && [ -f "$undertow_quiet_text" ] \
+  || fail "the default undertow analysis run should still write the analysis text file"
+assert_contains "$undertow_quiet_text" "[5] default-host 設定の利用状況"
+collect_report_files "$undertow_quiet_reports"
+[ ${#REPORT_FILES[@]} -eq 1 ] || fail "expected one full build report for the quiet undertow scenario"
+assert_contains "${REPORT_FILES[0]}" "[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析"
+assert_contains "${REPORT_FILES[0]}" "[5] default-host 設定の利用状況"
 
 # --- 矛盾するオプションの組み合わせは起動前に弾く ---
 undertow_conflict_output="$TEST_TMP/undertow-conflict.out"
@@ -3655,6 +3690,7 @@ if ! (
     --directory-tree-depth 1 \
     --suppress-removed-logs \
     --cwagent-delivery-report \
+    --cwagent-verify-display \
     --report-dir "$TEST_TMP/cwagent-reports"
 ) >"$cwagent_verify_output" 2>&1; then
   cat "$cwagent_verify_output" >&2
@@ -3709,6 +3745,7 @@ if ! (
     --env-list-limit 1 \
     --directory-tree-depth 1 \
     --suppress-removed-logs \
+    --cwagent-verify-display \
     --report-dir "$TEST_TMP/cwagent-no-report-reports"
 ) >"$cwagent_no_report_output" 2>&1; then
   cat "$cwagent_no_report_output" >&2
@@ -3735,6 +3772,51 @@ cwagent_no_report_files=("${REPORT_FILES[@]}")
 [ -f "${cwagent_no_report_files[0]}" ] || fail "cwagent no-delivery-report report was not created"
 assert_contains "${cwagent_no_report_files[0]}" "[情報] ログイベントの送達"
 
+# --- 既定 (--cwagent-verify-display なし) では起動後の検証結果を画面へ出さないこと ---
+# 「CloudWatch Agent の送信状況チェック」「cwagent の警告・エラー」
+# 「cwagent のログ送信検証」の 3 つを画面から省き、検証そのもの (段の記録・総合判定・
+# 全量レポートへの記載) は従来どおり行うこと。ビルド前の設定ファイルチェックは
+# 対象外なので、これまでどおり画面へ出ること。
+cwagent_quiet_output="$TEST_TMP/cwagent-quiet.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$cwagent_fixture_dir/compose-cwagent.yml" \
+    --compose-service app,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs \
+    --report-dir "$TEST_TMP/cwagent-quiet-reports"
+) >"$cwagent_quiet_output" 2>&1; then
+  cat "$cwagent_quiet_output" >&2
+  fail "the default cwagent verification run returned a non-zero status"
+fi
+# ビルド前の設定ファイルチェックは既定でも画面へ出すこと
+assert_contains "$cwagent_quiet_output" "ビルド前の設定ファイルチェック"
+assert_contains "$cwagent_quiet_output" "[OK] 収集対象ログファイルのマウント"
+# 起動後の 3 つは画面へ出さないこと
+assert_not_contains "$cwagent_quiet_output" "CloudWatch Agent の送信状況チェック"
+assert_not_contains "$cwagent_quiet_output" "[cwagent の警告・エラー（最大 20 行）]"
+assert_not_contains "$cwagent_quiet_output" "[OK] cwagent コンテナの起動"
+assert_not_contains "$cwagent_quiet_output" "[OK] cwagent の警告・エラーログ"
+assert_not_contains "$cwagent_quiet_output" "[OK] コンテナ内の設定ファイル (/etc/cwagentconfig/cwagent-config.json)"
+assert_not_contains "$cwagent_quiet_output" "[情報] ログイベントの送達"
+# 省略したことと表示方法は 1 度だけ案内すること
+assert_occurrences "$cwagent_quiet_output" \
+  "cwagent の送信状況チェック・警告・エラー・ログ送信検証の画面表示を省略しました (表示するには --cwagent-verify-display)。" 1
+# 検証そのものは行い、総合判定と全量レポートの内容は変わらないこと
+assert_contains "$cwagent_quiet_output" "cwagent のログ送信検証: 全段 OK です。"
+collect_report_files "$TEST_TMP/cwagent-quiet-reports"
+cwagent_quiet_report_files=("${REPORT_FILES[@]}")
+[ -f "${cwagent_quiet_report_files[0]}" ] || fail "the default cwagent verification report was not created"
+assert_contains "${cwagent_quiet_report_files[0]}" "[8] CloudWatch Logs 送信検証 (cwagent)"
+assert_contains "${cwagent_quiet_report_files[0]}" "[OK] cwagent の警告・エラーログ"
+assert_contains "${cwagent_quiet_report_files[0]}" "総合判定: 全段 OK"
+
 # --- 既定 (--cwagent-create-log-group なし) ではロググループを作成しないこと ---
 # 実 CloudWatch Logs 宛てでロググループが存在しない構成でも、明示指定が無ければ
 # CreateLogGroup を呼ばず、指定方法を案内するだけにとどめること。
@@ -3756,7 +3838,8 @@ if ! (
     --suppress-removed-logs \
     --cwagent-delivery-target aws \
     --cwagent-delivery-timeout 1 \
-    --cwagent-delivery-interval 1
+    --cwagent-delivery-interval 1 \
+    --cwagent-verify-display
 ) >"$cwagent_default_no_create_output" 2>&1; then
   cat "$cwagent_default_no_create_output" >&2
   fail "cwagent verification without --cwagent-create-log-group returned a non-zero status"
@@ -3795,6 +3878,7 @@ if ! (
     --cwagent-delivery-interval 1 \
     --cwagent-create-log-group \
     --cwagent-delivery-report \
+    --cwagent-verify-display \
     --report-dir "$TEST_TMP/cwagent-create-reports"
 ) >"$cwagent_create_group_output" 2>&1; then
   cat "$cwagent_create_group_output" >&2
@@ -3841,7 +3925,8 @@ if ! (
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
     --cwagent-create-log-group \
-    --cwagent-delivery-report
+    --cwagent-delivery-report \
+    --cwagent-verify-display
 ) >"$cwagent_existing_group_output" 2>&1; then
   cat "$cwagent_existing_group_output" >&2
   fail "cwagent verification with existing log groups returned a non-zero status"
@@ -3870,7 +3955,8 @@ if ! (
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
     --cwagent-delivery-report \
-    --no-cwagent-create-log-group
+    --no-cwagent-create-log-group \
+    --cwagent-verify-display
 ) >"$cwagent_no_create_output" 2>&1; then
   cat "$cwagent_no_create_output" >&2
   fail "--no-cwagent-create-log-group returned a non-zero status"
@@ -3898,7 +3984,8 @@ if ! (
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
     --cwagent-create-log-group \
-    --cwagent-delivery-report
+    --cwagent-delivery-report \
+    --cwagent-verify-display
 ) >"$cwagent_create_failed_output" 2>&1; then
   cat "$cwagent_create_failed_output" >&2
   fail "cwagent log group creation failure returned a non-zero status"
@@ -3937,7 +4024,8 @@ if ! (
     --suppress-removed-logs \
     --cwagent-delivery-timeout 1 \
     --cwagent-delivery-interval 1 \
-    --cwagent-delivery-report
+    --cwagent-delivery-report \
+    --cwagent-verify-display
 ) >"$cwagent_broken_output" 2>&1; then
   cat "$cwagent_broken_output" >&2
   fail "cwagent verification of the broken fixture returned a non-zero status"

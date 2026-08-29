@@ -238,7 +238,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--undertow-probe-path PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。`Host` ヘッダーを差し替えた実リクエストの送信先パス | (`WFLYUT0021` から検出したコンテキストルート) |
 | `--no-undertow-probe` | **`build_and_verify.sh` / `--build-only` 委譲時**。実リクエストを送らず、`standalone.xml` の解析だけで判定する | `false` |
 | `--undertow-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析のテキスト出力先を明示する (内容は画面表示と同一) | (`--report-dir` 配下へ自動命名) |
-| `--no-undertow-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析の画面出力だけを抑制する (テキストと全量レポートへは出力する) | `false` |
+| `--undertow-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析を、ダイアログの操作後に画面へも出力する (既定では画面へ出さない) | `false` (画面表示しない) |
+| `--no-undertow-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析の画面出力を抑制する (既定と同じ。`--undertow-analysis-display` を打ち消す。テキストと全量レポートへは出力する) | `true` (既定) |
 | `--no-undertow-analysis-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析のテキスト出力だけを抑制する (画面へは出力する) | `false` |
 | `--no-undertow-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない | `false` |
 | `--cert-check-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。受領した自己証明書の詳細と HTTPS 接続の結果を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
@@ -1779,7 +1780,10 @@ services:
 
 呼び出し元が `Host` ヘッダーにホスト名を指定してきたとき、**どのバーチャルホストが
 そのリクエストを処理するのか**を、コンテナ内の `standalone.xml` から判定します。
-オプション指定は不要で、**既定で毎回実行し、画面とテキストの両方へ出力**します。
+オプション指定は不要で、**既定で毎回実行**します。ただし、この分析は
+Compose サービスの選択ダイアログを終えた直後に走るため、**既定では画面へ出さず**、
+テキスト (`--report-dir` 指定時) と全量レポートの `[12]` へ出力します。画面でも読む
+ときは `--undertow-analysis-display` を指定してください。
 
 Undertow の振り分けは `NameVirtualHostHandler` が次の順で決めます。
 
@@ -1826,7 +1830,7 @@ Undertow の振り分けは `NameVirtualHostHandler` が次の順で決めます
 `build_and_verify_<日時>_undertow_virtual_host.txt` (画面と同じ内容) を出力します。
 
 ```bash
-# 既定。分析は毎回実行され、画面とテキストの両方へ出力される
+# 既定。分析は毎回実行され、画面へは出さずテキストと全量レポートへ出力される
 ./build_and_verify.sh --verify-startup     --compose-service app --startup-service app     --report-dir ./reports
 
 # 本番の FQDN や ALB のホスト名を渡して、default-host へ落ちないかを確かめる
@@ -1835,7 +1839,11 @@ Undertow の振り分けは `NameVirtualHostHandler` が次の順で決めます
 # 実リクエストを送らず、設定ファイルの解析だけで判定する
 ./build_and_verify.sh --verify-startup --no-undertow-probe
 
-# 出力先ごとに抑制する (両方を同時に抑制するとエラー)
+# ダイアログの操作後に、分析結果を画面へも出す
+./build_and_verify.sh --verify-startup --undertow-analysis-display
+
+# 出力先ごとに抑制する (--no-undertow-analysis-display と --no-undertow-analysis-text の
+# 同時指定はエラー)
 ./build_and_verify.sh --verify-startup --no-undertow-analysis-display
 ./build_and_verify.sh --verify-startup --no-undertow-analysis-text
 
@@ -1916,6 +1924,13 @@ CloudWatch Logs には届きません。
 書き終えた時点でコンテナ内の設定を照合します。実際の送達確認は
 `--cwagent-delivery-report` を指定した実行だけで行います。
 
+チェックそのものは既定でも行いますが、**その結果の画面表示は既定では行いません**。
+「CloudWatch Agent の送信状況チェック」「cwagent の警告・エラー」
+「cwagent のログ送信検証」の 3 つを画面でも読むときは `--cwagent-verify-display` を
+指定してください。指定しない場合も、段の記録・総合判定・全量レポート `[8]` の内容と
+`--cwagent-required` による終了コードは変わりません
+(ビルド前の設定ファイルチェックは対象外で、従来どおり画面へ出ます)。
+
 1. 起動した `cwagent` コンテナから設定ファイルを読み出し、ホスト側の内容と比較します。
    一致しない場合は「編集した設定が反映されていない」「マウントが効いていない」ことが
    分かります。
@@ -1983,6 +1998,8 @@ CloudWatch Logs には届きません。
 | `--cwagent-service NAME` | CloudWatch Agent の Compose サービス名 (既定: `cwagent`) |
 | `--cwagent-config-dir PATH` | コンテナ内の設定ディレクトリ (既定: `/etc/cwagentconfig`) |
 | `--cwagent-delivery-target auto\|mock\|aws` | 送信状況の確認先。`auto` は `logs.endpoint_override` があれば `mock`、無ければ `aws` (既定: `auto`) |
+| `--cwagent-verify-display` | ビルド・デプロイ後の「CloudWatch Agent の送信状況チェック」「cwagent の警告・エラー」「cwagent のログ送信検証」を画面へ表示する (既定では表示しない) |
+| `--no-cwagent-verify-display` | 上記 3 つを画面へ表示しない (既定) |
 | `--cwagent-delivery-report` | 送達を待ち合わせて送達レポートを表示する (既定では行わない) |
 | `--no-cwagent-delivery-report` | 送達レポートを行わない (既定) |
 | `--cwagent-delivery-timeout SEC` | 送達を待つ最大秒数。`--cwagent-delivery-report` 指定時に使う (既定: 60) |
