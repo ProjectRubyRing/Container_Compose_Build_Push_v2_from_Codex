@@ -159,6 +159,7 @@
 ### 情報表示・レポート
 
 > Java 例外解析の Excel / テキストは、`--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力します (`--report-dir` だけでは出力しません)。
+> 全量レポートの `[10]` (Java 例外解析) と `[11]` (読み取り専用ファイルシステム分析) も、`--deploy-exception-report` / `--readonly-analysis-report` を指定したときだけ記載します。
 
 | オプション | 値 | 既定 | 説明 |
 | --- | --- | --- | --- |
@@ -174,12 +175,16 @@
 | `--report-dir DIR` | ディレクトリパス | (なし) | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 (読み取り専用 FS 分析の Excel / テキストも同じ場所へ) |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | WAR デプロイ時 Java 例外解析の結果を画面へ表示する |
 | `--no-deploy-exception-display` | フラグ | — | 画面表示を行わない (既定と同じ) |
+| `--deploy-exception-report` | フラグ | `false` (非出力) | 全量レポートの `[10]` へ解析結果を出力する (`--report-dir` と併用) |
+| `--no-deploy-exception-report` | フラグ | `true` (既定) | 全量レポートへ解析結果を出力しない |
 | `--deploy-exception-excel FILE` | `.xlsx` のパス | (なし) | Java 例外解析の Excel 出力先。**指定したときだけ出力**する |
 | `--deploy-exception-text FILE` | ファイルパス | (なし) | Java 例外解析のテキスト出力先。**指定したときだけ出力**する |
 | `--deploy-exception-limit N` | 1 以上の整数 | `50` | 詳細分析を行う例外の最大件数 |
 | `--no-deploy-exception-analysis` | フラグ | `false` | Java 例外の解析とファイル出力を行わない |
 | `--readonly-analysis-display` | フラグ | `false` (非表示) | 読み取り専用ファイルシステム分析の結果を画面へ表示する |
 | `--no-readonly-analysis-display` | フラグ | — | 画面表示を行わない (既定と同じ) |
+| `--readonly-analysis-report` | フラグ | `false` (非出力) | 全量レポートの `[11]` へ分析結果を出力する (`--report-dir` と併用) |
+| `--no-readonly-analysis-report` | フラグ | `true` (既定) | 全量レポートへ分析結果を出力しない |
 | `--readonly-analysis-excel FILE` | `.xlsx` のパス | (なし) | 読み取り専用ファイルシステム分析の Excel 出力先 |
 | `--readonly-analysis-text FILE` | ファイルパス | (なし) | 同じ内容のテキスト出力先。`--no-readonly-analysis` とは排他 |
 | `--no-readonly-analysis` | フラグ | `false` | 読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない |

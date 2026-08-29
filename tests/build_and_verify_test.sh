@@ -1158,7 +1158,8 @@ export FAKE_COMPOSE_CONFIG_SERVICES="base app adot-collector"
 export FAKE_COMPOSE_NO_CONTAINERS="true"
 if (
   cd "$REPO_ROOT"
-  bash ./build_and_verify.sh --report-dir "$TEST_TMP/build-failure-reports"
+  bash ./build_and_verify.sh --report-dir "$TEST_TMP/build-failure-reports" \
+    --deploy-exception-report
 ) >"$build_failure_output" 2>&1; then
   unset FAKE_DOCKER_BUILD_FAIL FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
   cat "$build_failure_output" >&2
@@ -1186,7 +1187,8 @@ assert_occurrences "${build_failure_reports[0]}" "(このサービスのログ�
 # ビルド失敗で compose up まで到達しなかった場合も Java 例外解析は必ず実行し、
 # 「0 件検出」ではなく「未評価」として理由まで残す。
 # 画面表示は既定で行わないため (--deploy-exception-display 未指定)、結果が残るのは
-# 全量レポートの [10] だけになる。Excel もテキストも既定では出力しない。
+# --deploy-exception-report を指定した全量レポートの [10] だけになる。
+# Excel もテキストも既定では出力しない。
 if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つかりません" "$build_failure_output"; then
   assert_not_contains "$build_failure_output" \
     "WAR デプロイ時 Java 例外解析: コンテナ起動 (compose up) まで到達しなかったため、解析対象のログがありません"
@@ -4154,6 +4156,7 @@ if (
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-reports" \
     --deploy-exception-display \
+    --deploy-exception-report \
     --deploy-exception-excel "$deploy_exception_excel_path" \
     --deploy-exception-text "$deploy_exception_text_path" \
     --exit-on-deploy-error \
@@ -4296,8 +4299,8 @@ fi
 # --- 既定では画面表示も Excel / テキスト出力も行わないこと ---
 # 同じ例外ログを与えても、--deploy-exception-display / --deploy-exception-excel /
 # --deploy-exception-text を指定しなければ、解析結果はビルド結果の画面に現れず、
-# Excel もテキストも作らない。解析そのものは動いており、結果は全量レポートの
-# [10] に残る。
+# Excel もテキストも作らない。解析そのものは動いており、--deploy-exception-report
+# を指定した全量レポートの [10] に残る。
 deploy_exception_quiet_output="$TEST_TMP/deploy-exception-quiet.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
@@ -4311,6 +4314,7 @@ if (
     --startup-service app \
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-quiet-reports" \
+    --deploy-exception-report \
     --exit-on-deploy-error \
     --suppress-removed-logs
 ) >"$deploy_exception_quiet_output" 2>&1; then
@@ -4349,9 +4353,50 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
     "テキスト      : (未出力。--deploy-exception-text FILE を指定すると出力します)"
 fi
 
+# --- --report-dir だけでは全量レポート [10] へ記載しないこと ---
+# 解析結果は 1 例外あたり数十行になり、レポートを読みにくくする。そのため
+# --deploy-exception-report を指定しない限り、見出しの下へ未出力である旨だけを
+# 残す。ほかに出力先が無いため、解析そのものも行わない。
+deploy_exception_report_off_output="$TEST_TMP/deploy-exception-report-off.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/deploy-exception-report-off-reports" \
+    --exit-on-deploy-error \
+    --suppress-removed-logs
+) >"$deploy_exception_report_off_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_report_off_output" >&2
+  fail "java exception fixture unexpectedly returned zero without --deploy-exception-report"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+
+collect_report_files "$TEST_TMP/deploy-exception-report-off-reports"
+report_off_reports=("${REPORT_FILES[@]}")
+[ ${#report_off_reports[@]} -eq 1 ] && [ -f "${report_off_reports[0]}" ] \
+  || fail "expected one report without --deploy-exception-report"
+# 見出しは残し、その下に未出力である旨だけを書く。
+assert_contains "${report_off_reports[0]}" "[10] WAR デプロイ時 Java 例外解析"
+assert_contains "${report_off_reports[0]}" \
+  "--deploy-exception-report を指定していないため出力していません。"
+assert_contains "${report_off_reports[0]}" "デプロイ処理の Java 例外解析は [10] へ記載しない"
+assert_not_contains "${report_off_reports[0]}" \
+  "根本原因      : org.jboss.weld.exceptions.DeploymentException"
+# 受け取り先が 1 つも無いため、解析そのものも走らない。
+assert_not_contains "$deploy_exception_report_off_output" "WAR デプロイ時に Java の例外を"
+
 # --- 出力先が 1 つも無い実行では、解析そのものを行わないこと ---
-# --report-dir も --deploy-exception-* も無い場合、結果を出す場所が無いため、
-# ログ収集と解析ヘルパーの起動ごと省く (画面には何も現れない)。
+# --deploy-exception-report と --report-dir の併用も --deploy-exception-* も無い
+# 場合、結果を出す場所が無いため、ログ収集と解析ヘルパーの起動ごと省く
+# (画面には何も現れない)。
 deploy_exception_nosink_output="$TEST_TMP/deploy-exception-nosink.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-java-exception.log"
@@ -4425,6 +4470,7 @@ if ! (
     --env-list-limit 1 \
     --report-dir "$TEST_TMP/deploy-exception-clean-reports" \
     --deploy-exception-display \
+    --deploy-exception-report \
     --deploy-exception-excel "$deploy_exception_clean_excel_path" \
     --deploy-exception-text "$deploy_exception_clean_text_path" \
     --suppress-removed-logs
@@ -4475,6 +4521,7 @@ if (
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-upfail-reports" \
     --deploy-exception-display \
+    --deploy-exception-report \
     --deploy-exception-excel "$deploy_exception_upfail_excel_path" \
     --deploy-exception-text "$deploy_exception_upfail_text_path" \
     --suppress-removed-logs
@@ -4532,6 +4579,7 @@ if (
     --no-up-retry \
     --report-dir "$TEST_TMP/deploy-exception-nolog-reports" \
     --deploy-exception-display \
+    --deploy-exception-report \
     --deploy-exception-excel "$TEST_TMP/deploy-exception-nolog-reports/java_exceptions.xlsx" \
     --suppress-removed-logs
 ) >"$deploy_exception_nolog_output" 2>&1; then
@@ -4589,7 +4637,48 @@ off_texts=("$TEST_TMP/deploy-exception-off-reports"/build_and_verify_*_java_exce
 [ ! -e "${off_texts[0]}" ] || fail "did not expect a text file with --no-deploy-exception-analysis"
 collect_report_files "$TEST_TMP/deploy-exception-off-reports"
 off_reports=("${REPORT_FILES[@]}")
-assert_contains "${off_reports[0]}" "--no-deploy-exception-analysis が指定されたため解析していません。"
+# 解析を止めた実行では [10] へ何も載らない (--deploy-exception-report とは
+# 排他のため、記載を求めることもできない)。
+assert_contains "${off_reports[0]}" \
+  "--deploy-exception-report を指定していないため出力していません。"
+
+# --- --deploy-exception-report と --no-deploy-exception-analysis は排他 ---
+deploy_exception_report_conflict_output="$TEST_TMP/deploy-exception-report-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --deploy-exception-report \
+    --no-deploy-exception-analysis
+) >"$deploy_exception_report_conflict_output" 2>&1; then
+  cat "$deploy_exception_report_conflict_output" >&2
+  fail "--deploy-exception-report accepted --no-deploy-exception-analysis"
+fi
+assert_contains "$deploy_exception_report_conflict_output" \
+  "--deploy-exception-report と --no-deploy-exception-analysis は同時に指定できません。"
+
+# --- --report-dir が無ければ --deploy-exception-report は警告して無視すること ---
+deploy_exception_report_nodir_output="$TEST_TMP/deploy-exception-report-nodir.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_CONFIG_SERVICES="app"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --deploy-exception-report \
+    --suppress-removed-logs
+) >"$deploy_exception_report_nodir_output" 2>&1; then
+  unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+  cat "$deploy_exception_report_nodir_output" >&2
+  fail "--deploy-exception-report without --report-dir returned a non-zero status"
+fi
+unset FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_PS_SERVICES
+assert_contains "$deploy_exception_report_nodir_output" \
+  "--deploy-exception-report は --report-dir と併用してください"
 
 # --- オプション値の検証 ---
 deploy_exception_ext_output="$TEST_TMP/deploy-exception-ext.out"
@@ -4720,6 +4809,7 @@ if ! (
     --suppress-startup-logs \
     --suppress-removed-logs \
     --readonly-analysis-display \
+    --readonly-analysis-report \
     --report-dir "$TEST_TMP/readonly-missing-reports"
 ) >"$readonly_missing_output" 2>&1; then
   cat "$readonly_missing_output" >&2
@@ -4808,9 +4898,10 @@ else
     "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
 fi
 
-# --- 既定 (--readonly-analysis-display なし) では画面へ出さないこと ---
-# 分析そのものは行い、全量レポート・Excel・テキストへは同じ内容を残す。
-# 画面に残すのは、書き出したファイルの置き場所だけ。
+# --- 既定では画面へ出さず、全量レポート [11] へも記載しないこと ---
+# 分析そのものは行い、Excel・テキストへは同じ内容を残す。画面に残すのは、
+# 書き出したファイルの置き場所だけ。全量レポートは、--readonly-analysis-report
+# を指定していないため見出しの下に未出力である旨と出力先だけを載せる。
 readonly_quiet_output="$TEST_TMP/readonly-quiet.out"
 : > "$FAKE_DOCKER_CALLS"
 if ! (
@@ -4855,7 +4946,14 @@ else
     || fail "report was not created without --readonly-analysis-display"
   assert_contains "${readonly_quiet_reports[0]}" \
     "[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析"
-  assert_contains "${readonly_quiet_reports[0]}" "[要対応] /opt/jboss-eap/standalone/tmp"
+  assert_contains "${readonly_quiet_reports[0]}" \
+    "--readonly-analysis-report を指定していないため出力していません。"
+  assert_contains "${readonly_quiet_reports[0]}" \
+    "読み取り専用ファイルシステムの書き込み先分析は [11] へ記載しない"
+  assert_not_contains "${readonly_quiet_reports[0]}" "[要対応] /opt/jboss-eap/standalone/tmp"
+  # 記載しない場合も、Excel / テキストの置き場所だけはレポートへ残す。
+  assert_contains "${readonly_quiet_reports[0]}" "Excel ブック  : "
+  assert_contains "${readonly_quiet_reports[0]}" "テキスト      : "
 fi
 
 # --- read_only: true で tmpfs / ボリュームを揃えた構成 (問題なし) ---
@@ -4975,8 +5073,10 @@ assert_not_contains "$readonly_disabled_output" \
 collect_report_files "$TEST_TMP/readonly-disabled-reports"
 readonly_disabled_reports=("${REPORT_FILES[@]}")
 [ -f "${readonly_disabled_reports[0]}" ] || fail "report was not created with --no-readonly-analysis"
+# 分析を止めた実行では [11] へ何も載らない (--readonly-analysis-report とは
+# 排他のため、記載を求めることもできない)。
 assert_contains "${readonly_disabled_reports[0]}" \
-  "--no-readonly-analysis が指定されたため分析していません。"
+  "--readonly-analysis-report を指定していないため出力していません。"
 for readonly_disabled_path in "$TEST_TMP/readonly-disabled-reports"/build_and_verify_*_readonly_filesystem.*; do
   if [ -e "$readonly_disabled_path" ]; then
     fail "--no-readonly-analysis still produced an analysis file: $readonly_disabled_path"
@@ -5020,6 +5120,35 @@ if (
 fi
 assert_contains "$readonly_display_conflict_output" \
   "--readonly-analysis-display と --no-readonly-analysis は同時に指定できません。"
+
+readonly_report_conflict_output="$TEST_TMP/readonly-report-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --readonly-analysis-report \
+    --no-readonly-analysis
+) >"$readonly_report_conflict_output" 2>&1; then
+  cat "$readonly_report_conflict_output" >&2
+  fail "--readonly-analysis-report accepted --no-readonly-analysis"
+fi
+assert_contains "$readonly_report_conflict_output" \
+  "--readonly-analysis-report と --no-readonly-analysis は同時に指定できません。"
+
+# --report-dir が無ければ、記載の指定は書き出す先が無いため警告して無視する。
+readonly_report_nodir_output="$TEST_TMP/readonly-report-nodir.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-file "$readonly_fixture_dir/compose-readonly-missing.yml" \
+    --compose-service app \
+    --suppress-removed-logs \
+    --readonly-analysis-report
+) >"$readonly_report_nodir_output" 2>&1; then
+  cat "$readonly_report_nodir_output" >&2
+  fail "--readonly-analysis-report without --report-dir returned a non-zero status"
+fi
+assert_contains "$readonly_report_nodir_output" \
+  "--readonly-analysis-report は --report-dir と併用してください"
 
 # --no-readonly-analysis-display は --readonly-analysis-display を打ち消すため、
 # 併用しても排他エラーにはならず、画面表示も行わない (既定と同じ)。

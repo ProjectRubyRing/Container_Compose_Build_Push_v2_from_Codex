@@ -64,7 +64,8 @@
 #                          --deploy-exception-text FILE を指定したときだけ出す
 #                          (ビルド結果を埋もれさせない。--report-dir を指定した
 #                           だけでは Excel もテキストも作らない)。
-#                          解析結果そのものは、指定が無くても全量レポートへ保存する。
+#                          全量レポート [10] への記載も既定では行わず、
+#                          --deploy-exception-report を指定したときだけ保存する。
 #                          ブックは 概要 / 例外一覧 / 原因分析 /
 #                          対処方法 / スタックトレース / デプロイログ の 6 シート
 #                          構成で、フォントは Meiryo UI、行高は内容と列幅から
@@ -88,12 +89,13 @@
 #                          焼き込み済みのため read_only でも問題にならず、
 #                          「ビルド時のみ」として対象から外す。entrypoint.sh など
 #                          起動のたびに走るスクリプトの書き込み先は、実際に失敗する
-#                          場所として「要対応」に挙げる。結果は全量レポートに加え、
-#                          Excel ブック
+#                          場所として「要対応」に挙げる。結果は Excel ブック
 #                          (build_and_verify_<日時>_readonly_filesystem.xlsx) と
-#                          テキスト (同 _readonly_filesystem.txt) へも出力する。
+#                          テキスト (同 _readonly_filesystem.txt) へ出力する。
 #                          画面表示は既定では行わず、--readonly-analysis-display を
 #                          指定したときだけ出す (ビルド結果を埋もれさせない)。
+#                          全量レポート [11] への記載も既定では行わず、
+#                          --readonly-analysis-report を指定したときだけ保存する。
 #                          既定で有効。--no-readonly-analysis で無効化できる。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
@@ -831,10 +833,14 @@ JBOSS_MODULE_LIST_TEXT_OUTPUT=""      # 直近に出力したテキストのパ�
 # 押し流してしまう。そのため画面表示は既定で行わず、--deploy-exception-display を
 # 指定したときだけ出す。Excel ブックとテキストファイルも同じ考え方で、
 # --report-dir を指定しただけでは書き出さず、--deploy-exception-excel FILE /
-# --deploy-exception-text FILE で出力先を指定したときだけ出力する
-# (全量レポートへの記載は指定が無くても行う)。
+# --deploy-exception-text FILE で出力先を指定したときだけ出力する。
+# 全量レポート [10] への記載も同じ理由で既定では行わない。数十行の解析結果が
+# 毎回入ると、ビルド結果や環境変数を追うのに邪魔になるため、
+# --deploy-exception-report を指定したときだけ書き出す ([3] / [4] のツリーを
+# --directory-tree-report で切り替えるのと同じ考え方)。
 DEPLOY_EXCEPTION_ANALYSIS="true"   # false: Java 例外の解析を行わない
 DEPLOY_EXCEPTION_DISPLAY="false"   # true (--deploy-exception-display): 解析結果を画面へ表示する
+DEPLOY_EXCEPTION_REPORT="false"    # true (--deploy-exception-report): 全量レポート [10] へ記載する
 DEPLOY_EXCEPTION_EXCEL=""          # Excel の出力先 (--deploy-exception-excel の指定時のみ出力)
 DEPLOY_EXCEPTION_EXCEL_SET="false" # 出力先が明示指定されたか (Excel 出力の有無そのもの)
 DEPLOY_EXCEPTION_TEXT=""           # テキストの出力先 (--deploy-exception-text の指定時のみ出力)
@@ -880,9 +886,12 @@ DEPLOY_EXCEPTION_SERVICE_MARKER=$'\037'
 # 分析結果はディレクトリごとの理由・対処まで含むため数十行になり、ビルドの成否や
 # 動作確認の結果を画面から押し流してしまう。そのため画面表示は既定で行わず、
 # --readonly-analysis-display を指定したときだけ出す (Java 例外解析と同じ考え方)。
-# 分析そのものと、全量レポート・Excel・テキストへの出力は指定が無くても行う。
+# 全量レポート [11] への記載も同じ理由で既定では行わず、
+# --readonly-analysis-report を指定したときだけ書き出す。分析そのものと、
+# Excel・テキストへの出力は指定が無くても行う (--report-dir 配下へ自動命名する)。
 READONLY_ANALYSIS="true"            # false (--no-readonly-analysis): 分析を行わない
 READONLY_ANALYSIS_DISPLAY="false"   # true (--readonly-analysis-display): 分析結果を画面へ表示する
+READONLY_ANALYSIS_REPORT="false"    # true (--readonly-analysis-report): 全量レポート [11] へ記載する
 READONLY_ANALYSIS_EXCEL=""          # Excel の出力先。空なら --report-dir 配下へ自動命名
 READONLY_ANALYSIS_EXCEL_SET="false" # 出力先が明示指定されたか
 READONLY_ANALYSIS_TEXT=""           # テキストの出力先。空なら --report-dir 配下へ自動命名
@@ -1786,13 +1795,15 @@ JBoss マスターパスワードの伝搬検証:
                            繰り返し指定またはカンマ区切りで複数指定できる。
                            指定すると画面表示を自動で有効にする
   --report-dir DIR         ビルド結果、環境変数一覧、JVM パラメータ、
-                           OpenTelemetry 設定、WAR デプロイ時 Java 例外解析、
-                           読み取り専用ファイルシステム分析、Undertow
-                           バーチャルホスト分析を
+                           OpenTelemetry 設定、Undertow バーチャルホスト分析を
                            DIR/build_and_verify_<日時>.txt へ保存する。
                            コンテナ内ツリーと JBoss EAP デプロイ構造は既定では
                            保存せず、--directory-tree-report を併用したときだけ
                            画面の制限にかかわらず全深度・全ファイル名で保存する。
+                           WAR デプロイ時 Java 例外解析と読み取り専用ファイル
+                           システム分析も既定では保存せず、それぞれ
+                           --deploy-exception-report / --readonly-analysis-report
+                           を併用したときだけ [10] / [11] へ保存する。
                            あわせて読み取り専用ファイルシステム分析を
                            DIR/build_and_verify_<日時>_readonly_filesystem.xlsx と
                            DIR/build_and_verify_<日時>_readonly_filesystem.txt へ、
@@ -1827,12 +1838,14 @@ JBoss マスターパスワードの伝搬検証:
 
 WAR デプロイ時の Java 例外解析:
   (デプロイ処理のログに Java 例外があれば自動で解析する。ただし画面表示と
-   Excel・テキスト出力は既定では行わず、下のオプションを指定したときだけ出力する)
+   全量レポートへの記載・Excel・テキスト出力は既定では行わず、下のオプションを
+   指定したときだけ出力する。出力先が 1 つも無い実行では解析そのものを行わない)
   解析内容               コンテナ起動後のログから Java の例外ブロックを切り出し、
                          Caused by の連鎖をたどって根本原因の例外クラスを特定する。
                          例外クラスごとに「何が起きたか」「発生の仕組み」
                          「想定される原因」「確認手順」「対処方法」「再発防止」を
-                         生成し、全量レポート ([10]) へ出力する。
+                         生成する (全量レポート [10] への記載は
+                         --deploy-exception-report を指定したときだけ行う)。
                          クラスロード / データソース / JNDI / CDI (Weld) /
                          JPA / TLS / メモリなど、EAP のデプロイで起きやすい
                          例外クラスを分類し、WFLYSRV0021・WFLYCTL0080 といった
@@ -1846,6 +1859,14 @@ WAR デプロイ時の Java 例外解析:
   --no-deploy-exception-display
                          画面表示を行わない (既定と同じ。
                          --deploy-exception-display を打ち消す)
+  --deploy-exception-report
+                         --report-dir の全量レポート [10] へ解析結果を出力する。
+                         既定では出力せず、見出しの下に未出力である旨だけを残す
+                         (1 例外あたり数十行になり、ビルド結果や環境変数を
+                         追いにくくなるため)。画面表示の有無
+                         (--deploy-exception-display) とは独立して指定する
+  --no-deploy-exception-report
+                         全量レポートへ解析結果を出力しない (既定)
   --deploy-exception-excel FILE
                          Java 例外解析の結果を Excel ブック (.xlsx) として
                          FILE へ出力する。既定では出力せず、このオプションを
@@ -1882,8 +1903,9 @@ WAR デプロイ時の Java 例外解析:
                              SECRET / HEADERS 等) は [REDACTED] で表示する
 
 読み取り専用ファイルシステム (read_only) の書き込み先分析:
-  (オプション指定不要。既定で毎回分析するが、画面表示は
-   --readonly-analysis-display を指定したときだけ行う)
+  (オプション指定不要。既定で毎回分析し、Excel・テキストへ出力するが、
+   画面表示は --readonly-analysis-display を、全量レポート [11] への記載は
+   --readonly-analysis-report を指定したときだけ行う)
   分析内容               compose.yml の read_only / tmpfs / volumes の指定と、
                          実際に動いたコンテナの状態を突き合わせ、アプリが書き込む
                          ディレクトリに書き込み先が用意されているかを判定する。
@@ -1917,9 +1939,10 @@ WAR デプロイ時の Java 例外解析:
                          deployments、JVM の /tmp、CloudWatch Agent・MySQL・
                          nginx・Tomcat の書き込み先といった、ソフトウェアごとの
                          既知のディレクトリも併せて確認する。
-                         結果は全量レポートへ出力し、不足分を埋めた
+                         結果は Excel・テキストへ出力し、不足分を埋めた
                          compose.yml の設定例も生成する
-                         (画面表示は --readonly-analysis-display 指定時のみ)。
+                         (画面表示は --readonly-analysis-display、全量レポート
+                          [11] への記載は --readonly-analysis-report 指定時のみ)。
   --readonly-analysis-display
                          分析結果を画面へ表示する。既定では表示しない
                          (ディレクトリごとの理由・対処まで含めると数十行になり、
@@ -1929,6 +1952,14 @@ WAR デプロイ時の Java 例外解析:
   --no-readonly-analysis-display
                          画面表示を行わない (既定と同じ。
                          --readonly-analysis-display を打ち消す)
+  --readonly-analysis-report
+                         --report-dir の全量レポート [11] へ分析結果を出力する。
+                         既定では出力せず、見出しの下に未出力である旨だけを残す
+                         (ディレクトリごとの理由・対処まで含めると数十行になり、
+                         ビルド結果や環境変数を追いにくくなるため)。Excel と
+                         テキストへの出力は、この指定が無くても行う
+  --no-readonly-analysis-report
+                         全量レポートへ分析結果を出力しない (既定)
   --readonly-analysis-excel FILE
                          分析結果を Excel ブック (.xlsx) として FILE へ出力する。
                          --report-dir 指定時は未指定でも
@@ -2265,12 +2296,16 @@ while [ $# -gt 0 ]; do
                            JBOSS_MODULE_LIST_TEXT_ENABLED="false"; shift ;;
     --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
     --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
+    --deploy-exception-report) DEPLOY_EXCEPTION_REPORT="true"; shift ;;
+    --no-deploy-exception-report) DEPLOY_EXCEPTION_REPORT="false"; shift ;;
     --deploy-exception-excel) need_value "$1" $#; DEPLOY_EXCEPTION_EXCEL="$2"; DEPLOY_EXCEPTION_EXCEL_SET="true"; shift 2 ;;
     --deploy-exception-text) need_value "$1" $#; DEPLOY_EXCEPTION_TEXT="$2"; DEPLOY_EXCEPTION_TEXT_SET="true"; shift 2 ;;
     --deploy-exception-limit) need_value "$1" $#; DEPLOY_EXCEPTION_MAX="$2"; shift 2 ;;
     --no-deploy-exception-analysis) DEPLOY_EXCEPTION_ANALYSIS="false"; shift ;;
     --readonly-analysis-display)    READONLY_ANALYSIS_DISPLAY="true"; shift ;;
     --no-readonly-analysis-display) READONLY_ANALYSIS_DISPLAY="false"; shift ;;
+    --readonly-analysis-report)    READONLY_ANALYSIS_REPORT="true"; shift ;;
+    --no-readonly-analysis-report) READONLY_ANALYSIS_REPORT="false"; shift ;;
     --readonly-analysis-excel) need_value "$1" $#; READONLY_ANALYSIS_EXCEL="$2"; READONLY_ANALYSIS_EXCEL_SET="true"; shift 2 ;;
     --readonly-analysis-text)  need_value "$1" $#; READONLY_ANALYSIS_TEXT="$2"; READONLY_ANALYSIS_TEXT_SET="true"; shift 2 ;;
     --no-readonly-analysis)    READONLY_ANALYSIS="false"; shift ;;
@@ -2471,6 +2506,15 @@ if [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && [ "$DEPLOY_EXCEPTION_ANALYSIS" !=
   err "--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません。"
   exit 2
 fi
+# 解析を止めておきながら全量レポートへの記載を求める指定も、同じく矛盾する。
+if [ "$DEPLOY_EXCEPTION_REPORT" = "true" ] && [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
+  err "--deploy-exception-report と --no-deploy-exception-analysis は同時に指定できません。"
+  exit 2
+fi
+# 全量レポート自体を作らない実行では、記載の指定は書き出す先が無い。
+if [ "$DEPLOY_EXCEPTION_REPORT" = "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+  warn "--deploy-exception-report は --report-dir と併用してください (全量レポートを出力しないため無視します)。"
+fi
 if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ]; then
   if [ -z "$DEPLOY_EXCEPTION_EXCEL" ] || [ "$DEPLOY_EXCEPTION_EXCEL" = "-" ]; then
     err "--deploy-exception-excel にはファイルパスを指定してください: $DEPLOY_EXCEPTION_EXCEL"
@@ -2510,6 +2554,14 @@ fi
 if [ "$READONLY_ANALYSIS_DISPLAY" = "true" ] && [ "$READONLY_ANALYSIS" != "true" ]; then
   err "--readonly-analysis-display と --no-readonly-analysis は同時に指定できません。"
   exit 2
+fi
+if [ "$READONLY_ANALYSIS_REPORT" = "true" ] && [ "$READONLY_ANALYSIS" != "true" ]; then
+  err "--readonly-analysis-report と --no-readonly-analysis は同時に指定できません。"
+  exit 2
+fi
+# 全量レポート自体を作らない実行では、記載の指定は書き出す先が無い。
+if [ "$READONLY_ANALYSIS_REPORT" = "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+  warn "--readonly-analysis-report は --report-dir と併用してください (全量レポートを出力しないため無視します)。"
 fi
 if [ "$READONLY_ANALYSIS_EXCEL_SET" = "true" ]; then
   if [ -z "$READONLY_ANALYSIS_EXCEL" ] || [ "$READONLY_ANALYSIS_EXCEL" = "-" ]; then
@@ -22997,15 +23049,17 @@ read_deploy_exception_summary() {
   done < "$summary_file"
 }
 
-# 解析結果を受け取る先が 1 つでもあるかを返す。画面表示 (既定は無効)、
-# テキスト (--deploy-exception-text)、Excel (--deploy-exception-excel /
-# --report-dir)、全量レポート (--report-dir) のいずれも要求されていない実行では、
-# 解析しても結果を出す場所が無いため、ログ収集とヘルパー起動ごと省く。
+# 解析結果を受け取る先が 1 つでもあるかを返す。画面表示 (--deploy-exception-display)、
+# テキスト (--deploy-exception-text)、Excel (--deploy-exception-excel)、
+# 全量レポート (--deploy-exception-report と --report-dir の併用) のいずれも
+# 要求されていない実行では、解析しても結果を出す場所が無いため、ログ収集と
+# ヘルパー起動ごと省く。--report-dir だけの実行は、全量レポートへ記載しない
+# 既定のままなので受け取り先にはならない。
 deploy_exception_output_requested() {
   [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && return 0
   [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] && return 0
   [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] && return 0
-  [ -n "$BUILD_REPORT_DIR" ] && return 0
+  [ "$DEPLOY_EXCEPTION_REPORT" = "true" ] && [ -n "$BUILD_REPORT_DIR" ] && return 0
   return 1
 }
 
@@ -23036,7 +23090,7 @@ analyze_war_deploy_exceptions() {
   # ログ収集と Python ヘルパーの起動を無駄に走らせないため)。
   if ! deploy_exception_output_requested; then
     DEPLOY_EXCEPTION_ANALYZED="true"
-    DEPLOY_EXCEPTION_SKIP_REASON="画面表示・ファイル出力・全量レポートのいずれも要求されていないため解析していません (--deploy-exception-display / --deploy-exception-text / --deploy-exception-excel / --report-dir)。"
+    DEPLOY_EXCEPTION_SKIP_REASON="画面表示・ファイル出力・全量レポートのいずれも要求されていないため解析していません (--deploy-exception-display / --deploy-exception-text / --deploy-exception-excel / --deploy-exception-report と --report-dir の併用)。"
     return 0
   fi
   if [ "$DRY_RUN" = "true" ]; then
@@ -23144,7 +23198,8 @@ analyze_war_deploy_exceptions() {
 # 0 件のときは 1 行の結果表示に留める (成功時のログを埋もれさせないため)。
 #
 # 既定 (--deploy-exception-display なし) では画面表示を行わない。解析結果は
-# 全量レポートの [10] と Excel へ残るため、ビルド結果の画面は素のままにする。
+# 出力先を指定した Excel / テキストと、--deploy-exception-report を指定した
+# ときの全量レポート [10] へ残るため、ビルド結果の画面は素のままにする。
 # ただしファイルを実際に書き出した場合は、その置き場所だけ 1 行で知らせる。
 show_war_deploy_exception_analysis() {
   if [ "$DEPLOY_EXCEPTION_DISPLAY" != "true" ]; then
@@ -23195,9 +23250,16 @@ show_war_deploy_exception_outputs() {
 }
 
 # 全量レポートへ Java 例外解析の結果を追記する。
+# 既定では見出しの下に未出力である旨だけを残し、--deploy-exception-report を
+# 指定したときだけ解析結果の全文を書き出す。
 append_deploy_exception_report() {
   local report_file="$1"
 
+  if [ "$DEPLOY_EXCEPTION_REPORT" != "true" ]; then
+    printf '%s\n' '--deploy-exception-report を指定していないため出力していません。' \
+        >> "$report_file"
+    return 0
+  fi
   if [ -z "$DEPLOY_EXCEPTION_TEXT_FILE" ] || [ ! -s "$DEPLOY_EXCEPTION_TEXT_FILE" ]; then
     printf '%s\n' "${DEPLOY_EXCEPTION_SKIP_REASON:-解析結果を取得できなかったため記載できません。}" \
         >> "$report_file"
@@ -27102,8 +27164,9 @@ analyze_readonly_filesystem() {
 # 短い形になっているため、判定にかかわらずそのまま表示する。
 #
 # 既定 (--readonly-analysis-display なし) では画面表示を行わない。分析結果は
-# 全量レポートの [11] と Excel / テキストへ残るため、ビルド結果の画面は素のままに
-# する。ただしファイルを実際に書き出した場合は、その置き場所だけ 1 行で知らせる。
+# Excel / テキストと、--readonly-analysis-report を指定したときの全量レポート
+# [11] へ残るため、ビルド結果の画面は素のままにする。ただしファイルを実際に
+# 書き出した場合は、その置き場所だけ 1 行で知らせる。
 show_readonly_filesystem_analysis() {
   if [ "$READONLY_ANALYSIS_DISPLAY" != "true" ]; then
     show_readonly_analysis_outputs
@@ -27144,9 +27207,23 @@ show_readonly_analysis_outputs() {
 }
 
 # 全量レポートへ読み取り専用ファイルシステム分析の結果を追記する。
+# 既定では見出しの下に未出力である旨だけを残し、--readonly-analysis-report を
+# 指定したときだけ分析結果の全文を書き出す (Excel / テキストへの出力は既定でも行う)。
 append_readonly_analysis_report() {
   local report_file="$1"
 
+  if [ "$READONLY_ANALYSIS_REPORT" != "true" ]; then
+    printf '%s\n' '--readonly-analysis-report を指定していないため出力していません。' \
+        >> "$report_file"
+    if [ -n "$READONLY_ANALYSIS_EXCEL_FILE" ]; then
+      printf 'Excel ブック  : %s\n' "$READONLY_ANALYSIS_EXCEL_FILE" >> "$report_file"
+    fi
+    if [ -n "$READONLY_ANALYSIS_TEXT_OUTPUT" ]; then
+      printf 'テキスト      : %s (Excel と同じ内容。全ディレクトリの判定と根拠を含む)\n' \
+          "$READONLY_ANALYSIS_TEXT_OUTPUT" >> "$report_file"
+    fi
+    return 0
+  fi
   if [ -z "$READONLY_ANALYSIS_DIGEST_FILE" ] || [ ! -s "$READONLY_ANALYSIS_DIGEST_FILE" ]; then
     printf '%s\n' "${READONLY_ANALYSIS_SKIP_REASON:-分析結果を取得できなかったため記載できません。}" \
         >> "$report_file"
@@ -28490,14 +28567,24 @@ write_build_report() {
     printf '                JVM パラメータと OpenTelemetry 設定は検出した全件\n'
     printf '                失敗時は全 Compose サービスのログをサービス単位に全行保存\n'
     printf '                (SIGTERM で終了させたうえで、終了処理のログまで含める)\n'
-    printf '                デプロイ処理の Java 例外解析は [10] に記載\n'
+    if [ "$DEPLOY_EXCEPTION_REPORT" = "true" ]; then
+      printf '                デプロイ処理の Java 例外解析は [10] に記載\n'
+      printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
+    else
+      printf '                デプロイ処理の Java 例外解析は [10] へ記載しない\n'
+      printf '                (--deploy-exception-report を併用すると解析結果を全量で記載)\n'
+    fi
     printf '                (画面表示は --deploy-exception-display、Excel は\n'
     printf '                 --deploy-exception-excel FILE、テキストは\n'
     printf '                 --deploy-exception-text FILE を指定したときだけ出力する)\n'
-    printf '                Java 例外解析はコンテナの起動に失敗した場合でも必ず実行する\n'
-    printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
+    if [ "$READONLY_ANALYSIS_REPORT" = "true" ]; then
+      printf '                読み取り専用ファイルシステムの書き込み先分析は [11] に記載\n'
+    else
+      printf '                読み取り専用ファイルシステムの書き込み先分析は [11] へ記載しない\n'
+      printf '                (--readonly-analysis-report を併用すると分析結果を全量で記載)\n'
+    fi
     printf '                (画面表示は --readonly-analysis-display を指定したときだけ行う)\n'
-    printf '                (Excel とテキストも併せて出力。コンテナ未起動でも compose.yml から判定)\n'
+    printf '                (Excel とテキストは指定が無くても出力。コンテナ未起動でも compose.yml から判定)\n'
     printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
     printf '                コピーしたファイルの取り込み検証は [13] に記載\n'
     printf '                (テキストも併せて出力。Host ヘッダーごとの振り分けと実測結果を含む)\n'
@@ -28976,7 +29063,7 @@ if [ "$NEED_CONTAINER" != "true" ]; then
     warn "  デプロイ先がボリューム / バインドマウントで覆われている場合、ビルドが成功していても古い成果物が使われ続けます。"
   fi
   if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
-      || [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ]; then
+      || [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] || [ "$DEPLOY_EXCEPTION_REPORT" = "true" ]; then
     warn "WAR デプロイ時 Java 例外解析は、コンテナを起動していないため解析対象のログがありません (結果は「未評価」として出力します)。--verify-startup または --verify-url を併用してください。"
   fi
   if [ "$CWAGENT_VERIFY_ACTIVE" = "true" ]; then

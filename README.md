@@ -81,12 +81,14 @@ xlsx は標準ライブラリだけで組み立てます)。
 **Java の JVM パラメータ一覧表示**、**OpenTelemetry 環境変数・JVM パラメータ一覧表示**、
 **全量テキストレポートの保存**、
 **WAR デプロイ時 Java 例外エラー解析** (スタックトレースと例外クラスから原因分析と
-対処提案を生成し、全量レポートと Excel ブックへ出力。画面表示は
-`--deploy-exception-display`、テキスト出力は `--deploy-exception-text` の指定時のみ)、
+対処提案を生成。画面表示は `--deploy-exception-display`、全量レポートへの記載は
+`--deploy-exception-report`、Excel は `--deploy-exception-excel`、テキストは
+`--deploy-exception-text` の指定時のみ)、
 **読み取り専用ファイルシステム (`read_only`) の書き込み先分析** (Dockerfile の
 ビルド時の書き込みと `entrypoint.sh` などの実行時の書き込みを分けて集計し、
 tmpfs やバインドマウントを割り当てるべきディレクトリを判定して、Excel ブックと
-テキストファイルにも出力。画面表示は `--readonly-analysis-display` の指定時のみ)、
+テキストファイルへ出力。画面表示は `--readonly-analysis-display`、
+全量レポートへの記載は `--readonly-analysis-report` の指定時のみ)、
 **JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 **CloudWatch Agent (cwagent) のログ送信検証** (設定ファイルのチェックと、
 `--cwagent-delivery-report` 指定時の設定済みロググループへの送達確認)、
@@ -222,15 +224,19 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータ、WAR デプロイ時 Java 例外解析、読み取り専用ファイルシステム分析を、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する | (なし) |
-| `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示せず、全量レポート `[10]` にだけ残す | `false` (非表示) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を、WAR デプロイ時 Java 例外解析 `[10]` は `--deploy-exception-report` を、読み取り専用ファイルシステム分析 `[11]` は `--readonly-analysis-report` を併用したときだけ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する | (なし) |
+| `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない | `false` (非表示) |
 | `--no-deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--deploy-exception-display` を打ち消す) | `true` (既定) |
+| `--deploy-exception-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[10]` へ解析結果を出力する。**指定したときだけ出力**し、既定では見出しの下に未出力である旨だけを残す | `false` (記載しない) |
+| `--no-deploy-exception-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。全量レポートへ解析結果を出力しない (`--deploy-exception-report` を打ち消す) | `true` (既定) |
 | `--deploy-exception-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の Excel ブック (`.xlsx`) を出力する。**指定したときだけ出力する** (`--report-dir` だけでは出力しない) | (なし) |
 | `--deploy-exception-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を指定する。**指定したときだけ出力**し、`--report-dir` だけでは出力しない | (出力しない) |
 | `--deploy-exception-limit N` | **`build_and_verify.sh` / `--build-only` 委譲時**。詳細分析を行う例外の最大件数 | `50` |
 | `--no-deploy-exception-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外の解析と Excel 出力を行わない | `false` |
-| `--readonly-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) の書き込み先分析の結果を画面へ表示する。既定では表示せず、全量レポート `[11]` と Excel / テキストにだけ残す | `false` (非表示) |
+| `--readonly-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) の書き込み先分析の結果を画面へ表示する。既定では表示せず、Excel / テキストにだけ残す | `false` (非表示) |
 | `--no-readonly-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--readonly-analysis-display` を打ち消す) | `true` (既定) |
+| `--readonly-analysis-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[11]` へ分析結果を出力する。**指定したときだけ出力**し、既定では見出しの下に未出力である旨と Excel / テキストの出力先だけを残す | `false` (記載しない) |
+| `--no-readonly-analysis-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。全量レポートへ分析結果を出力しない (`--readonly-analysis-report` を打ち消す) | `true` (既定) |
 | `--readonly-analysis-excel FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステム (`read_only`) 分析の Excel ブックの出力先を明示する (`.xlsx`) | (`--report-dir` 配下へ自動命名) |
 | `--readonly-analysis-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。Excel と同じ内容のテキストの出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--no-readonly-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。読み取り専用ファイルシステムの書き込み先分析とファイル出力を行わない | `false` |
@@ -1225,9 +1231,11 @@ Compose が付ける既定名 (`<プロジェクト>-<サービス>` / `<プロ�
   `[13] コピーしたファイル (--copy-file) の取り込み検証` です。
   ヘッダーの `コピー取込検証` 行には、差し替えたファイルがコンテナへ届いたかの
   要約 (一致 / 不一致 / 未検出の件数) を残します。
-- WAR のデプロイ処理で発生した Java 例外の解析結果は、`--report-dir` を指定していれば
-  全量レポートの `[10]` へ必ず残ります (**コンテナの起動に失敗した場合でも解析します**。
-  解析対象のログを取得できなかった場合は、その理由と `未評価` の判定を記録します)。
+- WAR のデプロイ処理で発生した Java 例外の解析結果は、`--report-dir` に加えて
+  `--deploy-exception-report` を指定したときだけ全量レポートの `[10]` へ残ります
+  (**その場合はコンテナの起動に失敗しても必ず解析します**。解析対象のログを
+  取得できなかった場合は、その理由と `未評価` の判定を記録します)。指定が無いときは
+  見出しの下に未出力である旨だけを残します。
   Excel ブックとテキストは `--deploy-exception-excel FILE` /
   `--deploy-exception-text FILE` を指定したときだけ出力します (`--report-dir` の
   指定だけでは出力しません)。詳細は後述の
@@ -1237,7 +1245,10 @@ Compose が付ける既定名 (`<プロジェクト>-<サービス>` / `<プロ�
   `DIR/build_and_verify_<YYYYMMDDHHMMSS>_readonly_filesystem.txt` も追加出力します。
   `read_only` を有効にしたまま動かすために `tmpfs` やマウントが要るディレクトリを
   まとめたもので、**コンテナを起動しない実行 (ビルドのみ) でも出力します**
-  (その場合は `compose.yml` の定義だけで判定します)。詳細は後述の
+  (その場合は `compose.yml` の定義だけで判定します)。全量レポートの `[11]` へ
+  同じ内容の要約を載せるには `--readonly-analysis-report` を併用します
+  (指定が無いときは、見出しの下に未出力である旨と Excel / テキストの出力先だけを
+  残します)。詳細は後述の
   [読み取り専用ファイルシステム (`read_only`) の書き込み先分析](#読み取り専用ファイルシステム-read_only-の書き込み先分析) を参照してください。
 - ビルドや動作確認が失敗した場合、レポート末尾の
   **`[9] Compose サービス別ログ`** へ全 Compose サービスのログ全文を追記します。
@@ -1274,8 +1285,8 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
   未指定なら `logs` です。`logs` では起動中の各 Compose サービスを番号で選び、
   ログ表示・bash 接続・healthcheck 調査・MySQL 実行・送達診断を繰り返し行えます。
 - 対話操作に入る前に、失敗した起動ログを表示し、**WAR デプロイ時 Java 例外解析**も
-  先に済ませます (結果は全量レポート `[10]` へ。画面でも読みたい場合は
-  `--deploy-exception-display` を指定します)。
+  先に済ませます (画面で読みたい場合は `--deploy-exception-display`、全量レポート
+  `[10]` へ残したい場合は `--deploy-exception-report` を指定します)。
 - 対話操作を終えてもコンテナは起動状態のまま残ります。不要になったら
   `docker compose -f compose.yml down` で削除してください。
 - デプロイエラーは失敗のままなので、終了コードは `1` です。
@@ -1459,27 +1470,30 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 なぜそうなり、何を直せばよいのか**はログを読む側の知識に依存していました。
 
 `build_and_verify.sh` は**専用オプションなしに**この解析を自動実行し、
-検出した例外の詳細な分析と対処提案を**全量レポートの `[10]`** と
-**Excel ブック**へ残します。
+検出した例外の詳細な分析と対処提案を、指定した出力先へ残します。
 
-> **画面への表示と Excel / テキストファイルへの出力は、既定では行いません。**
+> **画面への表示、全量レポートへの記載、Excel / テキストファイルへの出力は、
+> いずれも既定では行いません。**
 > 解析結果は 1 例外あたり数十行になり、ビルドの成否や動作確認の結果を画面から
-> 押し流してしまうためです。必要なときだけ次のオプションで有効にします。
+> 押し流し、全量レポートも読みにくくしてしまうためです。必要なときだけ次の
+> オプションで有効にします。
 >
 > | 出力 | 既定 | 有効にするオプション |
 > | --- | --- | --- |
 > | 画面表示 | 出さない | `--deploy-exception-display` |
+> | 全量レポート `[10]` | 出さない (`--report-dir` だけでは記載しない) | `--deploy-exception-report` |
 > | Excel ブック | 出さない (`--report-dir` だけでは出力しない) | `--deploy-exception-excel FILE` |
 > | テキストファイル | 出さない (`--report-dir` だけでは出力しない) | `--deploy-exception-text FILE` |
-> | 全量レポート `[10]` | 出す | (`--report-dir` 指定時) |
 >
-> 上記のいずれも要求されていない実行 (`--report-dir` も `--deploy-exception-*` も
-> 無い) では、結果を出す先が無いため解析自体を行いません。
+> 上記のいずれも要求されていない実行では、結果を出す先が無いため解析自体を
+> 行いません。全量レポートを出力する実行でも、`--deploy-exception-report` が
+> 無ければ `[10]` は見出しと未出力である旨の 1 行だけになります。
 
-**コンテナの起動 (`compose up`) に失敗した実行でも解析は必ず行います。**
+**出力先を指定していれば、コンテナの起動 (`compose up`) に失敗した実行でも
+解析は必ず行います。**
 起動できない原因そのものがデプロイ処理中の Java 例外であることが多いため、
 失敗するまでに出力されたログを対象に、成功時と同じ内容の解析結果
-(`[10]`、指定時は画面 / Excel / テキスト) を出力します。
+(指定時の `[10]` / 画面 / Excel / テキスト) を出力します。
 
 #### 解析の内容
 
@@ -1516,8 +1530,8 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 #### 解析対象ログの状況 (`ログ取得状況`)
 
 解析はどの経路でも実行するため、「どこまでのログを解析できたのか」を
-全量レポート `[10]`・Excel の「概要」シート (画面表示時は画面へも) へ
-同じ文言で残します。
+全量レポート `[10]` (`--deploy-exception-report` 指定時)・Excel の「概要」シート
+(画面表示時は画面へも) へ同じ文言で残します。
 
 | 状況 | `ログ取得状況` | 総合判定 |
 | --- | --- | --- |
@@ -1538,8 +1552,8 @@ JBoss EAP のデプロイ処理 (WAR の展開 → デプロイメント記述�
 | `--deploy-exception-excel FILE` のパス | **`--deploy-exception-excel FILE` を指定したときだけ**出力する (`--report-dir` を指定しただけでは出力しない) | 下表の 6 シート構成の Excel ブック |
 | `--deploy-exception-text FILE` のパス | **`--deploy-exception-text FILE` を指定したときだけ**出力する (`--report-dir` を指定しただけでは出力しない) | **Excel と同じ内容のテキスト版**。Excel を開けない環境や、`grep` / `diff` で追跡したい場合に使う |
 
-Excel もテキストも自動命名を行いません。同じ内容が全量レポート `[10]` にも載るため、
-既定で同じファイルを増やさないようにしています。
+Excel もテキストも自動命名を行いません。`--report-dir` を指定しただけで
+ファイルが増えないようにしています。
 
 テキスト版は画面表示と違い、**全スタックフレーム**と**区分付きデプロイログ**まで
 含むため、Excel と同じ情報量になります (画面と全量レポート `[10]` は、
@@ -1570,16 +1584,18 @@ Excel もテキストも自動命名を行いません。同じ内容が全量�
 `未評価 (解析対象のログが無いため判定できません)` で理由が分かるようにします。
 
 ```bash
-# デプロイ結果ファイルへ Java 例外解析を残す
-# (画面表示も Excel / テキストの出力も行わない ← 既定。結果は [10] に残る)
+# 全量レポート [10] へ Java 例外解析を残す
+# (--deploy-exception-report が無ければ [10] へは記載しない ← 既定)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
-    --report-dir ./reports
+    --report-dir ./reports \
+    --deploy-exception-report
 
 # 解析結果を画面でも読む (既定は非表示)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports \
+    --deploy-exception-report \
     --deploy-exception-display
 
 # Excel / テキストの出力先を明示する
@@ -1604,7 +1620,7 @@ Excel もテキストも自動命名を行いません。同じ内容が全量�
 - **例外を検出しても終了コードは変わりません**。終了コードは従来どおり、
   起動確認や URL 応答確認の結果で決まります。
 - `--dry-run` および起動確認を伴わないビルドのみの実行では解析しません
-  (全量レポートの `[10]` へ理由を記録します)。
+  (`--deploy-exception-report` 指定時は、全量レポートの `[10]` へ理由を記録します)。
 
 ### 読み取り専用ファイルシステム (`read_only`) の書き込み先分析
 
@@ -1619,8 +1635,9 @@ Excel もテキストも自動命名を行いません。同じ内容が全量�
 
 `build_and_verify.sh` は**専用オプションなしに**この分析を毎回実行し、
 ディレクトリごとに「書き込むのに書き込み先が無い」状態を判定します
-(結果の画面表示だけは既定では行わず、`--readonly-analysis-display` を指定した
-ときに出します)。
+(結果は Excel / テキストへ出力します。画面表示は `--readonly-analysis-display`、
+全量レポート `[11]` への記載は `--readonly-analysis-report` を指定したときだけ
+行います)。
 `read_only` を使っていない構成でも、**書き込みが発生するディレクトリを洗い出し、
 有効化するなら `tmpfs` とバインドマウントのどちらを割り当てるべきか**を出力します。
 
@@ -1728,18 +1745,27 @@ services:
 | 推奨 compose 設定 | サービスごとの `compose.yml` 設定例 |
 | 参考: 書き込み先の知識 | ソフトウェア別の書き込み先一覧 (用途 / 書き込む内容 / 推奨 / 永続の要否 / `tmpfs` 可否) |
 
-全量レポート `[11]` には要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧)
-を出力し、全件と参考知識はテキスト / Excel に残します。
-**画面表示は既定では行いません。**要約を画面でも読むときは
-`--readonly-analysis-display` を指定します (分析結果はディレクトリごとの理由と対処を
-含むため数十行になり、ビルドの成否や動作確認の結果を画面から押し流してしまうため)。
+全量レポート `[11]` へ要約 (要対応・要確認は理由付き、推奨は 1 行ずつの一覧) を
+載せるには `--readonly-analysis-report` を指定します。**既定では記載せず**、
+見出しの下に未出力である旨と Excel / テキストの出力先だけを残します
+(要約でも数十行になり、ビルド結果や環境変数を追いにくくなるため)。全件と
+参考知識は、指定の有無にかかわらずテキスト / Excel に残ります。
+**画面表示も既定では行いません。**要約を画面でも読むときは
+`--readonly-analysis-display` を指定します。
 画面表示を抑止していても、書き出した Excel / テキストのパスは 1 行で知らせます。
 
 ```bash
 # 既定。分析は毎回実行され、--report-dir があれば Excel とテキストも出力される
+# (全量レポート [11] へは記載しない)
 ./build_and_verify.sh --verify-startup \
     --compose-service app --startup-service app \
     --report-dir ./reports
+
+# 全量レポート [11] にも分析結果を残す
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports \
+    --readonly-analysis-report
 
 # Excel / テキストの出力先を明示する
 ./build_and_verify.sh --verify-startup \
