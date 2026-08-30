@@ -1288,7 +1288,7 @@ logs_mode_output="$TEST_TMP/keep-mode-logs.out"
 : > "$FAKE_DOCKER_CALLS"
 : > "$FAKE_USAGE_CHECK_CALLS"
 export FAKE_COMPOSE_PS_SERVICES="app db"
-if ! printf 'invalid\n3\n2\ninvalid\n1\n\n0\n1\n2\n3\n\n0\n0\n' | (
+if ! printf 'invalid\n3\n2\ninvalid\n1\n\n0\n1\n2\n4\n3\n\n0\n0\n' | (
   cd "$REPO_ROOT"
   bash ./build_and_verify.sh \
     --compose-service app,db \
@@ -1309,12 +1309,14 @@ assert_occurrences "$logs_mode_output" "操作する起動中の Compose サー�
 assert_occurrences "$logs_mode_output" "  1) app" 3
 assert_occurrences "$logs_mode_output" "  2) db" 3
 assert_occurrences "$logs_mode_output" "0 から 2 の番号を入力してください。" 2
-assert_occurrences "$logs_mode_output" "0 から 3 の番号を入力してください。" 1
+assert_occurrences "$logs_mode_output" "0 から 4 の番号を入力してください。" 1
 assert_occurrences "$logs_mode_output" "Compose サービス 'db' で実行する操作を選択してください:" 3
-assert_occurrences "$logs_mode_output" "Compose サービス 'app' で実行する操作を選択してください:" 3
-assert_occurrences "$logs_mode_output" "  1) ログを表示" 6
-assert_occurrences "$logs_mode_output" "  2) bash へ接続 (cd・tree・任意コマンドを実行可能)" 6
-assert_occurrences "$logs_mode_output" "  3) healthcheck 設定・実行履歴・通信を確認" 6
+assert_occurrences "$logs_mode_output" "Compose サービス 'app' で実行する操作を選択してください:" 4
+assert_occurrences "$logs_mode_output" "  1) ログを表示" 7
+assert_occurrences "$logs_mode_output" "  2) bash へ接続 (cd・tree・任意コマンドを実行可能)" 7
+assert_occurrences "$logs_mode_output" "  3) healthcheck 設定・実行履歴・通信を確認" 7
+# root ユーザでの bash 接続は、追加操作の有無にかかわらず末尾の番号で選べる。
+assert_occurrences "$logs_mode_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)" 7
 assert_not_contains "$logs_mode_output" "MySQL クライアントへ接続 (SQL クエリを対話実行)"
 assert_occurrences "$logs_mode_output" "Compose サービスログ (サービス:" 1
 assert_contains "$logs_mode_output" "Compose サービスログ (サービス: db, 末尾 50/52 行 (指定上限: 50)):"
@@ -1327,6 +1329,15 @@ assert_contains "$logs_mode_output" "この bash セッション内では cd に
 assert_contains "$logs_mode_output" \
   "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
 assert_contains "$logs_mode_output" "bash セッションを終了しました。サービス操作の選択へ戻ります。"
+# root ユーザでの接続は docker exec -u 0:0 で同じセッションスクリプトを起動する。
+assert_contains "$logs_mode_output" \
+  "Compose サービスの bash へ root ユーザ (uid/gid 0) で接続します (service=app, container=test-app-1)。"
+assert_contains "$logs_mode_output" \
+  "コンテナの既定ユーザーでは権限不足になる調査 (制限されたファイルの参照、パッケージ導入など) に使えます。"
+assert_contains "$logs_mode_output" \
+  "コンテナの root ユーザでの bash セッションを終了しました。サービス操作の選択へ戻ります。"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash -c"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it -u 0:0 cid-app /bin/bash -c"
 assert_contains "$logs_mode_output" "Docker healthcheck 診断"
 assert_contains "$logs_mode_output" "Compose サービス : app"
 assert_contains "$logs_mode_output" "curl -fs http://127.0.0.1:8080/health >/dev/null || exit 1"
@@ -1679,9 +1690,9 @@ assert_contains "$cert_check_text" "判定: OK — 検出したトラストス�
 collect_report_files "$cert_check_reports"
 [ "${#REPORT_FILES[@]}" -eq 1 ] \
   || fail "expected exactly one full report next to the cert check text (got ${#REPORT_FILES[@]})"
-# 証明書チェックを持たないサービスでは従来どおり 0 から 3 のまま。
+# 証明書チェックを持たないサービスでは操作が増えない (root bash までの 0 から 4 のまま)。
 assert_contains "$cert_check_output" "Compose サービス 'app' で実行する操作を選択してください:"
-assert_not_contains "$cert_check_output" "0 から 4 の番号を入力してください。"
+assert_not_contains "$cert_check_output" "0 から 5 の番号を入力してください。"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-tlsapp /bin/sh -c"
 # パスワードはコンテナ内で解決するため、docker のコマンドラインへは載らない。
 assert_not_contains "$FAKE_DOCKER_CALLS" "-storepass changeit"
@@ -1854,9 +1865,9 @@ assert_contains "$jboss_modules_output" "[   1] org.jboss.logging:main"
 assert_contains "$jboss_modules_output" "jboss-logging-3.5.3.Final-redhat-00001.jar"
 assert_contains "$jboss_modules_output" "=== 3. 認識されているモジュールの jar ファイル一覧 ==="
 assert_contains "$jboss_modules_output" "JBoss モジュール一覧 : OK"
-# jboss-cli.sh を持たないサービスには操作を出さない (番号は 0-3 のまま)。
+# jboss-cli.sh を持たないサービスには操作を出さない (番号は root bash までの 0-4 のまま)。
 assert_contains "$jboss_modules_output" "Compose サービス 'app' で実行する操作を選択してください:"
-assert_not_contains "$jboss_modules_output" "0 から 4 の番号を入力してください。"
+assert_not_contains "$jboss_modules_output" "0 から 5 の番号を入力してください。"
 
 # 画面と同じ内容がテキストファイルへ残ること (--report-dir 配下へサービス名付きで自動命名)。
 jboss_modules_text="${jboss_modules_reports}"/build_and_verify_*_jboss_modules_eapapp.txt
@@ -2052,9 +2063,9 @@ assert_contains "$alb_healthcheck_output" "User-Agent         : ELB-HealthChecke
 assert_contains "$alb_healthcheck_output" "status=200  matcher=一致     判定=成功  戻り値(exit)=0"
 assert_contains "$alb_healthcheck_output" "ALB ヘルスチェック判定 : OK (healthy かつその場のチェックも成功)"
 assert_before "$alb_healthcheck_output" "起動状態           : running" "ALB ヘルスチェック判定 : OK"
-# ターゲットに登録されていないサービスでは従来どおり 0 から 3 のまま。
+# ターゲットに登録されていないサービスでは操作が増えない (root bash までの 0 から 4 のまま)。
 assert_contains "$alb_healthcheck_output" "Compose サービス 'app' で実行する操作を選択してください:"
-assert_not_contains "$alb_healthcheck_output" "0 から 4 の番号を入力してください。"
+assert_not_contains "$alb_healthcheck_output" "0 から 5 の番号を入力してください。"
 assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli has-service frontend"
 assert_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli report frontend"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-alb-healthcheck /bin/sh -c"
@@ -2169,7 +2180,7 @@ assert_contains "$alb_healthcheck_unavailable_output" "ALB ヘルスチェック
 assert_contains "$alb_healthcheck_unavailable_output" "ALB ヘルスチェック確認に失敗しました。サービス操作の選択へ戻ります。"
 assert_contains "$alb_healthcheck_unavailable_output" "Compose サービスの対話操作を終了しました。"
 
-# 偽装サービスが起動していない構成では操作が増えない (従来どおり 0 から 3)。
+# 偽装サービスが起動していない構成では操作が増えない (root bash までの 0 から 4)。
 alb_healthcheck_absent_output="$TEST_TMP/keep-mode-alb-healthcheck-absent.out"
 : > "$FAKE_DOCKER_CALLS"
 export FAKE_COMPOSE_PS_SERVICES="frontend"

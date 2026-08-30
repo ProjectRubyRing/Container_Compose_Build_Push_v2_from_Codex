@@ -36,7 +36,8 @@
 #                          bash 接続 (接続前に tree を使える状態にする。コンテナに
 #                          tree が無ければ bash だけで動く簡易実装を用意する) するか、
 #                          対話式の HTTP リクエスト、または
-#                          起動中 Compose サービスのログ閲覧・bash / MySQL 接続、
+#                          起動中 Compose サービスのログ閲覧・bash 接続
+#                          (root ユーザでの接続も選べる)・MySQL 接続、
 #                          healthcheck 設定・実行履歴・HTTP 通信、
 #                          cwagent / OTel のローカル送達診断、および
 #                          JVM トラストストアを持つコンテナ (front / back 等) の
@@ -1655,6 +1656,10 @@ JBoss マスターパスワードの伝搬検証:
                               logs  起動中 Compose サービスを番号で選択後、
                                     ログ表示、対話式 bash 接続、healthcheck の
                                     設定・実行履歴・通信確認を繰り返す。
+                                    同じ bash 接続を root ユーザ (uid/gid 0) で
+                                    行う操作も選択でき、コンテナの既定ユーザー
+                                    では権限不足になるファイル参照やパッケージ
+                                    導入も調べられる。
                                     MySQL サーバーでは SQL の対話実行も選択できる。
                                     cwagent / cloudwatch-logs-mock では CloudWatch
                                     Logs 偽装送達、otel / adot-collector / jaeger
@@ -10325,16 +10330,27 @@ CONTAINER_INTERACTIVE_BASH_SCRIPT="${CONTAINER_INTERACTIVE_BASH_SCRIPT//$'\r'/}"
 
 # コンテナ内の対話 bash を起動する。素の docker exec ではなく、上のセッション
 # スクリプト経由で起動して tree を使える状態にしてから bash を開始する。
+# $2 を指定すると docker exec -u へそのまま渡す (root ユーザでの接続で使う)。
 exec_container_interactive_bash() {
-  local container_id="$1"
-  docker exec -it "$container_id" /bin/bash -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
+  local container_id="$1" exec_user="${2:-}"
+  local -a exec_args=(exec -it)
+  [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
+  docker "${exec_args[@]}" "$container_id" /bin/bash -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
 }
 
 # 選択された Compose サービスの実行中コンテナへ対話式 bash で接続する。
 # 同じシェルセッションが続くため、cd で移動しながら任意のコマンドを実行できる。
+# $2 に root を渡すと root ユーザとして接続する。コンテナの既定ユーザーが非 root の
+# 構成 (JBoss EAP の jboss ユーザー等) では、ログや設定ファイルの参照、パッケージの
+# 導入が権限不足で行えないため、その調査を同じ操作メニューのまま行えるようにする。
+# 指定は uid:gid の数値で行う。/etc/passwd に root の項目が無いイメージでも同じ
+# ように uid/gid 0 で入れるため、名前 (root) ではなく 0:0 を渡す。
 run_interactive_compose_bash() {
-  local service_name="$1" container_id container_name
+  local service_name="$1" connect_user="${2:-}" container_id container_name
+  local exec_user=""
   local -a container_ids=()
+
+  [ "$connect_user" = "root" ] && exec_user="0:0"
 
   mapfile -t container_ids < <(compose_container_ids "$service_name")
   if [ ${#container_ids[@]} -eq 0 ]; then
@@ -10348,15 +10364,29 @@ run_interactive_compose_bash() {
   fi
 
   diag ""
-  diag "Compose サービスの bash へ接続します (service=${service_name}, container=${container_name})。"
+  if [ -n "$exec_user" ]; then
+    diag "Compose サービスの bash へ root ユーザ (uid/gid 0) で接続します (service=${service_name}, container=${container_name})。"
+    diag "コンテナの既定ユーザーでは権限不足になる調査 (制限されたファイルの参照、パッケージ導入など) に使えます。"
+  else
+    diag "Compose サービスの bash へ接続します (service=${service_name}, container=${container_name})。"
+  fi
   diag "この bash セッション内では cd によるディレクトリ移動と任意のコマンド実行が可能です。"
   diag "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
   diag "bash を終了するとサービス操作の選択へ戻ります。コンテナは起動状態を維持します。"
-  if ! exec_container_interactive_bash "$container_id"; then
-    err "Compose サービス '${service_name}' の /bin/bash へ接続できませんでした: ${container_name}"
+  if ! exec_container_interactive_bash "$container_id" "$exec_user"; then
+    if [ -n "$exec_user" ]; then
+      err "Compose サービス '${service_name}' の /bin/bash へ root ユーザで接続できませんでした: ${container_name}"
+      err "  → user namespace の remap や root 実行を禁止する設定では root で接続できません。通常の bash 接続を使ってください。"
+    else
+      err "Compose サービス '${service_name}' の /bin/bash へ接続できませんでした: ${container_name}"
+    fi
     return 1
   fi
-  log "コンテナの bash セッションを終了しました。サービス操作の選択へ戻ります。"
+  if [ -n "$exec_user" ]; then
+    log "コンテナの root ユーザでの bash セッションを終了しました。サービス操作の選択へ戻ります。"
+  else
+    log "コンテナの bash セッションを終了しました。サービス操作の選択へ戻ります。"
+  fi
 }
 
 # 選択された Compose サービスが MySQL サーバーコンテナかを実行ファイルで判定する。
@@ -18239,7 +18269,7 @@ run_otel_jaeger_trace_helper() {
   diag "トレース属性・イベントには機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
 }
 
-# 選択済み Compose サービスについて、ログ表示、対話式 bash / MySQL 接続、
+# 選択済み Compose サービスについて、ログ表示、対話式 bash / root bash / MySQL 接続、
 # healthcheck 診断、対応サービスのローカル可観測性診断、ALB ヘルスチェック確認を
 # 繰り返す。0 を選択すると、起動中 Compose サービスの選択へ戻る。
 compose_service_observability_helper_kind() {
@@ -18262,7 +18292,7 @@ run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
   local mysql_action=0 observability_action=0 cert_check_action=0
   local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
-  local jboss_module_action=0
+  local jboss_module_action=0 root_bash_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -18296,6 +18326,10 @@ run_interactive_compose_service_actions() {
     max_action=$(( max_action + 1 ))
     jboss_module_action="$max_action"
   fi
+  # root ユーザでの bash 接続はどのサービスでも選べるが、他の追加操作と同じく
+  # 末尾へ採番して、既存操作の番号を変えないようにする。
+  max_action=$(( max_action + 1 ))
+  root_bash_action="$max_action"
   while :; do
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
@@ -18328,6 +18362,7 @@ run_interactive_compose_service_actions() {
     if [ "$jboss_module_action" -gt 0 ]; then
       diag "  ${jboss_module_action}) JBoss モジュール一覧 (jboss-cli.sh -c の module-info で認識済みのモジュール名 / jar を出力)"
     fi
+    diag "  ${root_bash_action}) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
     if ! IFS= read -r action; then
@@ -18402,6 +18437,10 @@ run_interactive_compose_service_actions() {
             warn "JBoss モジュール一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
+        elif [ "$root_bash_action" -gt 0 ] && [ "$action" = "$root_bash_action" ]; then
+          if ! run_interactive_compose_bash "$service_name" "root"; then
+            warn "root ユーザでの bash 接続に失敗しました。サービス操作の選択へ戻ります。"
+          fi
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -18479,7 +18518,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash / MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;
