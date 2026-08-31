@@ -285,6 +285,18 @@ if [ "${1:-}" = "compose" ]; then
               *" alb-healthcheck "*) printf 'cid-alb-healthcheck\n' ;;
             esac
             ;;
+          # 偽装バッチサーバーと偽装 EFS も同様に、FAKE_COMPOSE_PS_SERVICES へ
+          # 含めたときだけ「起動している」ものとして扱う。
+          batch-mock)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" batch-mock "*) printf 'cid-batch-mock\n' ;;
+            esac
+            ;;
+          efs-mock)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" efs-mock "*) printf 'cid-efs-mock\n' ;;
+            esac
+            ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -740,6 +752,23 @@ PATH=/usr/bin}"
     *"com.docker.compose.service"*)
       printf 'app\n'
       ;;
+    # EFS マウント伝播確認が使う形式 (識別キー / マウント先 / rw|ro)。
+    # FAKE_EFS_MOUNT_ENTRIES は "コンテナ ID|識別キー|マウント先|rw または ro" の行。
+    *"{{if .Name}}"*)
+      if [ -n "${FAKE_EFS_MOUNT_ENTRIES:-}" ]; then
+        fake_mount_cid=""
+        for fake_mount_arg in "$@"; do
+          case "$fake_mount_arg" in
+            cid-*) fake_mount_cid="$fake_mount_arg" ;;
+          esac
+        done
+        while IFS='|' read -r fake_m_cid fake_m_key fake_m_dest fake_m_rw; do
+          [ -n "$fake_m_cid" ] || continue
+          [ "$fake_m_cid" = "$fake_mount_cid" ] || continue
+          printf '%s\t%s\t%s\n' "$fake_m_key" "$fake_m_dest" "$fake_m_rw"
+        done <<< "$FAKE_EFS_MOUNT_ENTRIES"
+      fi
+      ;;
     *"{{.Name}}"*)
       case "$*" in
         *"cid-cwagent"*) printf '/cwagent\n' ;;
@@ -752,6 +781,8 @@ PATH=/usr/bin}"
         *"cid-tlsapp"*) printf '/app-front\n' ;;
         *"cid-eapapp"*) printf '/app-eap\n' ;;
         *"cid-alb-healthcheck"*) printf '/alb-healthcheck\n' ;;
+        *"cid-batch-mock"*) printf '/batch-mock\n' ;;
+        *"cid-efs-mock"*) printf '/efs-mock\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
       ;;
@@ -807,6 +838,120 @@ if [ "${1:-}" = "diff" ]; then
   if [ -n "${FAKE_DOCKER_DIFF:-}" ]; then
     printf '%s\n' "$FAKE_DOCKER_DIFF"
   fi
+  exit 0
+fi
+
+# POSIX sh 版の対話セッション。bash 版と同じく、実際にシェルを起動するわけには
+# いかないので、目印 (build-and-verify-session) を確認して成功を返す。
+if [ "${1:-}" = "exec" ] && [[ " $* " == *" -it "* ]] \
+    && [[ " $* " == *" build-and-verify-session "* ]]; then
+  printf 'fake interactive POSIX sh session\n'
+  exit 0
+fi
+
+# ---- 偽装バッチサーバー (batch-mock) の CLI ---------------------------------
+# コンテナ内 CLI の代わりに、テスト用の状態ファイル (FAKE_BATCH_MOCK_STATE) へ
+# 「印」を書き出す。伝播プローブはこの状態ファイルを読んで内容を返すため、
+# 「偽装バッチサーバーが書いたものが他コンテナから見える」流れを再現できる。
+fake_batch_mock_state() {
+  printf '%s' "${FAKE_BATCH_MOCK_STATE:-${TMPDIR:-/tmp}/fake-batch-mock-state}"
+}
+
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"batch_cli="* ]]; then
+  fake_batch_sub="${7:-}"
+  fake_batch_token="${8:-}"
+  fake_batch_marker="${9:-}"
+  fake_batch_state="$(fake_batch_mock_state)"
+  if [ "${FAKE_BATCH_MOCK_CLI_MISSING:-false}" = "true" ]; then
+    printf '偽装バッチサーバーの CLI が見つかりません: /opt/batch-mock/efs-propagation.sh\n' >&2
+    exit 2
+  fi
+  case "$fake_batch_sub" in
+    mounts)
+      printf '/mnt/logs\n'
+      printf '/mnt/data\n'
+      ;;
+    ready) : ;;
+    write)
+      if [ "${FAKE_BATCH_MOCK_WRITE_FAIL:-false}" = "true" ]; then
+        printf 'EFS へ書き込めません: /mnt/logs/batch-mock (uid=6301 gid=6302)\n' >&2
+        exit 1
+      fi
+      printf '%s\n' "$fake_batch_marker" > "$fake_batch_state"
+      for fake_batch_root in /mnt/logs /mnt/data; do
+        printf 'path=%s/batch-mock/%s.d kind=dir owner=6301:6302 mode=2775\n' \
+          "$fake_batch_root" "$fake_batch_token"
+        printf 'path=%s/batch-mock/%s.d/payload.txt kind=file owner=6301:6302 mode=664\n' \
+          "$fake_batch_root" "$fake_batch_token"
+        printf 'path=%s/batch-mock/%s-file.link kind=symlink target=%s.d/payload.txt\n' \
+          "$fake_batch_root" "$fake_batch_token" "$fake_batch_token"
+        printf 'read=%s/batch-mock/%s-file.link\n' "$fake_batch_root" "$fake_batch_token"
+      done
+      ;;
+    append)
+      if [ "${FAKE_BATCH_MOCK_APPEND_FAIL:-false}" = "true" ]; then
+        printf 'EFS 上のファイルを書き換えられません\n' >&2
+        exit 1
+      fi
+      printf '%s\n' "$fake_batch_marker" >> "$fake_batch_state"
+      printf 'appended: %s\n' "$fake_batch_marker"
+      ;;
+    cleanup)
+      if [ "${FAKE_BATCH_MOCK_CLEANUP_FAIL:-false}" = "true" ]; then
+        exit 1
+      fi
+      rm -f -- "$fake_batch_state"
+      ;;
+    *)
+      fail "batch-mock cli $*"
+      ;;
+  esac
+  exit 0
+fi
+
+# 偽装バッチサーバーの実行 uid:gid。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *'id -u'* ]]; then
+  printf '%s' "${FAKE_BATCH_MOCK_UID_GID:-6301:6302}"
+  exit 0
+fi
+
+# ---- EFS マウント伝播のプローブ ---------------------------------------------
+# 対象コンテナから「シンボリックリンクをたどって読む」動きを再現する。
+# 状態ファイルが無ければ missing、あれば symlink 経由で読めたものとして返す。
+#   FAKE_EFS_PROPAGATION_BLIND_CONTAINERS  … 常に見えない (マウント漏れの再現)
+#   FAKE_EFS_PROPAGATION_BROKEN_CONTAINERS … リンク先を解決できない (絶対パスの再現)
+#   FAKE_EFS_PROPAGATION_STALE_CONTAINERS  … 最初の行しか見えない (更新が届かない再現)
+if [ "${1:-}" = "exec" ] && [ "${4:-}" = "-c" ] && [ "${6:-}" = "efs-propagation-probe" ]; then
+  fake_probe_cid="${2:-}"
+  fake_probe_target="${7:-}"
+  fake_batch_state="$(fake_batch_mock_state)"
+  case " ${FAKE_EFS_PROPAGATION_BLIND_CONTAINERS:-} " in
+    *" $fake_probe_cid "*) printf 'type=missing\n'; exit 3 ;;
+  esac
+  if [ ! -f "$fake_batch_state" ]; then
+    printf 'type=missing\n'
+    exit 3
+  fi
+  printf 'type=symlink\n'
+  printf 'target=%s\n' "$(printf '%s' "${fake_probe_target##*/}" | sed 's/-file\.link$/.d\/payload.txt/')"
+  case " ${FAKE_EFS_PROPAGATION_BROKEN_CONTAINERS:-} " in
+    *" $fake_probe_cid "*) printf 'resolved=broken\n'; exit 4 ;;
+  esac
+  printf 'resolved=ok\n'
+  printf 'owner=6301:6302\n'
+  printf 'mode=664\n'
+  printf 'read=ok\n'
+  case " ${FAKE_EFS_PROPAGATION_STALE_CONTAINERS:-} " in
+    *" $fake_probe_cid "*)
+      printf 'content:%s\n' "$(head -n 1 "$fake_batch_state")"
+      exit 0
+      ;;
+  esac
+  while IFS= read -r fake_probe_line; do
+    printf 'content:%s\n' "$fake_probe_line"
+  done < "$fake_batch_state"
   exit 0
 fi
 
@@ -986,6 +1131,46 @@ if [ "${FAKE_COPY_ARTIFACT_PROBE_NOSHELL:-false}" = "true" ] && [ "${1:-}" = "ex
       exit 126
       ;;
   esac
+fi
+
+# ---- 対話シェルの解決 (bash が無いコンテナの再現) ----------------------------
+# build_and_verify.sh は bash 系 → POSIX sh 系の順に `<シェル> -c 'exit 0'` を試す。
+# FAKE_NO_BASH_CONTAINERS に挙げたコンテナでは bash 系をすべて失敗させ、
+# alpine / busybox のような「bash を持たないイメージ」を再現する。
+# FAKE_NO_SHELL_CONTAINERS に挙げたコンテナは sh も失敗させ、distroless を再現する。
+if [ "${1:-}" = "exec" ]; then
+  fake_shell_probe_cid=""
+  fake_shell_probe_bin=""
+  if [ "${2:-}" = "-u" ] && [ "${6:-}" = "-c" ] && [ "${7:-}" = "exit 0" ]; then
+    fake_shell_probe_cid="${4:-}"
+    fake_shell_probe_bin="${5:-}"
+  elif [ "${4:-}" = "-c" ] && [ "${5:-}" = "exit 0" ]; then
+    fake_shell_probe_cid="${2:-}"
+    fake_shell_probe_bin="${3:-}"
+  fi
+  if [ -n "$fake_shell_probe_bin" ]; then
+    case " ${FAKE_NO_SHELL_CONTAINERS:-} " in
+      *" $fake_shell_probe_cid "*)
+        printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
+          "$fake_shell_probe_bin" "$fake_shell_probe_bin" >&2
+        exit 126
+        ;;
+    esac
+    case "$fake_shell_probe_bin" in
+      /bin/bash)
+        case " ${FAKE_NO_BASH_CONTAINERS:-} " in
+          *" $fake_shell_probe_cid "*)
+            printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/bash": stat /bin/bash: no such file or directory: unknown\n' >&2
+            exit 126
+            ;;
+        esac
+        exit 0
+        ;;
+      /usr/bin/bash|/usr/local/bin/bash) exit 126 ;;
+      /bin/sh) exit 0 ;;
+      /usr/bin/sh|/bin/ash|/busybox/sh|/bin/dash) exit 126 ;;
+    esac
+  fi
 fi
 
 # ---- JBoss マスターパスワードの伝搬検証 -------------------------------------

@@ -2204,6 +2204,231 @@ unset FAKE_COMPOSE_PS_SERVICES
 assert_not_contains "$alb_healthcheck_absent_output" "ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
 assert_not_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli"
 
+# --- bash を持たないコンテナ (偽装 EFS など) への対話接続 --------------------
+# alpine ベースの efs-mock には /bin/bash が無く、/bin/bash 決め打ちの接続では
+# 「exec: "/bin/bash": ... no such file or directory」で入れなかった。
+# bash → POSIX sh の順にシェルを解決し、sh 用のセッションスクリプトで接続する。
+no_bash_output="$TEST_TMP/keep-mode-no-bash.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app efs-mock"
+export FAKE_NO_BASH_CONTAINERS="cid-efs-mock"
+# efs-mock (bash なし) → app (bash あり) の順に bash 接続を試す。
+if ! printf '2\n2\n0\n1\n2\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,efs-mock \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$no_bash_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_BASH_CONTAINERS
+  cat "$no_bash_output" >&2
+  fail "interactive shell fallback for a container without bash returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_BASH_CONTAINERS
+
+assert_contains "$no_bash_output" "Compose サービスの bash へ接続します (service=efs-mock, container=efs-mock)。"
+assert_contains "$no_bash_output" "このコンテナには bash がないため、/bin/sh (POSIX シェル) で接続します。"
+assert_contains "$no_bash_output" "bash 固有の書き方 (配列、[[ ]]、シェル関数の export など) は使えません。"
+assert_contains "$no_bash_output" "bash セッションを終了しました。サービス操作の選択へ戻ります。"
+assert_not_contains "$no_bash_output" "bash 接続に失敗しました。"
+# 探索は bash を先に試し、無ければ /bin/sh のセッションスクリプトで接続する。
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-efs-mock /bin/bash -c exit 0"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-efs-mock /bin/sh -c exit 0"
+assert_contains "$FAKE_DOCKER_CALLS" "build-and-verify-session /bin/sh"
+assert_not_contains "$FAKE_DOCKER_CALLS" "exec -it cid-efs-mock /bin/bash -c"
+# bash があるコンテナは従来どおり bash 用のセッションスクリプトで接続する。
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash -c"
+
+# シェルを一切持たないコンテナ (distroless) では、その旨を伝えて操作選択へ戻る。
+no_shell_output="$TEST_TMP/keep-mode-no-shell.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app efs-mock"
+export FAKE_NO_SHELL_CONTAINERS="cid-efs-mock"
+if ! printf '2\n2\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,efs-mock \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$no_shell_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_SHELL_CONTAINERS
+  cat "$no_shell_output" >&2
+  fail "interactive shell fallback without any shell returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_SHELL_CONTAINERS
+
+assert_contains "$no_shell_output" "コンテナ内に対話できるシェルが見つかりません"
+assert_contains "$no_shell_output" "シェルを持たないイメージ (distroless など) では docker exec による対話接続はできません。"
+assert_contains "$no_shell_output" "bash 接続に失敗しました。サービス操作の選択へ戻ります。"
+
+# --- EFS マウント伝播確認 (偽装バッチサーバー経由) ---------------------------
+# 偽装バッチサーバーが EFS 上へファイルとシンボリックリンクを作り、同じ EFS を
+# マウントする全コンテナからシンボリックリンク経由で読めること、書き換えが
+# 伝わること、削除が伝わることを確認する。
+# efs-mock はマウント先が異なる (/mnt/efs/logs) ため、パスの読み替えも確かめる。
+export FAKE_EFS_MOUNT_ENTRIES="cid-batch-mock|demo_efs-logs|/mnt/logs|rw
+cid-batch-mock|demo_efs-data|/mnt/data|rw
+cid-app|demo_efs-logs|/mnt/logs|rw
+cid-app|demo_efs-data|/mnt/data|rw
+cid-cwagent|demo_efs-logs|/mnt/logs|ro
+cid-efs-mock|demo_efs-logs|/mnt/efs/logs|rw
+cid-efs-mock|demo_efs-data|/mnt/efs/data|rw"
+export FAKE_BATCH_MOCK_STATE="$TEST_TMP/fake-batch-mock-state"
+
+efs_propagation_output="$TEST_TMP/keep-mode-efs-propagation.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_BATCH_MOCK_STATE"
+export FAKE_COMPOSE_PS_SERVICES="app batch-mock cwagent efs-mock"
+export FAKE_NO_BASH_CONTAINERS="cid-efs-mock cid-batch-mock"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,batch-mock,cwagent,efs-mock \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$efs_propagation_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_BASH_CONTAINERS
+  cat "$efs_propagation_output" >&2
+  fail "EFS mount propagation check returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_NO_BASH_CONTAINERS
+
+assert_contains "$efs_propagation_output" \
+  "4) EFS マウント伝播確認 (偽装バッチサーバーが書いた内容とシンボリックリンクが全コンテナへ反映されるか)"
+assert_contains "$efs_propagation_output" "EFS マウント伝播確認 (偽装バッチサーバー経由)"
+assert_contains "$efs_propagation_output" "確認対象           : app"
+assert_contains "$efs_propagation_output" "偽装バッチサーバー : batch-mock"
+assert_contains "$efs_propagation_output" "実行 uid:gid       : 6301:6302 (期待値: 6301:6302)"
+assert_contains "$efs_propagation_output" "EFS マウント       : /mnt/logs (rw, ボリューム=demo_efs-logs)"
+assert_contains "$efs_propagation_output" "EFS マウント       : /mnt/data (rw, ボリューム=demo_efs-data)"
+assert_contains "$efs_propagation_output" "[同じ EFS をマウントしている実行中コンテナ]"
+assert_contains "$efs_propagation_output" "  - app : /mnt/logs (rw)"
+assert_contains "$efs_propagation_output" "  - cwagent : /mnt/logs (ro)"
+assert_contains "$efs_propagation_output" "  - efs-mock : /mnt/efs/logs (rw)"
+assert_contains "$efs_propagation_output" "[作成直後の反映 (シンボリックリンク経由で読む)]"
+assert_contains "$efs_propagation_output" "[書き換え後の反映 (更新が全コンテナへ伝わるか)]"
+assert_contains "$efs_propagation_output" "全コンテナから消えていることを確認しました。"
+assert_contains "$efs_propagation_output" \
+  "EFS マウント伝播判定 : OK (作成・書き換え・削除のすべてが全コンテナへ反映)"
+# :ro でマウントしているコンテナからも読めることを、rw/ro 付きで示す。
+assert_matches "$efs_propagation_output" '\[OK\] cwagent \(cwagent, ro\) : /mnt/logs/batch-mock/.*-file\.link ->'
+# 偽装バッチサーバーとマウント先が違うコンテナでは、マウント先を読み替えて確認する。
+assert_matches "$efs_propagation_output" '\[OK\] efs-mock \(efs-mock, rw\) : /mnt/efs/logs/batch-mock/'
+assert_matches "$efs_propagation_output" '\[OK\] efs-mock \(efs-mock, rw\) : /mnt/efs/data/batch-mock/'
+# 1 コンテナが複数ボリュームを持つ場合でも、同じパスを重複して確認しない。
+assert_occurrences "$efs_propagation_output" "  [OK] cwagent (cwagent, ro) : /mnt/logs/batch-mock/" 2
+assert_contains "$FAKE_DOCKER_CALLS" "batch-mock-cli mounts"
+assert_contains "$FAKE_DOCKER_CALLS" "batch-mock-cli write "
+assert_contains "$FAKE_DOCKER_CALLS" "batch-mock-cli append "
+assert_contains "$FAKE_DOCKER_CALLS" "batch-mock-cli cleanup "
+# 伝播プローブは bash を持たないコンテナでも /bin/sh で実行する。
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-efs-mock /bin/sh -c "
+# 偽装バッチサーバー自身は確認対象から外す (自分で書いたものを自分で読んでも意味がない)。
+assert_not_contains "$efs_propagation_output" "  - batch-mock : "
+
+# マウント漏れ / 絶対パスのシンボリックリンク / 更新が届かない、をそれぞれ NG として出す。
+efs_propagation_ng_output="$TEST_TMP/keep-mode-efs-propagation-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_BATCH_MOCK_STATE"
+export FAKE_COMPOSE_PS_SERVICES="app batch-mock cwagent efs-mock"
+export FAKE_EFS_PROPAGATION_BLIND_CONTAINERS="cid-cwagent"
+export FAKE_EFS_PROPAGATION_BROKEN_CONTAINERS="cid-efs-mock"
+export FAKE_EFS_PROPAGATION_STALE_CONTAINERS="cid-app"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,batch-mock,cwagent,efs-mock \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$efs_propagation_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_EFS_PROPAGATION_BLIND_CONTAINERS \
+    FAKE_EFS_PROPAGATION_BROKEN_CONTAINERS FAKE_EFS_PROPAGATION_STALE_CONTAINERS
+  cat "$efs_propagation_ng_output" >&2
+  fail "EFS mount propagation check with unreflected containers returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_EFS_PROPAGATION_BLIND_CONTAINERS \
+  FAKE_EFS_PROPAGATION_BROKEN_CONTAINERS FAKE_EFS_PROPAGATION_STALE_CONTAINERS
+
+assert_matches "$efs_propagation_ng_output" '\[NG\] cwagent \(cwagent, ro\) : .* が見えません'
+assert_matches "$efs_propagation_ng_output" '\[NG\] efs-mock \(efs-mock, rw\) : .* のリンク先を解決できません'
+assert_contains "$efs_propagation_ng_output" \
+  "→ シンボリックリンクを絶対パスで張っていると、マウント先が違うコンテナでは解決できません。"
+assert_matches "$efs_propagation_ng_output" '\[NG\] app \(test-app-1, rw\) : .* を読めましたが印が見つかりません'
+assert_contains "$efs_propagation_ng_output" "EFS マウント伝播判定 : NG (上の [NG] 行を確認してください)"
+
+# 偽装バッチサーバーが EFS へ書けない場合は、書き込み失敗として理由を出す。
+efs_propagation_write_fail_output="$TEST_TMP/keep-mode-efs-propagation-write-fail.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_BATCH_MOCK_STATE"
+export FAKE_COMPOSE_PS_SERVICES="app batch-mock cwagent"
+export FAKE_BATCH_MOCK_WRITE_FAIL="true"
+export FAKE_BATCH_MOCK_UID_GID="1000:1000"
+if ! printf '1\n4\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,batch-mock,cwagent \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$efs_propagation_write_fail_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_BATCH_MOCK_WRITE_FAIL FAKE_BATCH_MOCK_UID_GID
+  cat "$efs_propagation_write_fail_output" >&2
+  fail "EFS mount propagation check with a failing write returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_BATCH_MOCK_WRITE_FAIL FAKE_BATCH_MOCK_UID_GID
+
+assert_contains "$efs_propagation_write_fail_output" \
+  "偽装バッチサーバーの uid:gid が偽装 EFS の初期化値と異なります (1000:1000 != 6301:6302)。"
+assert_contains "$efs_propagation_write_fail_output" \
+  "偽装バッチサーバーが EFS へ書き込めませんでした (exit=1)。"
+assert_contains "$efs_propagation_write_fail_output" \
+  "EFS マウント伝播確認に失敗しました。サービス操作の選択へ戻ります。"
+
+# 偽装バッチサーバーが起動していない構成では操作が増えない。
+efs_propagation_absent_output="$TEST_TMP/keep-mode-efs-propagation-absent.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app cwagent"
+if ! printf '1\n3\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,cwagent \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$efs_propagation_absent_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$efs_propagation_absent_output" >&2
+  fail "service actions without the batch server emulator returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_not_contains "$efs_propagation_absent_output" "EFS マウント伝播確認"
+assert_not_contains "$FAKE_DOCKER_CALLS" "batch-mock-cli"
+
+unset FAKE_EFS_MOUNT_ENTRIES FAKE_BATCH_MOCK_STATE
+
 cwagent_helper_output="$TEST_TMP/keep-mode-cwagent-helper.out"
 : > "$FAKE_DOCKER_CALLS"
 : > "$FAKE_CURL_CALLS"
