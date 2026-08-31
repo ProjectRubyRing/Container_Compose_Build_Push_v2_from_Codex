@@ -10626,6 +10626,9 @@ CONTAINER_INTERACTIVE_SH_SCRIPT="${CONTAINER_INTERACTIVE_SH_SCRIPT//$'\r'/}"
 #
 # 解決結果は「シェルのパス」「種別 (bash / sh)」を次の 2 変数へ入れる。
 # 同じコンテナへ何度も接続するため、探索結果はコンテナ ID をキーに覚えておく。
+# healthcheck 用の detect_container_shell とは目的が違う (あちらは「POSIX sh の
+# コマンドを流せるシェルが 1 つあればよい」ので /bin/sh を先に探す)。こちらは
+# 人が入る対話セッション用なので、bash があれば bash を優先する。
 INTERACTIVE_SHELL_PATH=""         # 解決したシェルのパス (例: /bin/bash, /bin/sh)
 INTERACTIVE_SHELL_KIND=""         # bash: bash 系 / sh: POSIX sh 系
 declare -A RESOLVED_INTERACTIVE_SHELLS=()   # container_id[:user] → "パス|種別"
@@ -13272,13 +13275,12 @@ done < "$probe_path"
 
 # 対象コンテナで上のプローブを実行する。使うシェルはコンテナごとに解決する
 # (偽装 EFS や各種 mock は alpine で bash を持たないため /bin/bash 決め打ちにしない)。
+# プローブは POSIX sh で書いてあるので、healthcheck と同じ detect_container_shell
+# (/bin/sh を先に探す・コンテナ単位でキャッシュする) をそのまま使う。
 efs_propagation_probe() {
-  local container_id="$1" probe_path="$2"
-  local shell_path="/bin/sh"
+  local container_id="$1" probe_path="$2" shell_path
 
-  if resolve_container_interactive_shell "$container_id"; then
-    shell_path="$INTERACTIVE_SHELL_PATH"
-  fi
+  shell_path="$(detect_container_shell "$container_id")" || shell_path="/bin/sh"
   docker exec "$container_id" "$shell_path" -c \
     "$EFS_PROPAGATION_PROBE_SCRIPT" efs-propagation-probe "$probe_path" 2>&1
 }
@@ -13449,7 +13451,7 @@ print_batch_mock_service_state() {
 run_interactive_compose_efs_propagation() {
   local service_name="$1" container_id container_name token marker append_marker
   local write_output="" append_output="" exec_status=0 overall=0 line probe_path
-  local key mount_dest rw entry_service entry_cid entry_dest entry_rw
+  local key mount_dest rw entry_service entry_dest entry_rw
   local -a container_ids=() read_paths=()
 
   mapfile -t container_ids < <(compose_container_ids "$BATCH_MOCK_SERVICE")
@@ -13498,12 +13500,8 @@ run_interactive_compose_efs_propagation() {
     return 1
   fi
   for line in "${EFS_PROPAGATION_TARGETS[@]}"; do
-    IFS=$'\t' read -r entry_service _ entry_cid _ entry_dest entry_rw <<< "$line"
+    IFS=$'\t' read -r entry_service _ _ _ entry_dest entry_rw <<< "$line"
     diag "  - ${entry_service} : ${entry_dest} (${entry_rw})"
-    # プローブはコマンド置換 (サブシェル) の中で走り、そこで解決したシェルは
-    # 呼び出し元へ残らない。ここで先に解決してキャッシュへ載せ、確認のたびに
-    # bash → sh の探索を繰り返さないようにする。
-    resolve_container_interactive_shell "$entry_cid" >/dev/null 2>&1 || true
   done
 
   # 印は実行ごとに一意にする (前回の残りを読んで OK と誤判定しないため)。

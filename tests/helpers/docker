@@ -841,46 +841,6 @@ if [ "${1:-}" = "diff" ]; then
   exit 0
 fi
 
-# ---- 対話シェルの解決 (bash が無いコンテナの再現) ----------------------------
-# build_and_verify.sh は bash 系 → POSIX sh 系の順に `<シェル> -c 'exit 0'` を試す。
-# FAKE_NO_BASH_CONTAINERS に挙げたコンテナでは bash 系をすべて失敗させ、
-# alpine / busybox のような「bash を持たないイメージ」を再現する。
-# FAKE_NO_SHELL_CONTAINERS に挙げたコンテナは sh も失敗させ、distroless を再現する。
-if [ "${1:-}" = "exec" ]; then
-  fake_shell_probe_cid=""
-  fake_shell_probe_bin=""
-  if [ "${2:-}" = "-u" ] && [ "${6:-}" = "-c" ] && [ "${7:-}" = "exit 0" ]; then
-    fake_shell_probe_cid="${4:-}"
-    fake_shell_probe_bin="${5:-}"
-  elif [ "${4:-}" = "-c" ] && [ "${5:-}" = "exit 0" ]; then
-    fake_shell_probe_cid="${2:-}"
-    fake_shell_probe_bin="${3:-}"
-  fi
-  if [ -n "$fake_shell_probe_bin" ]; then
-    case " ${FAKE_NO_SHELL_CONTAINERS:-} " in
-      *" $fake_shell_probe_cid "*)
-        printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
-          "$fake_shell_probe_bin" "$fake_shell_probe_bin" >&2
-        exit 126
-        ;;
-    esac
-    case "$fake_shell_probe_bin" in
-      /bin/bash)
-        case " ${FAKE_NO_BASH_CONTAINERS:-} " in
-          *" $fake_shell_probe_cid "*)
-            printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/bash": stat /bin/bash: no such file or directory: unknown\n' >&2
-            exit 126
-            ;;
-        esac
-        exit 0
-        ;;
-      /usr/bin/bash|/usr/local/bin/bash) exit 126 ;;
-      /bin/sh) exit 0 ;;
-      /usr/bin/sh|/bin/ash|/busybox/sh|/bin/dash) exit 126 ;;
-    esac
-  fi
-fi
-
 # POSIX sh 版の対話セッション。bash 版と同じく、実際にシェルを起動するわけには
 # いかないので、目印 (build-and-verify-session) を確認して成功を返す。
 if [ "${1:-}" = "exec" ] && [[ " $* " == *" -it "* ]] \
@@ -1171,6 +1131,46 @@ if [ "${FAKE_COPY_ARTIFACT_PROBE_NOSHELL:-false}" = "true" ] && [ "${1:-}" = "ex
       exit 126
       ;;
   esac
+fi
+
+# ---- 対話シェルの解決 (bash が無いコンテナの再現) ----------------------------
+# build_and_verify.sh は bash 系 → POSIX sh 系の順に `<シェル> -c 'exit 0'` を試す。
+# FAKE_NO_BASH_CONTAINERS に挙げたコンテナでは bash 系をすべて失敗させ、
+# alpine / busybox のような「bash を持たないイメージ」を再現する。
+# FAKE_NO_SHELL_CONTAINERS に挙げたコンテナは sh も失敗させ、distroless を再現する。
+if [ "${1:-}" = "exec" ]; then
+  fake_shell_probe_cid=""
+  fake_shell_probe_bin=""
+  if [ "${2:-}" = "-u" ] && [ "${6:-}" = "-c" ] && [ "${7:-}" = "exit 0" ]; then
+    fake_shell_probe_cid="${4:-}"
+    fake_shell_probe_bin="${5:-}"
+  elif [ "${4:-}" = "-c" ] && [ "${5:-}" = "exit 0" ]; then
+    fake_shell_probe_cid="${2:-}"
+    fake_shell_probe_bin="${3:-}"
+  fi
+  if [ -n "$fake_shell_probe_bin" ]; then
+    case " ${FAKE_NO_SHELL_CONTAINERS:-} " in
+      *" $fake_shell_probe_cid "*)
+        printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "%s": stat %s: no such file or directory: unknown\n' \
+          "$fake_shell_probe_bin" "$fake_shell_probe_bin" >&2
+        exit 126
+        ;;
+    esac
+    case "$fake_shell_probe_bin" in
+      /bin/bash)
+        case " ${FAKE_NO_BASH_CONTAINERS:-} " in
+          *" $fake_shell_probe_cid "*)
+            printf 'OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/bash": stat /bin/bash: no such file or directory: unknown\n' >&2
+            exit 126
+            ;;
+        esac
+        exit 0
+        ;;
+      /usr/bin/bash|/usr/local/bin/bash) exit 126 ;;
+      /bin/sh) exit 0 ;;
+      /usr/bin/sh|/bin/ash|/busybox/sh|/bin/dash) exit 126 ;;
+    esac
+  fi
 fi
 
 # ---- JBoss マスターパスワードの伝搬検証 -------------------------------------
