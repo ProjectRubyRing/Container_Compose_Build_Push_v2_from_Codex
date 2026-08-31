@@ -595,6 +595,26 @@ ALB_HEALTHCHECK_CLI_DEFAULT="/opt/alb-healthcheck/healthcheck.py"
 # 案内にだけ使う (コンテナの ALB_HEALTHCHECK_LISTEN_PORT があればそちらを優先)。
 ALB_HEALTHCHECK_API_PORT="8080"
 
+# ---- 偽装バッチサーバー経由の EFS マウント伝播確認 ----------------------------
+# ECS/EFS 構成では、同じ EFS を frontend / backend / バッチサーバーが同時に
+# マウントし、片方が置いたファイルをもう片方が読む。ローカルの compose では
+# named volume を偽装 EFS (efs-mock) として共有するが、
+#   - マウントはできていても uid/gid・setgid・umask のずれで書き込みが届かない
+#   - シンボリックリンクの参照先が「相対か絶対か」でコンテナごとに解決が変わる
+#   - :ro でマウントしたコンテナだけ更新が見えていない
+# といった食い違いは、コンテナ 1 つを覗いただけでは分からない。
+# そこで実環境のバッチサーバーに相当する偽装サービスを立て、そこから
+# EFS 上へファイルとシンボリックリンクを作り・書き換え・消して、
+# 同じ EFS をマウントする全コンテナからどう見えるかを突き合わせる。
+BATCH_MOCK_SERVICE="batch-mock"   # 偽装バッチサーバーの Compose サービス名
+# 偽装バッチサーバーのコンテナ内 CLI。コンテナの環境変数 BATCH_MOCK_CLI が
+# あればそちらを優先し、無い場合にこの既定パスを使う。
+BATCH_MOCK_CLI_DEFAULT="/opt/batch-mock/efs-propagation.sh"
+# 偽装バッチサーバーが EFS 上のファイルを作るときの uid:gid。
+# 偽装 EFS (efs-mock) がマウントポイントを chown する値と一致させること
+# (一致していないと、書けたつもりで他コンテナから更新できないファイルになる)。
+BATCH_MOCK_EFS_UID_GID="6301:6302"
+
 # ---- CloudWatch Agent (cwagent) のログ送信検証 --------------------------------
 # ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml で起動する構成では、
 # 「設定ファイルがコンテナへ届いていない」「logs.endpoint_override の送信先を名前解決
@@ -1651,7 +1671,10 @@ JBoss マスターパスワードの伝搬検証:
                              bash  docker exec で /bin/bash へ直接接続する
                                    (接続前に tree を使える状態にする。コンテナに
                                     tree が無ければ bash だけで動く簡易実装を
-                                    用意する)
+                                    用意する。/bin/bash を持たないコンテナ
+                                    (alpine / busybox 系の偽装 EFS や各種 mock)
+                                    では /bin/sh へ自動で切り替え、POSIX sh 版の
+                                    簡易 tree を用意して同じ操作を行う)
                              http  JBoss EAP へ対話式の HTTP リクエストを送る
                               logs  起動中 Compose サービスを番号で選択後、
                                     ログ表示、対話式 bash 接続、healthcheck の
@@ -1694,7 +1717,17 @@ JBoss マスターパスワードの伝搬検証:
                                     テキストファイルへも出力する
                                     (--jboss-module-list-text /
                                      --no-jboss-module-list-text)
-                                    (bash 接続先には /bin/bash が必要)
+                                    偽装バッチサーバー (batch-mock) が起動して
+                                    いれば、同じ EFS をマウントするサービスと
+                                    偽装バッチサーバー自身で
+                                    「EFS マウント伝播確認」も選択でき、偽装
+                                    バッチサーバーから uid:gid 6301:6302 で
+                                    ファイルとシンボリックリンクを作成・書き換え・
+                                    削除して、その内容がシンボリックリンク経由で
+                                    全コンテナへ反映されるかを確認する
+                                    (パラメータ入力なし)
+                                    (bash 接続先に /bin/bash が無い場合は
+                                     /bin/sh を使う)
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
                            送達診断の JSON 整形には curl と Python 3 が必要。
@@ -10328,14 +10361,345 @@ CONTAINER_INTERACTIVE_BASH_SCRIPT_END
 # そのままコンテナ内の bash へ渡すと 1 行目から構文エラーになるため落としておく。
 CONTAINER_INTERACTIVE_BASH_SCRIPT="${CONTAINER_INTERACTIVE_BASH_SCRIPT//$'\r'/}"
 
-# コンテナ内の対話 bash を起動する。素の docker exec ではなく、上のセッション
-# スクリプト経由で起動して tree を使える状態にしてから bash を開始する。
+# ---- bash が無いコンテナ向けの POSIX sh セッション ---------------------------
+# efs-mock (alpine) のような軽量イメージには /bin/bash が無く、上の bash 用
+# セッションスクリプトは `docker exec` の時点で
+# 「exec: "/bin/bash": stat /bin/bash: no such file or directory」となって
+# 接続できない。マウントの中身やシンボリックリンクの参照先を確かめたいのは
+# まさにこうしたイメージなので、bash が無ければ POSIX sh へ切り替えて同じ
+# 操作 (tree 付きの対話シェル) を提供する。
+#
+# bash 用との違いは 2 点。
+#   (1) POSIX sh には配列・shopt・declare -f が無いため、tree の簡易実装を
+#       「位置パラメータで再帰する」書き方に置き換えている
+#   (2) POSIX sh には export -f (関数のエクスポート) が無い。対話シェルは
+#       このスクリプトの子プロセスになるため、シェル関数では tree を渡せない。
+#       そこで実装は必ずファイルとして書き出し、PATH の先頭へ足す。書き込める
+#       ディレクトリが 1 つも無い場合だけ tree 無しで対話シェルを始める
+# 実行するシェルのパスは $1 で受け取る (/bin/sh とは限らないため。
+# 書き出す tree のシェバンにもこの値を使う)。
+CONTAINER_INTERACTIVE_SH_SCRIPT="$(cat <<'CONTAINER_INTERACTIVE_SH_SCRIPT_END'
+_bv_shell_bin="${1:-/bin/sh}"
+
+# tree の簡易実装 (POSIX sh 版) をファイルとして書き出す。
+# ここだけ 1 つの here-document にまとめてあるので、実装の追加・修正は
+# この中だけを直せばよい。
+_bv_tree_write_program() {
+  printf '#!%s\n' "$_bv_shell_bin"
+  cat <<'BV_TREE_PROGRAM_END'
+# build_and_verify.sh が対話セッション用に用意した tree の簡易実装 (POSIX sh 版)。
+# find / awk / sort を使わずシェルの展開だけで動くため、コマンドがほとんど無い
+# コンテナでも同じように使える。
+_bv_tree_usage() {
+  cat <<'BV_TREE_USAGE_END'
+使い方: tree [-a] [-d] [-f] [-L 深さ] [--noreport] [ディレクトリ...]
+  -a          ドットで始まるファイルも表示する (sh 版はドット項目を先に並べる)
+  -d          ディレクトリだけを表示する
+  -f          各行にパス全体を表示する
+  -L 深さ     たどる深さの上限 (既定: 制限なし)
+  --noreport  末尾の集計行 (N directories, M files) を表示しない
+  --help      この使い方を表示する
+BV_TREE_USAGE_END
+}
+
+# シンボリックリンクの参照先。readlink が無いコンテナでは空を返す。
+_bv_tree_link_target() {
+  _bv_tree_lt=""
+  if command -v readlink >/dev/null 2>&1; then
+    _bv_tree_lt="$(readlink -- "$1" 2>/dev/null)" || _bv_tree_lt=""
+  fi
+  printf '%s' "$_bv_tree_lt"
+}
+
+# $1 のディレクトリの中身を 1 階層ぶん出力し、必要なら再帰する。
+# $2 は行頭の飾り、$3 はこの階層の深さ (直下を 1 とする)。
+# POSIX sh には local が無く、普通の変数では再帰を跨いで値を保てない。
+# 位置パラメータは呼び出しごとに退避・復元されるため、先頭 3 つを
+# 「ディレクトリ / 飾り / 深さ」に固定し、4 つ目以降へ対象の項目を並べる。
+_bv_tree_walk() {
+  if [ ! -r "$1" ] || [ ! -x "$1" ]; then
+    printf '%s└── [error opening dir]\n' "$2"
+    return 0
+  fi
+  _bv_tree_base="$1"
+  [ "$_bv_tree_base" = "/" ] && _bv_tree_base=""
+  if [ "$_BV_TREE_ALL" = "1" ]; then
+    set -- "$1" "$2" "$3" "$_bv_tree_base"/.[!.]* "$_bv_tree_base"/..?* "$_bv_tree_base"/*
+  else
+    set -- "$1" "$2" "$3" "$_bv_tree_base"/*
+  fi
+
+  # 該当が無く展開されなかったグロブと、-d 指定時のファイルをここで落とす。
+  # 先頭 3 つを退避 → 残りを先頭から取り出して末尾へ積み直す、の順で組み替える。
+  _bv_tree_d="$1"; _bv_tree_p="$2"; _bv_tree_dep="$3"
+  _bv_tree_n=$(( $# - 3 ))
+  shift 3
+  while [ "$_bv_tree_n" -gt 0 ]; do
+    _bv_tree_e="$1"; shift; _bv_tree_n=$(( _bv_tree_n - 1 ))
+    if [ -e "$_bv_tree_e" ] || [ -L "$_bv_tree_e" ]; then
+      if [ "$_BV_TREE_DIRSONLY" = "1" ] && [ ! -d "$_bv_tree_e" ]; then
+        continue
+      fi
+      set -- "$@" "$_bv_tree_e"
+    fi
+  done
+  set -- "$_bv_tree_d" "$_bv_tree_p" "$_bv_tree_dep" "$@"
+
+  while [ $# -gt 3 ]; do
+    _bv_tree_e="$4"
+    # 残り 1 件なら最後の枝 (└──)、それ以外は途中の枝 (├──)。
+    if [ $# -eq 4 ]; then
+      _bv_tree_conn="└── "
+      _bv_tree_next="$2    "
+    else
+      _bv_tree_conn="├── "
+      _bv_tree_next="$2│   "
+    fi
+    if [ "$_BV_TREE_FULL" = "1" ]; then
+      _bv_tree_disp="$_bv_tree_e"
+    else
+      _bv_tree_disp="${_bv_tree_e##*/}"
+    fi
+    # 今回の項目 (4 つ目) を取り除き、先頭 3 つは保ったまま次の周回へ進む。
+    # 再帰で壊れて困る値はこの行より前で取り出し終えている。
+    _bv_tree_d="$1"; _bv_tree_p="$2"; _bv_tree_dep="$3"
+    shift 4
+    set -- "$_bv_tree_d" "$_bv_tree_p" "$_bv_tree_dep" "$@"
+    # シンボリックリンクは参照先を併記し、たどらない (循環を避けるため)。
+    if [ -L "$_bv_tree_e" ]; then
+      _bv_tree_target="$(_bv_tree_link_target "$_bv_tree_e")"
+      if [ -n "$_bv_tree_target" ]; then
+        printf '%s%s%s -> %s\n' "$_bv_tree_p" "$_bv_tree_conn" "$_bv_tree_disp" "$_bv_tree_target"
+      else
+        printf '%s%s%s\n' "$_bv_tree_p" "$_bv_tree_conn" "$_bv_tree_disp"
+      fi
+      _BV_TREE_FILES=$(( _BV_TREE_FILES + 1 ))
+      continue
+    fi
+    printf '%s%s%s\n' "$_bv_tree_p" "$_bv_tree_conn" "$_bv_tree_disp"
+    if [ -d "$_bv_tree_e" ]; then
+      _BV_TREE_DIRS=$(( _BV_TREE_DIRS + 1 ))
+      if [ -z "$_BV_TREE_LEVEL" ] || [ "$_bv_tree_dep" -lt "$_BV_TREE_LEVEL" ]; then
+        _bv_tree_walk "$_bv_tree_e" "$_bv_tree_next" $(( _bv_tree_dep + 1 ))
+      fi
+    else
+      _BV_TREE_FILES=$(( _BV_TREE_FILES + 1 ))
+    fi
+  done
+}
+
+_bv_tree_main() {
+  _BV_TREE_ALL=0
+  _BV_TREE_DIRSONLY=0
+  _BV_TREE_FULL=0
+  _BV_TREE_LEVEL=""
+  _BV_TREE_REPORT=1
+  _BV_TREE_DIRS=0
+  _BV_TREE_FILES=0
+  _bv_tree_status=0
+  _bv_tree_targets=0
+
+  # オプションを取り除き、対象ディレクトリだけを位置パラメータへ残す
+  # (先頭から取り出して末尾へ積み直す)。
+  _bv_tree_argc=$#
+  while [ "$_bv_tree_argc" -gt 0 ]; do
+    _bv_tree_a="$1"; shift; _bv_tree_argc=$(( _bv_tree_argc - 1 ))
+    case "$_bv_tree_a" in
+      -a) _BV_TREE_ALL=1 ;;
+      -d) _BV_TREE_DIRSONLY=1 ;;
+      -f) _BV_TREE_FULL=1 ;;
+      -L)
+        if [ "$_bv_tree_argc" -lt 1 ]; then
+          printf 'tree: -L には深さを指定してください。\n' >&2
+          return 2
+        fi
+        _bv_tree_l="$1"; shift; _bv_tree_argc=$(( _bv_tree_argc - 1 ))
+        case "$_bv_tree_l" in
+          ''|*[!0-9]*)
+            printf 'tree: -L には 1 以上の数値を指定してください: %s\n' "$_bv_tree_l" >&2
+            return 2
+            ;;
+        esac
+        if [ "$_bv_tree_l" -lt 1 ]; then
+          printf 'tree: -L には 1 以上の数値を指定してください: %s\n' "$_bv_tree_l" >&2
+          return 2
+        fi
+        _BV_TREE_LEVEL="$_bv_tree_l"
+        ;;
+      --noreport) _BV_TREE_REPORT=0 ;;
+      -h|--help) _bv_tree_usage; return 0 ;;
+      --version)
+        printf 'tree (build_and_verify.sh がセッション用に用意した簡易実装)\n'
+        return 0
+        ;;
+      --)
+        while [ "$_bv_tree_argc" -gt 0 ]; do
+          set -- "$@" "$1"; shift; _bv_tree_argc=$(( _bv_tree_argc - 1 ))
+          _bv_tree_targets=$(( _bv_tree_targets + 1 ))
+        done
+        ;;
+      -*)
+        printf 'tree: 未対応のオプションです: %s (--help で使い方を表示します)\n' "$_bv_tree_a" >&2
+        return 2
+        ;;
+      *)
+        set -- "$@" "$_bv_tree_a"
+        _bv_tree_targets=$(( _bv_tree_targets + 1 ))
+        ;;
+    esac
+  done
+  [ "$_bv_tree_targets" -gt 0 ] || set -- "."
+
+  for _bv_tree_t in "$@"; do
+    while [ "$_bv_tree_t" != "/" ] && [ "${_bv_tree_t%/}" != "$_bv_tree_t" ]; do
+      _bv_tree_t="${_bv_tree_t%/}"
+    done
+    printf '%s\n' "$_bv_tree_t"
+    if [ -d "$_bv_tree_t" ]; then
+      _bv_tree_walk "$_bv_tree_t" "" 1
+    else
+      printf '└── [error opening dir]\n'
+      _bv_tree_status=1
+    fi
+  done
+  if [ "$_BV_TREE_REPORT" = "1" ]; then
+    printf '\n%s directories, %s files\n' "$_BV_TREE_DIRS" "$_BV_TREE_FILES"
+  fi
+  return "$_bv_tree_status"
+}
+
+_bv_tree_main "$@"
+BV_TREE_PROGRAM_END
+}
+
+# tree を使える状態にする。コンテナに導入済みならそれを使う。
+_bv_tree_bin=""
+_bv_tree_hint=""
+_bv_tree_note=""
+if command -v tree >/dev/null 2>&1; then
+  _bv_tree_hint="tree コマンドが利用できます (コンテナに導入済みのものを使用します)。"
+else
+  _bv_tree_note="tree の簡易実装は -a / -d / -f / -L 深さ / --noreport に対応しています (tree --help)。"
+  for _bv_tree_dir in "${TMPDIR:-}" /tmp /var/tmp /dev/shm "${HOME:-}"; do
+    [ -n "$_bv_tree_dir" ] && [ -d "$_bv_tree_dir" ] && [ -w "$_bv_tree_dir" ] || continue
+    _bv_tree_bin="${_bv_tree_dir}/.build_and_verify_tree.$$"
+    if mkdir "$_bv_tree_bin" 2>/dev/null \
+        && _bv_tree_write_program > "${_bv_tree_bin}/tree" 2>/dev/null \
+        && chmod 755 "${_bv_tree_bin}/tree" 2>/dev/null \
+        && "${_bv_tree_bin}/tree" --version >/dev/null 2>&1; then
+      PATH="${_bv_tree_bin}:${PATH}"
+      export PATH
+      _bv_tree_hint="tree コマンドが利用できます (このセッション用の簡易実装を ${_bv_tree_bin}/tree へ用意しました)。"
+      break
+    fi
+    rm -rf -- "$_bv_tree_bin" 2>/dev/null
+    _bv_tree_bin=""
+  done
+  # POSIX sh には export -f が無く、対話シェルは子プロセスになるため、
+  # ファイルとして置けなければ tree は渡せない (bash 版のような関数での
+  # 受け渡しができない)。その場合は tree 無しで対話シェルを始める。
+  if [ -z "$_bv_tree_hint" ]; then
+    _bv_tree_hint="tree コマンドは利用できません (書き込めるディレクトリが無く、簡易実装を置けませんでした)。"
+    _bv_tree_note=""
+  fi
+fi
+printf '%s\n' "$_bv_tree_hint" >&2
+[ -n "$_bv_tree_note" ] && printf '%s\n' "$_bv_tree_note" >&2
+
+# 対話シェルはここで起動する。終了したら、用意した簡易実装を片付けてから抜ける。
+"$_bv_shell_bin"
+_bv_shell_status=$?
+[ -n "$_bv_tree_bin" ] && rm -rf -- "$_bv_tree_bin" 2>/dev/null
+exit "$_bv_shell_status"
+CONTAINER_INTERACTIVE_SH_SCRIPT_END
+)"
+CONTAINER_INTERACTIVE_SH_SCRIPT="${CONTAINER_INTERACTIVE_SH_SCRIPT//$'\r'/}"
+
+# ---- 接続に使うシェルの解決 --------------------------------------------------
+# 対話接続の入口は 1 つだが、コンテナに /bin/bash があるとは限らない。
+# 偽装 EFS (alpine)、各種 mock (busybox / distroless 系) には bash が無く、
+# /bin/bash 決め打ちの docker exec は
+#   OCI runtime exec failed: ... exec: "/bin/bash": stat /bin/bash: no such file
+# となって接続そのものができない。マウントの中身やシンボリックリンクの
+# 参照先を確かめたいのはむしろそうしたコンテナなので、bash → POSIX sh の順で
+# 実在するシェルを探し、見つかった方に合わせたセッションスクリプトで接続する。
+#
+# 解決結果は「シェルのパス」「種別 (bash / sh)」を次の 2 変数へ入れる。
+# 同じコンテナへ何度も接続するため、探索結果はコンテナ ID をキーに覚えておく。
+INTERACTIVE_SHELL_PATH=""         # 解決したシェルのパス (例: /bin/bash, /bin/sh)
+INTERACTIVE_SHELL_KIND=""         # bash: bash 系 / sh: POSIX sh 系
+declare -A RESOLVED_INTERACTIVE_SHELLS=()   # container_id[:user] → "パス|種別"
+
+# bash 系を先に、POSIX sh 系を後に並べる。前者が見つかれば従来どおりの
+# セッション (配列や shopt を使う簡易 tree) をそのまま使える。
+INTERACTIVE_BASH_CANDIDATES=(/bin/bash /usr/bin/bash /usr/local/bin/bash)
+INTERACTIVE_SH_CANDIDATES=(/bin/sh /usr/bin/sh /bin/ash /busybox/sh /bin/dash)
+
+# コンテナ内で使える対話シェルを探す。見つかれば 0 を返し、上の 2 変数を設定する。
+# $2 を指定すると docker exec -u へ渡す (root 接続でも同じ判定になるようにする)。
+resolve_container_interactive_shell() {
+  local container_id="$1" exec_user="${2:-}" candidate kind cached cache_key
+  local -a exec_args=()
+
+  INTERACTIVE_SHELL_PATH=""
+  INTERACTIVE_SHELL_KIND=""
+  cache_key="${container_id}:${exec_user}"
+  cached="${RESOLVED_INTERACTIVE_SHELLS[$cache_key]:-}"
+  if [ -n "$cached" ]; then
+    INTERACTIVE_SHELL_PATH="${cached%%|*}"
+    INTERACTIVE_SHELL_KIND="${cached##*|}"
+    [ -n "$INTERACTIVE_SHELL_PATH" ] || return 1
+    return 0
+  fi
+
+  for candidate in "${INTERACTIVE_BASH_CANDIDATES[@]}" "${INTERACTIVE_SH_CANDIDATES[@]}"; do
+    case " ${INTERACTIVE_BASH_CANDIDATES[*]} " in
+      *" $candidate "*) kind="bash" ;;
+      *)                kind="sh" ;;
+    esac
+    exec_args=(exec)
+    [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
+    # -c 'exit 0' まで通ったものだけを採用する。実行ビットが無い / 別アーキ等で
+    # 起動できないファイルを、存在するというだけで選ばないための確認。
+    if docker "${exec_args[@]}" "$container_id" "$candidate" -c 'exit 0' >/dev/null 2>&1; then
+      INTERACTIVE_SHELL_PATH="$candidate"
+      INTERACTIVE_SHELL_KIND="$kind"
+      RESOLVED_INTERACTIVE_SHELLS["$cache_key"]="${candidate}|${kind}"
+      return 0
+    fi
+  done
+  RESOLVED_INTERACTIVE_SHELLS["$cache_key"]="|"
+  return 1
+}
+
+# コンテナ内の対話シェルを起動する。素の docker exec ではなく、上のセッション
+# スクリプト経由で起動して tree を使える状態にしてから対話シェルを開始する。
+# bash があれば bash 用、無ければ POSIX sh 用のスクリプトを使う。
 # $2 を指定すると docker exec -u へそのまま渡す (root ユーザでの接続で使う)。
 exec_container_interactive_bash() {
   local container_id="$1" exec_user="${2:-}"
   local -a exec_args=(exec -it)
   [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
-  docker "${exec_args[@]}" "$container_id" /bin/bash -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
+
+  if ! resolve_container_interactive_shell "$container_id" "$exec_user"; then
+    err "コンテナ内に対話できるシェルが見つかりません (探索: ${INTERACTIVE_BASH_CANDIDATES[*]} ${INTERACTIVE_SH_CANDIDATES[*]})。"
+    err "  → シェルを持たないイメージ (distroless など) では docker exec による対話接続はできません。"
+    return 127
+  fi
+
+  if [ "$INTERACTIVE_SHELL_KIND" = "bash" ]; then
+    docker "${exec_args[@]}" "$container_id" \
+      "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
+    return $?
+  fi
+
+  # bash が無いコンテナ。POSIX sh 用のセッションスクリプトへ切り替える。
+  # 使うシェルのパスは引数で渡す ($0 相当の第 1 引数はラベル)。
+  diag "このコンテナには bash がないため、${INTERACTIVE_SHELL_PATH} (POSIX シェル) で接続します。"
+  diag "bash 固有の書き方 (配列、[[ ]]、シェル関数の export など) は使えません。"
+  docker "${exec_args[@]}" "$container_id" \
+    "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_SH_SCRIPT" \
+    build-and-verify-session "$INTERACTIVE_SHELL_PATH"
 }
 
 # 選択された Compose サービスの実行中コンテナへ対話式 bash で接続する。
@@ -10375,10 +10739,10 @@ run_interactive_compose_bash() {
   diag "bash を終了するとサービス操作の選択へ戻ります。コンテナは起動状態を維持します。"
   if ! exec_container_interactive_bash "$container_id" "$exec_user"; then
     if [ -n "$exec_user" ]; then
-      err "Compose サービス '${service_name}' の /bin/bash へ root ユーザで接続できませんでした: ${container_name}"
+      err "Compose サービス '${service_name}' の ${INTERACTIVE_SHELL_PATH:-/bin/bash} へ root ユーザで接続できませんでした: ${container_name}"
       err "  → user namespace の remap や root 実行を禁止する設定では root で接続できません。通常の bash 接続を使ってください。"
     else
-      err "Compose サービス '${service_name}' の /bin/bash へ接続できませんでした: ${container_name}"
+      err "Compose サービス '${service_name}' の ${INTERACTIVE_SHELL_PATH:-/bin/bash} へ接続できませんでした: ${container_name}"
     fi
     return 1
   fi
@@ -12751,6 +13115,464 @@ run_interactive_compose_alb_healthcheck() {
       ;;
   esac
   diag "注意: その場のチェックは ALB の状態機械 (連続回数) には反映しません。"
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
+# ---- 偽装バッチサーバー経由の EFS マウント伝播確認 ----------------------------
+# 偽装バッチサーバーのコンテナ内 CLI を実行する共通経路。
+# ALB ヘルスチェック偽装と同じ考え方だが、こちらは alpine のような軽量イメージでも
+# 動かせるよう CLI を POSIX sh で実装する前提とし、python は要求しない。
+# docker のコマンドラインへ渡すのはサブコマンドと引数だけ (機微情報を載せない)。
+batch_mock_exec() {
+  local container_id="$1"
+  shift
+  docker exec "$container_id" /bin/sh -c '
+    # batch-mock-cli: 偽装バッチサーバーの CLI をコンテナ内で解決して実行する
+    batch_cli="${BATCH_MOCK_CLI:-'"$BATCH_MOCK_CLI_DEFAULT"'}"
+    if [ ! -f "$batch_cli" ]; then
+      printf "偽装バッチサーバーの CLI が見つかりません: %s\n" "$batch_cli" >&2
+      exit 2
+    fi
+    if [ -x "$batch_cli" ]; then
+      exec "$batch_cli" "$@"
+    fi
+    exec /bin/sh "$batch_cli" "$@"
+  ' batch-mock-cli "$@"
+}
+
+# コンテナのマウント一覧を「識別キー<TAB>マウント先<TAB>rw|ro」で出力する。
+# 識別キーは named volume ならボリューム名、bind なら実体パス。同じ EFS を共有して
+# いるかどうかは、このキーが一致するかで判断する (マウント先のパスはコンテナごとに
+# 違い得るため、パスの一致では判断できない)。
+container_mount_entries() {
+  local container_id="$1"
+  docker inspect \
+    -f '{{range .Mounts}}{{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}	{{.Destination}}	{{if .RW}}rw{{else}}ro{{end}}{{"\n"}}{{end}}' \
+    "$container_id" 2>/dev/null | awk 'NF'
+}
+
+# 偽装バッチサーバーが EFS として扱うマウントを「識別キー<TAB>マウント先<TAB>rw|ro」で
+# 列挙する。マウント先は CLI (mounts サブコマンド) が唯一の情報源なので、compose 側で
+# マウント先を変えても build_and_verify.sh を直さずに追従する。
+batch_mock_efs_mount_keys() {
+  local container_id="$1" dest key mount_dest rw
+  local -a dests=()
+
+  mapfile -t dests < <(batch_mock_exec "$container_id" mounts 2>/dev/null | awk 'NF')
+  [ ${#dests[@]} -gt 0 ] || return 1
+  while IFS=$'\t' read -r key mount_dest rw; do
+    [ -n "$key" ] || continue
+    for dest in "${dests[@]}"; do
+      [ "$mount_dest" = "$dest" ] && printf '%s\t%s\t%s\n' "$key" "$mount_dest" "$rw"
+    done
+  done < <(container_mount_entries "$container_id")
+}
+
+# 選択された Compose サービスに「EFS マウント伝播確認」を出すかを決める。
+# 偽装バッチサーバー自身か、偽装バッチサーバーと同じ EFS (同じ識別キーのマウント) を
+# 持つサービスのときだけ出す。対象のサービス名を build_and_verify.sh 側へ固定で持たない
+# ため、compose 側で EFS を共有するサービスを増やせば表示対象も自動で増える。
+compose_service_supports_efs_propagation() {
+  local service_name="$1" batch_container container_id key mount_dest rw batch_key
+  local -a batch_ids=() target_ids=() batch_keys=()
+
+  mapfile -t batch_ids < <(compose_container_ids "$BATCH_MOCK_SERVICE")
+  [ ${#batch_ids[@]} -gt 0 ] || return 1
+  batch_container="${batch_ids[0]}"
+  # 偽装バッチサーバー自身を選んだ場合は、全コンテナへの伝播をまとめて確認できる
+  [ "$service_name" = "$BATCH_MOCK_SERVICE" ] && return 0
+
+  mapfile -t batch_keys < <(batch_mock_efs_mount_keys "$batch_container" | cut -f1)
+  [ ${#batch_keys[@]} -gt 0 ] || return 1
+
+  mapfile -t target_ids < <(compose_container_ids "$service_name")
+  [ ${#target_ids[@]} -gt 0 ] || return 1
+  container_id="${target_ids[0]}"
+  while IFS=$'\t' read -r key mount_dest rw; do
+    for batch_key in "${batch_keys[@]}"; do
+      [ "$key" = "$batch_key" ] && return 0
+    done
+  done < <(container_mount_entries "$container_id")
+  return 1
+}
+
+# 偽装バッチサーバーと同じ EFS をマウントしている実行中コンテナを列挙する。
+# 出力は「サービス名<TAB>コンテナ名<TAB>コンテナ ID<TAB>識別キー<TAB>マウント先<TAB>rw|ro」。
+# 識別キー (ボリューム名) まで持たせるのは、1 コンテナが複数のボリュームを
+# マウントしている場合に、パスをどのマウント先へ読み替えるかを一意に決めるため。
+# 「全コンテナに反映されるか」を見るのが目的なので、選択したサービスだけでなく
+# 同じ compose で起動している全サービスを対象にする。
+efs_propagation_target_containers() {
+  local batch_container="$1" service_name container_id container_name
+  local key mount_dest rw batch_key
+  local -a batch_keys=() services=() container_ids=()
+
+  mapfile -t batch_keys < <(batch_mock_efs_mount_keys "$batch_container" | cut -f1 | awk 'NF && !seen[$0]++')
+  [ ${#batch_keys[@]} -gt 0 ] || return 1
+
+  mapfile -t services < <(compose_started_services)
+  for service_name in ${services[@]+"${services[@]}"}; do
+    [ "$service_name" = "$BATCH_MOCK_SERVICE" ] && continue
+    mapfile -t container_ids < <(compose_container_ids "$service_name")
+    [ ${#container_ids[@]} -gt 0 ] || continue
+    for container_id in "${container_ids[@]}"; do
+      container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+      while IFS=$'\t' read -r key mount_dest rw; do
+        for batch_key in "${batch_keys[@]}"; do
+          [ "$key" = "$batch_key" ] || continue
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$service_name" "$container_name" "$container_id" "$key" "$mount_dest" "$rw"
+        done
+      done < <(container_mount_entries "$container_id")
+    done
+  done
+}
+
+# 対象コンテナから 1 つのパスを「シンボリックリンクをたどって」読む。
+# 出力は type / target / resolved / owner / mode / read / content: の行
+# (stat や readlink が無いコンテナでは、取れない項目を落として続ける)。
+EFS_PROPAGATION_PROBE_SCRIPT='
+probe_path="$1"
+if [ -L "$probe_path" ]; then
+  printf "type=symlink\n"
+  if command -v readlink >/dev/null 2>&1; then
+    printf "target=%s\n" "$(readlink -- "$probe_path" 2>/dev/null)"
+  fi
+elif [ -d "$probe_path" ]; then
+  printf "type=dir\n"
+elif [ -f "$probe_path" ]; then
+  printf "type=file\n"
+else
+  printf "type=missing\n"
+  exit 3
+fi
+# リンク先まで含めた実体を確認する (壊れたシンボリックリンクはここで分かる)。
+if [ ! -e "$probe_path" ]; then
+  printf "resolved=broken\n"
+  exit 4
+fi
+printf "resolved=ok\n"
+if command -v stat >/dev/null 2>&1; then
+  printf "owner=%s\n" "$(stat -L -c "%u:%g" "$probe_path" 2>/dev/null)"
+  printf "mode=%s\n"  "$(stat -L -c "%a" "$probe_path" 2>/dev/null)"
+fi
+if [ -d "$probe_path" ]; then
+  exit 0
+fi
+if [ ! -r "$probe_path" ]; then
+  printf "read=denied\n"
+  exit 5
+fi
+printf "read=ok\n"
+while IFS= read -r probe_line || [ -n "$probe_line" ]; do
+  printf "content:%s\n" "$probe_line"
+done < "$probe_path"
+'
+
+# 対象コンテナで上のプローブを実行する。使うシェルはコンテナごとに解決する
+# (偽装 EFS や各種 mock は alpine で bash を持たないため /bin/bash 決め打ちにしない)。
+efs_propagation_probe() {
+  local container_id="$1" probe_path="$2"
+  local shell_path="/bin/sh"
+
+  if resolve_container_interactive_shell "$container_id"; then
+    shell_path="$INTERACTIVE_SHELL_PATH"
+  fi
+  docker exec "$container_id" "$shell_path" -c \
+    "$EFS_PROPAGATION_PROBE_SCRIPT" efs-propagation-probe "$probe_path" 2>&1
+}
+
+# プローブ出力から key= の値を取り出す (content: 行は対象外)。
+efs_propagation_probe_value() {
+  local output="$1" key="$2"
+  printf '%s\n' "$output" | awk -v k="${key}=" 'index($0, k) == 1 { print substr($0, length(k) + 1); exit }'
+}
+
+# 偽装バッチサーバー側のパスを、対象コンテナのマウント先へ読み替える。
+# 例: 偽装バッチサーバーの /mnt/logs/batch-mock/x.txt は、同じボリュームを
+# /mnt/efs/logs へマウントしているコンテナでは /mnt/efs/logs/batch-mock/x.txt になる。
+# $1: 偽装バッチサーバー側のパス / $2: 対象マウントの識別キー / $3: 対象のマウント先
+# パスが指すボリュームと対象マウントのボリュームが違う場合は 1 を返す
+# (1 コンテナが複数ボリュームを持つとき、同じパスを何度も確認しないため)。
+EFS_PROPAGATION_MOUNT_MAP=()   # "偽装バッチサーバーのマウント先<TAB>識別キー"
+efs_propagation_localize_path() {
+  local probe_path="$1" mount_key="$2" mount_dest="$3" map_entry batch_dest map_key
+
+  for map_entry in ${EFS_PROPAGATION_MOUNT_MAP[@]+"${EFS_PROPAGATION_MOUNT_MAP[@]}"}; do
+    IFS=$'\t' read -r batch_dest map_key <<< "$map_entry"
+    case "$probe_path" in
+      "$batch_dest"/*)
+        [ "$map_key" = "$mount_key" ] || return 1
+        if [ "$batch_dest" = "$mount_dest" ]; then
+          printf '%s' "$probe_path"
+        else
+          printf '%s%s' "${mount_dest%/}" "${probe_path#"$batch_dest"}"
+        fi
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# 1 ラウンド (作成直後 / 書き換え後) の反映状況を全コンテナぶん表示する。
+# 1 つでも反映されていなければ 1 を返す。
+# $1: 見出し, $2: 期待する印, $3 以降: 確認するパス (偽装バッチサーバーが知らせたもの)
+# 対象コンテナ一覧は EFS_PROPAGATION_TARGETS へ入れておく。
+EFS_PROPAGATION_TARGETS=()
+print_efs_propagation_round() {
+  local title="$1" marker="$2"
+  shift 2
+  local -a paths=("$@")
+  local entry service_name container_name container_id mount_key mount_dest rw
+  local probe_path local_path output probe_type probe_target probe_owner probe_mode probe_resolved
+  local status=0 checked=0
+
+  diag ""
+  diag "[${title}]"
+  diag "期待する印 : ${marker}"
+  for entry in ${EFS_PROPAGATION_TARGETS[@]+"${EFS_PROPAGATION_TARGETS[@]}"}; do
+    IFS=$'\t' read -r service_name container_name container_id mount_key mount_dest rw <<< "$entry"
+    for probe_path in ${paths[@]+"${paths[@]}"}; do
+      local_path="$(efs_propagation_localize_path "$probe_path" "$mount_key" "$mount_dest")" || continue
+      checked=$(( checked + 1 ))
+      output="$(efs_propagation_probe "$container_id" "$local_path")"
+      probe_type="$(efs_propagation_probe_value "$output" type)"
+      probe_target="$(efs_propagation_probe_value "$output" target)"
+      probe_owner="$(efs_propagation_probe_value "$output" owner)"
+      probe_mode="$(efs_propagation_probe_value "$output" mode)"
+      probe_resolved="$(efs_propagation_probe_value "$output" resolved)"
+      if [ "$probe_type" = "missing" ]; then
+        diag "  [NG] ${service_name} (${container_name}, ${rw}) : ${local_path} が見えません"
+        status=1
+        continue
+      fi
+      if [ "$probe_resolved" = "broken" ]; then
+        diag "  [NG] ${service_name} (${container_name}, ${rw}) : ${local_path} -> ${probe_target:-(参照先不明)} のリンク先を解決できません"
+        diag "       → シンボリックリンクを絶対パスで張っていると、マウント先が違うコンテナでは解決できません。"
+        status=1
+        continue
+      fi
+      if printf '%s\n' "$output" | grep -Fq "content:${marker}"; then
+        if [ "$probe_type" = "symlink" ]; then
+          diag "  [OK] ${service_name} (${container_name}, ${rw}) : ${local_path} -> ${probe_target:-(参照先不明)} 経由で反映 (owner=${probe_owner:-不明} mode=${probe_mode:-不明})"
+        else
+          diag "  [OK] ${service_name} (${container_name}, ${rw}) : ${local_path} に反映 (owner=${probe_owner:-不明} mode=${probe_mode:-不明})"
+        fi
+        continue
+      fi
+      diag "  [NG] ${service_name} (${container_name}, ${rw}) : ${local_path} を読めましたが印が見つかりません"
+      diag "       (プローブ出力: $(printf '%s' "$output" | tr '\n' ' ' | cut -c1-160))"
+      status=1
+    done
+  done
+  if [ "$checked" -eq 0 ]; then
+    diag "  確認できる対象コンテナがありませんでした。"
+    return 1
+  fi
+  return "$status"
+}
+
+# 後始末の確認。全コンテナで、指定した全パスが見えなくなっていれば 0 を返す。
+# 「消したのにまだ読める」= EFS ではなくコンテナごとの複製になっている、を検知する。
+check_efs_propagation_absent() {
+  local -a paths=("$@")
+  local entry service_name container_name container_id mount_key mount_dest rw
+  local probe_path local_path output probe_type status=0
+
+  for entry in ${EFS_PROPAGATION_TARGETS[@]+"${EFS_PROPAGATION_TARGETS[@]}"}; do
+    IFS=$'\t' read -r service_name container_name container_id mount_key mount_dest rw <<< "$entry"
+    for probe_path in ${paths[@]+"${paths[@]}"}; do
+      local_path="$(efs_propagation_localize_path "$probe_path" "$mount_key" "$mount_dest")" || continue
+      output="$(efs_propagation_probe "$container_id" "$local_path")"
+      probe_type="$(efs_propagation_probe_value "$output" type)"
+      [ "$probe_type" = "missing" ] && continue
+      diag "  [NG] ${service_name} (${container_name}, ${rw}) : 削除したはずの ${local_path} がまだ見えます"
+      status=1
+    done
+  done
+  return "$status"
+}
+
+# 偽装バッチサーバー自身の状態 (起動状態・healthcheck・実行 uid/gid・マウント) を表示する。
+# ここが健全でない、あるいは uid/gid が偽装 EFS の初期化値と違っていると、
+# 以降の書き込みと伝播の判定は当てにならない。
+print_batch_mock_service_state() {
+  local container_id="$1" container_name="$2"
+  local state_line="" state_status="" health_status="" failing_streak=""
+  local restart_count="" started_at="" run_uid_gid="" key mount_dest rw
+
+  if state_line="$(
+    docker inspect -f \
+      '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{else}}(healthcheck なし)|-{{end}}|{{.RestartCount}}|{{.State.StartedAt}}' \
+      "$container_id" 2>/dev/null
+  )"; then
+    state_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    health_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    failing_streak="${state_line%%|*}"; state_line="${state_line#*|}"
+    restart_count="${state_line%%|*}"; started_at="${state_line#*|}"
+  fi
+  run_uid_gid="$(docker exec "$container_id" /bin/sh -c 'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
+
+  diag ""
+  diag "[偽装バッチサーバーの状態 (ここが健全でないと伝播の判定も当てにならない)]"
+  diag "コンテナ           : ${container_name}"
+  diag "起動状態           : ${state_status:-取得できず}"
+  diag "自身の healthcheck : ${health_status:-取得できず} (連続失敗 ${failing_streak:--})"
+  diag "再起動回数         : ${restart_count:-取得できず}"
+  if [ -n "$started_at" ]; then
+    diag "起動時刻           : $(to_jst_display_time "$started_at")"
+  fi
+  diag "実行 uid:gid       : ${run_uid_gid:-取得できず} (期待値: ${BATCH_MOCK_EFS_UID_GID})"
+  while IFS=$'\t' read -r key mount_dest rw; do
+    diag "EFS マウント       : ${mount_dest} (${rw}, ボリューム=${key})"
+  done < <(batch_mock_efs_mount_keys "$container_id")
+
+  if [ -n "$run_uid_gid" ] && [ "$run_uid_gid" != "$BATCH_MOCK_EFS_UID_GID" ]; then
+    warn "偽装バッチサーバーの uid:gid が偽装 EFS の初期化値と異なります (${run_uid_gid} != ${BATCH_MOCK_EFS_UID_GID})。"
+    warn "  → 書き込めても他コンテナから更新できないファイルになり得ます。compose の user: を確認してください。"
+  fi
+  if [ "$state_status" != "running" ] || [ "$health_status" = "unhealthy" ]; then
+    warn "偽装バッチサーバーが健全ではありません。docker compose logs ${BATCH_MOCK_SERVICE} を確認してください。"
+  fi
+}
+
+# 偽装バッチサーバー経由で EFS マウントの伝播を確認する。
+# 手順は 4 段で、いずれも「偽装バッチサーバーが書き、全コンテナが読む」形にする:
+#   (1) 偽装バッチサーバーの状態と、同じ EFS を持つコンテナの洗い出し
+#   (2) 作成    … ファイル・ディレクトリ・シンボリックリンクを作り、全コンテナから
+#                  シンボリックリンク経由で読めることを確認する
+#   (3) 書き換え… 同じファイルへ追記し、更新が全コンテナへ伝わることを確認する
+#                  (複製ではなく本当に共有されているかはここで分かる)
+#   (4) 後始末  … 作ったものを消し、全コンテナから消えたことを確認する
+run_interactive_compose_efs_propagation() {
+  local service_name="$1" container_id container_name token marker append_marker
+  local write_output="" append_output="" exec_status=0 overall=0 line probe_path
+  local key mount_dest rw entry_service entry_cid entry_dest entry_rw
+  local -a container_ids=() read_paths=()
+
+  mapfile -t container_ids < <(compose_container_ids "$BATCH_MOCK_SERVICE")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "偽装バッチサーバーの Compose サービス '${BATCH_MOCK_SERVICE}' が実行中ではありません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${BATCH_MOCK_SERVICE}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  diag ""
+  diag "════════════ EFS マウント伝播確認 (偽装バッチサーバー経由) ════════════"
+  diag "確認対象           : ${service_name}"
+  diag "偽装バッチサーバー : ${BATCH_MOCK_SERVICE}"
+  diag "位置づけ           : 実環境で同じ EFS をマウントするバッチサーバーの代わりに、偽装バッチ"
+  diag "                     サーバーからファイルとシンボリックリンクを作り・書き換え・消して、"
+  diag "                     同じ EFS を持つ全コンテナからどう見えるかを突き合わせる。"
+  diag "                     マウントできていても uid/gid・setgid・:ro・リンクの張り方の違いで"
+  diag "                     「片方からしか見えない」状態になり得るため、全コンテナで確認する。"
+
+  print_batch_mock_service_state "$container_id" "$container_name"
+
+  # 偽装バッチサーバーのマウント先 → 識別キーの対応表 (パスの読み替えに使う)。
+  EFS_PROPAGATION_MOUNT_MAP=()
+  while IFS=$'\t' read -r key mount_dest rw; do
+    EFS_PROPAGATION_MOUNT_MAP+=("${mount_dest}"$'\t'"${key}")
+  done < <(batch_mock_efs_mount_keys "$container_id")
+  if [ ${#EFS_PROPAGATION_MOUNT_MAP[@]} -eq 0 ]; then
+    err "偽装バッチサーバーから EFS のマウント先を取得できませんでした。"
+    diag "docker compose logs ${BATCH_MOCK_SERVICE} と、CLI (${BATCH_MOCK_CLI_DEFAULT}) を確認してください。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+
+  EFS_PROPAGATION_TARGETS=()
+  mapfile -t EFS_PROPAGATION_TARGETS < <(efs_propagation_target_containers "$container_id")
+  diag ""
+  diag "[同じ EFS をマウントしている実行中コンテナ]"
+  if [ ${#EFS_PROPAGATION_TARGETS[@]} -eq 0 ]; then
+    diag "  (ありません)"
+    warn "偽装バッチサーバー以外に同じ EFS をマウントしているコンテナがないため、伝播は確認できません。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  for line in "${EFS_PROPAGATION_TARGETS[@]}"; do
+    IFS=$'\t' read -r entry_service _ entry_cid _ entry_dest entry_rw <<< "$line"
+    diag "  - ${entry_service} : ${entry_dest} (${entry_rw})"
+    # プローブはコマンド置換 (サブシェル) の中で走り、そこで解決したシェルは
+    # 呼び出し元へ残らない。ここで先に解決してキャッシュへ載せ、確認のたびに
+    # bash → sh の探索を繰り返さないようにする。
+    resolve_container_interactive_shell "$entry_cid" >/dev/null 2>&1 || true
+  done
+
+  # 印は実行ごとに一意にする (前回の残りを読んで OK と誤判定しないため)。
+  token="bv-$(date '+%Y%m%d-%H%M%S')-$$"
+  marker="efs-propagation ${token} created"
+  append_marker="efs-propagation ${token} updated"
+
+  diag ""
+  diag "[偽装バッチサーバーからの書き込み]"
+  write_output="$(batch_mock_exec "$container_id" write "$token" "$marker" 2>&1)" || exec_status=$?
+  while IFS= read -r line; do
+    [ -n "$line" ] && diag "  ${line}"
+  done <<< "$write_output"
+  if [ "$exec_status" -ne 0 ]; then
+    err "偽装バッチサーバーが EFS へ書き込めませんでした (exit=${exec_status})。"
+    diag "  → uid:gid (${BATCH_MOCK_EFS_UID_GID}) と、マウントポイントの所有者・mode 2775 (setgid) を確認してください。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  # CLI が「他コンテナから読むべきパス」として知らせた行だけを確認対象にする。
+  mapfile -t read_paths < <(printf '%s\n' "$write_output" | awk 'index($0, "read=") == 1 { print substr($0, 6) }' | awk 'NF')
+  if [ ${#read_paths[@]} -eq 0 ]; then
+    err "偽装バッチサーバーの CLI から確認対象のパス (read=...) を取得できませんでした。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+
+  print_efs_propagation_round "作成直後の反映 (シンボリックリンク経由で読む)" "$marker" \
+    ${read_paths[@]+"${read_paths[@]}"} || overall=1
+
+  diag ""
+  diag "[偽装バッチサーバーからの書き換え (シンボリックリンク経由で追記)]"
+  exec_status=0
+  append_output="$(batch_mock_exec "$container_id" append "$token" "$append_marker" 2>&1)" || exec_status=$?
+  while IFS= read -r line; do
+    [ -n "$line" ] && diag "  ${line}"
+  done <<< "$append_output"
+  if [ "$exec_status" -ne 0 ]; then
+    err "偽装バッチサーバーが EFS 上のファイルを書き換えられませんでした (exit=${exec_status})。"
+    overall=1
+  else
+    print_efs_propagation_round "書き換え後の反映 (更新が全コンテナへ伝わるか)" "$append_marker" \
+      ${read_paths[@]+"${read_paths[@]}"} || overall=1
+  fi
+
+  diag ""
+  diag "[後始末 (偽装バッチサーバーから削除)]"
+  if batch_mock_exec "$container_id" cleanup "$token" >/dev/null 2>&1; then
+    for probe_path in "${read_paths[@]}"; do
+      diag "  削除しました: ${probe_path}"
+    done
+    if check_efs_propagation_absent ${read_paths[@]+"${read_paths[@]}"}; then
+      diag "  全コンテナから消えていることを確認しました。"
+    else
+      warn "削除したはずのファイルがまだ見えています。EFS ではなくコンテナごとの複製になっている可能性があります。"
+      overall=1
+    fi
+  else
+    warn "偽装バッチサーバーでの後始末に失敗しました。${token} を含むファイルが EFS 上に残っている可能性があります。"
+  fi
+
+  diag ""
+  if [ "$overall" -eq 0 ]; then
+    diag "EFS マウント伝播判定 : OK (作成・書き換え・削除のすべてが全コンテナへ反映)"
+  else
+    diag "EFS マウント伝播判定 : NG (上の [NG] 行を確認してください)"
+    diag "よくある原因: マウント忘れ / :ro の付け違い / uid:gid と mode 2775 (setgid) の不一致 /"
+    diag "              シンボリックリンクを絶対パスで張っており、コンテナごとにマウント先が違う"
+  fi
   diag "════════════════════════════════════════════════════════"
   return 0
 }
@@ -18292,7 +19114,7 @@ run_interactive_compose_service_actions() {
   local service_name="$1" action helper_kind="" max_action=3
   local mysql_action=0 observability_action=0 cert_check_action=0
   local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
-  local jboss_module_action=0 root_bash_action=0
+  local jboss_module_action=0 root_bash_action=0 efs_propagation_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -18325,6 +19147,11 @@ run_interactive_compose_service_actions() {
   if compose_service_supports_jboss_module_list "$service_name"; then
     max_action=$(( max_action + 1 ))
     jboss_module_action="$max_action"
+  fi
+  # EFS マウント伝播確認 (偽装バッチサーバー経由) も同様に末尾へ採番する。
+  if compose_service_supports_efs_propagation "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    efs_propagation_action="$max_action"
   fi
   # root ユーザでの bash 接続はどのサービスでも選べるが、他の追加操作と同じく
   # 末尾へ採番して、既存操作の番号を変えないようにする。
@@ -18361,6 +19188,9 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$jboss_module_action" -gt 0 ]; then
       diag "  ${jboss_module_action}) JBoss モジュール一覧 (jboss-cli.sh -c の module-info で認識済みのモジュール名 / jar を出力)"
+    fi
+    if [ "$efs_propagation_action" -gt 0 ]; then
+      diag "  ${efs_propagation_action}) EFS マウント伝播確認 (偽装バッチサーバーが書いた内容とシンボリックリンクが全コンテナへ反映されるか)"
     fi
     diag "  ${root_bash_action}) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
     diag "  0) Compose サービスの選択へ戻る"
@@ -18435,6 +19265,11 @@ run_interactive_compose_service_actions() {
         elif [ "$jboss_module_action" -gt 0 ] && [ "$action" = "$jboss_module_action" ]; then
           if ! run_interactive_compose_jboss_module_list "$service_name"; then
             warn "JBoss モジュール一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$efs_propagation_action" -gt 0 ] && [ "$action" = "$efs_propagation_action" ]; then
+          if ! run_interactive_compose_efs_propagation "$service_name"; then
+            warn "EFS マウント伝播確認に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
         elif [ "$root_bash_action" -gt 0 ] && [ "$action" = "$root_bash_action" ]; then
@@ -18512,13 +19347,13 @@ run_keep_container_interaction() {
   if [ "$DRY_RUN" = "true" ]; then
     case "$KEEP_CONTAINER_MODE" in
       bash)
-        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します (tree コマンドを使える状態にしてから開始します)。"
+        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します (tree コマンドを使える状態にしてから開始します。bash が無いコンテナは /bin/sh へ切り替えます)。"
         ;;
       http)
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;
@@ -18534,7 +19369,7 @@ run_keep_container_interaction() {
       diag "ディレクトリ構造を確認できるよう、tree コマンドを使える状態にしてから開始します。"
       diag "bash を終了してもコンテナは起動状態のまま残ります。"
       if ! exec_container_interactive_bash "$INTERACTION_CONTAINER_ID"; then
-        err "検証対象コンテナの /bin/bash へ接続できませんでした: ${INTERACTION_CONTAINER_NAME}"
+        err "検証対象コンテナの ${INTERACTIVE_SHELL_PATH:-/bin/bash} へ接続できませんでした: ${INTERACTION_CONTAINER_NAME}"
         return 1
       fi
       log "コンテナの bash セッションを終了しました。コンテナは起動状態を維持します。"

@@ -146,11 +146,12 @@
 
 | オプション | 値 | 既定 | 説明 |
 | --- | --- | --- | --- |
-| `--keep-container-mode MODE` | `bash` / `http` / `logs` | (なし) | 起動確認後の対話操作。`--verify-startup` と `--keep-container` を暗黙に有効化 |
+| `--keep-container-mode MODE` | `bash` / `http` / `logs` | (なし) | 起動確認後の対話操作。`--verify-startup` と `--keep-container` を暗黙に有効化。`bash` 接続先に `/bin/bash` が無い場合は `/bin/sh` (POSIX シェル) へ自動で切り替える |
 | `--jboss-context-root ROOT` | コンテキストルートのパス | (ログから検出) | `http` モード専用。コンテキストルート (URL 全体は指定不可) |
 | `--jboss-http-port PORT` | 1〜65535 | (ログから検出。既定 8080) | `http` モード専用。コンテナ側の HTTP ポート |
 | `--exit-on-deploy-error` | フラグ | `false` | デプロイエラーを検出しても調査用の対話操作へ入らず、従来どおり終了する |
 | `--keep-container-after-interaction` | フラグ | `false` | 対話操作をすべて終えても完全クリーンアップを行わず、従来どおりコンテナを残す |
+| (操作) EFS マウント伝播確認 | — | — | `logs` モードの操作。偽装バッチサーバー (`batch-mock`) から EFS へファイル・相対シンボリックリンクを作成 → 書き換え → 削除し、同じ EFS をマウントする全コンテナへ反映されるかを確認する。偽装サービス名は `BATCH_MOCK_SERVICE`、期待する `uid:gid` は `BATCH_MOCK_EFS_UID_GID` (既定 `6301:6302`) |
 | `--remove-volumes` | フラグ | `false` | この実行が行うすべての `compose down` に `--volumes` を付ける |
 | `--keep-volumes` | フラグ | `false` | 対話操作の終了後の後始末でもボリュームを削除しない (従来の動作) |
 | `--usage-check-script PATH` | ファイルパス | (自動解決) | 完全クリアに使う `docker-usage-check.sh` のパス |
