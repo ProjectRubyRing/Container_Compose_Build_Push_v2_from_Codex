@@ -840,6 +840,24 @@ JBOSS_MODULE_LIST_TEXT_SET="false"    # 出力先が明示指定されたか
 JBOSS_MODULE_LIST_TEXT_ENABLED="true" # false (--no-jboss-module-list-text): 出力しない
 JBOSS_MODULE_LIST_TEXT_OUTPUT=""      # 直近に出力したテキストのパス
 
+# ---- トラストストア一覧 (JBoss EAP 上の Java アプリで有効なもの) --------------
+# 証明書チェックが「今つながるか」を見るのに対し、こちらは「何を信頼して
+# いるのか」を棚卸しする。-Djavax.net.ssl.trustStore の指定があれば Java アプリは
+# そのストア 1 つだけを使い、指定が無ければ JDK 同梱の cacerts が使われる。
+# Elytron の trust-manager は ssl-context を指定した通信でだけ効く。どれが
+# 効いているのかを取り違えたまま keytool -importcert しても証明書は届かず、
+# 「入れたのにつながらない」の原因になる。そこで、検出したトラストストアごとに
+# 有効性まで判定し、登録証明書のファイルフルパス・種別・ドメイン URL を並べ、
+# カスタムとして追加された証明書を強調して示す。さらに、追加された証明書の
+# ドメイン情報から接続確認用の curl コマンドを組み立てて出す。
+# 画面は流れてしまい、証明書の棚卸し結果は前回のイメージとの突き合わせに
+# 使いたくなるため、同じ内容をテキストへも残す。
+# 出力先は --truststore-inventory-text > --report-dir 配下 > 一時ディレクトリ の順。
+TRUSTSTORE_INVENTORY_TEXT=""             # テキストの出力先。空なら自動命名する
+TRUSTSTORE_INVENTORY_TEXT_SET="false"    # 出力先が明示指定されたか
+TRUSTSTORE_INVENTORY_TEXT_ENABLED="true" # false (--no-truststore-inventory-text): 出力しない
+TRUSTSTORE_INVENTORY_TEXT_OUTPUT=""      # 直近に出力したテキストのパス
+
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
 # 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
@@ -1698,6 +1716,15 @@ JBoss マスターパスワードの伝搬検証:
                                     トラストアンカーにできるかまで表示し、
                                     同じ内容をテキストファイルへも出力する
                                     (--cert-check-text / --no-cert-check-text)。
+                                    同じコンテナでは「トラストストア一覧」も
+                                    選択でき、JBoss EAP 上の Java アプリから
+                                    有効になっているトラストストアのフルパスと、
+                                    登録されている証明書の種別・ドメイン URL を
+                                    一覧化する。カスタムとして追加された証明書は
+                                    ★ 付きで強調し、そのドメインから推測した
+                                    接続確認用の curl コマンドまで組み立てて
+                                    表示・出力する (--truststore-inventory-text /
+                                    --no-truststore-inventory-text)。
                                     ALB ヘルスチェック偽装サービス
                                     (alb-healthcheck) が起動していれば、その
                                     ターゲット (frontend / backend 等) と偽装
@@ -1872,6 +1899,22 @@ JBoss マスターパスワードの伝搬検証:
                            確認したときは連番を足し、前回の結果を上書きしない
   --no-jboss-module-list-text
                            JBoss モジュール一覧のテキスト出力を行わない
+                           (画面表示だけにする)
+  --truststore-inventory-text FILE
+                           トラストストア一覧 (--keep-container-mode logs の操作)
+                           の結果を FILE へ出力する。JBoss EAP 上の Java アプリから
+                           有効になっているトラストストアのファイルフルパスと、
+                           そこへ登録されている証明書の種別・ドメイン URL、
+                           カスタムとして追加された証明書の強調表示、追加された
+                           証明書のドメインから組み立てた接続確認用 curl コマンドを、
+                           画面と同じ内容で残す。
+                           未指定時は --report-dir 配下の
+                           DIR/build_and_verify_<日時>_truststore_inventory_<サービス名>.txt、
+                           --report-dir も無い場合は一時ディレクトリへ出力し、
+                           そのパスを画面へ表示する。同じサービスを繰り返し
+                           確認したときは連番を足し、前回の結果を上書きしない
+  --no-truststore-inventory-text
+                           トラストストア一覧のテキスト出力を行わない
                            (画面表示だけにする)
 
 WAR デプロイ時の Java 例外解析:
@@ -2332,6 +2375,10 @@ while [ $# -gt 0 ]; do
                            need_value "$1" $#; JBOSS_MODULE_LIST_TEXT="$2"; JBOSS_MODULE_LIST_TEXT_SET="true"; shift 2 ;;
     --no-jboss-module-list-text)
                            JBOSS_MODULE_LIST_TEXT_ENABLED="false"; shift ;;
+    --truststore-inventory-text)
+                           need_value "$1" $#; TRUSTSTORE_INVENTORY_TEXT="$2"; TRUSTSTORE_INVENTORY_TEXT_SET="true"; shift 2 ;;
+    --no-truststore-inventory-text)
+                           TRUSTSTORE_INVENTORY_TEXT_ENABLED="false"; shift ;;
     --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
     --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
     --deploy-exception-report) DEPLOY_EXCEPTION_REPORT="true"; shift ;;
@@ -2518,6 +2565,16 @@ if [ "$JBOSS_MODULE_LIST_TEXT_SET" = "true" ]; then
   fi
   if [ "$JBOSS_MODULE_LIST_TEXT_ENABLED" != "true" ]; then
     err "--jboss-module-list-text と --no-jboss-module-list-text は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$TRUSTSTORE_INVENTORY_TEXT_SET" = "true" ]; then
+  if [ -z "$TRUSTSTORE_INVENTORY_TEXT" ] || [ "$TRUSTSTORE_INVENTORY_TEXT" = "-" ]; then
+    err "--truststore-inventory-text にはファイルパスを指定してください: $TRUSTSTORE_INVENTORY_TEXT"
+    exit 2
+  fi
+  if [ "$TRUSTSTORE_INVENTORY_TEXT_ENABLED" != "true" ]; then
+    err "--truststore-inventory-text と --no-truststore-inventory-text は同時に指定できません。"
     exit 2
   fi
 fi
@@ -12477,6 +12534,1172 @@ CERT_CHECK_SCRIPT
   return 0
 }
 
+# ---- トラストストア一覧 (JBoss EAP 上の Java アプリで有効なもの) --------------
+# 対象サービスの判定は証明書チェックと同じ compose_service_supports_cert_check を
+# 使う。「トラストストアと HTTPS 接続先を持つ AP コンテナ」でだけ意味のある操作で、
+# 判定条件を二重に持つと片方だけ表示される食い違いが起きるため。
+
+# トラストストア一覧テキストの出力先を決める。
+#   --truststore-inventory-text の明示指定 > --report-dir 配下 > 一時ディレクトリ
+# 対話中は同じサービスを何度でも確認できるため、既存ファイルがあれば連番を足し、
+# 直前の結果を上書きしない (証明書を入れ替えながらの比較ができるようにする)。
+resolve_truststore_inventory_path() {
+  local service_name="$1"
+  local safe_name base dir_part base_name prefix extension candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ "$TRUSTSTORE_INVENTORY_TEXT_SET" = "true" ]; then
+    base="$TRUSTSTORE_INVENTORY_TEXT"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_truststore_inventory_${safe_name}.txt"
+  else
+    # 出力先の指定が無くても、証明書の棚卸し結果は後から突き合わせたくなる情報な
+    # ので一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_truststore_inventory_${safe_name}.txt"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  base_name="$(basename -- "$base")"
+  case "$base_name" in
+    ?*.*) prefix="${base_name%.*}"; extension=".${base_name##*.}" ;;
+    *)    prefix="$base_name";      extension="" ;;
+  esac
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 画面へ出したものと同じ内容を、どの構成に対する結果かが分かる見出しを付けて残す。
+# トラストストア・証明書・接続先のパスを含むため、他ユーザーからは読めない権限で作る。
+write_truststore_inventory_text() {
+  local path="$1" service_name="$2" container_name="$3" capture_file="$4" verdict="$5"
+  local dir_path
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "トラストストア一覧の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "トラストストア一覧のテキストを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf 'トラストストア一覧 (build_and_verify.sh)\n'
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf 'Compose サービス : %s\n' "$service_name"
+    printf 'コンテナ         : %s\n' "$container_name"
+    printf 'compose ファイル : %s\n' "$COMPOSE_FILE"
+    printf '判定             : %s\n' "$verdict"
+    printf '取得方法         : 起動中 JVM の -Djavax.net.ssl.trustStore、JDK 同梱の\n'
+    printf '                   cacerts、standalone.xml の Elytron key-store、\n'
+    printf '                   standalone.conf の JAVA_OPTS、*TRUSTSTORE* 環境変数を\n'
+    printf '                   コンテナ内から検出し、keytool -list -rfc で読み出した\n'
+    printf '                   証明書を openssl で解析する\n'
+    printf '記載内容         : 0. 検出したトラストストアと有効性 /\n'
+    printf '                   1-N. 各ストアの登録証明書 (フルパス / 種別 / ドメイン URL) /\n'
+    printf '                   2. カスタムとして追加された証明書 /\n'
+    printf '                   3. ドメインから組み立てた接続確認コマンド / 4. TSV\n'
+    printf '取り扱い         : 接続先・トラストストア・証明書の情報を含みます。\n'
+    printf '                   共有・保存の際は取り扱いに注意してください。\n'
+    printf '===================================================================\n'
+    redact_healthcheck_text < "$capture_file"
+  } >> "$path" 2>/dev/null || {
+    warn "トラストストア一覧のテキストを出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
+# コンテナ内で有効なトラストストアと登録証明書を一覧化し、画面とテキストへ出す。
+# 追加のパラメータ入力は不要 (ストア・パスワード・接続先はすべてコンテナ内から
+# 検出する)。パスワードはコンテナ内でだけ解決し、docker exec のコマンドライン
+# (ホストのプロセス引数) にも出力にも一切載せない。
+run_interactive_compose_truststore_inventory() {
+  local service_name="$1" container_id container_name inventory_script
+  local capture_file="" exec_status=0 verdict_text="" text_path=""
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  inventory_script="$(cat <<'TRUSTSTORE_INVENTORY_SCRIPT'
+set -u
+# truststore-inventory-report: JBoss EAP 上の Java アプリから有効になっている
+# トラストストアと、そこに登録されている証明書を一覧化する。
+#   $1 以降 = JBOSS_HOME の候補 (ホスト側の既定候補)
+#
+# 「トラストストアがコンテナに置いてある」ことと「JBoss EAP 上の Java アプリの
+# HTTPS 通信で実際に使われる」ことは別物で、-Djavax.net.ssl.trustStore の指定が
+# あればそれ 1 つだけが使われ、無ければ JDK 同梱の cacerts が使われる。
+# Elytron の trust-manager は ssl-context を明示した通信でのみ効く。
+# そのため、検出したストアごとに「有効性」まで判定して並べる。
+#   1. JBoss EAP を動かしている JVM の -Djavax.net.ssl.trustStore
+#      (argv に無ければ JAVA_TOOL_OPTIONS / JAVA_OPTS / JDK_JAVA_OPTIONS の environ)
+#   2. 1 が無い場合に使われる JDK 同梱の cacerts
+#   3. standalone.xml の Elytron key-store のうち trust-manager が参照するもの
+#   4. standalone.conf の JAVA_OPTS にある指定 (次回起動時に有効)
+#   5. *TRUSTSTORE* 環境変数 (アプリが明示的に読む実装のときだけ有効)
+#
+# 出力するセクション
+#   0.   検出したトラストストアと有効性
+#   1-N. 各トラストストアの登録証明書 (フルパス / 種別 / ドメイン URL / カスタム)
+#   2.   カスタムとして追加された証明書だけを抜き出した強調一覧
+#   3.   追加された証明書のドメイン情報から組み立てた接続確認コマンド
+#   4.   TSV (ストア / 別名 / 種別 / カスタム / ドメイン / SHA-256 / 有効期限 / 有効性)
+#        1-N. は有効なストアのみ全件、参考のストアはカスタム証明書だけを出すが、
+#        TSV には参考のストアの標準 CA も含めた全件を残す。
+# 終了コード: 0 = 一覧化できた / 1 = 読み取れたストアが無い / 2 = 実行不能
+
+TI_TAB="$(printf '\t')"
+TI_MAX_STORES=8
+TI_MAX_CERTS=500
+TI_CUSTOM_TOTAL=0
+TI_STORE_READ=0
+TI_CERT_TOTAL=0
+
+ti_section() { printf '\n=== %s ===\n' "$1"; }
+ti_info()    { printf '     %s\n' "$1"; }
+ti_star()    { printf '  ★ %s\n' "$1"; }
+ti_plain()   { printf '  %s\n' "$1"; }
+ti_cmd()     { printf '       %s\n' "$1"; }
+
+TI_KEYTOOL=""
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/keytool" ]; then
+  # AP サーバを動かしている JVM の keytool を優先する。PATH 上の keytool が
+  # 古い Java だと PKCS12 のトラストストアを読めないことがあるため。
+  TI_KEYTOOL="${JAVA_HOME}/bin/keytool"
+elif command -v keytool >/dev/null 2>&1; then
+  TI_KEYTOOL="$(command -v keytool)"
+fi
+if [ -z "$TI_KEYTOOL" ]; then
+  printf 'keytool がコンテナ内に見つからないためトラストストア一覧を作成できません。\n'
+  exit 2
+fi
+
+TI_OPENSSL=''
+if command -v openssl >/dev/null 2>&1; then
+  TI_OPENSSL="$(command -v openssl)"
+fi
+
+umask 077
+if ! TI_DIR="$(mktemp -d 2>/dev/null)"; then
+  printf 'トラストストア一覧用の一時ディレクトリを作成できません。\n'
+  exit 2
+fi
+ti_cleanup() { rm -rf -- "$TI_DIR"; }
+trap ti_cleanup EXIT HUP INT TERM
+
+# 環境変数はパスワードを含み得るため、ファイルへは書き出さずシェル変数だけで扱う。
+TI_ENV="$(env 2>/dev/null || true)"
+
+# 値のうち最初の空白・引用符より前だけを取り出す (standalone.conf の
+# JAVA_OPTS="... -Dxxx=/path" のような書き方から実パスだけを拾うため)。
+ti_clean_value() { sed 's/[[:space:]].*$//' | cut -d'"' -f1 | cut -d"'" -f1; }
+
+# 標準入力のトークン列から -D<名前>= の値を 1 つ取り出す。
+# `sh -c "java -D..."` のように 1 トークンへ複数の -D が詰まっている場合があるため、
+# 行頭固定にはせずマーカー以降を取り、最初の空白で切る。
+ti_scan_dvalue() {
+  sed -n "s/.*-D$1=//p" | ti_clean_value | head -n 1
+}
+
+ti_realpath() {
+  if command -v readlink >/dev/null 2>&1 && readlink -f "$1" >/dev/null 2>&1; then
+    readlink -f "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# TAB 区切りの文字列から n 列目を取り出す (ソースへリテラルのタブを書かずに済ませる)。
+ti_field() { printf '%s\n' "$1" | cut -f"$2"; }
+
+ti_count_lines() {
+  ti_cl_n="$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')"
+  case "${ti_cl_n:-}" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$ti_cl_n" ;;
+  esac
+}
+
+# ---- JBOSS_HOME と JBoss EAP の JVM を特定する ------------------------------
+TI_JBOSS_HOME=''
+for ti_cand in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+  [ -n "$ti_cand" ] || continue
+  if [ -f "$ti_cand/bin/standalone.sh" ] || [ -d "$ti_cand/modules" ]; then
+    TI_JBOSS_HOME="$ti_cand"
+    break
+  fi
+done
+
+# トラストストアを決めるのは「JBoss EAP を動かしている JVM」なので、
+# jboss-modules.jar / org.jboss.as / -Djboss.home.dir を持つプロセスを先に探す。
+# 見つからない場合だけ、トラストストアを指定した任意の Java プロセスへ落とす。
+TI_JVM_PID=''
+TI_JVM_ARGS=''
+TI_JVM_SOURCE=''
+TI_JVM_IS_JBOSS='no'
+ti_collect_jvm_args() {  # $1=/proc/<pid>
+  ti_cja_args="$(tr '\0' '\n' < "$1/cmdline" 2>/dev/null || true)"
+  if [ -r "$1/environ" ]; then
+    ti_cja_env="$(tr '\0' '\n' < "$1/environ" 2>/dev/null \
+      | sed -n -e 's/^JAVA_TOOL_OPTIONS=//p' -e 's/^JAVA_OPTS=//p' \
+               -e 's/^JDK_JAVA_OPTIONS=//p' \
+      | tr ' ' '\n' || true)"
+    if [ -n "$ti_cja_env" ]; then
+      ti_cja_args="$(printf '%s\n%s\n' "$ti_cja_args" "$ti_cja_env")"
+    fi
+  fi
+  printf '%s\n' "$ti_cja_args"
+}
+for ti_proc in /proc/[0-9]*; do
+  [ -r "$ti_proc/cmdline" ] || continue
+  ti_args="$(tr '\0' '\n' < "$ti_proc/cmdline" 2>/dev/null || true)"
+  case "$ti_args" in
+    *jboss-modules.jar*|*org.jboss.as*|*-Djboss.home.dir=*) ;;
+    *) continue ;;
+  esac
+  TI_JVM_PID="${ti_proc#/proc/}"
+  TI_JVM_ARGS="$(ti_collect_jvm_args "$ti_proc")"
+  TI_JVM_IS_JBOSS='yes'
+  TI_JVM_SOURCE='JBoss EAP の起動中 JVM'
+  break
+done
+if [ -z "$TI_JVM_ARGS" ]; then
+  for ti_proc in /proc/[0-9]*; do
+    [ -r "$ti_proc/cmdline" ] || continue
+    ti_args="$(ti_collect_jvm_args "$ti_proc")"
+    if printf '%s\n' "$ti_args" | grep -q -- '-Djavax.net.ssl.trustStore='; then
+      TI_JVM_PID="${ti_proc#/proc/}"
+      TI_JVM_ARGS="$ti_args"
+      TI_JVM_SOURCE='トラストストアを指定した起動中 JVM (JBoss EAP のプロセスは特定できず)'
+      break
+    fi
+  done
+fi
+
+TI_JVM_STORE="$(printf '%s\n' "$TI_JVM_ARGS" | ti_scan_dvalue 'javax\.net\.ssl\.trustStore')"
+TI_JVM_STORE_TYPE="$(printf '%s\n' "$TI_JVM_ARGS" | ti_scan_dvalue 'javax\.net\.ssl\.trustStoreType')"
+
+# ---- standalone.xml (Elytron key-store / trust-manager) ---------------------
+TI_JBOSS_CONFIG_NAME="$(printf '%s\n' "$TI_JVM_ARGS" | sed -n 's/^--server-config=//p' | head -n 1)"
+if [ -z "$TI_JBOSS_CONFIG_NAME" ]; then
+  TI_JBOSS_CONFIG_NAME="$(printf '%s\n' "$TI_JVM_ARGS" \
+    | ti_scan_dvalue 'jboss\.server\.default\.config')"
+fi
+[ -n "$TI_JBOSS_CONFIG_NAME" ] || TI_JBOSS_CONFIG_NAME='standalone.xml'
+TI_JBOSS_CONFIG_DIR="$(printf '%s\n' "$TI_JVM_ARGS" | ti_scan_dvalue 'jboss\.server\.config\.dir')"
+if [ -z "$TI_JBOSS_CONFIG_DIR" ] && [ -n "$TI_JBOSS_HOME" ]; then
+  TI_JBOSS_CONFIG_DIR="${TI_JBOSS_HOME}/standalone/configuration"
+fi
+TI_JBOSS_CONFIG=''
+if [ -n "$TI_JBOSS_CONFIG_DIR" ] \
+    && [ -r "${TI_JBOSS_CONFIG_DIR}/${TI_JBOSS_CONFIG_NAME}" ]; then
+  TI_JBOSS_CONFIG="${TI_JBOSS_CONFIG_DIR}/${TI_JBOSS_CONFIG_NAME}"
+fi
+
+# XML をタグ単位の行へ割ってから拾う。属性の順序や改行位置に左右されないようにする。
+TI_XML_TAGS="$TI_DIR/standalone-tags.txt"
+: > "$TI_XML_TAGS"
+if [ -n "$TI_JBOSS_CONFIG" ]; then
+  tr '\n' ' ' < "$TI_JBOSS_CONFIG" 2>/dev/null | tr '<' '\n' > "$TI_XML_TAGS" 2>/dev/null \
+    || : > "$TI_XML_TAGS"
+fi
+
+ti_resolve_relative_to() {
+  case "$1" in
+    jboss.server.config.dir) printf '%s' "$TI_JBOSS_CONFIG_DIR" ;;
+    jboss.server.base.dir)   [ -n "$TI_JBOSS_HOME" ] && printf '%s' "${TI_JBOSS_HOME}/standalone" ;;
+    jboss.server.data.dir)   [ -n "$TI_JBOSS_HOME" ] && printf '%s' "${TI_JBOSS_HOME}/standalone/data" ;;
+    jboss.home.dir)          printf '%s' "$TI_JBOSS_HOME" ;;
+    *) : ;;
+  esac
+}
+
+# ---- 検出したトラストストアの登録 -------------------------------------------
+TI_STORES_FILE="$TI_DIR/stores.tsv"
+: > "$TI_STORES_FILE"
+# 1 行 = パス<TAB>検出元<TAB>有効性<TAB>パスワードトークン
+ti_add_store() {
+  [ -n "${1:-}" ] || return 0
+  if cut -d"$TI_TAB" -f1 "$TI_STORES_FILE" | grep -qxF -- "$1"; then
+    return 0
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$TI_STORES_FILE"
+}
+
+# パスワードは画面へ出さず、使用する瞬間だけトークンから値を解決する。
+ti_password_of() {
+  case "$1" in
+    jvm)
+      printf '%s\n' "$TI_JVM_ARGS" \
+        | ti_scan_dvalue 'javax\.net\.ssl\.trustStorePassword'
+      ;;
+    default) printf 'changeit' ;;
+    none) : ;;
+    env:*)
+      ti_pw_name="${1#env:}"
+      if command -v printenv >/dev/null 2>&1; then
+        printenv "$ti_pw_name" 2>/dev/null || :
+      else
+        eval "printf '%s' \"\${${ti_pw_name}:-}\""
+      fi
+      ;;
+    xmlks:*)
+      # Elytron の key-store が credential-reference で持つ平文パスワード。
+      # 値は表示せず、keytool へ渡す瞬間だけ解決する。
+      [ -s "$TI_XML_TAGS" ] || return 0
+      awk -v want="${1#xmlks:}" '
+        /^key-store[ \t]/ {
+          cur = ""
+          if (match($0, /name="[^"]*"/)) { cur = substr($0, RSTART + 6, RLENGTH - 7) }
+          next
+        }
+        /^\/key-store/ { cur = "" ; next }
+        /^credential-reference[ \t]/ {
+          if (cur == want && match($0, /clear-text="[^"]*"/)) {
+            print substr($0, RSTART + 12, RLENGTH - 13); exit
+          }
+          next
+        }
+        /^clear-text>/ {
+          if (cur == want) { v = $0; sub(/^clear-text>/, "", v); print v; exit }
+        }
+      ' "$TI_XML_TAGS" 2>/dev/null
+      ;;
+  esac
+}
+
+# パスワードの出どころだけを (値は出さずに) 説明する。
+ti_password_note() {
+  case "$1" in
+    jvm)     printf 'JVM の -Djavax.net.ssl.trustStorePassword' ;;
+    default) printf '既定値 changeit' ;;
+    none)    printf 'パスワード無し' ;;
+    env:*)   printf '環境変数 %s' "${1#env:}" ;;
+    xmlks:*) printf 'standalone.xml の credential-reference' ;;
+    *)       printf '不明' ;;
+  esac
+}
+
+# (1) JBoss EAP の JVM が読み込んでいるトラストストア。
+if [ -n "$TI_JVM_STORE" ]; then
+  if [ "$TI_JVM_IS_JBOSS" = 'yes' ]; then
+    ti_add_store "$TI_JVM_STORE" \
+      "${TI_JVM_SOURCE} (pid ${TI_JVM_PID}) の -Djavax.net.ssl.trustStore" \
+      '有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う' 'jvm'
+  else
+    ti_add_store "$TI_JVM_STORE" \
+      "${TI_JVM_SOURCE} の -Djavax.net.ssl.trustStore" \
+      '有効 — 起動中 JVM の Java アプリはこのストアだけを使う' 'jvm'
+  fi
+fi
+
+# (2) JDK 同梱の cacerts。-Djavax.net.ssl.trustStore が無いときはこれが使われる。
+TI_JDK_CACERTS=''
+for ti_jc in "${JAVA_HOME:-}/lib/security/cacerts" \
+             "${JAVA_HOME:-}/jre/lib/security/cacerts" \
+             /etc/pki/ca-trust/extracted/java/cacerts \
+             /etc/ssl/certs/java/cacerts; do
+  case "$ti_jc" in
+    /lib/security/cacerts|/jre/lib/security/cacerts) continue ;;
+  esac
+  [ -r "$ti_jc" ] || continue
+  TI_JDK_CACERTS="$ti_jc"
+  break
+done
+if [ -n "$TI_JDK_CACERTS" ]; then
+  if [ -n "$TI_JVM_STORE" ]; then
+    ti_add_store "$TI_JDK_CACERTS" 'JDK 同梱の cacerts' \
+      '参考 — -Djavax.net.ssl.trustStore の指定があるため Java アプリからは使われない' 'default'
+  else
+    ti_add_store "$TI_JDK_CACERTS" 'JDK 同梱の cacerts' \
+      '有効 — -Djavax.net.ssl.trustStore の指定が無いため JDK 既定のこのストアが使われる' 'default'
+  fi
+fi
+
+# (3) Elytron の trust-manager が参照する key-store。
+if [ -s "$TI_XML_TAGS" ]; then
+  sed -n 's/^trust-manager[[:space:]].*key-store="\([^"]*\)".*/\1/p' "$TI_XML_TAGS" \
+    | awk 'NF && !seen[$0]++' > "$TI_DIR/trust-managers.txt" 2>/dev/null \
+    || : > "$TI_DIR/trust-managers.txt"
+  awk '
+    /^key-store[ \t]/ {
+      cur = ""
+      if (match($0, /name="[^"]*"/)) { cur = substr($0, RSTART + 6, RLENGTH - 7) }
+      next
+    }
+    /^\/key-store/ { cur = "" ; next }
+    /^file[ \t]/ {
+      if (cur == "") { next }
+      p = ""; r = ""
+      if (match($0, /path="[^"]*"/))        { p = substr($0, RSTART + 6, RLENGTH - 7) }
+      if (match($0, /relative-to="[^"]*"/)) { r = substr($0, RSTART + 13, RLENGTH - 14) }
+      if (p != "") { printf "%s\t%s\t%s\n", cur, p, r }
+    }
+  ' "$TI_XML_TAGS" > "$TI_DIR/keystores.tsv" 2>/dev/null || : > "$TI_DIR/keystores.tsv"
+  while IFS= read -r ti_tm_ks; do
+    [ -n "$ti_tm_ks" ] || continue
+    while IFS="$TI_TAB" read -r ti_ks_name ti_ks_path ti_ks_rel; do
+      [ "$ti_ks_name" = "$ti_tm_ks" ] || continue
+      case "$ti_ks_path" in
+        /*) ti_ks_full="$ti_ks_path" ;;
+        *)
+          ti_ks_base="$(ti_resolve_relative_to "$ti_ks_rel")"
+          [ -n "$ti_ks_base" ] || continue
+          ti_ks_full="${ti_ks_base%/}/${ti_ks_path}"
+          ;;
+      esac
+      ti_add_store "$ti_ks_full" \
+        "standalone.xml の Elytron key-store '${ti_ks_name}' (trust-manager から参照)" \
+        '有効 — ssl-context を指定した通信 (Elytron) で使われる' "xmlks:${ti_ks_name}"
+    done < "$TI_DIR/keystores.tsv"
+  done < "$TI_DIR/trust-managers.txt"
+fi
+
+# (4) standalone.conf の JAVA_OPTS。次回起動時に効く指定を取りこぼさない。
+if [ -n "$TI_JBOSS_HOME" ]; then
+  for ti_conf in "${TI_JBOSS_HOME}/bin/standalone.conf" "${TI_JBOSS_HOME}/bin/standalone.conf.d"/*.conf; do
+    [ -r "$ti_conf" ] || continue
+    ti_conf_store="$(grep -v '^[[:space:]]*#' "$ti_conf" 2>/dev/null \
+      | ti_scan_dvalue 'javax\.net\.ssl\.trustStore')"
+    [ -n "$ti_conf_store" ] || continue
+    ti_add_store "$ti_conf_store" "${ti_conf} の JAVA_OPTS" \
+      '参考 — 次回起動時に有効 (現在の JVM はこの指定で起動していない)' 'jvm'
+  done
+fi
+
+# (5) *TRUSTSTORE* / *TRUST_STORE* を名前に含み、絶対パスを値に持つ環境変数。
+printf '%s\n' "$TI_ENV" \
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*(TRUSTSTORE|TRUST_STORE)[A-Za-z0-9_]*=/' \
+  | grep -Ev '^[^=]*(PASSWORD|PASSWD|PASS|TYPE|ALIAS)[^=]*=' \
+  > "$TI_DIR/store-env.txt" 2>/dev/null || : > "$TI_DIR/store-env.txt"
+while IFS= read -r ti_line; do
+  [ -n "$ti_line" ] || continue
+  ti_name="${ti_line%%=*}"
+  ti_value="${ti_line#*=}"
+  case "$ti_name" in
+    *_FILE) ti_pw_env="${ti_name%_FILE}_PASSWORD" ;;
+    *_PATH) ti_pw_env="${ti_name%_PATH}_PASSWORD" ;;
+    *)      ti_pw_env="${ti_name}_PASSWORD" ;;
+  esac
+  ti_add_store "$ti_value" "環境変数 ${ti_name}" \
+    '参考 — アプリが明示的に読み込む実装のときだけ有効' "env:${ti_pw_env}"
+done < "$TI_DIR/store-env.txt"
+
+# ---- 接続先 (https:// を値に持つ環境変数) -----------------------------------
+# ドメインから接続確認コマンドを組み立てるとき、実際の接続先が分かっていれば
+# ポートとパスまで埋められる。証明書にドメイン情報が無い CA の受け皿にもなる。
+TI_TARGETS_FILE="$TI_DIR/targets.txt"
+printf '%s\n' "$TI_ENV" \
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*=https://[^[:space:]]+$' \
+  | sort -u > "$TI_TARGETS_FILE" 2>/dev/null || : > "$TI_TARGETS_FILE"
+
+ti_url_host() {
+  ti_uh="${1#*://}"
+  ti_uh="${ti_uh%%/*}"
+  ti_uh="${ti_uh##*@}"
+  case "$ti_uh" in
+    '['*']:'*) printf '%s' "${ti_uh%%]*}]" ;;
+    '['*']')   printf '%s' "$ti_uh" ;;
+    *:*)       printf '%s' "${ti_uh%%:*}" ;;
+    *)         printf '%s' "$ti_uh" ;;
+  esac
+}
+ti_url_hostport() {
+  ti_hp="${1#*://}"
+  ti_hp="${ti_hp%%/*}"
+  ti_hp="${ti_hp##*@}"
+  case "$ti_hp" in
+    '['*']:'*) printf '%s' "$ti_hp" ;;
+    '['*']')   printf '%s:443' "$ti_hp" ;;
+    *:*)       printf '%s' "$ti_hp" ;;
+    *)         printf '%s:443' "$ti_hp" ;;
+  esac
+}
+
+# ホスト名がドメイン (ワイルドカード可) に一致するか。
+ti_host_matches() {  # $1=ホスト名 $2=ドメイン
+  ti_hm_h="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  ti_hm_d="$(printf '%s' "$2" | tr 'A-Z' 'a-z')"
+  [ "$ti_hm_h" = "$ti_hm_d" ] && return 0
+  case "$ti_hm_d" in
+    '*.'*)
+      ti_hm_sfx="${ti_hm_d#\*}"
+      case "$ti_hm_h" in
+        *"$ti_hm_sfx")
+          ti_hm_pfx="${ti_hm_h%"$ti_hm_sfx"}"
+          case "$ti_hm_pfx" in
+            ''|*.*) return 1 ;;
+            *) return 0 ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+# ---- 受領した自己証明書 (ビルドで足したもの) の指紋 --------------------------
+# ${PKI_TRUST_DIR}/*.crt と *CACERT* / *CA_BUNDLE* 環境変数が指すファイル。
+# ここと指紋が一致する登録証明書は「ビルドで追加したもの」と断定できる。
+TI_ADDED_FILES="$TI_DIR/added-files.txt"
+: > "$TI_ADDED_FILES"
+ti_add_cacert_file() {
+  { [ -n "${1:-}" ] && [ -r "$1" ]; } || return 0
+  grep -qxF -- "$1" "$TI_ADDED_FILES" && return 0
+  printf '%s\n' "$1" >> "$TI_ADDED_FILES"
+}
+if [ -n "${PKI_TRUST_DIR:-}" ] && [ -d "${PKI_TRUST_DIR}" ]; then
+  for ti_crt in "${PKI_TRUST_DIR}"/*.crt "${PKI_TRUST_DIR}"/*.pem; do
+    ti_add_cacert_file "$ti_crt"
+  done
+fi
+printf '%s\n' "$TI_ENV" \
+  | grep -E '^[^=]*(CACERT|CA_CERT|CA_BUNDLE)[^=]*=/' \
+  > "$TI_DIR/cacert-env.txt" 2>/dev/null || : > "$TI_DIR/cacert-env.txt"
+while IFS= read -r ti_line; do
+  [ -n "$ti_line" ] || continue
+  ti_add_cacert_file "${ti_line#*=}"
+done < "$TI_DIR/cacert-env.txt"
+
+ti_x509() {
+  [ -n "$TI_OPENSSL" ] || return 1
+  ti_x_file="$1"; shift
+  "$TI_OPENSSL" x509 -in "$ti_x_file" -noout "$@" 2>/dev/null
+}
+ti_fp_of()        { ti_x509 "$1" -fingerprint -sha256 | sed 's/^.*=//' | tr -d '\r' | tr 'a-f' 'A-F'; }
+ti_subject_of()   { ti_x509 "$1" -subject | sed 's/^subject=[[:space:]]*//'; }
+ti_issuer_of()    { ti_x509 "$1" -issuer  | sed 's/^issuer=[[:space:]]*//'; }
+ti_notafter_of()  { ti_x509 "$1" -enddate | sed 's/^notAfter=//'; }
+ti_notbefore_of() { ti_x509 "$1" -startdate | sed 's/^notBefore=//'; }
+ti_subject_hash_of() { ti_x509 "$1" -subject_hash; }
+ti_issuer_hash_of()  { ti_x509 "$1" -issuer_hash; }
+ti_is_expired()   { [ -n "$TI_OPENSSL" ] && ! "$TI_OPENSSL" x509 -in "$1" -noout -checkend 0 >/dev/null 2>&1; }
+ti_is_ca()        { ti_x509 "$1" -text | grep -q 'CA:TRUE'; }
+ti_is_selfsigned() {
+  [ -n "$TI_OPENSSL" ] || return 1
+  [ "$(ti_subject_hash_of "$1")" = "$(ti_issuer_hash_of "$1")" ] || return 1
+  "$TI_OPENSSL" verify -CAfile "$1" "$1" >/dev/null 2>&1 && return 0
+  "$TI_OPENSSL" verify -CAfile "$1" "$1" 2>&1 \
+    | grep -qE 'certificate has expired|certificate is not yet valid'
+}
+
+# 証明書 1 枚の種別を短い日本語で返す。
+ti_kind_of() {
+  if [ -z "$TI_OPENSSL" ]; then
+    printf '判定できず (openssl 無し)'
+    return 0
+  fi
+  if ti_is_ca "$1"; then
+    if ti_is_selfsigned "$1"; then
+      printf 'ルート CA 証明書 (自己署名の CA)'
+    else
+      printf '中間 CA 証明書 (別の CA が発行した CA)'
+    fi
+  elif ti_is_selfsigned "$1"; then
+    printf '自己署名リーフ (CA ではない。この 1 枚だけを信頼する形になる)'
+  else
+    printf 'end-entity 証明書 (CA ではないリーフ)'
+  fi
+}
+
+# ---- 証明書からドメイン情報を出どころ付きで取り出す --------------------------
+# ルート CA には SAN が無いことが多いため、SAN だけを見ると「ドメイン情報なし」に
+# なってしまう。CN / DC / nameConstraints / CRL・AIA の URI まで見て、
+# 接続確認コマンドの宛先を推測できるだけの手掛かりを集める。
+# 出力は「出どころ<TAB>ドメイン」。優先度の高い出どころから並べ、重複は落とす。
+ti_domain_sources_of() {  # $1=PEM
+  [ -n "$TI_OPENSSL" ] || return 0
+  ti_ds_text="$TI_DIR/x509-text.out"
+  ti_x509 "$1" -text > "$ti_ds_text" 2>/dev/null || : > "$ti_ds_text"
+  ti_ds_subject="$(ti_subject_of "$1")"
+  {
+    # (a) SAN の DNS / IP。サーバ証明書ならここが最も確かな宛先になる。
+    sed -n '/X509v3 Subject Alternative Name/{n;s/^[[:space:]]*//;p;}' "$ti_ds_text" \
+      | head -n 1 | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      | sed -n -e 's/^DNS:/SAN\t/p' -e 's/^IP Address:/SAN\t/p'
+    # (b) nameConstraints の permitted DNS。CA が発行を許された範囲そのもの。
+    sed -n '/X509v3 Name Constraints/,/Signature Algorithm/p' "$ti_ds_text" \
+      | sed -n 's/^[[:space:]]*DNS:\(.*\)$/nameConstraints\t\1/p'
+    # (c) subject の CN。ホスト名がそのまま入っていることが多い。
+    printf '%s\n' "$ti_ds_subject" | tr ',/' '\n\n' \
+      | sed -n 's/^[[:space:]]*CN[[:space:]]*=[[:space:]]*//p' \
+      | sed 's/[[:space:]]*$//' | sed 's/^/CN\t/'
+    # (d) subject の DC (ドメインコンポーネント) を左から連結する。
+    ti_ds_dc="$(printf '%s\n' "$ti_ds_subject" | tr ',/' '\n\n' \
+      | sed -n 's/^[[:space:]]*DC[[:space:]]*=[[:space:]]*//p' \
+      | sed 's/[[:space:]]*$//' | tr '\n' '.' | sed 's/\.$//')"
+    [ -n "$ti_ds_dc" ] && printf 'DC\t%s\n' "$ti_ds_dc"
+    # (e) CRL 配布点 / 認証局情報アクセスの URI ホスト。運用ドメインが分かる。
+    sed -n 's#^[[:space:]]*URI:https\{0,1\}://\([^/]*\).*#CRL/AIA\t\1#p' "$ti_ds_text"
+    # (f) CN / O の中に埋め込まれたホスト名らしき文字列。
+    printf '%s\n' "$ti_ds_subject" | tr ',/' '\n\n' \
+      | sed -n -e 's/^[[:space:]]*CN[[:space:]]*=[[:space:]]*//p' \
+               -e 's/^[[:space:]]*O[[:space:]]*=[[:space:]]*//p' \
+      | grep -oE '[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)+' \
+      | sed 's/^/subject\t/'
+  } 2>/dev/null \
+    | sed 's/[[:space:]]*$//' \
+    | awk -F"$TI_TAB" '
+        # ホスト名らしいもの (最後のラベルが英字 2 文字以上) と IPv4 だけを残す。
+        # awk の -v は値のエスケープを解釈してしまうため、正規表現はここへ直接書く。
+        NF == 2 && $2 != "" \
+          && ($2 ~ /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)*\.[A-Za-z][A-Za-z-]+$/ \
+              || $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) \
+          && !seen[tolower($2)]++ { print }
+      '
+}
+
+# ドメインと検出した接続先から、確認に使う URL を 1 つ決める。
+# 出力は「URL<TAB>確度の説明」。
+ti_url_for_domain() {  # $1=ドメイン
+  ti_uf_domain="$1"
+  while IFS= read -r ti_uf_line; do
+    [ -n "$ti_uf_line" ] || continue
+    ti_uf_url="${ti_uf_line#*=}"
+    ti_uf_name="${ti_uf_line%%=*}"
+    ti_uf_host="$(ti_url_host "$ti_uf_url")"
+    if ti_host_matches "$ti_uf_host" "$ti_uf_domain"; then
+      printf '%s\t検出した接続先 %s と一致 (ポートとパスまで確定)\n' "$ti_uf_url" "$ti_uf_name"
+      return 0
+    fi
+  done < "$TI_TARGETS_FILE"
+  case "$ti_uf_domain" in
+    '*.'*)
+      printf 'https://<ホスト名>%s/\t証明書のワイルドカードから推測 (<ホスト名> は実際の名前へ置き換える)\n' \
+        "${ti_uf_domain#\*}"
+      ;;
+    *)
+      printf 'https://%s/\t証明書のドメインから推測 (ポート 443 / パス / と仮定)\n' "$ti_uf_domain"
+      ;;
+  esac
+}
+
+# ---- JDK 標準との差分を取るための基準指紋 -----------------------------------
+# 「カスタムとして追加された証明書」は、JDK 標準の cacerts に無いものとして求める。
+# 調べているストア自身が JDK の cacerts である (自己証明書をそこへ入れた) 構成では
+# 自分自身を基準にしても差分が出ないため、実体パスの違う別の cacerts を基準に選ぶ。
+TI_BASELINE_FP="$TI_DIR/baseline-fp.txt"
+TI_BASELINE_SRC=''
+ti_load_baseline() {  # $1=基準から除外するストアのパス
+  : > "$TI_BASELINE_FP"
+  TI_BASELINE_SRC=''
+  [ -n "$TI_OPENSSL" ] || return 0
+  ti_bl_self="$(ti_realpath "$1")"
+  ti_bl_pw="$(ti_password_of default)"
+  for ti_bl in "${JAVA_HOME:-}/lib/security/cacerts" \
+               "${JAVA_HOME:-}/jre/lib/security/cacerts" \
+               /etc/pki/ca-trust/extracted/java/cacerts \
+               /etc/ssl/certs/java/cacerts; do
+    case "$ti_bl" in
+      /lib/security/cacerts|/jre/lib/security/cacerts) continue ;;
+    esac
+    [ -r "$ti_bl" ] || continue
+    [ "$(ti_realpath "$ti_bl")" = "$ti_bl_self" ] && continue
+    "$TI_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+      -list -keystore "$ti_bl" -storepass "$ti_bl_pw" \
+      > "$TI_DIR/baseline.out" 2>/dev/null < /dev/null || continue
+    # 指紋の 16 進表記だけを拾う。見出し行はロケール依存だが値は依存しない。
+    grep -oE '([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}' "$TI_DIR/baseline.out" \
+      | tr 'a-f' 'A-F' | sort -u > "$TI_BASELINE_FP"
+    [ -s "$TI_BASELINE_FP" ] || continue
+    TI_BASELINE_SRC="$ti_bl"
+    break
+  done
+  ti_bl_pw=''
+  return 0
+}
+
+# ---- 0. 検出したトラストストアと有効性 --------------------------------------
+TI_STORE_TOTAL="$(ti_count_lines "$TI_STORES_FILE")"
+TI_TARGET_TOTAL="$(ti_count_lines "$TI_TARGETS_FILE")"
+TI_ADDED_TOTAL="$(ti_count_lines "$TI_ADDED_FILES")"
+
+ti_section '0. 検出したトラストストアと有効性'
+ti_info "keytool          : $TI_KEYTOOL"
+if [ -n "$TI_OPENSSL" ]; then
+  ti_info "openssl          : $TI_OPENSSL (種別・ドメイン・カスタム判定に使用)"
+else
+  ti_info 'openssl          : 見つからない (別名と件数のみ。種別とドメインは判定できない)'
+fi
+ti_info "JBOSS_HOME       : ${TI_JBOSS_HOME:-検出できず}"
+ti_info "standalone.xml   : ${TI_JBOSS_CONFIG:-検出できず}"
+if [ "$TI_JVM_IS_JBOSS" = 'yes' ]; then
+  ti_info "JBoss EAP の JVM : pid ${TI_JVM_PID} を検出"
+elif [ -n "$TI_JVM_PID" ]; then
+  ti_info "JBoss EAP の JVM : 特定できず (pid ${TI_JVM_PID} の JVM から検出)"
+else
+  ti_info 'JBoss EAP の JVM : 見つからない (起動中プロセスからは検出できなかった)'
+fi
+if [ -n "$TI_JVM_STORE" ]; then
+  ti_info "-Djavax.net.ssl.trustStore : ${TI_JVM_STORE}${TI_JVM_STORE_TYPE:+ (type=${TI_JVM_STORE_TYPE})}"
+else
+  ti_info '-Djavax.net.ssl.trustStore : 指定なし (JDK 同梱の cacerts が使われる)'
+fi
+
+if [ "$TI_STORE_TOTAL" -eq 0 ]; then
+  printf '\nトラストストアを検出できませんでした。\n'
+  printf '  -Djavax.net.ssl.trustStore を付けて JVM を起動しているか、\n'
+  printf '  JDK 同梱の cacerts を読めるか、*TRUSTSTORE* 環境変数があるかを確認してください。\n'
+  exit 2
+fi
+
+ti_info ''
+ti_info "検出したトラストストア: ${TI_STORE_TOTAL} 件"
+ti_store_index=0
+while IFS="$TI_TAB" read -r ti_store ti_source ti_effect ti_pwtoken; do
+  [ -n "$ti_store" ] || continue
+  ti_store_index=$((ti_store_index + 1))
+  ti_info "  [${ti_store_index}] ${ti_store}"
+  ti_info "      検出元  : ${ti_source}"
+  ti_info "      有効性  : ${ti_effect}"
+  if [ ! -r "$ti_store" ]; then
+    ti_info '      状態    : 読み取れない (パスとパーミッションを確認する)'
+  fi
+done < "$TI_STORES_FILE"
+if [ "$TI_STORE_TOTAL" -gt "$TI_MAX_STORES" ]; then
+  ti_info "  注意: 先頭 ${TI_MAX_STORES} 件のみ内容を一覧化します。"
+fi
+if [ "$TI_TARGET_TOTAL" -gt 0 ]; then
+  ti_info "検出した HTTPS 接続先: ${TI_TARGET_TOTAL} 件 (接続確認コマンドの宛先に使う)"
+  while IFS= read -r ti_line; do
+    [ -n "$ti_line" ] || continue
+    ti_info "  - ${ti_line%%=*} = ${ti_line#*=}"
+  done < "$TI_TARGETS_FILE"
+else
+  ti_info '検出した HTTPS 接続先: なし (証明書のドメインだけから宛先を推測します)'
+fi
+if [ "$TI_ADDED_TOTAL" -gt 0 ]; then
+  ti_info "ビルドで取り込んだ証明書ファイル: ${TI_ADDED_TOTAL} 件 (指紋一致でカスタムと断定する)"
+  while IFS= read -r ti_line; do
+    [ -n "$ti_line" ] || continue
+    ti_info "  - ${ti_line}"
+  done < "$TI_ADDED_FILES"
+fi
+
+# ---- 1-N. 各トラストストアの登録証明書 --------------------------------------
+TI_CERTS_TSV="$TI_DIR/certs.tsv"
+: > "$TI_CERTS_TSV"
+
+ti_store_index=0
+while IFS="$TI_TAB" read -r ti_store ti_source ti_effect ti_pwtoken; do
+  [ -n "$ti_store" ] || continue
+  ti_store_index=$((ti_store_index + 1))
+  [ "$ti_store_index" -le "$TI_MAX_STORES" ] || break
+
+  ti_section "1-${ti_store_index}. トラストストア ${ti_store}"
+  ti_info "ファイルフルパス: ${ti_store}"
+  ti_info "検出元          : ${ti_source}"
+  ti_info "有効性          : ${ti_effect}"
+  # 「有効」でないストア (JDK 同梱 cacerts が使われない構成、次回起動時の指定、
+  # 環境変数など) まで全件並べると、標準の CA 100 件以上に埋もれて、肝心の
+  # 有効なストアの内容が読めなくなる。参考のストアはカスタムとして追加された
+  # 証明書だけを出し、「入れた先が違う」という取り違えは拾えるようにする。
+  case "$ti_effect" in
+    有効*) ti_store_effective='yes' ;;
+    *)     ti_store_effective='no' ;;
+  esac
+  ti_store_skipped=0
+  if [ ! -r "$ti_store" ]; then
+    ti_info '結果            : 読み取れないため一覧化できません'
+    continue
+  fi
+
+  ti_listing="$TI_DIR/keytool-${ti_store_index}.out"
+  ti_keytool_err="$TI_DIR/keytool-${ti_store_index}.err"
+  ti_listed='no'
+  ti_used_token=''
+  # -J-Duser.language=en は keytool の見出し (Alias name: 等) を英語へ固定する。
+  # 後段で別名を拾うため、実行環境のロケールに左右されないようにしておく。
+  for ti_token in "$ti_pwtoken" jvm default none; do
+    [ -n "$ti_token" ] || continue
+    ti_pw="$(ti_password_of "$ti_token")"
+    if [ "$ti_token" = 'none' ] || [ -z "$ti_pw" ]; then
+      "$TI_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+        -list -rfc -keystore "$ti_store" \
+        > "$ti_listing" 2> "$ti_keytool_err" < /dev/null \
+        && { ti_listed='yes'; ti_used_token='none'; }
+    else
+      "$TI_KEYTOOL" -J-Duser.language=en -J-Duser.country=US \
+        -list -rfc -keystore "$ti_store" -storepass "$ti_pw" \
+        > "$ti_listing" 2> "$ti_keytool_err" < /dev/null \
+        && { ti_listed='yes'; ti_used_token="$ti_token"; }
+    fi
+    ti_pw=''
+    [ "$ti_listed" = 'yes' ] && break
+  done
+  if [ "$ti_listed" != 'yes' ]; then
+    ti_info '結果            : keytool で読み取れない (パスワード / ストア種別を確認する)'
+    sed 's/^/       /' "$ti_keytool_err" 2>/dev/null | head -n 5
+    continue
+  fi
+  ti_info "パスワード      : $(ti_password_note "$ti_used_token") で読み取り成功 (値は表示しません)"
+  TI_STORE_READ=$((TI_STORE_READ + 1))
+
+  ti_split_dir="$TI_DIR/split-${ti_store_index}"
+  mkdir -p "$ti_split_dir"
+  awk -v dir="$ti_split_dir" '
+    /-----BEGIN CERTIFICATE-----/ { n++; out = sprintf("%s/cert-%03d.pem", dir, n); w = 1 }
+    w { print > out }
+    /-----END CERTIFICATE-----/   { w = 0 }
+  ' "$ti_listing"
+  # keytool -rfc は証明書の直前に "Alias name: <別名>" を出す。分割順と同じ順で
+  # 拾えるので、添字で対応付けできる。別名は keytool -delete / -exportcert の
+  # 対象指定にそのまま使う。
+  ti_alias_file="$TI_DIR/alias-${ti_store_index}.tsv"
+  awk '
+    /^Alias name:/ { a = $0; sub(/^Alias name:[ \t]*/, "", a); next }
+    /-----BEGIN CERTIFICATE-----/ { n++; printf "%03d\t%s\n", n, a }
+  ' "$ti_listing" > "$ti_alias_file" 2>/dev/null || : > "$ti_alias_file"
+
+  ti_store_certs=0
+  for ti_pem in "$ti_split_dir"/cert-*.pem; do
+    [ -r "$ti_pem" ] || continue
+    ti_store_certs=$((ti_store_certs + 1))
+  done
+  ti_info "登録証明書      : ${ti_store_certs} 件"
+  if [ "$ti_store_effective" != 'yes' ]; then
+    ti_info '一覧の範囲      : このストアは Java アプリから使われないため、カスタムとして追加された証明書だけを出します'
+  fi
+  if [ "$ti_store_certs" -eq 0 ]; then
+    continue
+  fi
+
+  ti_load_baseline "$ti_store"
+  if [ -n "$TI_BASELINE_SRC" ]; then
+    ti_info "カスタム判定    : ${TI_BASELINE_SRC} に無い証明書をカスタムとして扱う"
+  elif [ "$TI_ADDED_TOTAL" -gt 0 ]; then
+    ti_info 'カスタム判定    : JDK 標準の比較先が無いため、取り込んだ証明書ファイルとの指紋一致だけで判定する'
+  else
+    ti_info 'カスタム判定    : 比較先が無いため判定できない (openssl / JDK 同梱 cacerts を確認する)'
+  fi
+
+  ti_shown=0
+  for ti_pem in "$ti_split_dir"/cert-*.pem; do
+    [ -r "$ti_pem" ] || continue
+    ti_shown=$((ti_shown + 1))
+    if [ "$ti_shown" -gt "$TI_MAX_CERTS" ]; then
+      ti_info "  ... 残り $((ti_store_certs - TI_MAX_CERTS)) 件は省略しました。"
+      break
+    fi
+    ti_idx="$(basename -- "$ti_pem" | sed -e 's/^cert-//' -e 's/\.pem$//')"
+    ti_alias="$(awk -F"$TI_TAB" -v i="$ti_idx" '$1 == i { print $2 }' "$ti_alias_file" 2>/dev/null)"
+    [ -n "$ti_alias" ] || ti_alias='(別名不明)'
+    ti_fp="$(ti_fp_of "$ti_pem")"
+    ti_kind="$(ti_kind_of "$ti_pem")"
+
+    # カスタム判定。取り込んだ証明書ファイルとの指紋一致が最も強い根拠になる。
+    ti_custom='unknown'
+    ti_custom_why=''
+    if [ -n "$ti_fp" ] && [ "$TI_ADDED_TOTAL" -gt 0 ]; then
+      while IFS= read -r ti_added; do
+        [ -n "$ti_added" ] || continue
+        ti_added_norm="$TI_DIR/added-norm.pem"
+        if grep -q -- '-----BEGIN CERTIFICATE-----' "$ti_added" 2>/dev/null; then
+          cp -- "$ti_added" "$ti_added_norm" 2>/dev/null || continue
+        elif [ -n "$TI_OPENSSL" ] \
+            && "$TI_OPENSSL" x509 -inform DER -in "$ti_added" -out "$ti_added_norm" >/dev/null 2>&1; then
+          :
+        else
+          continue
+        fi
+        if [ "$(ti_fp_of "$ti_added_norm")" = "$ti_fp" ]; then
+          ti_custom='yes'
+          ti_custom_why="ビルドで取り込んだ ${ti_added} と同一"
+          break
+        fi
+      done < "$TI_ADDED_FILES"
+    fi
+    if [ "$ti_custom" = 'unknown' ] && [ -s "$TI_BASELINE_FP" ] && [ -n "$ti_fp" ]; then
+      if grep -qxF -- "$ti_fp" "$TI_BASELINE_FP"; then
+        ti_custom='no'
+        ti_custom_why="${TI_BASELINE_SRC} にも入っている標準の CA"
+      else
+        ti_custom='yes'
+        ti_custom_why="${TI_BASELINE_SRC} に無い"
+      fi
+    fi
+
+    # ドメイン情報。出どころ付きで集め、接続確認コマンドの宛先に使う。
+    ti_dom_file="$TI_DIR/domains-${ti_store_index}-${ti_idx}.tsv"
+    ti_domain_sources_of "$ti_pem" > "$ti_dom_file" 2>/dev/null || : > "$ti_dom_file"
+    ti_dom_csv="$(cut -f2 "$ti_dom_file" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+
+    # 集計と TSV は表示を絞る前に済ませる (4. の TSV には全件を残す)。
+    TI_CERT_TOTAL=$((TI_CERT_TOTAL + 1))
+    if [ "$ti_custom" = 'yes' ]; then
+      TI_CUSTOM_TOTAL=$((TI_CUSTOM_TOTAL + 1))
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$ti_store" "$ti_alias" "$ti_kind" "$ti_custom" "$ti_dom_csv" \
+      "${ti_fp:-}" "$(ti_notafter_of "$ti_pem")" "$ti_effect" "$ti_used_token" \
+      >> "$TI_CERTS_TSV"
+    if [ "$ti_store_effective" != 'yes' ] && [ "$ti_custom" != 'yes' ]; then
+      ti_store_skipped=$((ti_store_skipped + 1))
+      continue
+    fi
+
+    printf '\n'
+    if [ "$ti_custom" = 'yes' ]; then
+      ti_star "カスタム追加 [${ti_shown}] alias=${ti_alias}  ← このイメージで足した証明書"
+    else
+      ti_plain "   [${ti_shown}] alias=${ti_alias}"
+    fi
+    ti_info "    ファイルフルパス: ${ti_store}"
+    ti_info "    種別            : ${ti_kind}"
+    case "$ti_custom" in
+      yes) ti_info "    カスタム        : ★ はい (${ti_custom_why})" ;;
+      no)  ti_info "    カスタム        : いいえ (${ti_custom_why})" ;;
+      *)   ti_info '    カスタム        : 判定できず (比較先が無い)' ;;
+    esac
+    ti_info "    subject         : $(ti_subject_of "$ti_pem")"
+    ti_info "    issuer          : $(ti_issuer_of "$ti_pem")"
+    ti_info "    有効期間        : $(ti_notbefore_of "$ti_pem") 〜 $(ti_notafter_of "$ti_pem")"
+    ti_info "    SHA-256         : ${ti_fp:-取得できず}"
+    if ti_is_expired "$ti_pem"; then
+      ti_info '    期限            : ★有効期限切れ★ (この CA では検証できない)'
+    fi
+    if [ -s "$ti_dom_file" ]; then
+      ti_info '    ドメイン URL    :'
+      while IFS="$TI_TAB" read -r ti_dsrc ti_dom; do
+        [ -n "$ti_dom" ] || continue
+        ti_url_line="$(ti_url_for_domain "$ti_dom")"
+        ti_info "      - ${ti_dom}  (出どころ: ${ti_dsrc})"
+        ti_info "        URL: $(ti_field "$ti_url_line" 1)   [$(ti_field "$ti_url_line" 2)]"
+      done < "$ti_dom_file"
+    else
+      ti_info '    ドメイン URL    : 証明書からは取得できず (CA 証明書には SAN / CN のホスト名が無いことが多い)'
+      if [ "$TI_TARGET_TOTAL" -gt 0 ]; then
+        ti_info '                      接続確認は検出した HTTPS 接続先を宛先に使います (3. を参照)'
+      fi
+    fi
+  done
+  if [ "$ti_store_skipped" -gt 0 ]; then
+    printf '\n'
+    ti_info "  (カスタムではない証明書 ${ti_store_skipped} 件は、このストアが Java アプリから"
+    ti_info '   使われないため一覧から省略しました。全件は 4. の TSV に残しています)'
+  fi
+done < "$TI_STORES_FILE"
+
+# ---- 2. カスタムとして追加された証明書だけの一覧 ----------------------------
+ti_section '2. カスタムとして追加された証明書 (JDK 標準に無いもの)'
+if [ "$TI_CUSTOM_TOTAL" -eq 0 ]; then
+  ti_info 'カスタムとして追加された証明書はありませんでした。'
+  ti_info '  自己証明書を取り込んだつもりであれば、取り込み先のストアかビルド手順を確認してください。'
+  ti_info '  -Djavax.net.ssl.trustStore が指すストアと、keytool -importcert の -keystore が'
+  ti_info '  同じファイルを指しているかがよくある行き違いです。'
+else
+  ti_info "カスタムとして追加された証明書: ${TI_CUSTOM_TOTAL} 件"
+  ti_info 'ここに出る証明書だけが「このイメージで足したもの」です。'
+  awk -F"$TI_TAB" '$4 == "yes" {
+      printf "\n"
+      printf "  ★ alias=%s\n", $2
+      printf "     トラストストア  : %s\n", $1
+      printf "     種別            : %s\n", $3
+      printf "     ドメイン URL    : %s\n", ($5 == "" ? "証明書からは取得できず" : $5)
+      printf "     SHA-256         : %s\n", $6
+      printf "     有効期限        : %s\n", $7
+      printf "     ストアの有効性  : %s\n", $8
+    }' "$TI_CERTS_TSV"
+fi
+
+# ---- 3. 接続確認コマンド ----------------------------------------------------
+ti_section '3. 追加された証明書のドメイン情報から組み立てた接続確認コマンド'
+ti_info 'コンテナ内でそのまま実行できる形にしてあります。'
+ti_info 'パスワードは値を出さないため <トラストストアのパスワード> を置き換えてください'
+ti_info '(既定値 changeit で読めたストアはその値を埋めてあります)。'
+if [ "$TI_CUSTOM_TOTAL" -eq 0 ]; then
+  ti_info ''
+  ti_info 'カスタムとして追加された証明書が無いため、組み立てる対象がありません。'
+else
+  ti_cmd_index=0
+  while IFS="$TI_TAB" read -r ti_c_store ti_c_alias ti_c_kind ti_c_custom ti_c_doms \
+      ti_c_fp ti_c_exp ti_c_effect ti_c_token; do
+    [ "$ti_c_custom" = 'yes' ] || continue
+    ti_cmd_index=$((ti_cmd_index + 1))
+    case "$ti_c_token" in
+      default) ti_pw_arg="changeit" ;;
+      none)    ti_pw_arg='' ;;
+      *)       ti_pw_arg='<トラストストアのパスワード>' ;;
+    esac
+    if [ -n "$ti_pw_arg" ]; then
+      ti_storepass=" -storepass '${ti_pw_arg}'"
+    else
+      ti_storepass=''
+    fi
+    ti_pem_out="/tmp/truststore-check-${ti_cmd_index}.pem"
+    ti_bundle_out="/tmp/truststore-bundle-${ti_cmd_index}.pem"
+
+    printf '\n'
+    ti_star "alias=${ti_c_alias}  (${ti_c_kind})"
+    ti_info "  トラストストア: ${ti_c_store}"
+    ti_info "  ストアの有効性: ${ti_c_effect}"
+    ti_info "  パスワードの出どころ: $(ti_password_note "$ti_c_token")"
+
+    # 宛先の決定。証明書のドメインが取れなければ検出した接続先を使う。
+    ti_urls_file="$TI_DIR/urls-${ti_cmd_index}.txt"
+    : > "$ti_urls_file"
+    if [ -n "$ti_c_doms" ]; then
+      # 最後の要素を落とさないよう、tr へ渡す前に必ず改行で終わらせる。
+      printf '%s\n' "$ti_c_doms" | tr ',' '\n' | while IFS= read -r ti_c_dom; do
+        [ -n "$ti_c_dom" ] || continue
+        ti_url_line="$(ti_url_for_domain "$ti_c_dom")"
+        printf '%s\t%s\t%s\n' "$(ti_field "$ti_url_line" 1)" "$ti_c_dom" \
+          "$(ti_field "$ti_url_line" 2)" >> "$ti_urls_file"
+      done
+    fi
+    # 証明書から引けたドメインだけでは、CA 証明書の本来の用途 (この CA で
+    # 実際の接続先を検証できるか) を確かめられない。検出した接続先も宛先へ足す。
+    if [ "$TI_TARGET_TOTAL" -gt 0 ]; then
+      while IFS= read -r ti_t_line; do
+        [ -n "$ti_t_line" ] || continue
+        ti_t_url="${ti_t_line#*=}"
+        cut -f1 "$ti_urls_file" 2>/dev/null | grep -qxF -- "$ti_t_url" && continue
+        printf '%s\t%s\t%s\n' "$ti_t_url" "$(ti_url_host "$ti_t_url")" \
+          "検出した接続先 ${ti_t_line%%=*} (この証明書で検証できるかを確認する)" >> "$ti_urls_file"
+      done < "$TI_TARGETS_FILE"
+    fi
+    if [ ! -s "$ti_urls_file" ]; then
+      ti_info '  宛先を推測できませんでした (証明書にドメイン情報が無く、https:// の環境変数もありません)。'
+      ti_info '  接続先が分かっている場合は、下のコマンドの URL 部分を置き換えて実行してください。'
+      printf '%s\t%s\t%s\n' 'https://<接続先ホスト>/' '<接続先ホスト>' '宛先不明のためプレースホルダ' \
+        >> "$ti_urls_file"
+    fi
+
+    ti_info '  1) トラストストア全体を PEM へ書き出して接続を確認する (JVM と同じ信頼範囲)'
+    ti_cmd "${TI_KEYTOOL} -list -rfc -keystore '${ti_c_store}'${ti_storepass} > ${ti_bundle_out}"
+    while IFS="$TI_TAB" read -r ti_u_url ti_u_dom ti_u_why; do
+      [ -n "$ti_u_url" ] || continue
+      ti_cmd "curl -sS -o /dev/null -w 'HTTP %{http_code}\\n' --cacert ${ti_bundle_out} '${ti_u_url}'"
+      ti_info "     ↑ 宛先の根拠: ${ti_u_dom} — ${ti_u_why}"
+    done < "$ti_urls_file"
+
+    ti_info '  2) この証明書 1 枚だけを信頼して接続を確認する (この CA だけで足りるかの切り分け)'
+    ti_cmd "${TI_KEYTOOL} -exportcert -rfc -alias '${ti_c_alias}' -keystore '${ti_c_store}'${ti_storepass} -file ${ti_pem_out}"
+    while IFS="$TI_TAB" read -r ti_u_url ti_u_dom ti_u_why; do
+      [ -n "$ti_u_url" ] || continue
+      ti_cmd "curl -sS -o /dev/null -w 'HTTP %{http_code}\\n' --cacert ${ti_pem_out} '${ti_u_url}'"
+    done < "$ti_urls_file"
+
+    ti_info '  3) 対照: CA を渡さずに接続する (ここが失敗して 1) が成功すれば、この CA が効いている)'
+    while IFS="$TI_TAB" read -r ti_u_url ti_u_dom ti_u_why; do
+      [ -n "$ti_u_url" ] || continue
+      ti_cmd "curl -sS -o /dev/null -w 'HTTP %{http_code}\\n' '${ti_u_url}'"
+    done < "$ti_urls_file"
+
+    if [ -n "$TI_OPENSSL" ]; then
+      ti_info '  4) サーバが提示するチェーンを見て、発行者がこの CA かを突き合わせる'
+      while IFS="$TI_TAB" read -r ti_u_url ti_u_dom ti_u_why; do
+        [ -n "$ti_u_url" ] || continue
+        ti_u_hp="$(ti_url_hostport "$ti_u_url")"
+        ti_u_h="${ti_u_hp%:*}"
+        ti_cmd "${TI_OPENSSL} s_client -connect ${ti_u_hp} -servername ${ti_u_h} -showcerts </dev/null"
+      done < "$ti_urls_file"
+    fi
+  done < "$TI_CERTS_TSV"
+fi
+
+# ---- 4. TSV -----------------------------------------------------------------
+ti_section '4. TSV (トラストストア / 別名 / 種別 / カスタム / ドメイン / SHA-256 / 有効期限 / ストアの有効性)'
+printf 'truststore\talias\tkind\tcustom\tdomains\tsha256\tnot_after\teffective\n'
+if [ -s "$TI_CERTS_TSV" ]; then
+  cut -f1-8 "$TI_CERTS_TSV"
+fi
+
+ti_section '結果'
+printf '  トラストストア=%d (読み取り成功 %d)  登録証明書=%d  カスタム追加=%d\n' \
+  "$TI_STORE_TOTAL" "$TI_STORE_READ" "$TI_CERT_TOTAL" "$TI_CUSTOM_TOTAL"
+if [ "$TI_STORE_READ" -eq 0 ]; then
+  printf '判定: NG — 内容を読み取れたトラストストアがありません。\n'
+  exit 1
+fi
+printf '判定: OK — 有効なトラストストアと登録証明書を一覧化しました。\n'
+exit 0
+TRUSTSTORE_INVENTORY_SCRIPT
+)"
+
+  diag ""
+  diag "════════════ トラストストア一覧 (有効な証明書の棚卸し) ════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "JBoss EAP 上の Java アプリから有効になっているトラストストアを検出し、"
+  diag "ファイルフルパス・登録証明書の種別・ドメイン URL を一覧化します"
+  diag "(追加の入力は不要)。カスタムとして追加された証明書は ★ 付きで強調し、"
+  diag "そのドメイン情報から推測した接続確認用の curl コマンドも組み立てて出します。"
+  diag "証明書の枚数に比例して時間がかかるため、完了まで数十秒かかることがあります。"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "トラストストア一覧の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  docker exec "$container_id" /bin/sh -c "$inventory_script" \
+    _ "${JBOSS_HOME_CANDIDATES[@]}" \
+    > "$capture_file" 2>&1 || exec_status=$?
+  # 一覧そのものを画面で読めるようにするため、表示上限を広げる (全量はテキストへ残す)。
+  print_healthcheck_capture "$capture_file" "(トラストストア一覧の出力がありません)" 1048576
+
+  case "$exec_status" in
+    0) verdict_text="OK (有効なトラストストアと登録証明書を一覧化しました)" ;;
+    1) verdict_text="NG (内容を読み取れたトラストストアがありません)" ;;
+    2) verdict_text="実行不能 (トラストストアまたは keytool をコンテナ内から検出できませんでした)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 実行不能・エラーで終わった場合も、そこまでに出た内容は残す。
+  if [ "$TRUSTSTORE_INVENTORY_TEXT_ENABLED" = "true" ]; then
+    text_path="$(resolve_truststore_inventory_path "$service_name")"
+    if [ -n "$text_path" ] \
+        && write_truststore_inventory_text "$text_path" "$service_name" "$container_name" \
+             "$capture_file" "$verdict_text"; then
+      TRUSTSTORE_INVENTORY_TEXT_OUTPUT="$text_path"
+      diag "トラストストア一覧のテキスト : ${text_path}"
+      if [ "$TRUSTSTORE_INVENTORY_TEXT_SET" != "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+        diag "  (--report-dir または --truststore-inventory-text を指定すると出力先を変えられます)"
+      fi
+    fi
+  else
+    diag "トラストストア一覧のテキスト : 出力しません (--no-truststore-inventory-text)"
+  fi
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "トラストストア一覧 : OK"
+      ;;
+    1)
+      diag "トラストストア一覧 : NG (内容を読み取れたトラストストアがありません)"
+      ;;
+    2)
+      warn "トラストストアまたは keytool をコンテナ内から検出できませんでした。"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' でトラストストア一覧を取得できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
+  diag "トラストストアの内容には接続先や証明書の情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
 # ---- JBoss モジュール一覧 (module-loading:module-info) ------------------------
 # frontend / backend のような JBoss EAP コンテナで、$JBOSS_HOME/bin/jboss-cli.sh -c
 # により管理インターフェースへ接続し、/core-service=module-loading:module-info を
@@ -19113,6 +20336,7 @@ run_interactive_compose_service_actions() {
   local mysql_action=0 observability_action=0 cert_check_action=0
   local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
   local jboss_module_action=0 root_bash_action=0 efs_propagation_action=0
+  local truststore_inventory_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -19150,6 +20374,12 @@ run_interactive_compose_service_actions() {
   if compose_service_supports_efs_propagation "$service_name"; then
     max_action=$(( max_action + 1 ))
     efs_propagation_action="$max_action"
+  fi
+  # トラストストア一覧は証明書チェックと同じ条件のサービスへ出す。判定を二重に
+  # 持たないよう、証明書チェックが採番されたかどうかだけを見て末尾へ採番する。
+  if [ "$cert_check_action" -gt 0 ]; then
+    max_action=$(( max_action + 1 ))
+    truststore_inventory_action="$max_action"
   fi
   # root ユーザでの bash 接続はどのサービスでも選べるが、他の追加操作と同じく
   # 末尾へ採番して、既存操作の番号を変えないようにする。
@@ -19189,6 +20419,9 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$efs_propagation_action" -gt 0 ]; then
       diag "  ${efs_propagation_action}) EFS マウント伝播確認 (偽装バッチサーバーが書いた内容とシンボリックリンクが全コンテナへ反映されるか)"
+    fi
+    if [ "$truststore_inventory_action" -gt 0 ]; then
+      diag "  ${truststore_inventory_action}) トラストストア一覧 (JBoss EAP の Java アプリで有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンド)"
     fi
     diag "  ${root_bash_action}) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
     diag "  0) Compose サービスの選択へ戻る"
@@ -19268,6 +20501,11 @@ run_interactive_compose_service_actions() {
         elif [ "$efs_propagation_action" -gt 0 ] && [ "$action" = "$efs_propagation_action" ]; then
           if ! run_interactive_compose_efs_propagation "$service_name"; then
             warn "EFS マウント伝播確認に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$truststore_inventory_action" -gt 0 ] && [ "$action" = "$truststore_inventory_action" ]; then
+          if ! run_interactive_compose_truststore_inventory "$service_name"; then
+            warn "トラストストア一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
         elif [ "$root_bash_action" -gt 0 ] && [ "$action" = "$root_bash_action" ]; then
@@ -19351,7 +20589,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

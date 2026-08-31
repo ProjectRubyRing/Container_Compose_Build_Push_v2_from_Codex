@@ -201,6 +201,8 @@
 | `--no-cert-check-text` | フラグ | `false` | 証明書チェック結果のテキスト出力を行わない (画面表示だけにする) |
 | `--jboss-module-list-text FILE` | ファイルパス | (なし) | JBoss モジュール一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先 |
 | `--no-jboss-module-list-text` | フラグ | `false` | JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) |
+| `--truststore-inventory-text FILE` | ファイルパス | (なし) | トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先 |
+| `--no-truststore-inventory-text` | フラグ | `false` | トラストストア一覧のテキスト出力を行わない (画面表示だけにする) |
 
 ### 終了時のクリーンアップ
 

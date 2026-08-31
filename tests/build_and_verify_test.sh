@@ -51,7 +51,9 @@ assert_matches() {
 # 同じディレクトリには読み取り専用ファイルシステム分析のテキスト
 # (build_and_verify_<日時>_readonly_filesystem.txt)、証明書チェックの
 # テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt)、JBoss
-# モジュール一覧 (build_and_verify_<日時>_jboss_modules_<サービス名>.txt) も出力される
+# モジュール一覧 (build_and_verify_<日時>_jboss_modules_<サービス名>.txt)、
+# トラストストア一覧
+# (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
 # この関数を使う。Java 例外解析のテキスト (_java_exceptions.txt) は
 # --deploy-exception-text 指定時にしか作られないが、除外は残しておく。
@@ -63,6 +65,7 @@ collect_report_files() {
       *_java_exceptions.txt|*_readonly_filesystem.txt|*_undertow_virtual_host.txt) continue ;;
       *_cert_check_*.txt) continue ;;
       *_jboss_modules_*.txt) continue ;;
+      *_truststore_inventory_*.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -1828,6 +1831,224 @@ if (
 fi
 assert_contains "$cert_check_conflict_output" \
   "--cert-check-text と --no-cert-check-text は同時に指定できません。"
+
+# --- トラストストア一覧 (JBoss EAP の Java アプリで有効なストアと登録証明書) --
+# 証明書チェックと同じ条件のコンテナでだけ操作が増え、既存操作の番号は変わらないこと。
+truststore_output="$TEST_TMP/keep-mode-truststore-inventory.out"
+truststore_reports="$TEST_TMP/truststore-inventory-reports"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app tlsapp"
+if ! printf '2\n5\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,tlsapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$truststore_reports" \
+    --suppress-removed-logs
+) >"$truststore_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$truststore_output" >&2
+  fail "truststore inventory helper returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+# 証明書チェック (4) の後ろへ採番され、root bash はさらにその後ろへ回ること。
+assert_contains "$truststore_output" "  4) 証明書チェック (トラストストアと HTTPS 接続先を自動検出して確認)"
+assert_contains "$truststore_output" "  5) トラストストア一覧 (JBoss EAP の Java アプリで有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンド)"
+assert_contains "$truststore_output" "  6) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+assert_contains "$truststore_output" "Compose サービス : tlsapp"
+assert_contains "$truststore_output" "コンテナ         : app-front"
+assert_contains "$truststore_output" \
+  "そのドメイン情報から推測した接続確認用の curl コマンドも組み立てて出します。"
+# 有効性・ファイルフルパス・種別・カスタムの強調が画面へ出ること。
+assert_contains "$truststore_output" \
+  "有効性  : 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う"
+assert_contains "$truststore_output" "ファイルフルパス: /opt/app/security/truststore.p12"
+assert_contains "$truststore_output" "種別            : ルート CA 証明書 (自己署名の CA)"
+assert_contains "$truststore_output" "★ カスタム追加 [2] alias=cacert  ← このイメージで足した証明書"
+assert_contains "$truststore_output" "=== 2. カスタムとして追加された証明書 (JDK 標準に無いもの) ==="
+assert_contains "$truststore_output" "ストアの有効性  : 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う"
+# Java アプリから使われないストアは、標準の CA まで並べず絞り込むこと
+# (JDK 標準 100 件超に有効なストアの内容が埋もれるのを防ぐ)。
+assert_contains "$truststore_output" \
+  "一覧の範囲      : このストアは Java アプリから使われないため、カスタムとして追加された証明書だけを出します"
+assert_contains "$truststore_output" "(カスタムではない証明書 3 件は、このストアが Java アプリから"
+# 追加された証明書のドメインから、接続確認用の curl が組み立てられていること。
+assert_contains "$truststore_output" "=== 3. 追加された証明書のドメイン情報から組み立てた接続確認コマンド ==="
+assert_contains "$truststore_output" \
+  "--cacert /tmp/truststore-bundle-1.pem 'https://secure-api:8443/api/v1/ping'"
+assert_contains "$truststore_output" "判定: OK — 有効なトラストストアと登録証明書を一覧化しました。"
+assert_contains "$truststore_output" "トラストストア一覧 : OK"
+# レポート出力先と同じディレクトリへ、サービス名付きで自動命名して残ること。
+truststore_text="${truststore_reports}"/build_and_verify_*_truststore_inventory_tlsapp.txt
+truststore_text="$(ls -1 ${truststore_text} 2>/dev/null | head -n 1)"
+[ -n "$truststore_text" ] && [ -s "$truststore_text" ] \
+  || fail "truststore inventory text was not written under the report directory"
+assert_contains "$truststore_output" "トラストストア一覧のテキスト : ${truststore_text}"
+assert_contains "$truststore_text" "トラストストア一覧 (build_and_verify.sh)"
+assert_contains "$truststore_text" "Compose サービス : tlsapp"
+assert_contains "$truststore_text" "判定             : OK (有効なトラストストアと登録証明書を一覧化しました)"
+assert_contains "$truststore_text" "★ カスタム追加 [2] alias=cacert  ← このイメージで足した証明書"
+assert_contains "$truststore_text" \
+  "=== 4. TSV (トラストストア / 別名 / 種別 / カスタム / ドメイン / SHA-256 / 有効期限 / ストアの有効性) ==="
+assert_contains "$truststore_text" \
+  "=== 3. 追加された証明書のドメイン情報から組み立てた接続確認コマンド ==="
+assert_contains "$truststore_text" \
+  "--cacert /tmp/truststore-bundle-1.pem 'https://secure-api:8443/api/v1/ping'"
+# 全量レポートの数え上げに、トラストストア一覧のテキストが混ざらないこと。
+collect_report_files "$truststore_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected exactly one full report next to the truststore inventory text (got ${#REPORT_FILES[@]})"
+# 証明書チェックを持たないサービス (app) では操作が増えないこと。
+# この入力では tlsapp の操作メニューが 2 回 (選択直後と操作から戻った後)、app の
+# 操作メニューが 1 回表示される。app 側にもこの操作が出れば 3 回になるため、
+# 2 回ちょうどであることが「app には増えていない」ことの確認になる。
+assert_contains "$truststore_output" "Compose サービス 'app' で実行する操作を選択してください:"
+assert_occurrences "$truststore_output" "Compose サービス 'tlsapp' で実行する操作を選択してください:" 2
+assert_occurrences "$truststore_output" "Compose サービス 'app' で実行する操作を選択してください:" 1
+assert_occurrences "$truststore_output" "  5) トラストストア一覧 (JBoss EAP の Java アプリで有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンド)" 2
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-tlsapp /bin/sh -c"
+# パスワードはコンテナ内で解決するため、docker のコマンドラインへは載らない。
+assert_not_contains "$FAKE_DOCKER_CALLS" "-storepass changeit"
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+# 読み取れるストアが 1 つも無い場合は NG。診断結果なのでヘルパーの失敗にはしない。
+truststore_ng_output="$TEST_TMP/keep-mode-truststore-inventory-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+export FAKE_TRUSTSTORE_INVENTORY_RESULT="ng"
+if ! printf '1\n5\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$truststore_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_TRUSTSTORE_INVENTORY_RESULT
+  cat "$truststore_ng_output" >&2
+  fail "NG truststore inventory did not return to the service action menu"
+fi
+unset FAKE_TRUSTSTORE_INVENTORY_RESULT
+
+assert_contains "$truststore_ng_output" "判定: NG — 内容を読み取れたトラストストアがありません。"
+assert_contains "$truststore_ng_output" \
+  "トラストストア一覧 : NG (内容を読み取れたトラストストアがありません)"
+assert_not_contains "$truststore_ng_output" "トラストストア一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$truststore_ng_output" "Compose サービス 'tlsapp' で実行する操作を選択してください:" 2
+
+# 検出できない場合 (exit 2) は失敗として扱い、そこまでの内容はテキストへ残す。
+truststore_undetectable_output="$TEST_TMP/keep-mode-truststore-inventory-undetectable.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_TRUSTSTORE_INVENTORY_RESULT="undetectable"
+if ! printf '1\n5\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$truststore_undetectable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_TRUSTSTORE_INVENTORY_RESULT
+  cat "$truststore_undetectable_output" >&2
+  fail "undetectable truststore inventory did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_TRUSTSTORE_INVENTORY_RESULT
+
+assert_contains "$truststore_undetectable_output" \
+  "トラストストアまたは keytool をコンテナ内から検出できませんでした。"
+assert_contains "$truststore_undetectable_output" \
+  "トラストストア一覧の取得に失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$truststore_undetectable_output" "Compose サービスの対話操作を終了しました。"
+assert_contains "$truststore_undetectable_output" "トラストストア一覧のテキスト : "
+assert_contains "$truststore_undetectable_output" \
+  "  (--report-dir または --truststore-inventory-text を指定すると出力先を変えられます)"
+truststore_fallback_text="$(sed -n 's/^トラストストア一覧のテキスト : //p' \
+  "$truststore_undetectable_output" | head -n 1)"
+[ -n "$truststore_fallback_text" ] && [ -s "$truststore_fallback_text" ] \
+  || fail "truststore inventory text was not written to the temporary directory fallback"
+case "$truststore_fallback_text" in
+  "$TEST_TMP"/*) ;;
+  *) fail "truststore inventory text fallback ignored TMPDIR: $truststore_fallback_text" ;;
+esac
+assert_contains "$truststore_fallback_text" \
+  "判定             : 実行不能 (トラストストアまたは keytool をコンテナ内から検出できませんでした)"
+
+# --truststore-inventory-text で出力先を明示でき、--no-... で出力を止められること。
+truststore_text_opt_output="$TEST_TMP/keep-mode-truststore-inventory-text-opt.out"
+truststore_text_opt="$TEST_TMP/truststore-explicit/inventory.txt"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+if ! printf '1\n5\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --truststore-inventory-text "$truststore_text_opt" \
+    --suppress-removed-logs
+) >"$truststore_text_opt_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$truststore_text_opt_output" >&2
+  fail "explicit --truststore-inventory-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$truststore_text_opt_output" "トラストストア一覧のテキスト : ${truststore_text_opt}"
+[ -s "$truststore_text_opt" ] || fail "--truststore-inventory-text did not create $truststore_text_opt"
+assert_contains "$truststore_text_opt" "=== 2. カスタムとして追加された証明書 (JDK 標準に無いもの) ==="
+
+truststore_no_text_output="$TEST_TMP/keep-mode-truststore-inventory-no-text.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="tlsapp"
+if ! printf '1\n5\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service tlsapp \
+    --startup-service tlsapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --no-truststore-inventory-text \
+    --suppress-removed-logs
+) >"$truststore_no_text_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$truststore_no_text_output" >&2
+  fail "--no-truststore-inventory-text scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_contains "$truststore_no_text_output" \
+  "トラストストア一覧のテキスト : 出力しません (--no-truststore-inventory-text)"
+# 画面表示そのものは従来どおり行う。
+assert_contains "$truststore_no_text_output" "=== 2. カスタムとして追加された証明書 (JDK 標準に無いもの) ==="
+
+# 出力先を指定しつつ出力を止める指定は、意味が矛盾するため受け付けない。
+truststore_conflict_output="$TEST_TMP/truststore-inventory-option-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --truststore-inventory-text "$TEST_TMP/never-written-inventory.txt" \
+    --no-truststore-inventory-text \
+    --dry-run
+) >"$truststore_conflict_output" 2>&1; then
+  cat "$truststore_conflict_output" >&2
+  fail "--truststore-inventory-text with --no-truststore-inventory-text should be rejected"
+fi
+assert_contains "$truststore_conflict_output" \
+  "--truststore-inventory-text と --no-truststore-inventory-text は同時に指定できません。"
 
 # --- JBoss モジュール一覧 (module-loading:module-info) ------------------------
 # jboss-cli.sh と modules を持つコンテナ (frontend / backend の JBoss EAP) だけで
@@ -6983,4 +7204,4 @@ assert_not_contains "$keep_post_output" "未使用リソースを含めて完全
 [ ! -s "$FAKE_USAGE_CHECK_CALLS" ] \
   || fail "docker-usage-check.sh must not run while --keep-service is in effect"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection\n'
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection\n'

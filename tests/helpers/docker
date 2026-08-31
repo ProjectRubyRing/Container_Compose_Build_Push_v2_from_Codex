@@ -1217,6 +1217,147 @@ if [ "${1:-}" = "build" ] && [[ " $* " == *" --output "* ]]; then
   exit 0
 fi
 
+# トラストストア一覧の本体。証明書チェックと同じ判定 (cert-check-probe) の
+# コンテナで選べる操作なので、対象判定用のハンドラは足さずに本体だけを模擬する。
+# 出力はヒアドキュメント (引用符付き) で丸ごと持つ。curl の -w に渡す "\n" や
+# "%{http_code}" を printf の書式として解釈させないため。
+if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
+    && [[ "${5:-}" == *"truststore-inventory-report"* ]]; then
+  case "${FAKE_TRUSTSTORE_INVENTORY_RESULT:-ok}" in
+    undetectable)
+      cat <<'FAKE_TI_UNDETECTABLE'
+
+=== 0. 検出したトラストストアと有効性 ===
+     keytool          : /opt/java/openjdk/bin/keytool
+
+トラストストアを検出できませんでした。
+  -Djavax.net.ssl.trustStore を付けて JVM を起動しているか、
+  JDK 同梱の cacerts を読めるか、*TRUSTSTORE* 環境変数があるかを確認してください。
+FAKE_TI_UNDETECTABLE
+      exit 2
+      ;;
+    ng)
+      cat <<'FAKE_TI_NG'
+
+=== 1-1. トラストストア /opt/app/security/truststore.p12 ===
+     ファイルフルパス: /opt/app/security/truststore.p12
+     結果            : keytool で読み取れない (パスワード / ストア種別を確認する)
+
+=== 結果 ===
+  トラストストア=1 (読み取り成功 0)  登録証明書=0  カスタム追加=0
+判定: NG — 内容を読み取れたトラストストアがありません。
+FAKE_TI_NG
+      exit 1
+      ;;
+    *)
+      cat <<'FAKE_TI_OK'
+
+=== 0. 検出したトラストストアと有効性 ===
+     keytool          : /opt/java/openjdk/bin/keytool
+     openssl          : /usr/bin/openssl (種別・ドメイン・カスタム判定に使用)
+     JBOSS_HOME       : /opt/jboss-eap
+     standalone.xml   : /opt/jboss-eap/standalone/configuration/standalone.xml
+     JBoss EAP の JVM : pid 1 を検出
+     -Djavax.net.ssl.trustStore : /opt/app/security/truststore.p12 (type=PKCS12)
+
+     検出したトラストストア: 2 件
+       [1] /opt/app/security/truststore.p12
+           検出元  : JBoss EAP の起動中 JVM (pid 1) の -Djavax.net.ssl.trustStore
+           有効性  : 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う
+       [2] /opt/java/openjdk/lib/security/cacerts
+           検出元  : JDK 同梱の cacerts
+           有効性  : 参考 — -Djavax.net.ssl.trustStore の指定があるため Java アプリからは使われない
+     検出した HTTPS 接続先: 1 件 (接続確認コマンドの宛先に使う)
+       - SECURE_API_URL = https://secure-api:8443/api/v1/ping
+     ビルドで取り込んだ証明書ファイル: 1 件 (指紋一致でカスタムと断定する)
+       - /etc/pki/ca-trust/source/anchors/cacert.crt
+
+=== 1-1. トラストストア /opt/app/security/truststore.p12 ===
+     ファイルフルパス: /opt/app/security/truststore.p12
+     検出元          : JBoss EAP の起動中 JVM (pid 1) の -Djavax.net.ssl.trustStore
+     有効性          : 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う
+     パスワード      : JVM の -Djavax.net.ssl.trustStorePassword で読み取り成功 (値は表示しません)
+     登録証明書      : 2 件
+     カスタム判定    : /opt/java/openjdk/lib/security/cacerts に無い証明書をカスタムとして扱う
+
+     [1] alias=publicrootca1
+         ファイルフルパス: /opt/app/security/truststore.p12
+         種別            : ルート CA 証明書 (自己署名の CA)
+         カスタム        : いいえ (/opt/java/openjdk/lib/security/cacerts にも入っている標準の CA)
+         subject         : CN=Public Root CA G1, O=Public Trust Services
+         有効期間        : Jan  1 00:00:00 2020 GMT 〜 Jan  1 00:00:00 2040 GMT
+         SHA-256         : 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00
+         ドメイン URL    : 証明書からは取得できず (CA 証明書には SAN / CN のホスト名が無いことが多い)
+                           接続確認は検出した HTTPS 接続先を宛先に使います (3. を参照)
+
+  ★ カスタム追加 [2] alias=cacert  ← このイメージで足した証明書
+         ファイルフルパス: /opt/app/security/truststore.p12
+         種別            : ルート CA 証明書 (自己署名の CA)
+         カスタム        : ★ はい (ビルドで取り込んだ /etc/pki/ca-trust/source/anchors/cacert.crt と同一)
+         subject         : CN=Example Internal Root CA
+         有効期間        : Jan  1 00:00:00 2026 GMT 〜 Jan  1 00:00:00 2036 GMT
+         SHA-256         : AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99
+         ドメイン URL    :
+           - secure-api  (出どころ: SAN)
+             URL: https://secure-api:8443/api/v1/ping   [検出した接続先 SECURE_API_URL と一致 (ポートとパスまで確定)]
+
+=== 1-2. トラストストア /opt/java/openjdk/lib/security/cacerts ===
+     ファイルフルパス: /opt/java/openjdk/lib/security/cacerts
+     検出元          : JDK 同梱の cacerts
+     有効性          : 参考 — -Djavax.net.ssl.trustStore の指定があるため Java アプリからは使われない
+     パスワード      : 既定値 changeit で読み取り成功 (値は表示しません)
+     登録証明書      : 3 件
+     一覧の範囲      : このストアは Java アプリから使われないため、カスタムとして追加された証明書だけを出します
+     カスタム判定    : /etc/pki/ca-trust/extracted/java/cacerts に無い証明書をカスタムとして扱う
+
+       (カスタムではない証明書 3 件は、このストアが Java アプリから
+        使われないため一覧から省略しました。全件は 4. の TSV に残しています)
+
+=== 2. カスタムとして追加された証明書 (JDK 標準に無いもの) ===
+     カスタムとして追加された証明書: 1 件
+     ここに出る証明書だけが「このイメージで足したもの」です。
+
+  ★ alias=cacert
+     トラストストア  : /opt/app/security/truststore.p12
+     種別            : ルート CA 証明書 (自己署名の CA)
+     ドメイン URL    : secure-api
+     SHA-256         : AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99
+     有効期限        : Jan  1 00:00:00 2036 GMT
+     ストアの有効性  : 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う
+
+=== 3. 追加された証明書のドメイン情報から組み立てた接続確認コマンド ===
+     コンテナ内でそのまま実行できる形にしてあります。
+     パスワードは値を出さないため <トラストストアのパスワード> を置き換えてください
+     (既定値 changeit で読めたストアはその値を埋めてあります)。
+
+  ★ alias=cacert  (ルート CA 証明書 (自己署名の CA))
+       トラストストア: /opt/app/security/truststore.p12
+       ストアの有効性: 有効 — JBoss EAP 上の Java アプリの HTTPS 通信はこのストアだけを使う
+       パスワードの出どころ: JVM の -Djavax.net.ssl.trustStorePassword
+       1) トラストストア全体を PEM へ書き出して接続を確認する (JVM と同じ信頼範囲)
+       /opt/java/openjdk/bin/keytool -list -rfc -keystore '/opt/app/security/truststore.p12' -storepass '<トラストストアのパスワード>' > /tmp/truststore-bundle-1.pem
+       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --cacert /tmp/truststore-bundle-1.pem 'https://secure-api:8443/api/v1/ping'
+          ↑ 宛先の根拠: secure-api — 検出した接続先 SECURE_API_URL と一致 (ポートとパスまで確定)
+       2) この証明書 1 枚だけを信頼して接続を確認する (この CA だけで足りるかの切り分け)
+       /opt/java/openjdk/bin/keytool -exportcert -rfc -alias 'cacert' -keystore '/opt/app/security/truststore.p12' -storepass '<トラストストアのパスワード>' -file /tmp/truststore-check-1.pem
+       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --cacert /tmp/truststore-check-1.pem 'https://secure-api:8443/api/v1/ping'
+       3) 対照: CA を渡さずに接続する (ここが失敗して 1) が成功すれば、この CA が効いている)
+       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' 'https://secure-api:8443/api/v1/ping'
+       4) サーバが提示するチェーンを見て、発行者がこの CA かを突き合わせる
+       /usr/bin/openssl s_client -connect secure-api:8443 -servername secure-api -showcerts </dev/null
+
+=== 4. TSV (トラストストア / 別名 / 種別 / カスタム / ドメイン / SHA-256 / 有効期限 / ストアの有効性) ===
+truststore	alias	kind	custom	domains	sha256	not_after	effective
+
+=== 結果 ===
+  トラストストア=2 (読み取り成功 2)  登録証明書=5  カスタム追加=1
+判定: OK — 有効なトラストストアと登録証明書を一覧化しました。
+FAKE_TI_OK
+      exit 0
+      ;;
+  esac
+fi
+
 # コンテナ内シェルで実行される伝搬検証のプローブ。
 # build_and_verify.sh は次の形で呼ぶため、スクリプト本文の特徴で処理を振り分ける。
 #   docker exec    <cid> /bin/sh -c '<script>' _ <引数...>   → script は $5

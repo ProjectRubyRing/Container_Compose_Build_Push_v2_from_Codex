@@ -197,7 +197,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
 | `--remove-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。この実行が行うすべての `compose down` に `--volumes` を付け、Compose プロジェクトの名前付きボリュームも毎回削除する | `false` |
 | `--keep-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。対話操作の終了後の後始末でもボリュームを削除しない (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する | `false` |
@@ -252,6 +252,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-cert-check-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック結果のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--jboss-module-list-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。`module-info` が `success` となったモジュール名・スロット・jar ファイル名を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-jboss-module-list-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
+| `--truststore-inventory-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。有効なトラストストアのフルパス・登録証明書の種別・ドメイン URL・カスタム証明書の強調・接続確認コマンドを、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
+| `--no-truststore-inventory-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -2085,7 +2087,8 @@ CloudWatch Logs には届きません。
   選べます。`3` では Docker healthcheck の設定・実行履歴・通信内容を確認できます。
   さらに、コンテナの設定に応じて MySQL 接続・送達診断・証明書チェック・ALB ヘルスチェック
   確認（ステータスコード / 成功失敗判定）・JBoss モジュール一覧（`module-info` が `success`
-  となったモジュール名と jar ファイル名）が追加されます。
+  となったモジュール名と jar ファイル名）・トラストストア一覧（JBoss EAP 上の Java アプリから
+  有効になっているトラストストアと、そこに登録された証明書の棚卸し）が追加されます。
   **最後の操作番号**には、どのサービスでも選べる `root ユーザで bash へ接続` が並びます。
   `2` と同じ対話 bash を `docker exec -u 0:0` で開くため、コンテナの既定ユーザーが
   非 root（JBoss EAP の `jboss` ユーザー等）で権限不足になるファイル参照やパッケージ導入も
@@ -2342,6 +2345,106 @@ MD5 / SHA-1 署名・RSA 2048 bit 未満といった**その証明書自体の�
 > 署名を作れないため、サーバはその CA が発行した証明書を提示できません。詳細と対処は
 > [詳細ガイド 11 章](docs/build_and_verify_guide.md#11-自己証明書だけがあり秘密鍵が無い場合の対処)
 > を参照してください。
+
+#### トラストストア一覧（JBoss EAP 上の Java アプリで有効な証明書の棚卸し）
+
+証明書チェックが「**今つながるか**」を見るのに対し、`トラストストア一覧` は
+「**何を信頼しているのか**」を棚卸しします。表示条件は証明書チェックとまったく同じで
+（判定を二重に持つと片方だけ出る食い違いが起きるため、`compose_service_supports_cert_check`
+を共用しています）、証明書チェックの次の操作番号として追加されます。既存操作の番号は
+変わらず、`root ユーザで bash へ接続` がその後ろへ回ります。
+
+「トラストストアがコンテナに置いてある」ことと「JBoss EAP 上の Java アプリの HTTPS 通信で
+実際に使われる」ことは別物です。`-Djavax.net.ssl.trustStore` の指定があれば JVM は
+**そのストア 1 つだけ**を使い、指定が無ければ JDK 同梱の `cacerts` が使われます。Elytron の
+`trust-manager` は `ssl-context` を明示した通信でだけ効きます。どれが効いているのかを
+取り違えたまま `keytool -importcert` しても証明書は届かず、「入れたのにつながらない」の
+原因になります。そこで検出したストアごとに**有効性まで判定**して並べます。
+
+| 検出元 | 有効性の表示 |
+|--------|--------------|
+| JBoss EAP を動かしている JVM の `-Djavax.net.ssl.trustStore`（`argv` に無ければ `JAVA_TOOL_OPTIONS` / `JAVA_OPTS` / `JDK_JAVA_OPTIONS` の `environ`） | **有効** — Java アプリの HTTPS 通信はこのストアだけを使う |
+| JDK 同梱の `cacerts`（`$JAVA_HOME/lib/security/cacerts` 等） | 上の指定が無ければ**有効**、あれば「参考」 |
+| `standalone.xml` の Elytron `key-store` のうち `trust-manager` が参照するもの | **有効** — `ssl-context` を指定した通信で使われる |
+| `standalone.conf` / `standalone.conf.d/*.conf` の `JAVA_OPTS` | 参考 — 次回起動時に有効 |
+| 絶対パスを値に持つ `*TRUSTSTORE*` / `*TRUST_STORE*` 環境変数 | 参考 — アプリが明示的に読む実装のときだけ有効 |
+
+JBoss EAP の JVM は `jboss-modules.jar` / `org.jboss.as` / `-Djboss.home.dir` を含むプロセスとして
+特定します。ストアのパスワードは JVM の `-Djavax.net.ssl.trustStorePassword`、対応する
+`*_PASSWORD` 環境変数、Elytron の `credential-reference clear-text`、`changeit`、パスワード無しの
+順に試し、**値は表示せず出どころだけ**を示します（`docker exec` のコマンドラインにも載りません）。
+
+ストアごとに `keytool -list -rfc` で証明書を取り出し、1 枚ずつ次を表示します。
+
+| 項目 | 内容 |
+|------|------|
+| ファイルフルパス | そのトラストストアの絶対パス（証明書ごとに再掲するため、行を拾えばどのストアの話か迷いません） |
+| 別名 (`alias`) | `keytool -exportcert` / `-delete` の対象指定にそのまま使えます |
+| 種別 | ルート CA 証明書（自己署名の CA）/ 中間 CA 証明書 / 自己署名リーフ / end-entity 証明書 |
+| **カスタム** | JDK 標準の `cacerts` に無い証明書、またはビルドで取り込んだ `${PKI_TRUST_DIR}/*.crt` などと SHA-256 が一致する証明書を **★ 付き**で強調 |
+| ドメイン URL | SAN の `DNS` / `IP`、`nameConstraints` の許可 DNS、`CN`、`DC` の連結、CRL 配布点 / AIA の URI ホスト、`CN` / `O` に埋め込まれたホスト名から集め、**出どころ付き**で表示 |
+| subject / issuer / 有効期間 / SHA-256 | 配布元との突き合わせに使う識別情報（期限切れは `★有効期限切れ★`） |
+
+`カスタム` の判定基準は、調べているストア自身を除いた別の `cacerts` です。自己証明書を
+`$JAVA_HOME/lib/security/cacerts` へ直接取り込んだ構成でも自分自身と比較して 0 件になることが
+ないよう、`readlink -f` で実体パスが異なるものだけを基準に選びます。基準を選べない場合でも、
+`${PKI_TRUST_DIR}/*.crt` や `*CACERT*` / `*CA_BUNDLE*` 環境変数が指すファイルとの
+SHA-256 一致だけは判定できるため、「ビルドで足した証明書」は取りこぼしません。
+
+一覧の範囲は「有効性」で変えます。**有効**と判定したストアは登録証明書を全件並べ、
+**参考**のストア（`-Djavax.net.ssl.trustStore` があるときの JDK 同梱 `cacerts`、
+`standalone.conf` の次回起動時指定、`*TRUSTSTORE*` 環境変数）は**カスタムとして追加された
+証明書だけ**を出して、省略した件数を明記します。JDK 標準の 100 件超をすべて並べると
+有効なストアの内容が埋もれてしまう一方、「取り込み先のストアを間違えた」という
+取り違えは参考のストア側のカスタム証明書にこそ現れるためです。省略した分も含めた全件は
+セクション `4.` の TSV に残します。
+
+セクション `2.` にはカスタムとして追加された証明書だけを抜き出して再掲します。
+1 件も無い場合は「取り込み先のストアかビルド手順を確認してください」という
+指摘（`-Djavax.net.ssl.trustStore` が指すストアと `keytool -importcert` の `-keystore` が
+別ファイルになっている、というよくある行き違い）を表示します。
+
+#### 追加された証明書のドメインから組み立てる接続確認コマンド
+
+セクション `3.` では、**カスタムとして追加された各証明書のドメイン情報から宛先を推測**して、
+コンテナ内でそのまま実行できる接続確認コマンドを組み立てて表示・出力します。
+
+宛先は次の順で決まります。`https://` で始まる値を持つ環境変数（`SECURE_API_URL` 等）の
+ホストが証明書のドメインと一致（ワイルドカードは 1 ラベルまで照合）すれば、**ポートとパスまで
+確定した実際の URL**を使います。一致しなければ `https://<ドメイン>/` を推測として使い、
+ワイルドカードは `https://<ホスト名>.example.com/` の形で置き換え位置を示します。
+ルート CA のようにドメイン情報を持たない証明書でも、検出した接続先そのものを宛先へ足すため、
+「この CA で実際の接続先を検証できるか」を確かめられます。各コマンドには**宛先の根拠**
+（どのドメインから、どういう理由でその URL になったか）を併記します。
+
+組み立てるのは次の 4 種類です。
+
+1. トラストストア全体を PEM へ書き出して接続を確認する（JVM と同じ信頼範囲）
+   — `keytool -list -rfc` → `curl --cacert`
+2. その証明書 1 枚だけを信頼して接続を確認する（この CA だけで足りるかの切り分け）
+   — `keytool -exportcert -rfc -alias <別名>` → `curl --cacert`
+3. 対照テスト — `--cacert` を渡さない `curl`。ここが失敗して 1. が成功すれば、
+   その CA が効いていると確定できます
+4. `openssl s_client -connect <ホスト>:<ポート> -servername <ホスト> -showcerts`
+   — サーバが提示するチェーンと発行者を突き合わせる
+
+`-storepass` にはパスワードの値を出さず `<トラストストアのパスワード>` を置きます
+（既定値 `changeit` で読めたストアだけはその値を埋めます）。パスワードの出どころは
+コマンドの直前に注記します。
+
+#### 結果のテキスト出力（トラストストア一覧）
+
+一覧の結果は、画面表示と**同じ内容をテキストファイルへも出力**します。出力先は
+`--truststore-inventory-text FILE` → `--report-dir` 配下の
+`build_and_verify_<日時>_truststore_inventory_<サービス名>.txt` → 一時ディレクトリ、の順に
+決まり、実際のパスを画面へ表示します。**レポート出力先と同じディレクトリ**へ出るため、
+全量レポートと並べて保管できます。同じサービスを繰り返し確認した場合は連番を付けるため、
+証明書を入れ替えながらの比較ができます。出力を止めるには `--no-truststore-inventory-text`
+を指定します（`--truststore-inventory-text` との同時指定は起動時にエラーになります）。
+
+判定は `判定: OK`（一覧化できた）/ `判定: NG`（内容を読み取れたストアが 1 つも無い）として
+表示します。`NG` は診断結果であり、操作選択へそのまま戻ります。`keytool` もトラストストアも
+検出できない構成では、その旨を表示して操作選択へ戻ります。
 
 さらに、対象のComposeサービス名に応じて次の可観測性専用操作が追加されます。MySQL 操作と
 同時に利用可能な場合も番号は重複せず、専用操作を使わない通常サービスでは
