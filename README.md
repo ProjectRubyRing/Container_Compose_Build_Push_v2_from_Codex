@@ -221,6 +221,9 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-directory-tree` | **`build_and_verify.sh` / `--build-only` 委譲時**。上記の画面表示を行わない。深さ等の指定による自動有効化も打ち消す | `false` |
 | `--directory-tree-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[3]` `[4]` へ、コンテナ内ツリーと JBoss EAP デプロイ構造を出力する。画面表示 (`--directory-tree`) とは独立して指定する | `false` (レポートへ出力しない) |
 | `--no-directory-tree-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。全量レポートへツリーとデプロイ構造を出力しない | `true` (既定) |
+| `--directory-tree-excel` | **`build_and_verify.sh` / `--build-only` 委譲時**。コンテナ内のディレクトリツリー (ディレクトリのみ) を Excel ブック (`.xlsx`) へ追加出力する。対象は frontend と backend の**両方**のコンテナ (サービス名がキーワードと完全一致、またはキーワードを含むもの。どちらも無い場合は起動確認の対象コンテナで代替)。階層ごとに列を分けたオートフィルタ付きの一覧・罫線で描いたツリー・概要の 3 シート構成で、フォントは Meiryo UI。出力先は `DIR/build_and_verify_<日時>_directory_tree.xlsx`。通常ファイルは含めず、深さの制限もかけない。出力には Python 3 が必要 | `false` (出力しない) |
+| `--no-directory-tree-excel` | **`build_and_verify.sh` / `--build-only` 委譲時**。上記の Excel 出力を行わない | `true` (既定) |
+| `--directory-tree-excel-file FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。上記 Excel の出力先を明示指定する (`.xlsx` で終わるパス)。指定すると Excel 出力を有効にするため、`--report-dir` が無い実行でも出力できる | (なし) |
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
@@ -1221,6 +1224,11 @@ Compose が付ける既定名 (`<プロジェクト>-<サービス>` / `<プロ�
   既定では見出しだけを残して内容を保存しません。** 保存する場合は
   `--directory-tree-report` を併用してください (画面表示の有無とは独立した指定です)。
   併用したときは、除外対象を除く全ディレクトリ深度・全ファイル名で保存します。
+  `--directory-tree-excel` を併用すると、frontend と backend の**両方**のコンテナに
+  ついて「ディレクトリだけ」のツリーを
+  `DIR/build_and_verify_<YYYYMMDDHHMMSS>_directory_tree.xlsx` へ追加出力します。
+  階層ごとに列を分けたオートフィルタ付きの一覧シートを持つため、深さや階層名での
+  絞り込みがそのまま行えます (フォントは Meiryo UI、出力には Python 3 が必要)。
   起動確認を伴わないビルドのみの場合、コンテナ由来の 5 セクションは
   「未取得」と記録します。`--dry-run` ではファイルを作成せず、出力予定だけを表示します。
   レポートの構成は `[1] ビルド結果` / `[2] 環境変数一覧` / `[3] コンテナ内ディレクトリツリー` /
@@ -1350,6 +1358,15 @@ AP サーバ (JBoss EAP など) は起動したものの、**アプリのデプ�
 # 画面にはツリーを出さず、レポートにだけツリーを残す
 ./build_and_verify.sh --verify-startup \
     --directory-tree-report --report-dir ./build-reports
+
+# frontend / backend の「ディレクトリだけ」のツリーを Excel へ追加出力する
+# (階層ごとに列が分かれるため、深さや階層名での絞り込みがそのまま行える)
+./build_and_verify.sh --verify-startup \
+    --directory-tree-excel --report-dir ./build-reports
+
+# Excel の出力先を明示指定する (--report-dir が無い実行でも出力できる)
+./build_and_verify.sh --verify-startup \
+    --directory-tree-excel-file ./reports/container-directories.xlsx
 
 # app / batch / db をまとめてビルド・起動し、JBoss EAP の app だけを確認
 ./build_and_verify.sh --compose-service app,batch,db \

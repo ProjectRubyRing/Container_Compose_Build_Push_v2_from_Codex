@@ -416,6 +416,7 @@ arg_takes_value() {
     --jboss-secret-id|--jboss-config-file|--jboss-cli-path|--jboss-elytron-tool) return 0 ;;
     --jboss-credential-store) return 0 ;;
     --directory-tree-depth|--directory-file-limit|--deployment-dir-env|--report-dir) return 0 ;;
+    --directory-tree-excel-file) return 0 ;;
     --prune-build-cache-keep) return 0 ;;
     --deploy-exception-excel|--deploy-exception-text|--deploy-exception-limit) return 0 ;;
     --readonly-analysis-excel|--readonly-analysis-text) return 0 ;;

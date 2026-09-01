@@ -32,6 +32,11 @@
 #                          OpenTelemetry 設定を日時付きテキストファイルへ保存する。
 #                          ツリーとデプロイ構造は --directory-tree-report 指定時
 #                          のみ保存する。
+#                          --directory-tree-excel を指定すると、frontend と
+#                          backend の両方のコンテナについて、ディレクトリのみの
+#                          ツリーを Excel ブックへ追加出力する。階層ごとに列を
+#                          分けたオートフィルタ付きの一覧で、階層単位の絞り込みが
+#                          できる (フォントは Meiryo UI)。
 #   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
 #                          bash 接続 (接続前に tree を使える状態にする。コンテナに
 #                          tree が無ければ bash だけで動く簡易実装を用意する) するか、
@@ -746,6 +751,37 @@ DIRECTORY_TREE_HIDDEN_PATHS=(
   /usr/share/osinfo
   /usr/share/zoneinfo
 )
+
+# ---- ディレクトリツリーの Excel レポート出力 ---------------------------------
+# 全量レポート [3] のテキストツリーとは別に、「ディレクトリだけ」のツリーを Excel
+# ブックへ追加出力する。テキストのツリーは目で追う分には読みやすい反面、
+# 「深さ 3 のディレクトリだけ見たい」「特定の階層名で絞り込みたい」といった
+# 読み方ができない。そこで階層ごとに列を分けたオートフィルタ付きの一覧と、
+# 罫線で描いたディレクトリのみのツリーを 1 冊にまとめる。
+#
+# 対象は frontend と backend の両方のコンテナ。サービス名がキーワードと完全一致
+# するか、キーワードを含むもので判定する (--frontend-context などと同じ判定)。
+# frontend / backend のどちらも見つからない構成では、起動確認の対象コンテナへ
+# フォールバックし、「対象が無いので出力なし」で終わらないようにする。
+#
+# 出力するかどうかは --directory-tree-excel / --directory-tree-excel-file で
+# 指定する。既定では出力しない (--report-dir や --directory-tree-report だけでは
+# 出力しない)。ツリーは巨大になりやすく、必要なときだけ作るのが扱いやすいため。
+DIRECTORY_TREE_EXCEL="false"          # true: ディレクトリツリーの Excel ブックを出力
+DIRECTORY_TREE_EXCEL_PATH=""          # 出力先の明示指定 (--directory-tree-excel-file)
+DIRECTORY_TREE_EXCEL_PATH_SET="false" # 出力先が明示指定されたか
+DIRECTORY_TREE_EXCEL_FILE=""          # 実際に出力した Excel のパス
+DIRECTORY_TREE_EXCEL_DONE="false"     # 成功経路と EXIT トラップの二重実行を防ぐ
+DIRECTORY_TREE_EXCEL_SKIP_REASON=""   # 出力しなかった理由 (全量レポートへ載せる)
+DIRECTORY_TREE_EXCEL_SUMMARY=""       # 出力内容の要約 (全量レポートへ載せる)
+DIRECTORY_TREE_EXCEL_SERVICES="0"     # 出力したサービス数 (ヘルパーからの集計値)
+DIRECTORY_TREE_EXCEL_DIRECTORIES="0"  # 出力したディレクトリ数 (同上)
+DIRECTORY_TREE_EXCEL_MAX_DEPTH="0"    # 最も深い階層 (同上)
+# 対象コンテナの判定に使うサービス名のキーワード。
+DIRECTORY_TREE_EXCEL_SERVICE_KEYWORDS=("frontend" "backend")
+# 階層ごとの列は深さの分だけ増える。極端に深いツリーで列が破綻しないよう上限を
+# 設ける (上限を超えた階層はフルパス列で追える)。
+DIRECTORY_TREE_EXCEL_MAX_LEVEL_COLUMNS="15"
 
 # ---- Java JVM パラメータ / OpenTelemetry 設定出力 -----------------------------
 # /proc/<pid>/cmdline は NUL 区切りのため、コンテナ内で US (0x1f) へ置き換えてから
@@ -1842,6 +1878,24 @@ JBoss マスターパスワードの伝搬検証:
                            画面表示の有無 (--directory-tree) とは独立して指定する
   --no-directory-tree-report
                            全量レポートへツリーとデプロイ構造を出力しない (既定)
+  --directory-tree-excel   コンテナ内のディレクトリツリー (ディレクトリのみ) を
+                           Excel ブック (.xlsx) へ追加出力する。対象は frontend と
+                           backend の両方のコンテナ (サービス名がキーワードと完全
+                           一致、またはキーワードを含むもの)。どちらも見つからない
+                           場合は起動確認の対象コンテナで代替する。
+                           階層ごとに列を分けたオートフィルタ付きの一覧、罫線で
+                           描いたツリー、概要の 3 シート構成 (フォントは Meiryo UI)。
+                           出力先は --report-dir 配下の
+                           DIR/build_and_verify_<日時>_directory_tree.xlsx。
+                           全量レポートの [3] とは独立した指定で、深さの制限や
+                           通常ファイルの表示指定は適用しない (全深度・ディレクトリ
+                           のみ)。出力には Python 3 が必要
+  --no-directory-tree-excel
+                           上記の Excel 出力を行わない (既定)
+  --directory-tree-excel-file FILE
+                           上記 Excel の出力先を明示指定する (.xlsx で終わるパス)。
+                           指定すると Excel 出力を有効にするため、--report-dir が
+                           無い実行でも出力できる
   --directory-tree-depth N|all
                            表示するコンテナ内ディレクトリツリーの最大深さ。
                            / 直下を深さ 1 とし、既定の all は最下層まで表示する。
@@ -2367,6 +2421,12 @@ while [ $# -gt 0 ]; do
     --no-directory-tree-report) DIRECTORY_TREE_REPORT="false"; shift ;;
     --directory-tree-depth) need_value "$1" $#; DIRECTORY_TREE_DEPTH="$2"; DIRECTORY_TREE_DEPTH_SET="true"; shift 2 ;;
     --directory-file-limit) need_value "$1" $#; DIRECTORY_FILE_LIMIT="$2"; DIRECTORY_FILE_LIMIT_SET="true"; shift 2 ;;
+    --directory-tree-excel) DIRECTORY_TREE_EXCEL="true"; shift ;;
+    --no-directory-tree-excel) DIRECTORY_TREE_EXCEL="false"; shift ;;
+    --directory-tree-excel-file)
+      need_value "$1" $#
+      DIRECTORY_TREE_EXCEL_PATH="$2"; DIRECTORY_TREE_EXCEL_PATH_SET="true"
+      DIRECTORY_TREE_EXCEL="true"; shift 2 ;;
     --deployment-dir-env) need_value "$1" $#; append_services DEPLOYMENT_DIR_ENVS "$2"; shift 2 ;;
     --report-dir)          need_value "$1" $#; BUILD_REPORT_DIR="$2"; BUILD_REPORT_DIR_SET="true"; shift 2 ;;
     --cert-check-text)     need_value "$1" $#; CERT_CHECK_TEXT="$2"; CERT_CHECK_TEXT_SET="true"; shift 2 ;;
@@ -2547,6 +2607,28 @@ fi
 # 全量レポート自体を作らない実行では、ツリーの出力指定は書き出す先が無い。
 if [ "$DIRECTORY_TREE_REPORT" = "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
   warn "--directory-tree-report は --report-dir と併用してください (全量レポートを出力しないため無視します)。"
+fi
+# 拡張子が .xlsx でないと Excel が形式を判別できず、開けないファイルになる。
+if [ "$DIRECTORY_TREE_EXCEL_PATH_SET" = "true" ]; then
+  if [ -z "$DIRECTORY_TREE_EXCEL_PATH" ] || [ "$DIRECTORY_TREE_EXCEL_PATH" = "-" ]; then
+    err "--directory-tree-excel-file にはファイルパスを指定してください: $DIRECTORY_TREE_EXCEL_PATH"
+    exit 2
+  fi
+  case "$DIRECTORY_TREE_EXCEL_PATH" in
+    *.xlsx) ;;
+    *)
+      err "--directory-tree-excel-file には .xlsx で終わるパスを指定してください: $DIRECTORY_TREE_EXCEL_PATH"
+      exit 2
+      ;;
+  esac
+fi
+# 出力先が決まらない実行 (--report-dir も明示指定も無い) では、Excel を書き出す
+# 先が無い。黙って何も作らないと指定が効いていないように見えるため、理由を出す。
+if [ "$DIRECTORY_TREE_EXCEL" = "true" ] && [ "$DIRECTORY_TREE_EXCEL_PATH_SET" != "true" ] \
+    && [ -z "$BUILD_REPORT_DIR" ]; then
+  warn "--directory-tree-excel は --report-dir または --directory-tree-excel-file と併用してください (出力先が決まらないため無視します)。"
+  DIRECTORY_TREE_EXCEL="false"
+  DIRECTORY_TREE_EXCEL_SKIP_REASON="出力先が決まらないため出力していません (--report-dir または --directory-tree-excel-file を併用してください)。"
 fi
 if [ "$CERT_CHECK_TEXT_SET" = "true" ]; then
   if [ -z "$CERT_CHECK_TEXT" ] || [ "$CERT_CHECK_TEXT" = "-" ]; then
@@ -7349,6 +7431,908 @@ show_verified_container_deployment_structures() {
   done < "$deployment_report_tmp"
   rm -f -- "$deployment_report_tmp"
 }
+
+
+# ---- ディレクトリツリーの Excel レポート出力 ---------------------------------
+# frontend / backend のコンテナからディレクトリだけを集め、階層ごとに列を分けた
+# Excel ブックへ書き出す。全量レポート [3] のテキストツリーと同じ枝刈り・同じ
+# 除外パスを使うため、同じ構造を「読み方の違う 2 形式」で追えるようにしてある。
+
+# サービス名がキーワード (frontend / backend) と完全一致するか、キーワードを
+# 含むかを判定する。--frontend-context などの対象判定と同じ規則に揃えている。
+directory_tree_excel_service_matches() {
+  local service_name="$1" keyword
+  for keyword in "${DIRECTORY_TREE_EXCEL_SERVICE_KEYWORDS[@]}"; do
+    case "$service_name" in
+      *"$keyword"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# 出力対象のコンテナ ID を、キーワードに一致するサービスの順に列挙する。
+# 起動確認の対象サービス (--startup-service) では絞らない。frontend だけを起動
+# 確認している実行でも、backend のツリーまで 1 冊へまとめるのが目的のため。
+directory_tree_excel_target_container_ids() {
+  local service_name cid
+  while IFS= read -r service_name; do
+    [ -n "$service_name" ] || continue
+    directory_tree_excel_service_matches "$service_name" || continue
+    while IFS= read -r cid; do
+      [ -n "$cid" ] && printf '%s\n' "$cid"
+    done < <(compose_container_ids "$service_name")
+  done < <(compose_started_services)
+}
+
+# 1 コンテナ分のディレクトリ一覧を "サービス<TAB>コンテナ<TAB>パス" で facts_file へ
+# 追記する。ディレクトリのみを対象とするため、通常ファイルの find は行わない。
+collect_directory_tree_excel_facts() {
+  local cid="$1" service_name="$2" container_name="$3" facts_file="$4"
+  local directory_list_tmp find_status=0 directory hidden_path hide_directory index
+  local -a find_args=()
+
+  if ! directory_list_tmp="$(mktemp 2>/dev/null)"; then
+    warn "ディレクトリツリー Excel 用の一時ファイルを作成できませんでした (サービス: ${service_name})。"
+    return 1
+  fi
+
+  # 全量レポートのツリーと同じ枝刈りを適用する。巨大な仮想ファイルシステム等は
+  # ディレクトリ自体を 1 ノードとして出し、その配下だけを探索しない。
+  find_args=(find /)
+  find_args+=("(")
+  for index in "${!DIRECTORY_TREE_PRUNE_PATHS[@]}"; do
+    [ "$index" -gt 0 ] && find_args+=(-o)
+    find_args+=(-path "${DIRECTORY_TREE_PRUNE_PATHS[$index]}")
+  done
+  find_args+=(")" -prune -print0 -o -type d -print0)
+
+  docker exec "$cid" "${find_args[@]}" > "$directory_list_tmp" 2>/dev/null || find_status=$?
+  if [ ! -s "$directory_list_tmp" ]; then
+    rm -f -- "$directory_list_tmp"
+    warn "ディレクトリツリーを取得できませんでした (サービス: ${service_name}, コンテナ: ${container_name})。"
+    return 1
+  fi
+  if [ "$find_status" -ne 0 ]; then
+    warn "ディレクトリツリーの一部を取得できませんでした (サービス: ${service_name})。取得できた範囲だけを Excel へ出力します。"
+  fi
+
+  while IFS= read -r -d '' directory; do
+    hide_directory="false"
+    for hidden_path in "${DIRECTORY_TREE_HIDDEN_PATHS[@]}"; do
+      if [ "$directory" = "$hidden_path" ]; then
+        hide_directory="true"
+        break
+      fi
+    done
+    [ "$hide_directory" = "true" ] && continue
+    printf '%s\t%s\t%s\n' "$service_name" "$container_name" "$directory" >> "$facts_file"
+  done < <(LC_ALL=C sort -z "$directory_list_tmp")
+
+  rm -f -- "$directory_list_tmp"
+  return 0
+}
+
+# ヘルパーが標準エラーへ返す集計値を読み取る。
+read_directory_tree_excel_summary() {
+  local summary_file="$1" line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      DIRECTORY_TREE_EXCEL_SERVICES=*)    DIRECTORY_TREE_EXCEL_SERVICES="${line#*=}" ;;
+      DIRECTORY_TREE_EXCEL_DIRECTORIES=*) DIRECTORY_TREE_EXCEL_DIRECTORIES="${line#*=}" ;;
+      DIRECTORY_TREE_EXCEL_MAX_DEPTH=*)   DIRECTORY_TREE_EXCEL_MAX_DEPTH="${line#*=}" ;;
+    esac
+  done < "$summary_file"
+}
+
+# ヘルパーへ渡すメタ情報を書き出す。Excel の「概要」シートに載る。
+write_directory_tree_excel_meta() {
+  local meta_file="$1" exit_status="$2" target_mode="$3" target_services="$4"
+  local overall_status report_file
+
+  if [ "$exit_status" -eq 0 ]; then
+    overall_status="成功"
+  else
+    overall_status="失敗 (exit=${exit_status})"
+  fi
+  # 全量レポートより先に走ることがあるため、確定前は予定のパスを載せる。
+  if [ -n "$BUILD_REPORT_FILE" ]; then
+    report_file="$BUILD_REPORT_FILE"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    report_file="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}.txt (出力予定)"
+  else
+    report_file=""
+  fi
+
+  {
+    analysis_meta_entry "analyzed_at" "$(now_display_time)"
+    analysis_meta_entry "run_started_at" "$RUN_STARTED_AT"
+    analysis_meta_entry "script" "build_and_verify.sh"
+    analysis_meta_entry "compose_file" "${COMPOSE_FILE_ORIGINAL:-$COMPOSE_FILE}"
+    analysis_meta_entry "overall_status" "$overall_status"
+    analysis_meta_entry "report_file" "$report_file"
+    analysis_meta_entry "target_keywords" "${DIRECTORY_TREE_EXCEL_SERVICE_KEYWORDS[*]}"
+    analysis_meta_entry "target_mode" "$target_mode"
+    analysis_meta_entry "target_services" "$target_services"
+    analysis_meta_entry "max_level_columns" "$DIRECTORY_TREE_EXCEL_MAX_LEVEL_COLUMNS"
+    analysis_meta_entry "prune_paths" "${DIRECTORY_TREE_PRUNE_PATHS[*]}"
+    analysis_meta_entry "hidden_paths" "${DIRECTORY_TREE_HIDDEN_PATHS[*]}"
+  } > "$meta_file"
+}
+
+# ディレクトリツリーの Excel ブックを出力する。成功経路 (主処理の末尾) と失敗経路
+# (EXIT トラップ) の双方から呼ばれるため、二重に実行しないよう守る。コンテナを
+# 停止・削除する前に呼ぶ必要がある (docker exec find を使うため)。
+output_directory_tree_excel_report() {
+  local exit_status="${1:-0}"
+  local facts_file="" meta_file="" summary_file="" excel_path="" line=""
+  local helper_status=0 cid service_name container_name collected=0
+  local target_mode="frontend / backend のサービス" target_services=""
+  local -a target_container_ids=()
+  local -a helper_args=()
+
+  [ "$DIRECTORY_TREE_EXCEL_DONE" = "true" ] && return 0
+
+  if [ "$DIRECTORY_TREE_EXCEL" != "true" ]; then
+    DIRECTORY_TREE_EXCEL_DONE="true"
+    # 起動時の検証で理由を立てている場合 (出力先が決まらない等) は、そちらを残す。
+    [ -n "$DIRECTORY_TREE_EXCEL_SKIP_REASON" ] \
+      || DIRECTORY_TREE_EXCEL_SKIP_REASON="--directory-tree-excel を指定していないため出力していません。"
+    return 0
+  fi
+  DIRECTORY_TREE_EXCEL_DONE="true"
+  if [ "$DRY_RUN" = "true" ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="DRY-RUN のため出力していません。"
+    log "[DRY-RUN] ディレクトリツリーの Excel ブック出力をプレビューします (対象: frontend / backend、ディレクトリのみ・全深度)。"
+    return 0
+  fi
+  if [ "$STARTED_CONTAINER" != "true" ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="コンテナを起動していないため出力していません (ディレクトリツリーはコンテナ内から取得します)。"
+    log "ディレクトリツリーの Excel ブックは出力しません: ${DIRECTORY_TREE_EXCEL_SKIP_REASON}"
+    return 0
+  fi
+  if ! resolve_analysis_python; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="出力に必要な Python 3 が見つかりませんでした (python3 / python / /usr/libexec/platform-python)。"
+    warn "ディレクトリツリーの Excel ブック出力をスキップしました: Python 3 が見つかりません。"
+    return 0
+  fi
+
+  mapfile -t target_container_ids < <(directory_tree_excel_target_container_ids)
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    # frontend / backend のサービスを持たない構成 (単一サービスの compose.yml 等)。
+    # 出力そのものを諦めず、起動確認の対象コンテナで代替する。どちらで作った
+    # ブックなのかは「概要」シートと画面へ明示する。
+    mapfile -t target_container_ids < <(verification_target_container_ids)
+    target_mode="起動確認の対象コンテナ (frontend / backend のサービスが見つからないため代替)"
+  fi
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="対象コンテナが見つからないため出力していません。"
+    warn "ディレクトリツリーの Excel ブックを出力できませんでした。対象コンテナが見つかりません。"
+    return 0
+  fi
+
+  if ! facts_file="$(mktemp 2>/dev/null)" \
+      || ! meta_file="$(mktemp 2>/dev/null)" \
+      || ! summary_file="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$facts_file" "$meta_file" "$summary_file"
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="出力用の一時ファイルを作成できませんでした。"
+    warn "ディレクトリツリー Excel 用の一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  : > "$facts_file"
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+    container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    if collect_directory_tree_excel_facts "$cid" "$service_name" "$container_name" "$facts_file"; then
+      collected=$((collected + 1))
+      if [ -n "$target_services" ]; then
+        target_services="${target_services} ${service_name}"
+      else
+        target_services="$service_name"
+      fi
+    fi
+  done
+
+  if [ "$collected" -eq 0 ] || [ ! -s "$facts_file" ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="対象コンテナからディレクトリを 1 件も取得できなかったため出力していません。"
+    warn "ディレクトリツリーの Excel ブックを出力できませんでした: ${DIRECTORY_TREE_EXCEL_SKIP_REASON}"
+    rm -f -- "$facts_file" "$meta_file" "$summary_file"
+    return 1
+  fi
+
+  write_directory_tree_excel_meta "$meta_file" "$exit_status" "$target_mode" "$target_services"
+
+  excel_path="$(prepare_analysis_output \
+      "$DIRECTORY_TREE_EXCEL_PATH" "$DIRECTORY_TREE_EXCEL_PATH_SET" "xlsx" " Excel" \
+      "_directory_tree" "ディレクトリツリー")"
+  if [ -z "$excel_path" ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="出力先を用意できなかったため出力していません。"
+    rm -f -- "$facts_file" "$meta_file" "$summary_file"
+    return 1
+  fi
+
+  helper_args=(
+    --facts-file "$facts_file"
+    --meta-file "$meta_file"
+    --excel-out "$excel_path"
+    --max-level-columns "$DIRECTORY_TREE_EXCEL_MAX_LEVEL_COLUMNS"
+  )
+
+  # 出力は日本語と罫線文字を含むため、ロケール既定の文字コード (Windows の cp932 等)
+  # で落ちないよう UTF-8 を明示する。
+  printf '%s' "$DIRECTORY_TREE_EXCEL_PY" \
+    | PYTHONIOENCODING=utf-8 "$OBSERVABILITY_PYTHON" - "${helper_args[@]}" 2> "$summary_file"
+  helper_status=$?
+  if [ "$helper_status" -ne 0 ]; then
+    warn "ディレクトリツリーの Excel ブック出力に失敗しました (exit=${helper_status})。"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] && diag "  $line"
+    done < "$summary_file"
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="出力ヘルパーの実行に失敗しました (exit=${helper_status})。"
+    rm -f -- "$facts_file" "$meta_file" "$summary_file"
+    return 1
+  fi
+  read_directory_tree_excel_summary "$summary_file"
+  rm -f -- "$facts_file" "$meta_file" "$summary_file"
+
+  if [ ! -s "$excel_path" ]; then
+    DIRECTORY_TREE_EXCEL_SKIP_REASON="出力ヘルパーがブックを書き出せませんでした: ${excel_path}"
+    warn "ディレクトリツリーの Excel ブックを書き出せませんでした: $excel_path"
+    return 1
+  fi
+
+  DIRECTORY_TREE_EXCEL_FILE="$excel_path"
+  DIRECTORY_TREE_EXCEL_SUMMARY="対象 ${DIRECTORY_TREE_EXCEL_SERVICES} サービス (${target_services:-なし})、ディレクトリ ${DIRECTORY_TREE_EXCEL_DIRECTORIES} 件、最大深さ ${DIRECTORY_TREE_EXCEL_MAX_DEPTH}"
+  log "ディレクトリツリーの Excel ブックを出力しました: $DIRECTORY_TREE_EXCEL_FILE"
+  log "  ${DIRECTORY_TREE_EXCEL_SUMMARY}"
+  log "  対象の選び方: ${target_mode}"
+  return 0
+}
+
+# 全量レポートの [3] へ、Excel ブックの出力先だけを添える。テキストのツリーと
+# 同じ情報を別形式で開けることが、レポートだけを見た人にも分かるようにする。
+directory_tree_excel_note_lines() {
+  if [ -n "$DIRECTORY_TREE_EXCEL_FILE" ]; then
+    printf 'ディレクトリのみの Excel : %s\n' "$DIRECTORY_TREE_EXCEL_FILE"
+    printf '  出力内容               : %s\n' "$DIRECTORY_TREE_EXCEL_SUMMARY"
+  elif [ -n "$DIRECTORY_TREE_EXCEL_SKIP_REASON" ]; then
+    printf 'ディレクトリのみの Excel : %s\n' "$DIRECTORY_TREE_EXCEL_SKIP_REASON"
+  fi
+  return 0
+}
+
+append_directory_tree_excel_note() {
+  local report_file="$1"
+  directory_tree_excel_note_lines >> "$report_file"
+  return 0
+}
+
+# ディレクトリツリーを Excel ブックへ書き出すヘルパー本体。プログラムは標準入力から
+# 渡すため、コマンドライン長の制限 (Windows の Git Bash など) を受けない。
+# xlsx は標準ライブラリの zipfile だけで組み立てるため、openpyxl などの追加
+# パッケージは不要。
+read -r -d '' DIRECTORY_TREE_EXCEL_PY <<'DIRECTORY_TREE_EXCEL_PY_EOF' || true
+import argparse
+import datetime
+import math
+import os
+import re
+import sys
+import zipfile
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
+except Exception:
+    pass
+
+
+# =============================================================================
+# 入力の読み取り
+# =============================================================================
+
+def read_meta(path):
+    """"キー<TAB>値" の行を辞書へ読み込む。"""
+    meta = {}
+    if not path or not os.path.isfile(path):
+        return meta
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line or "\t" not in line:
+                continue
+            key, value = line.split("\t", 1)
+            meta[key] = value
+    return meta
+
+
+class ContainerTree(object):
+    """1 コンテナ分のディレクトリ集合。"""
+
+    __slots__ = ("service", "container", "paths", "seen")
+
+    def __init__(self, service, container):
+        self.service = service
+        self.container = container
+        self.paths = []
+        self.seen = set()
+
+    def add(self, path):
+        if path in self.seen:
+            return
+        self.seen.add(path)
+        self.paths.append(path)
+
+
+def read_facts(path):
+    """"サービス<TAB>コンテナ<TAB>ディレクトリ" の行を、コンテナ単位へまとめる。"""
+    trees = []
+    index = {}
+    if not path or not os.path.isfile(path):
+        return trees
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) < 3:
+                continue
+            service, container, directory = fields[0], fields[1], fields[2]
+            if not directory.startswith("/"):
+                continue
+            key = (service, container)
+            tree = index.get(key)
+            if tree is None:
+                tree = ContainerTree(service, container)
+                index[key] = tree
+                trees.append(tree)
+            tree.add(directory)
+    return trees
+
+
+# =============================================================================
+# ツリーの組み立て
+# =============================================================================
+
+def path_levels(path):
+    """"/opt/eap" -> ["opt", "eap"]。ルート "/" は空リスト。"""
+    trimmed = path.strip("/")
+    if not trimmed:
+        return []
+    return trimmed.split("/")
+
+
+def parent_path(path):
+    if path == "/":
+        return ""
+    parent = path.rsplit("/", 1)[0]
+    return parent or "/"
+
+
+def build_children(paths):
+    """親パス -> 子パス一覧 (名前順) を返す。"""
+    children = {}
+    known = set(paths)
+    for path in paths:
+        parent = parent_path(path)
+        if not parent or parent not in known:
+            # 枝刈りで親が欠けている経路は、ツリーの根として扱う。
+            continue
+        children.setdefault(parent, []).append(path)
+    for kids in children.values():
+        kids.sort()
+    return children
+
+
+def tree_roots(paths):
+    """親が集合内に無いパス (= ツリーの根) を名前順で返す。"""
+    known = set(paths)
+    roots = [path for path in paths
+             if not parent_path(path) or parent_path(path) not in known]
+    roots.sort()
+    return roots
+
+
+def walk_tree(node, prefix, children, out):
+    """罫線付きのツリー行を、深さ優先で out へ積む。"""
+    kids = children.get(node, [])
+    for index, kid in enumerate(kids):
+        last = index == len(kids) - 1
+        connector = "└── " if last else "├── "
+        out.append((kid, prefix + connector + kid.rsplit("/", 1)[-1] + "/"))
+        walk_tree(kid, prefix + ("    " if last else "│   "), children, out)
+
+
+def tree_lines(paths):
+    """(パス, 罫線付き表示) の一覧を、ツリーの並び順で返す。"""
+    children = build_children(paths)
+    lines = []
+    for root in tree_roots(paths):
+        lines.append((root, root if root == "/" else root.rsplit("/", 1)[-1] + "/"))
+        walk_tree(root, "", children, lines)
+    return lines
+
+
+# =============================================================================
+# xlsx 出力 (標準ライブラリのみ)
+# =============================================================================
+
+XML_INVALID_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CELL_LIMIT = 32000
+
+
+def xml_escape(text):
+    text = XML_INVALID_RE.sub("", str(text))
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("\"", "&quot;")
+
+
+def column_name(index):
+    """0 起点の列番号を A, B, ... AA へ変換する。"""
+    name = ""
+    index += 1
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name
+
+
+def east_asian_wide(char):
+    code = ord(char)
+    return (
+        0x1100 <= code <= 0x115F or 0x2E80 <= code <= 0xA4CF or
+        0xAC00 <= code <= 0xD7A3 or 0xF900 <= code <= 0xFAFF or
+        0xFE30 <= code <= 0xFE6F or 0xFF00 <= code <= 0xFF60 or
+        0xFFE0 <= code <= 0xFFE6 or 0x20000 <= code <= 0x3FFFD
+    )
+
+
+def display_width(text):
+    return sum(2 if east_asian_wide(char) else 1 for char in text)
+
+
+class Cell(object):
+    __slots__ = ("value", "style", "numeric")
+
+    def __init__(self, value, style=0, numeric=False):
+        self.value = value
+        self.style = style
+        self.numeric = numeric
+
+
+class Sheet(object):
+    def __init__(self, name, widths=None, freeze_rows=0, autofilter_row=0, autofilter_cols=0):
+        self.name = name
+        self.widths = widths or []
+        self.freeze_rows = freeze_rows
+        self.autofilter_row = autofilter_row
+        self.autofilter_cols = autofilter_cols
+        self.rows = []
+        self.merges = []          # (行番号, 開始列, 終了列)
+
+    def add(self, cells):
+        self.rows.append(cells)
+
+    def add_notice(self, message, style=None):
+        """全列を結合した 1 行のお知らせを追加する (狭い列で縦長にならないように)。"""
+        span = max(len(self.widths), 1)
+        self.add([Cell(message, S_BODY if style is None else style)]
+                 + [Cell("", S_BODY) for _ in range(span - 1)])
+        self.merges.append((len(self.rows), 0, span - 1))
+
+    def merged_width(self, row_number):
+        """結合行の実効的な列幅 (結合した列の幅の合計) を返す。結合が無ければ None。"""
+        for number, start, end in self.merges:
+            if number == row_number:
+                return sum(float(self.widths[index])
+                           for index in range(start, min(end + 1, len(self.widths))))
+        return None
+
+
+# スタイル番号 (styles.xml の cellXfs の並びと一致させる)
+S_DEFAULT = 0
+S_TITLE = 1
+S_HEADER = 2
+S_BODY = 3
+S_LABEL = 4
+S_MONO = 5
+S_CENTER = 6
+S_SECTION = 7
+
+# フォントはすべて Meiryo UI。日本語のパスとディレクトリ名を等幅に近い見た目で
+# 並べられ、Windows の Excel で追加インストールなしに開けるため。
+STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="0"/>
+<fonts count="5">
+<font><sz val="11"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="16"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><sz val="10"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+<font><b/><sz val="12"/><color rgb="FF1F3864"/><name val="Meiryo UI"/><family val="3"/><charset val="128"/></font>
+</fonts>
+<fills count="4">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border><left/><right/><top/><bottom/><diagonal/></border>
+<border>
+<left style="thin"><color rgb="FFBFBFBF"/></left>
+<right style="thin"><color rgb="FFBFBFBF"/></right>
+<top style="thin"><color rgb="FFBFBFBF"/></top>
+<bottom style="thin"><color rgb="FFBFBFBF"/></bottom>
+<diagonal/></border>
+</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="8">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="3" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+<dxfs count="0"/>
+<tableStyles count="0"/>
+</styleSheet>
+"""
+
+# 行の高さは Excel の自動調整に任せず、内容と列幅から計算して明示する。
+# 自動調整は環境によって働かず、折り返した本文が既定の高さで切れて読めなくなるため。
+ROW_LINE_HEIGHT = 16.5
+ROW_HEIGHT_MIN = 19.5
+ROW_HEIGHT_MAX = 409.0
+HEADER_ROW_HEIGHT = 33.0
+
+
+def wrapped_line_count(text, column_width):
+    """列幅 (Excel の文字数単位) で折り返したときに必要な行数を求める。"""
+    if text is None or text == "":
+        return 1
+    usable = max(float(column_width) - 1.0, 4.0)
+    total = 0
+    for line in str(text).split("\n"):
+        width = display_width(line)
+        total += 1 if width <= 0 else int(math.ceil(width / usable))
+    return max(total, 1)
+
+
+def calculate_row_height(cells, widths):
+    """行内で最も背の高いセルに合わせた行高 (pt) を返す。"""
+    lines = 1
+    for index, cell in enumerate(cells):
+        if cell is None or cell.numeric:
+            continue
+        width = widths[index] if index < len(widths) else 20
+        lines = max(lines, wrapped_line_count(cell.value, width))
+    return min(max(lines * ROW_LINE_HEIGHT, ROW_HEIGHT_MIN), ROW_HEIGHT_MAX)
+
+
+def sheet_xml(sheet):
+    out = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+           "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"]
+    if sheet.freeze_rows:
+        out.append(
+            "<sheetViews><sheetView workbookViewId=\"0\">"
+            "<pane ySplit=\"%d\" topLeftCell=\"A%d\" activePane=\"bottomLeft\" state=\"frozen\"/>"
+            "</sheetView></sheetViews>" % (sheet.freeze_rows, sheet.freeze_rows + 1)
+        )
+    out.append("<sheetFormatPr defaultRowHeight=\"%s\"/>" % ROW_HEIGHT_MIN)
+    if sheet.widths:
+        cols = ["<cols>"]
+        for index, width in enumerate(sheet.widths):
+            cols.append("<col min=\"%d\" max=\"%d\" width=\"%s\" customWidth=\"1\"/>"
+                        % (index + 1, index + 1, width))
+        cols.append("</cols>")
+        out.append("".join(cols))
+    out.append("<sheetData>")
+    for row_index, cells in enumerate(sheet.rows, 1):
+        merged_width = sheet.merged_width(row_index)
+        if sheet.freeze_rows and row_index <= sheet.freeze_rows:
+            height = HEADER_ROW_HEIGHT
+        elif merged_width is not None:
+            height = calculate_row_height(cells[:1], [merged_width])
+        else:
+            height = calculate_row_height(cells, sheet.widths)
+        parts = ["<row r=\"%d\" ht=\"%.1f\" customHeight=\"1\">" % (row_index, height)]
+        for col_index, cell in enumerate(cells):
+            if cell is None:
+                continue
+            ref = "%s%d" % (column_name(col_index), row_index)
+            if cell.numeric:
+                parts.append("<c r=\"%s\" s=\"%d\"><v>%s</v></c>" % (ref, cell.style, cell.value))
+                continue
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > CELL_LIMIT:
+                value = value[:CELL_LIMIT] + "\n... (以降は省略)"
+            if not value:
+                parts.append("<c r=\"%s\" s=\"%d\"/>" % (ref, cell.style))
+                continue
+            parts.append("<c r=\"%s\" s=\"%d\" t=\"inlineStr\"><is><t xml:space=\"preserve\">%s</t></is></c>"
+                         % (ref, cell.style, xml_escape(value)))
+        parts.append("</row>")
+        out.append("".join(parts))
+    out.append("</sheetData>")
+    if sheet.autofilter_row and sheet.autofilter_cols:
+        out.append("<autoFilter ref=\"A%d:%s%d\"/>"
+                   % (sheet.autofilter_row, column_name(sheet.autofilter_cols - 1),
+                      max(len(sheet.rows), sheet.autofilter_row)))
+    if sheet.merges:
+        merges = ["<mergeCells count=\"%d\">" % len(sheet.merges)]
+        for row_number, start, end in sheet.merges:
+            merges.append("<mergeCell ref=\"%s%d:%s%d\"/>"
+                          % (column_name(start), row_number, column_name(end), row_number))
+        merges.append("</mergeCells>")
+        out.append("".join(merges))
+    out.append("</worksheet>")
+    return "".join(out)
+
+
+def write_xlsx(path, sheets, title, creator):
+    content_types = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+                     "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+                     "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+                     "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
+                     "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+                     "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>",
+                     "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"]
+    for index in range(len(sheets)):
+        content_types.append("<Override PartName=\"/xl/worksheets/sheet%d.xml\" "
+                             "ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+                             % (index + 1))
+    content_types.append("</Types>")
+
+    root_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+        "</Relationships>"
+    )
+
+    sheet_entries = "".join(
+        "<sheet name=\"%s\" sheetId=\"%d\" r:id=\"rId%d\"/>" % (xml_escape(sheet.name), index + 1, index + 1)
+        for index, sheet in enumerate(sheets)
+    )
+    workbook = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<sheets>%s</sheets></workbook>" % sheet_entries
+    )
+
+    workbook_rels = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                     "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"]
+    for index in range(len(sheets)):
+        workbook_rels.append(
+            "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" "
+            "Target=\"worksheets/sheet%d.xml\"/>" % (index + 1, index + 1)
+        )
+    workbook_rels.append(
+        "<Relationship Id=\"rId%d\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
+        "Target=\"styles.xml\"/>" % (len(sheets) + 1)
+    )
+    workbook_rels.append("</Relationships>")
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    core = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+        "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+        "<dc:title>%s</dc:title><dc:creator>%s</dc:creator><cp:lastModifiedBy>%s</cp:lastModifiedBy>"
+        "<dcterms:created xsi:type=\"dcterms:W3CDTF\">%s</dcterms:created>"
+        "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">%s</dcterms:modified>"
+        "</cp:coreProperties>" % (xml_escape(title), xml_escape(creator), xml_escape(creator), now, now)
+    )
+    app = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+        "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+        "<Application>%s</Application></Properties>" % xml_escape(creator)
+    )
+
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as book:
+        book.writestr("[Content_Types].xml", "".join(content_types))
+        book.writestr("_rels/.rels", root_rels)
+        book.writestr("docProps/core.xml", core)
+        book.writestr("docProps/app.xml", app)
+        book.writestr("xl/workbook.xml", workbook)
+        book.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
+        book.writestr("xl/styles.xml", STYLES_XML)
+        for index, sheet in enumerate(sheets):
+            book.writestr("xl/worksheets/sheet%d.xml" % (index + 1), sheet_xml(sheet))
+
+
+def header_row(labels):
+    return [Cell(label, S_HEADER) for label in labels]
+
+
+# =============================================================================
+# シートの組み立て
+# =============================================================================
+
+def build_hierarchy_sheet(trees, level_columns):
+    """階層ごとに列を分けた一覧。オートフィルタで「深さ 3 だけ」「階層 2 が opt の
+    ものだけ」といった絞り込みができる、この出力の主役となるシート。"""
+    labels = ["サービス", "コンテナ", "深さ"]
+    labels += ["階層%d" % (level + 1) for level in range(level_columns)]
+    labels += ["ディレクトリ名", "親ディレクトリ", "フルパス", "直下ディレクトリ数"]
+    widths = [16, 24, 6] + [18] * level_columns + [24, 40, 52, 16]
+
+    sheet = Sheet("ディレクトリ階層", widths=widths, freeze_rows=1,
+                  autofilter_row=1, autofilter_cols=len(labels))
+    sheet.add(header_row(labels))
+
+    for tree in trees:
+        known = set(tree.paths)
+        child_counts = {}
+        for path in tree.paths:
+            parent = parent_path(path)
+            if parent and parent in known:
+                child_counts[parent] = child_counts.get(parent, 0) + 1
+        for path, _display in tree_lines(tree.paths):
+            levels = path_levels(path)
+            cells = [Cell(tree.service, S_BODY), Cell(tree.container, S_BODY),
+                     Cell(len(levels), S_CENTER, numeric=True)]
+            for index in range(level_columns):
+                cells.append(Cell(levels[index] if index < len(levels) else "", S_BODY))
+            cells.append(Cell(levels[-1] if levels else "/", S_BODY))
+            cells.append(Cell(parent_path(path) if levels else "", S_MONO))
+            cells.append(Cell(path, S_MONO))
+            cells.append(Cell(child_counts.get(path, 0), S_CENTER, numeric=True))
+            sheet.add(cells)
+    return sheet
+
+
+def build_tree_sheet(trees):
+    """罫線で描いたディレクトリのみのツリー。階層一覧では掴みにくい「入れ子の形」を
+    そのまま見るためのシート。"""
+    widths = [16, 24, 8, 96, 52]
+    sheet = Sheet("ディレクトリツリー", widths=widths, freeze_rows=1,
+                  autofilter_row=1, autofilter_cols=len(widths))
+    sheet.add(header_row(["サービス", "コンテナ", "深さ", "ツリー", "フルパス"]))
+    for tree in trees:
+        for path, display in tree_lines(tree.paths):
+            sheet.add([
+                Cell(tree.service, S_BODY),
+                Cell(tree.container, S_BODY),
+                Cell(len(path_levels(path)), S_CENTER, numeric=True),
+                Cell(display, S_MONO),
+                Cell(path, S_MONO),
+            ])
+    return sheet
+
+
+def build_summary_sheet(meta, trees, level_columns, max_depth, truncated_levels):
+    sheet = Sheet("概要", widths=[28, 96, 44], freeze_rows=0)
+    sheet.add([Cell("コンテナ内ディレクトリツリー (ディレクトリのみ) レポート", S_TITLE)])
+    sheet.add([])
+
+    def kv(label, value):
+        sheet.add([Cell(label, S_LABEL), Cell(value, S_BODY)])
+
+    sheet.add([Cell("1. 実行情報", S_SECTION)])
+    kv("出力日時", meta.get("analyzed_at", ""))
+    kv("処理開始日時", meta.get("run_started_at", ""))
+    kv("スクリプト", meta.get("script", "build_and_verify.sh"))
+    kv("Compose 定義", meta.get("compose_file", ""))
+    kv("全体結果", meta.get("overall_status", ""))
+    kv("全量レポート", meta.get("report_file", "") or "(未出力)")
+    sheet.add([])
+
+    sheet.add([Cell("2. 出力対象", S_SECTION)])
+    kv("対象の選び方", meta.get("target_mode", ""))
+    kv("対象キーワード", meta.get("target_keywords", ""))
+    kv("対象サービス", meta.get("target_services", "") or "(なし)")
+    kv("対象コンテナ数", "%d 件" % len(trees))
+    kv("収集方法", "コンテナ内で find / -type d を実行し、ディレクトリだけを集めています "
+                   "(通常ファイルは対象外)。深さの上限は設けていません。")
+    kv("探索しないパス", meta.get("prune_paths", "") or "(なし)")
+    kv("一覧から除くパス", meta.get("hidden_paths", "") or "(なし)")
+    sheet.add([])
+
+    sheet.add([Cell("3. 出力内容", S_SECTION)])
+    total = sum(len(tree.paths) for tree in trees)
+    kv("ディレクトリ件数", "%d 件" % total)
+    kv("最大の深さ", "%d 階層" % max_depth)
+    kv("階層列の数", "%d 列 (上限 %s 列)" % (level_columns, meta.get("max_level_columns", "")))
+    if truncated_levels:
+        kv("階層列の上限超過", "上限を超える深さのディレクトリが %d 件あります。"
+                               "階層列には途中までしか入らないため、その分は「フルパス」列で確認してください。"
+           % truncated_levels)
+    kv("フォント", "Meiryo UI (全シート共通)")
+    sheet.add([])
+
+    sheet.add([Cell("4. シートの見方", S_SECTION)])
+    kv("ディレクトリ階層",
+       "1 行 = 1 ディレクトリ。階層 1・階層 2 … と列が分かれているため、"
+       "オートフィルタで「深さ」や特定の階層名だけに絞り込めます。"
+       "「直下ディレクトリ数」はそのディレクトリが直接持つ子ディレクトリの数です。")
+    kv("ディレクトリツリー",
+       "同じ内容を罫線 (├── / └──) で描いたツリーです。入れ子の形をそのまま追いたいときに使います。"
+       "サービスで絞り込めるよう、こちらにもオートフィルタを付けています。")
+    sheet.add([])
+
+    sheet.add([Cell("5. コンテナ別の内訳", S_SECTION)])
+    if not trees:
+        sheet.add_notice("対象コンテナがありません。")
+    else:
+        sheet.add(header_row(["サービス", "コンテナ", "ディレクトリ件数 / 最大の深さ"]))
+        for tree in trees:
+            depth = max((len(path_levels(path)) for path in tree.paths), default=0)
+            sheet.add([Cell(tree.service, S_BODY), Cell(tree.container, S_BODY),
+                       Cell("%d 件 / %d 階層" % (len(tree.paths), depth), S_BODY)])
+    return sheet
+
+
+# =============================================================================
+# エントリポイント
+# =============================================================================
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--facts-file", required=True)
+    parser.add_argument("--meta-file", default="")
+    parser.add_argument("--excel-out", required=True)
+    parser.add_argument("--max-level-columns", type=int, default=15)
+    args = parser.parse_args(argv)
+
+    meta = read_meta(args.meta_file)
+    trees = read_facts(args.facts_file)
+
+    max_depth = 0
+    for tree in trees:
+        for path in tree.paths:
+            max_depth = max(max_depth, len(path_levels(path)))
+    level_limit = max(args.max_level_columns, 1)
+    level_columns = max(min(max_depth, level_limit), 1)
+    truncated = 0
+    if max_depth > level_columns:
+        for tree in trees:
+            for path in tree.paths:
+                if len(path_levels(path)) > level_columns:
+                    truncated += 1
+
+    sheets = [
+        build_summary_sheet(meta, trees, level_columns, max_depth, truncated),
+        build_hierarchy_sheet(trees, level_columns),
+        build_tree_sheet(trees),
+    ]
+    write_xlsx(args.excel_out, sheets,
+               "コンテナ内ディレクトリツリー (ディレクトリのみ)", "build_and_verify.sh")
+
+    total = sum(len(tree.paths) for tree in trees)
+    sys.stderr.write("DIRECTORY_TREE_EXCEL_SERVICES=%d\n" % len(trees))
+    sys.stderr.write("DIRECTORY_TREE_EXCEL_DIRECTORIES=%d\n" % total)
+    sys.stderr.write("DIRECTORY_TREE_EXCEL_MAX_DEPTH=%d\n" % max_depth)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception as exc:  # 出力の失敗でビルド全体を止めない
+        sys.stderr.write("[ERROR] ディレクトリツリーの Excel 出力に失敗しました: %s\n" % exc)
+        raise SystemExit(3)
+DIRECTORY_TREE_EXCEL_PY_EOF
 
 # ---- Java JVM パラメータ / OpenTelemetry 設定の収集 ---------------------------
 # コンテナ内の全プロセスのコマンドラインを "PID<US>arg0<US>arg1<US>..." で返す。
@@ -30713,6 +31697,7 @@ write_build_report() {
       printf '対象コンテナが起動していないため取得していません。\n'
       printf '\n[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)\n'
       printf '%s\n' "$tree_report_note"
+      directory_tree_excel_note_lines
       printf '\n[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)\n'
       printf '%s\n' "$tree_report_note"
       printf '\n[5] Java JVM パラメータ (全件)\n'
@@ -30746,6 +31731,7 @@ write_build_report() {
             "$report_tmp" "/" "コンテナ内ディレクトリツリー" "all" "all"
       done
     fi
+    append_directory_tree_excel_note "$report_tmp"
 
     printf '\n[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)\n' >> "$report_tmp"
     if [ "$DIRECTORY_TREE_REPORT" != "true" ]; then
@@ -30854,6 +31840,9 @@ cleanup_all() {
   # Undertow のバーチャルホスト分析も、standalone.xml の読み出しと実リクエストに
   # 起動中のコンテナが要るため、停止・削除より前に済ませる。
   analyze_undertow_virtual_hosts "$original_status"
+  # ディレクトリツリーの Excel ブックも、コンテナ内の find を使うため停止・削除より
+  # 前に済ませる。成功経路では実行済みのため、ここでの呼び出しは何もしない。
+  output_directory_tree_excel_report "$original_status"
   if ! write_build_report "$original_status"; then
     cleanup_status=1
   fi
@@ -31249,6 +32238,9 @@ fi
 show_verified_container_envs
 show_verified_container_directory_trees
 show_verified_container_deployment_structures
+# ディレクトリのみのツリーを Excel ブックへ出す (--directory-tree-excel 指定時のみ)。
+# コンテナ内の find を使うため、コンテナを片付ける前のここで実行する。
+output_directory_tree_excel_report 0
 show_verified_container_jvm_parameters
 show_verified_container_otel_settings
 

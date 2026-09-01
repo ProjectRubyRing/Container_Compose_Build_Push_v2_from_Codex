@@ -535,6 +535,193 @@ if ! (
 fi
 assert_contains "$tree_report_without_dir_output" "--directory-tree-report は --report-dir と併用してください"
 
+# --directory-tree-excel は、frontend / backend の両方のコンテナから
+# 「ディレクトリだけ」のツリーを集め、階層ごとに列を分けた Excel ブックへ出力する。
+export FAKE_COMPOSE_PS_SERVICES="app frontend-web backend-api"
+tree_excel_output="$TEST_TMP/tree-excel.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-excel \
+    --report-dir "$TEST_TMP/tree-excel-reports" \
+    --suppress-removed-logs
+) >"$tree_excel_output" 2>&1; then
+  cat "$tree_excel_output" >&2
+  unset FAKE_COMPOSE_PS_SERVICES
+  fail "--directory-tree-excel scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+assert_contains "$tree_excel_output" "ディレクトリツリーの Excel ブックを出力しました:"
+assert_contains "$tree_excel_output" "対象の選び方: frontend / backend のサービス"
+# 起動確認対象は app だけでも、frontend / backend の両方を集める。
+assert_contains "$tree_excel_output" "対象 2 サービス (frontend-web backend-api)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-frontend-web find /"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-backend-api find /"
+# ディレクトリのみのツリーなので、通常ファイルの find は行わない。
+if grep -F "exec cid-frontend-web find" "$FAKE_DOCKER_CALLS" | grep -Fq -- "-type f"; then
+  fail "did not expect a regular-file find for the directory tree workbook"
+fi
+
+tree_excel_books=("$TEST_TMP/tree-excel-reports"/build_and_verify_*_directory_tree.xlsx)
+tree_excel_book="${tree_excel_books[0]:-}"
+[ -f "$tree_excel_book" ] || fail "--directory-tree-excel did not write the workbook"
+# xlsx は ZIP コンテナ (先頭が PK)
+[ "$(head -c 2 "$tree_excel_book")" = "PK" ] \
+  || fail "directory tree workbook is not a zip container"
+
+# 全量レポートの [3] からも、同じ内容を Excel で開けることが分かるようにする。
+collect_report_files "$TEST_TMP/tree-excel-reports"
+tree_excel_report="${REPORT_FILES[0]:-}"
+[ -n "$tree_excel_report" ] || fail "expected a full build report for the --directory-tree-excel scenario"
+assert_contains "$tree_excel_report" "ディレクトリのみの Excel : $tree_excel_book"
+assert_contains "$tree_excel_report" "  出力内容               : 対象 2 サービス (frontend-web backend-api)"
+
+# xlsx は ZIP なので、必須パートとシート名・中身を展開して確認する。
+tree_excel_entries="$(unzip -Z1 "$tree_excel_book" 2>/dev/null || true)"
+if [ -z "$tree_excel_entries" ]; then
+  printf 'SKIP: directory tree workbook content assertions (unzip is unavailable)\n'
+else
+  for required_part in "[Content_Types].xml" "xl/workbook.xml" "xl/styles.xml" \
+      "xl/worksheets/sheet1.xml" "xl/worksheets/sheet2.xml" "xl/worksheets/sheet3.xml"; do
+    printf '%s\n' "$tree_excel_entries" | grep -Fqx -- "$required_part" \
+      || fail "expected '$required_part' in $tree_excel_book"
+  done
+  tree_excel_workbook_xml="$(unzip -p "$tree_excel_book" xl/workbook.xml)"
+  for required_sheet in "概要" "ディレクトリ階層" "ディレクトリツリー"; do
+    case "$tree_excel_workbook_xml" in
+      *"name=\"${required_sheet}\""*) ;;
+      *) fail "expected sheet '$required_sheet' in $tree_excel_book" ;;
+    esac
+  done
+  # フォントは Meiryo UI で統一し、他のフォント名は残さない。
+  tree_excel_styles_xml="$(unzip -p "$tree_excel_book" xl/styles.xml)"
+  case "$tree_excel_styles_xml" in
+    *'<name val="Meiryo UI"/>'*) ;;
+    *) fail "expected Meiryo UI fonts in $tree_excel_book" ;;
+  esac
+  case "$tree_excel_styles_xml" in
+    *'Yu Gothic'*|*'Consolas'*|*'Calibri'*)
+      fail "unexpected non-Meiryo UI font in $tree_excel_book" ;;
+  esac
+  # 「ディレクトリ階層」シートは階層ごとに列を分け、オートフィルタを付ける。
+  tree_excel_sheet2_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet2.xml)"
+  for required_text in "階層1" "階層2" "直下ディレクトリ数" "フルパス" "<autoFilter"; do
+    case "$tree_excel_sheet2_xml" in
+      *"$required_text"*) ;;
+      *) fail "expected '$required_text' in the hierarchy sheet of $tree_excel_book" ;;
+    esac
+  done
+  # 見切れ防止のため、各行に計算済みの行高を持たせる。
+  case "$tree_excel_sheet2_xml" in
+    *'customHeight="1"'*) ;;
+    *) fail "expected explicit row heights in $tree_excel_book" ;;
+  esac
+  # ディレクトリのみが対象なので、通常ファイル名はどのシートにも現れない。
+  case "$tree_excel_sheet2_xml" in
+    *"application.yaml"*|*"orders.war.deployed"*)
+      fail "expected only directories in the hierarchy sheet of $tree_excel_book" ;;
+  esac
+  # 「ディレクトリツリー」シートは罫線でツリーを描く。
+  tree_excel_sheet3_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet3.xml)"
+  for required_text in "├── app/" "└── " "/opt/eap/standalone/deployments/orders.war/WEB-INF"; do
+    case "$tree_excel_sheet3_xml" in
+      *"$required_text"*) ;;
+      *) fail "expected '$required_text' in the tree sheet of $tree_excel_book" ;;
+    esac
+  done
+  # 枝刈り対象は 1 ノードとして出し、その配下は出さない。
+  case "$tree_excel_sheet3_xml" in
+    *"/afs/cache"*) fail "expected pruned paths to stay out of $tree_excel_book" ;;
+  esac
+  # 「概要」シートには対象の選び方と読み方を残す。
+  tree_excel_sheet1_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet1.xml)"
+  for required_text in "コンテナ内ディレクトリツリー (ディレクトリのみ) レポート" \
+      "frontend / backend のサービス" "Meiryo UI (全シート共通)"; do
+    case "$tree_excel_sheet1_xml" in
+      *"$required_text"*) ;;
+      *) fail "expected '$required_text' in the summary sheet of $tree_excel_book" ;;
+    esac
+  done
+fi
+
+# frontend / backend のサービスが無い構成では、起動確認の対象コンテナで代替する。
+# 出力先を明示指定すれば --report-dir が無くても書き出す。
+tree_excel_fallback_output="$TEST_TMP/tree-excel-fallback.out"
+tree_excel_fallback_book="$TEST_TMP/tree-excel-fallback.xlsx"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-excel-file "$tree_excel_fallback_book" \
+    --suppress-removed-logs
+) >"$tree_excel_fallback_output" 2>&1; then
+  cat "$tree_excel_fallback_output" >&2
+  fail "--directory-tree-excel-file scenario returned a non-zero status"
+fi
+assert_contains "$tree_excel_fallback_output" \
+  "対象の選び方: 起動確認の対象コンテナ (frontend / backend のサービスが見つからないため代替)"
+assert_contains "$tree_excel_fallback_output" "対象 1 サービス (app)"
+[ -f "$tree_excel_fallback_book" ] || fail "--directory-tree-excel-file did not write the workbook"
+
+# 既定 (指定なし) では Excel を作らず、全量レポートにも理由だけを残す。
+tree_excel_off_output="$TEST_TMP/tree-excel-off.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --report-dir "$TEST_TMP/tree-excel-off-reports" \
+    --suppress-removed-logs
+) >"$tree_excel_off_output" 2>&1; then
+  cat "$tree_excel_off_output" >&2
+  fail "default directory tree excel scenario returned a non-zero status"
+fi
+assert_not_contains "$tree_excel_off_output" "ディレクトリツリーの Excel ブックを出力しました:"
+tree_excel_off_books=("$TEST_TMP/tree-excel-off-reports"/build_and_verify_*_directory_tree.xlsx)
+[ ! -e "${tree_excel_off_books[0]}" ] \
+  || fail "did not expect a directory tree workbook without --directory-tree-excel"
+collect_report_files "$TEST_TMP/tree-excel-off-reports"
+tree_excel_off_report="${REPORT_FILES[0]:-}"
+[ -n "$tree_excel_off_report" ] || fail "expected a full build report for the default excel scenario"
+assert_contains "$tree_excel_off_report" \
+  "ディレクトリのみの Excel : --directory-tree-excel を指定していないため出力していません。"
+
+# 出力先が決まらない実行 (--report-dir も --directory-tree-excel-file も無い) は警告する。
+tree_excel_without_dir_output="$TEST_TMP/tree-excel-without-dir.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --directory-tree-excel
+) >"$tree_excel_without_dir_output" 2>&1; then
+  cat "$tree_excel_without_dir_output" >&2
+  fail "--directory-tree-excel without an output path unexpectedly returned a non-zero status"
+fi
+assert_contains "$tree_excel_without_dir_output" \
+  "--directory-tree-excel は --report-dir または --directory-tree-excel-file と併用してください"
+
+# 拡張子が .xlsx でないと Excel が開けないため、指定の時点で弾く。
+tree_excel_ext_output="$TEST_TMP/tree-excel-ext.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --directory-tree-excel-file "$TEST_TMP/tree.xls"
+) >"$tree_excel_ext_output" 2>&1; then
+  cat "$tree_excel_ext_output" >&2
+  fail "--directory-tree-excel-file accepted a non-.xlsx path"
+fi
+assert_contains "$tree_excel_ext_output" \
+  "--directory-tree-excel-file には .xlsx で終わるパスを指定してください"
+
 invalid_startup_log_lines_output="$TEST_TMP/startup-log-lines-invalid.out"
 if (
   cd "$REPO_ROOT"
