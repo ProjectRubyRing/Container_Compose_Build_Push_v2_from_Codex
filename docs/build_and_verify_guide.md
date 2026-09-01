@@ -528,13 +528,13 @@ compose down (削除)
 | `--no-directory-tree` | フラグ | `false` | 不可 | 上記の画面表示を行わない。深さ等の指定による自動有効化も打ち消す |
 | `--directory-tree-report` | フラグ | `false` (非出力) | 不可 | 全量レポートの `[3]` `[4]` へツリーとデプロイ構造を出力する (`--report-dir` と併用) |
 | `--no-directory-tree-report` | フラグ | `true` (既定) | 不可 | 全量レポートへツリーとデプロイ構造を出力しない |
-| `--directory-tree-excel` | フラグ | `false` (非出力) | 不可 | ディレクトリのみのツリーを Excel ブック (`.xlsx`) へ追加出力する。対象は frontend と backend の両方のコンテナ (`--report-dir` または `--directory-tree-excel-file` と併用) |
+| `--directory-tree-excel` | フラグ | `false` (非出力) | 不可 | ディレクトリとシンボリックリンクのツリーを Excel ブック (`.xlsx`) へ追加出力する。リンク先は右端の列へ並べる。対象は frontend と backend の両方のコンテナ (`--report-dir` または `--directory-tree-excel-file` と併用) |
 | `--no-directory-tree-excel` | フラグ | `true` (既定) | 不可 | 上記の Excel 出力を行わない |
 | `--directory-tree-excel-file FILE` | `.xlsx` のパス | (なし) | 不可 | 上記 Excel の出力先を明示指定する。指定すると Excel 出力を有効にする (`--report-dir` が無くても出力できる) |
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリのみのツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリ構成のツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない。`--no-deploy-exception-analysis` とは排他 |
 | `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 不可 | `--report-dir` の全量レポート `[10]` へ解析結果を出力する。既定では出力せず、見出しの下に未出力である旨だけを残す。`--no-deploy-exception-analysis` とは排他 |
@@ -1532,7 +1532,7 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 | `--no-directory-tree` | 画面表示を行わない。下記オプションによる自動有効化も打ち消す |
 | `--directory-tree-report` | `--report-dir` の全量レポート `[3]` `[4]` へ出力する (画面表示とは独立) |
 | `--no-directory-tree-report` | 全量レポートへ出力しない (既定) |
-| `--directory-tree-excel` | ディレクトリのみのツリーを Excel ブックへ追加出力する (frontend / backend の両方が対象) |
+| `--directory-tree-excel` | ディレクトリとシンボリックリンクのツリーを Excel ブックへ追加出力する (frontend / backend の両方が対象。リンク先は右端の列) |
 | `--no-directory-tree-excel` | 上記の Excel 出力を行わない (既定) |
 | `--directory-tree-excel-file FILE` | 上記 Excel の出力先を明示指定する (`.xlsx`)。指定すると Excel 出力を有効にする |
 | `--directory-tree-depth N` | `/` 直下を深さ 1 として N 階層まで表示 (既定 `all` は最下層まで)。指定すると画面表示を自動で有効化 |
@@ -1548,7 +1548,7 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 > `--directory-tree-excel` も同じく、`--report-dir` または `--directory-tree-excel-file`
 > と併用してください。
 
-#### ディレクトリのみのツリー (Excel)
+#### ディレクトリ構成のツリー (Excel)
 
 `--directory-tree-excel` を指定すると、テキストのツリーとは別に Excel ブック
 (`build_and_verify_<日時>_directory_tree.xlsx`) を出力します。テキストのツリーは
@@ -1558,16 +1558,30 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 | 項目 | 内容 |
 | --- | --- |
 | 対象 | frontend と backend の**両方**のコンテナ (サービス名がキーワードと完全一致、またはキーワードを含むもの)。どちらも見つからない場合は起動確認の対象コンテナで代替する |
-| 対象の範囲 | 通常ファイルは含めず、ディレクトリのみ。深さの制限もかけない (`--directory-tree-depth` / `--directory-file-limit` は適用しない) |
-| 枝刈り | 全量レポートのツリーと同じ (上の表のとおり) |
+| 対象の範囲 | ディレクトリと**シンボリックリンク**。通常ファイルは含めない。深さの制限もかけない (`--directory-tree-depth` / `--directory-file-limit` は適用しない) |
+| 枝刈り | 全量レポートのツリーと同じ (上の表のとおり)。枝刈り対象の配下にあるシンボリックリンクも出さない |
 | シート | `概要` / `ディレクトリ階層` (階層ごとに列を分けたオートフィルタ付きの一覧) / `ディレクトリツリー` (罫線で描いたツリー) |
 | フォント | 全シート Meiryo UI |
 | 出力先 | `--report-dir` 配下へ自動命名。`--directory-tree-excel-file FILE` で明示指定もできる |
 | 必要なもの | Python 3 (`python3` / `python` / `/usr/libexec/platform-python` のいずれか)。追加パッケージは不要 |
 
-`ディレクトリ階層` シートは 1 行 = 1 ディレクトリで、`サービス` `コンテナ` `深さ`
-`階層1` `階層2` … `ディレクトリ名` `親ディレクトリ` `フルパス` `直下ディレクトリ数`
-の列を持ちます。オートフィルタが付いているため、階層単位の絞り込みがそのまま行えます。
+`ディレクトリ階層` シートは 1 行 = 1 ディレクトリまたは 1 シンボリックリンクで、
+`サービス` `コンテナ` `種別` `深さ` `階層1` `階層2` … `名前` `親ディレクトリ`
+`フルパス` `直下の項目数` `リンク先` の列を持ちます。オートフィルタが付いているため、
+階層単位の絞り込みや「シンボリックリンクだけ」といった絞り込みがそのまま行えます。
+
+`ディレクトリツリー` シートは同じ内容を罫線で描いたもので、シンボリックリンクは
+`tree` コマンドと同じ `名前 -> リンク先` の形で並べます。こちらにも右端に `リンク先`
+列があります。
+
+##### シンボリックリンクの扱い
+
+| 項目 | 内容 |
+| --- | --- |
+| 収集方法 | `find / -type l -printf '%p\037%l\0'` で、パスとリンク先を 1 回の `docker exec` のうちに取得する (コンテナへ `readlink` の実行やスクリプトの配置を求めない) |
+| リンク先 | `find` が返す生の値。相対パス (`usr/bin`) と絶対パス (`/var/log/eap`) のどちらもそのまま載せる |
+| リンクの先へ降りるか | 降りない (`find` の既定と同じ)。リンクはツリーの葉として並ぶ |
+| `-printf` が無い `find` | BusyBox の `find` など `-printf` を持たない実装では `-print0` へ切り替え、リンクの一覧だけを出す。`リンク先` 列は `(取得できませんでした)` になり、画面にも警告を 1 行出す |
 
 巨大・仮想・実行基盤固有のディレクトリは探索を打ち切ります (枝刈り)。
 
@@ -1586,7 +1600,7 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 | 保存タイミング | EXIT トラップの**最初**。コンテナ削除や Docker 削除より前に取得する |
 | 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[8]` |
 | ツリー・デプロイ構造 | `[3]` `[4]` は**既定では見出しだけ**を残し、中身は出力しない。`--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する |
-| ディレクトリのみの Excel | `--directory-tree-excel` を併用したときだけ `..._directory_tree.xlsx` を同じディレクトリへ追加出力する (`[3]` にはその出力先を添える) |
+| ディレクトリ構成の Excel | `--directory-tree-excel` を併用したときだけ `..._directory_tree.xlsx` (ディレクトリとシンボリックリンク) を同じディレクトリへ追加出力する (`[3]` にはその出力先を添える) |
 | Java 例外解析・`read_only` 分析 | `[10]` `[11]` も**既定では見出しと未出力である旨だけ**を残す。`--deploy-exception-report` / `--readonly-analysis-report` を併用したときだけ解析・分析結果を全量で保存する |
 | 失敗時 | `[8]` へ全 Compose サービスのログをサービス単位で全行追記。`[2]`〜`[6]` を集めた後に SIGTERM で停止するため、終了処理のログまで含まれる (3.6 参照) |
 | 画面表示との違い | 出力するセクションは、画面の表示上限 (`--env-list-limit` 等) にかかわらず**常に全量** |

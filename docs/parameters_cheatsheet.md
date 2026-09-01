@@ -170,7 +170,7 @@
 | `--no-directory-tree` | フラグ | `false` | ツリーの画面表示を行わない (深さ等の指定による自動有効化も打ち消す) |
 | `--directory-tree-report` | フラグ | `false` (非出力) | 全量レポートの `[3]` `[4]` へツリーとデプロイ構造を出力する (`--report-dir` と併用) |
 | `--no-directory-tree-report` | フラグ | `true` (既定) | 全量レポートへツリーとデプロイ構造を出力しない |
-| `--directory-tree-excel` | フラグ | `false` (非出力) | ディレクトリのみのツリーを Excel ブックへ追加出力する。対象は frontend と backend の両方 (`--report-dir` または `--directory-tree-excel-file` と併用) |
+| `--directory-tree-excel` | フラグ | `false` (非出力) | ディレクトリとシンボリックリンクのツリーを Excel ブックへ追加出力する。リンク先は右端の列。対象は frontend と backend の両方 (`--report-dir` または `--directory-tree-excel-file` と併用) |
 | `--no-directory-tree-excel` | フラグ | `true` (既定) | 上記の Excel 出力を行わない |
 | `--directory-tree-excel-file FILE` | `.xlsx` のパス | (なし) | 上記 Excel の出力先。指定すると Excel 出力を有効にする |
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | ツリーの最大深さ (指定すると画面表示を自動で有効化) |
