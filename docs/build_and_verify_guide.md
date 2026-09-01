@@ -528,10 +528,13 @@ compose down (削除)
 | `--no-directory-tree` | フラグ | `false` | 不可 | 上記の画面表示を行わない。深さ等の指定による自動有効化も打ち消す |
 | `--directory-tree-report` | フラグ | `false` (非出力) | 不可 | 全量レポートの `[3]` `[4]` へツリーとデプロイ構造を出力する (`--report-dir` と併用) |
 | `--no-directory-tree-report` | フラグ | `true` (既定) | 不可 | 全量レポートへツリーとデプロイ構造を出力しない |
+| `--directory-tree-excel` | フラグ | `false` (非出力) | 不可 | ディレクトリのみのツリーを Excel ブック (`.xlsx`) へ追加出力する。対象は frontend と backend の両方のコンテナ (`--report-dir` または `--directory-tree-excel-file` と併用) |
+| `--no-directory-tree-excel` | フラグ | `true` (既定) | 不可 | 上記の Excel 出力を行わない |
+| `--directory-tree-excel-file FILE` | `.xlsx` のパス | (なし) | 不可 | 上記 Excel の出力先を明示指定する。指定すると Excel 出力を有効にする (`--report-dir` が無くても出力できる) |
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリのみのツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない。`--no-deploy-exception-analysis` とは排他 |
 | `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 不可 | `--report-dir` の全量レポート `[10]` へ解析結果を出力する。既定では出力せず、見出しの下に未出力である旨だけを残す。`--no-deploy-exception-analysis` とは排他 |
@@ -1529,6 +1532,9 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 | `--no-directory-tree` | 画面表示を行わない。下記オプションによる自動有効化も打ち消す |
 | `--directory-tree-report` | `--report-dir` の全量レポート `[3]` `[4]` へ出力する (画面表示とは独立) |
 | `--no-directory-tree-report` | 全量レポートへ出力しない (既定) |
+| `--directory-tree-excel` | ディレクトリのみのツリーを Excel ブックへ追加出力する (frontend / backend の両方が対象) |
+| `--no-directory-tree-excel` | 上記の Excel 出力を行わない (既定) |
+| `--directory-tree-excel-file FILE` | 上記 Excel の出力先を明示指定する (`.xlsx`)。指定すると Excel 出力を有効にする |
 | `--directory-tree-depth N` | `/` 直下を深さ 1 として N 階層まで表示 (既定 `all` は最下層まで)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N` | 通常ファイルを表示。各ディレクトリ直下が N 件以下なら全ファイル名、超過時は拡張子別件数。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit all` | 件数にかかわらず全ファイル名を表示 |
@@ -1539,6 +1545,29 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 > (表示しない分の待ち時間も発生しません)。
 > `--directory-tree-report` は `--report-dir` と併用してください。単独で指定した場合は
 > 書き出す先が無いため警告して無視します。
+> `--directory-tree-excel` も同じく、`--report-dir` または `--directory-tree-excel-file`
+> と併用してください。
+
+#### ディレクトリのみのツリー (Excel)
+
+`--directory-tree-excel` を指定すると、テキストのツリーとは別に Excel ブック
+(`build_and_verify_<日時>_directory_tree.xlsx`) を出力します。テキストのツリーは
+目で追う分には読みやすい反面、「深さ 3 のディレクトリだけ見たい」「特定の階層名で
+絞り込みたい」といった読み方ができないため、階層ごとに列を分けた表を別に用意します。
+
+| 項目 | 内容 |
+| --- | --- |
+| 対象 | frontend と backend の**両方**のコンテナ (サービス名がキーワードと完全一致、またはキーワードを含むもの)。どちらも見つからない場合は起動確認の対象コンテナで代替する |
+| 対象の範囲 | 通常ファイルは含めず、ディレクトリのみ。深さの制限もかけない (`--directory-tree-depth` / `--directory-file-limit` は適用しない) |
+| 枝刈り | 全量レポートのツリーと同じ (上の表のとおり) |
+| シート | `概要` / `ディレクトリ階層` (階層ごとに列を分けたオートフィルタ付きの一覧) / `ディレクトリツリー` (罫線で描いたツリー) |
+| フォント | 全シート Meiryo UI |
+| 出力先 | `--report-dir` 配下へ自動命名。`--directory-tree-excel-file FILE` で明示指定もできる |
+| 必要なもの | Python 3 (`python3` / `python` / `/usr/libexec/platform-python` のいずれか)。追加パッケージは不要 |
+
+`ディレクトリ階層` シートは 1 行 = 1 ディレクトリで、`サービス` `コンテナ` `深さ`
+`階層1` `階層2` … `ディレクトリ名` `親ディレクトリ` `フルパス` `直下ディレクトリ数`
+の列を持ちます。オートフィルタが付いているため、階層単位の絞り込みがそのまま行えます。
 
 巨大・仮想・実行基盤固有のディレクトリは探索を打ち切ります (枝刈り)。
 
@@ -1557,6 +1586,7 @@ JBoss EAP デプロイ構造は、同じオプションでまとめて切り替�
 | 保存タイミング | EXIT トラップの**最初**。コンテナ削除や Docker 削除より前に取得する |
 | 保存内容 | ヘッダー (開始日時・全体結果・compose 定義・ビルド/起動対象) と後述のセクション `[1]`〜`[8]` |
 | ツリー・デプロイ構造 | `[3]` `[4]` は**既定では見出しだけ**を残し、中身は出力しない。`--directory-tree-report` を併用したときだけ全深度・全ファイル名で保存する |
+| ディレクトリのみの Excel | `--directory-tree-excel` を併用したときだけ `..._directory_tree.xlsx` を同じディレクトリへ追加出力する (`[3]` にはその出力先を添える) |
 | Java 例外解析・`read_only` 分析 | `[10]` `[11]` も**既定では見出しと未出力である旨だけ**を残す。`--deploy-exception-report` / `--readonly-analysis-report` を併用したときだけ解析・分析結果を全量で保存する |
 | 失敗時 | `[8]` へ全 Compose サービスのログをサービス単位で全行追記。`[2]`〜`[6]` を集めた後に SIGTERM で停止するため、終了処理のログまで含まれる (3.6 参照) |
 | 画面表示との違い | 出力するセクションは、画面の表示上限 (`--env-list-limit` 等) にかかわらず**常に全量** |
@@ -1995,7 +2025,7 @@ RUN --mount=type=secret,id=cacerts \
 | --- | --- | --- |
 | `[1] ビルド結果` | 結果 / 詳細 / イメージ情報 / 既存コンテナ点検 / `コピー取込検証` の要約 / 保存ポリシー | 記録される |
 | `[2] 環境変数一覧 (全件)` | コンテナごとの環境変数を種別付きで全件 | 「未取得」と記録 |
-| `[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)` | `--directory-tree-report` 指定時のみ `/` 起点のツリー。未指定なら「`--directory-tree-report` を指定していないため出力していません。」 | 「未取得」と記録 |
+| `[3] コンテナ内ディレクトリツリー (全深度・全ファイル名)` | `--directory-tree-report` 指定時のみ `/` 起点のツリー。未指定なら「`--directory-tree-report` を指定していないため出力していません。」。あわせて `--directory-tree-excel` で出力した Excel ブックの場所 (または出力しなかった理由) を添える | 「未取得」と記録 |
 | `[4] JBoss EAP デプロイ構造 (全深度・全ファイル名)` | `--directory-tree-report` 指定時のみデプロイ先 / Web ルート / クラスパスルート。未指定なら `[3]` と同じ案内 | 「未取得」と記録 |
 | `[5] Java JVM パラメータ (全件)` | Java プロセスごとの JVM パラメータ (分類別) | 「未取得」と記録 |
 | `[6] OpenTelemetry 環境変数・JVM パラメータ (全件)` | OpenTelemetry 関連の環境変数と JVM パラメータ | 「未取得」と記録 |

@@ -297,6 +297,16 @@ if [ "${1:-}" = "compose" ]; then
               *" efs-mock "*) printf 'cid-efs-mock\n' ;;
             esac
             ;;
+          frontend-web)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" frontend-web "*) printf 'cid-frontend-web\n' ;;
+            esac
+            ;;
+          backend-api)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" backend-api "*) printf 'cid-backend-api\n' ;;
+            esac
+            ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -750,7 +760,13 @@ PATH=/usr/bin}"
       printf '%s\n' "${FAKE_COMPOSE_PROJECT_NAME:-testproj}"
       ;;
     *"com.docker.compose.service"*)
-      printf 'app\n'
+      # ディレクトリツリーの Excel 出力は frontend / backend のサービス名で対象を
+      # 選ぶため、コンテナ ID から導ける偽装サービスはその名前を返す。
+      case "$*" in
+        *"cid-frontend-web"*) printf 'frontend-web\n' ;;
+        *"cid-backend-api"*) printf 'backend-api\n' ;;
+        *) printf 'app\n' ;;
+      esac
       ;;
     # EFS マウント伝播確認が使う形式 (識別キー / マウント先 / rw|ro)。
     # FAKE_EFS_MOUNT_ENTRIES は "コンテナ ID|識別キー|マウント先|rw または ro" の行。
@@ -783,6 +799,8 @@ PATH=/usr/bin}"
         *"cid-alb-healthcheck"*) printf '/alb-healthcheck\n' ;;
         *"cid-batch-mock"*) printf '/batch-mock\n' ;;
         *"cid-efs-mock"*) printf '/efs-mock\n' ;;
+        *"cid-frontend-web"*) printf '/test-frontend-web-1\n' ;;
+        *"cid-backend-api"*) printf '/test-backend-api-1\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
       ;;
