@@ -560,10 +560,11 @@ unset FAKE_COMPOSE_PS_SERVICES
 assert_contains "$tree_excel_output" "ディレクトリツリーの Excel ブックを出力しました:"
 assert_contains "$tree_excel_output" "対象の選び方: frontend / backend のサービス"
 # 起動確認対象は app だけでも、frontend / backend の両方を集める。
-assert_contains "$tree_excel_output" "対象 2 サービス (frontend-web backend-api)"
+assert_contains "$tree_excel_output" "対象 2 サービス (frontend-web backend-api)、ディレクトリ 64 件、シンボリックリンク 10 件"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-frontend-web find /"
 assert_contains "$FAKE_DOCKER_CALLS" "exec cid-backend-api find /"
-# ディレクトリのみのツリーなので、通常ファイルの find は行わない。
+# ディレクトリとシンボリックリンクだけを引き、通常ファイルの find は行わない。
+assert_contains "$FAKE_DOCKER_CALLS" "-type l -printf %p\037%l\0"
 if grep -F "exec cid-frontend-web find" "$FAKE_DOCKER_CALLS" | grep -Fq -- "-type f"; then
   fail "did not expect a regular-file find for the directory tree workbook"
 fi
@@ -579,7 +580,7 @@ tree_excel_book="${tree_excel_books[0]:-}"
 collect_report_files "$TEST_TMP/tree-excel-reports"
 tree_excel_report="${REPORT_FILES[0]:-}"
 [ -n "$tree_excel_report" ] || fail "expected a full build report for the --directory-tree-excel scenario"
-assert_contains "$tree_excel_report" "ディレクトリのみの Excel : $tree_excel_book"
+assert_contains "$tree_excel_report" "ディレクトリ構成の Excel : $tree_excel_book"
 assert_contains "$tree_excel_report" "  出力内容               : 対象 2 サービス (frontend-web backend-api)"
 
 # xlsx は ZIP なので、必須パートとシート名・中身を展開して確認する。
@@ -611,7 +612,8 @@ else
   esac
   # 「ディレクトリ階層」シートは階層ごとに列を分け、オートフィルタを付ける。
   tree_excel_sheet2_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet2.xml)"
-  for required_text in "階層1" "階層2" "直下ディレクトリ数" "フルパス" "<autoFilter"; do
+  for required_text in "階層1" "階層2" "種別" "直下の項目数" "フルパス" "リンク先" \
+      "シンボリックリンク" "<autoFilter"; do
     case "$tree_excel_sheet2_xml" in
       *"$required_text"*) ;;
       *) fail "expected '$required_text' in the hierarchy sheet of $tree_excel_book" ;;
@@ -622,27 +624,37 @@ else
     *'customHeight="1"'*) ;;
     *) fail "expected explicit row heights in $tree_excel_book" ;;
   esac
-  # ディレクトリのみが対象なので、通常ファイル名はどのシートにも現れない。
+  # 通常ファイルは対象外なので、ファイルのパスは現れない (リンク先として現れる
+  # 名前は別。application.yaml は active.yaml のリンク先として出るため使わない)。
   case "$tree_excel_sheet2_xml" in
-    *"application.yaml"*|*"orders.war.deployed"*)
-      fail "expected only directories in the hierarchy sheet of $tree_excel_book" ;;
+    *"deep.json"*|*"orders.war.deployed"*|*"libexample.so"*)
+      fail "expected only directories and symlinks in the hierarchy sheet of $tree_excel_book" ;;
   esac
-  # 「ディレクトリツリー」シートは罫線でツリーを描く。
+  # 「ディレクトリツリー」シートは罫線でツリーを描き、シンボリックリンクは
+  # tree コマンドと同じ「名前 -> リンク先」で並べる。
   tree_excel_sheet3_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet3.xml)"
-  for required_text in "├── app/" "└── " "/opt/eap/standalone/deployments/orders.war/WEB-INF"; do
+  # シートの XML では > が &gt; へエスケープされるため、そのまま突き合わせる。
+  for required_text in "├── app/" "└── " "/opt/eap/standalone/deployments/orders.war/WEB-INF" \
+      "current -&gt; /app/releases/2026-09-01" "bin -&gt; usr/bin" \
+      "current.war -&gt; orders.war" "log -&gt; /var/log/eap"; do
     case "$tree_excel_sheet3_xml" in
       *"$required_text"*) ;;
       *) fail "expected '$required_text' in the tree sheet of $tree_excel_book" ;;
     esac
   done
-  # 枝刈り対象は 1 ノードとして出し、その配下は出さない。
+  # 枝刈り対象は 1 ノードとして出し、その配下は出さない (リンクも同じ扱い)。
   case "$tree_excel_sheet3_xml" in
     *"/afs/cache"*) fail "expected pruned paths to stay out of $tree_excel_book" ;;
   esac
+  case "$tree_excel_sheet3_xml" in
+    *"/etc/localtime"*|*"/usr/lib/libexample.so"*)
+      fail "expected pruned symlinks to stay out of $tree_excel_book" ;;
+  esac
   # 「概要」シートには対象の選び方と読み方を残す。
   tree_excel_sheet1_xml="$(unzip -p "$tree_excel_book" xl/worksheets/sheet1.xml)"
-  for required_text in "コンテナ内ディレクトリツリー (ディレクトリのみ) レポート" \
-      "frontend / backend のサービス" "Meiryo UI (全シート共通)"; do
+  for required_text in "コンテナ内ディレクトリツリー (ディレクトリ / シンボリックリンク) レポート" \
+      "frontend / backend のサービス" "Meiryo UI (全シート共通)" \
+      "シンボリックリンク 10 件"; do
     case "$tree_excel_sheet1_xml" in
       *"$required_text"*) ;;
       *) fail "expected '$required_text' in the summary sheet of $tree_excel_book" ;;
@@ -673,6 +685,48 @@ assert_contains "$tree_excel_fallback_output" \
 assert_contains "$tree_excel_fallback_output" "対象 1 サービス (app)"
 [ -f "$tree_excel_fallback_book" ] || fail "--directory-tree-excel-file did not write the workbook"
 
+# find が -printf を持たない (BusyBox 等) 場合は、リンクの一覧だけを出す。
+# リンクを丸ごと落とすより、リンク先だけを諦めるほうが調査に使えるため。
+export FAKE_DOCKER_FIND_NO_PRINTF=true
+tree_excel_noprintf_output="$TEST_TMP/tree-excel-noprintf.out"
+tree_excel_noprintf_book="$TEST_TMP/tree-excel-noprintf.xlsx"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --env-list-limit 1 \
+    --directory-tree-excel-file "$tree_excel_noprintf_book" \
+    --suppress-removed-logs
+) >"$tree_excel_noprintf_output" 2>&1; then
+  cat "$tree_excel_noprintf_output" >&2
+  unset FAKE_DOCKER_FIND_NO_PRINTF
+  fail "directory tree excel without find -printf returned a non-zero status"
+fi
+unset FAKE_DOCKER_FIND_NO_PRINTF
+assert_contains "$tree_excel_noprintf_output" \
+  "シンボリックリンクのリンク先を取得できませんでした"
+# リンク先は諦めても、リンクの件数は数え上げること。
+assert_contains "$tree_excel_noprintf_output" "シンボリックリンク 5 件"
+[ -f "$tree_excel_noprintf_book" ] \
+  || fail "directory tree workbook was not written without find -printf"
+tree_excel_noprintf_entries="$(unzip -Z1 "$tree_excel_noprintf_book" 2>/dev/null || true)"
+if [ -z "$tree_excel_noprintf_entries" ]; then
+  printf 'SKIP: directory tree workbook (no -printf) content assertions (unzip is unavailable)\n'
+else
+  tree_excel_noprintf_sheet3_xml="$(unzip -p "$tree_excel_noprintf_book" xl/worksheets/sheet3.xml)"
+  # リンク先の列だけで「取れなかった」と伝え、罫線のツリーには混ぜない。
+  case "$tree_excel_noprintf_sheet3_xml" in
+    *"(取得できませんでした)"*) ;;
+    *) fail "expected the unknown-link-target notice in $tree_excel_noprintf_book" ;;
+  esac
+  case "$tree_excel_noprintf_sheet3_xml" in
+    *"-&gt; (取得できませんでした)"*)
+      fail "did not expect the unknown-link-target notice inside the tree column" ;;
+  esac
+fi
+
 # 既定 (指定なし) では Excel を作らず、全量レポートにも理由だけを残す。
 tree_excel_off_output="$TEST_TMP/tree-excel-off.out"
 if ! (
@@ -696,7 +750,7 @@ collect_report_files "$TEST_TMP/tree-excel-off-reports"
 tree_excel_off_report="${REPORT_FILES[0]:-}"
 [ -n "$tree_excel_off_report" ] || fail "expected a full build report for the default excel scenario"
 assert_contains "$tree_excel_off_report" \
-  "ディレクトリのみの Excel : --directory-tree-excel を指定していないため出力していません。"
+  "ディレクトリ構成の Excel : --directory-tree-excel を指定していないため出力していません。"
 
 # 出力先が決まらない実行 (--report-dir も --directory-tree-excel-file も無い) は警告する。
 tree_excel_without_dir_output="$TEST_TMP/tree-excel-without-dir.out"

@@ -33,10 +33,11 @@
 #                          ツリーとデプロイ構造は --directory-tree-report 指定時
 #                          のみ保存する。
 #                          --directory-tree-excel を指定すると、frontend と
-#                          backend の両方のコンテナについて、ディレクトリのみの
-#                          ツリーを Excel ブックへ追加出力する。階層ごとに列を
-#                          分けたオートフィルタ付きの一覧で、階層単位の絞り込みが
-#                          できる (フォントは Meiryo UI)。
+#                          backend の両方のコンテナについて、ディレクトリと
+#                          シンボリックリンクのツリーを Excel ブックへ追加出力する。
+#                          階層ごとに列を分けたオートフィルタ付きの一覧で、階層
+#                          単位の絞り込みができる。シンボリックリンクはリンク先を
+#                          右端の列へ並べる (フォントは Meiryo UI)。
 #   (9) --keep-container-mode: 起動確認後もコンテナを残し、検証対象へ直接
 #                          bash 接続 (接続前に tree を使える状態にする。コンテナに
 #                          tree が無ければ bash だけで動く簡易実装を用意する) するか、
@@ -753,11 +754,16 @@ DIRECTORY_TREE_HIDDEN_PATHS=(
 )
 
 # ---- ディレクトリツリーの Excel レポート出力 ---------------------------------
-# 全量レポート [3] のテキストツリーとは別に、「ディレクトリだけ」のツリーを Excel
-# ブックへ追加出力する。テキストのツリーは目で追う分には読みやすい反面、
-# 「深さ 3 のディレクトリだけ見たい」「特定の階層名で絞り込みたい」といった
+# 全量レポート [3] のテキストツリーとは別に、ディレクトリとシンボリックリンクの
+# ツリーを Excel ブックへ追加出力する。テキストのツリーは目で追う分には読みやすい
+# 反面、「深さ 3 のディレクトリだけ見たい」「特定の階層名で絞り込みたい」といった
 # 読み方ができない。そこで階層ごとに列を分けたオートフィルタ付きの一覧と、
-# 罫線で描いたディレクトリのみのツリーを 1 冊にまとめる。
+# 罫線で描いたツリーを 1 冊にまとめる。
+#
+# 通常ファイルは対象にしないが、シンボリックリンクは対象にする。JBoss EAP の
+# デプロイ先や設定ディレクトリはリンクで別の場所を指していることが多く、リンクを
+# 落とすと「実体がどこにあるのか」を追えなくなるため。リンク先は右端の列へ並べ、
+# ツリーの罫線表示にも tree コマンドと同じ "名前 -> リンク先" の形で載せる。
 #
 # 対象は frontend と backend の両方のコンテナ。サービス名がキーワードと完全一致
 # するか、キーワードを含むもので判定する (--frontend-context などと同じ判定)。
@@ -776,7 +782,11 @@ DIRECTORY_TREE_EXCEL_SKIP_REASON=""   # 出力しなかった理由 (全量レ�
 DIRECTORY_TREE_EXCEL_SUMMARY=""       # 出力内容の要約 (全量レポートへ載せる)
 DIRECTORY_TREE_EXCEL_SERVICES="0"     # 出力したサービス数 (ヘルパーからの集計値)
 DIRECTORY_TREE_EXCEL_DIRECTORIES="0"  # 出力したディレクトリ数 (同上)
+DIRECTORY_TREE_EXCEL_LINKS="0"        # 出力したシンボリックリンク数 (同上)
 DIRECTORY_TREE_EXCEL_MAX_DEPTH="0"    # 最も深い階層 (同上)
+# find の -printf でパスとリンク先を 1 レコードへ詰めるときの区切り。
+# パスにもリンク先にも現れない制御文字を使う。
+DIRECTORY_TREE_EXCEL_SEPARATOR=$'\037'
 # 対象コンテナの判定に使うサービス名のキーワード。
 DIRECTORY_TREE_EXCEL_SERVICE_KEYWORDS=("frontend" "backend")
 # 階層ごとの列は深さの分だけ増える。極端に深いツリーで列が破綻しないよう上限を
@@ -1878,18 +1888,21 @@ JBoss マスターパスワードの伝搬検証:
                            画面表示の有無 (--directory-tree) とは独立して指定する
   --no-directory-tree-report
                            全量レポートへツリーとデプロイ構造を出力しない (既定)
-  --directory-tree-excel   コンテナ内のディレクトリツリー (ディレクトリのみ) を
-                           Excel ブック (.xlsx) へ追加出力する。対象は frontend と
-                           backend の両方のコンテナ (サービス名がキーワードと完全
-                           一致、またはキーワードを含むもの)。どちらも見つからない
-                           場合は起動確認の対象コンテナで代替する。
+  --directory-tree-excel   コンテナ内のディレクトリツリー (ディレクトリと
+                           シンボリックリンク) を Excel ブック (.xlsx) へ追加出力
+                           する。シンボリックリンクはリンク先を右端の列へ並べ、
+                           罫線のツリーにも "名前 -> リンク先" の形で載せる。
+                           対象は frontend と backend の両方のコンテナ (サービス名
+                           がキーワードと完全一致、またはキーワードを含むもの)。
+                           どちらも見つからない場合は起動確認の対象コンテナで
+                           代替する。
                            階層ごとに列を分けたオートフィルタ付きの一覧、罫線で
                            描いたツリー、概要の 3 シート構成 (フォントは Meiryo UI)。
                            出力先は --report-dir 配下の
                            DIR/build_and_verify_<日時>_directory_tree.xlsx。
                            全量レポートの [3] とは独立した指定で、深さの制限や
-                           通常ファイルの表示指定は適用しない (全深度・ディレクトリ
-                           のみ)。出力には Python 3 が必要
+                           通常ファイルの表示指定は適用しない (全深度、通常ファイル
+                           は対象外)。出力には Python 3 が必要
   --no-directory-tree-excel
                            上記の Excel 出力を行わない (既定)
   --directory-tree-excel-file FILE
@@ -7434,9 +7447,10 @@ show_verified_container_deployment_structures() {
 
 
 # ---- ディレクトリツリーの Excel レポート出力 ---------------------------------
-# frontend / backend のコンテナからディレクトリだけを集め、階層ごとに列を分けた
-# Excel ブックへ書き出す。全量レポート [3] のテキストツリーと同じ枝刈り・同じ
-# 除外パスを使うため、同じ構造を「読み方の違う 2 形式」で追えるようにしてある。
+# frontend / backend のコンテナからディレクトリとシンボリックリンクを集め、階層
+# ごとに列を分けた Excel ブックへ書き出す。全量レポート [3] のテキストツリーと
+# 同じ枝刈り・同じ除外パスを使うため、同じ構造を「読み方の違う 2 形式」で
+# 追えるようにしてある。
 
 # サービス名がキーワード (frontend / backend) と完全一致するか、キーワードを
 # 含むかを判定する。--frontend-context などの対象判定と同じ規則に揃えている。
@@ -7464,31 +7478,57 @@ directory_tree_excel_target_container_ids() {
   done < <(compose_started_services)
 }
 
-# 1 コンテナ分のディレクトリ一覧を "サービス<TAB>コンテナ<TAB>パス" で facts_file へ
-# 追記する。ディレクトリのみを対象とするため、通常ファイルの find は行わない。
+# 一覧から除外するパス (RHEL 9 / UBI 9 の /usr/share 配下など) かを判定する。
+# ディレクトリとシンボリックリンクの双方で同じ規則を使う。
+directory_tree_excel_entry_hidden() {
+  local entry="$1" hidden_path
+  for hidden_path in "${DIRECTORY_TREE_HIDDEN_PATHS[@]}"; do
+    [ "$entry" = "$hidden_path" ] && return 0
+  done
+  return 1
+}
+
+# 1 コンテナ分のディレクトリとシンボリックリンクを
+# "サービス<TAB>コンテナ<TAB>種別<TAB>パス<TAB>リンク先" で facts_file へ追記する。
+# 通常ファイルは対象にしないため、-type f の find は行わない。
+#
+# リンク先は GNU find の -printf '%p\037%l\0' で 1 回の exec のうちに取る。
+# コンテナへ readlink の実行やシェルスクリプトを要求せずに済むため。
+# BusyBox の find など -printf を持たない実装では -print0 へ切り替え、リンク先を
+# 空のまま渡す (リンクの存在自体は残す)。「取得できなかった」という表示は、罫線の
+# ツリーへ余計な文字を混ぜないようヘルパー側でリンク先の列だけへ入れる。
 collect_directory_tree_excel_facts() {
   local cid="$1" service_name="$2" container_name="$3" facts_file="$4"
-  local directory_list_tmp find_status=0 directory hidden_path hide_directory index
-  local -a find_args=()
+  local directory_list_tmp link_list_tmp find_status=0 link_status=0
+  local entry link_path link_target index
+  local link_target_available="true"
+  local -a prune_args=()
+  local -a directory_find_args=()
+  local -a link_find_args=()
 
-  if ! directory_list_tmp="$(mktemp 2>/dev/null)"; then
+  if ! directory_list_tmp="$(mktemp 2>/dev/null)" || ! link_list_tmp="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$directory_list_tmp" "$link_list_tmp"
     warn "ディレクトリツリー Excel 用の一時ファイルを作成できませんでした (サービス: ${service_name})。"
     return 1
   fi
 
   # 全量レポートのツリーと同じ枝刈りを適用する。巨大な仮想ファイルシステム等は
   # ディレクトリ自体を 1 ノードとして出し、その配下だけを探索しない。
-  find_args=(find /)
-  find_args+=("(")
+  prune_args=("(")
   for index in "${!DIRECTORY_TREE_PRUNE_PATHS[@]}"; do
-    [ "$index" -gt 0 ] && find_args+=(-o)
-    find_args+=(-path "${DIRECTORY_TREE_PRUNE_PATHS[$index]}")
+    [ "$index" -gt 0 ] && prune_args+=(-o)
+    prune_args+=(-path "${DIRECTORY_TREE_PRUNE_PATHS[$index]}")
   done
-  find_args+=(")" -prune -print0 -o -type d -print0)
+  prune_args+=(")")
 
-  docker exec "$cid" "${find_args[@]}" > "$directory_list_tmp" 2>/dev/null || find_status=$?
+  directory_find_args=(find / "${prune_args[@]}" -prune -print0 -o -type d -print0)
+  # 枝刈り対象そのものはディレクトリ側で 1 ノードとして出すため、リンク側では
+  # -prune の枝を出力しない (同じパスが 2 行になるのを避ける)。
+  link_find_args=(find / "${prune_args[@]}" -prune -o -type l -printf '%p\037%l\0')
+
+  docker exec "$cid" "${directory_find_args[@]}" > "$directory_list_tmp" 2>/dev/null || find_status=$?
   if [ ! -s "$directory_list_tmp" ]; then
-    rm -f -- "$directory_list_tmp"
+    rm -f -- "$directory_list_tmp" "$link_list_tmp"
     warn "ディレクトリツリーを取得できませんでした (サービス: ${service_name}, コンテナ: ${container_name})。"
     return 1
   fi
@@ -7496,19 +7536,45 @@ collect_directory_tree_excel_facts() {
     warn "ディレクトリツリーの一部を取得できませんでした (サービス: ${service_name})。取得できた範囲だけを Excel へ出力します。"
   fi
 
-  while IFS= read -r -d '' directory; do
-    hide_directory="false"
-    for hidden_path in "${DIRECTORY_TREE_HIDDEN_PATHS[@]}"; do
-      if [ "$directory" = "$hidden_path" ]; then
-        hide_directory="true"
-        break
-      fi
-    done
-    [ "$hide_directory" = "true" ] && continue
-    printf '%s\t%s\t%s\n' "$service_name" "$container_name" "$directory" >> "$facts_file"
+  docker exec "$cid" "${link_find_args[@]}" > "$link_list_tmp" 2>/dev/null || link_status=$?
+  # -printf を持たない find は、使い方を表示して何も出さずに終わる。その場合だけ
+  # パスの一覧へ切り替える (リンクを丸ごと落とすより、リンク先だけを諦める)。
+  if [ "$link_status" -ne 0 ] && [ ! -s "$link_list_tmp" ]; then
+    link_status=0
+    link_target_available="false"
+    link_find_args=(find / "${prune_args[@]}" -prune -o -type l -print0)
+    docker exec "$cid" "${link_find_args[@]}" > "$link_list_tmp" 2>/dev/null || link_status=$?
+    if [ -s "$link_list_tmp" ]; then
+      warn "シンボリックリンクのリンク先を取得できませんでした (サービス: ${service_name})。コンテナの find が -printf に対応していないため、リンクの一覧だけを Excel へ出力します。"
+    fi
+  fi
+  if [ "$link_status" -ne 0 ] && [ -s "$link_list_tmp" ]; then
+    warn "シンボリックリンクの一部を取得できませんでした (サービス: ${service_name})。取得できた範囲だけを Excel へ出力します。"
+  fi
+
+  while IFS= read -r -d '' entry; do
+    directory_tree_excel_entry_hidden "$entry" && continue
+    printf '%s\t%s\tdir\t%s\t\n' "$service_name" "$container_name" "$entry" >> "$facts_file"
   done < <(LC_ALL=C sort -z "$directory_list_tmp")
 
-  rm -f -- "$directory_list_tmp"
+  while IFS= read -r -d '' entry; do
+    [ -n "$entry" ] || continue
+    if [ "$link_target_available" = "true" ]; then
+      link_path="${entry%%"$DIRECTORY_TREE_EXCEL_SEPARATOR"*}"
+      link_target=""
+      [ "$link_path" != "$entry" ] && link_target="${entry#*"$DIRECTORY_TREE_EXCEL_SEPARATOR"}"
+    else
+      # リンク先を取れなかった場合は空で渡す。「取得できなかった」という表示は
+      # ヘルパー側で行い、罫線のツリーには余計な文字を混ぜない。
+      link_path="$entry"
+      link_target=""
+    fi
+    directory_tree_excel_entry_hidden "$link_path" && continue
+    printf '%s\t%s\tlink\t%s\t%s\n' \
+        "$service_name" "$container_name" "$link_path" "$link_target" >> "$facts_file"
+  done < <(LC_ALL=C sort -z "$link_list_tmp")
+
+  rm -f -- "$directory_list_tmp" "$link_list_tmp"
   return 0
 }
 
@@ -7520,6 +7586,7 @@ read_directory_tree_excel_summary() {
     case "$line" in
       DIRECTORY_TREE_EXCEL_SERVICES=*)    DIRECTORY_TREE_EXCEL_SERVICES="${line#*=}" ;;
       DIRECTORY_TREE_EXCEL_DIRECTORIES=*) DIRECTORY_TREE_EXCEL_DIRECTORIES="${line#*=}" ;;
+      DIRECTORY_TREE_EXCEL_LINKS=*)       DIRECTORY_TREE_EXCEL_LINKS="${line#*=}" ;;
       DIRECTORY_TREE_EXCEL_MAX_DEPTH=*)   DIRECTORY_TREE_EXCEL_MAX_DEPTH="${line#*=}" ;;
     esac
   done < "$summary_file"
@@ -7583,7 +7650,7 @@ output_directory_tree_excel_report() {
   DIRECTORY_TREE_EXCEL_DONE="true"
   if [ "$DRY_RUN" = "true" ]; then
     DIRECTORY_TREE_EXCEL_SKIP_REASON="DRY-RUN のため出力していません。"
-    log "[DRY-RUN] ディレクトリツリーの Excel ブック出力をプレビューします (対象: frontend / backend、ディレクトリのみ・全深度)。"
+    log "[DRY-RUN] ディレクトリツリーの Excel ブック出力をプレビューします (対象: frontend / backend、ディレクトリとシンボリックリンク・全深度)。"
     return 0
   fi
   if [ "$STARTED_CONTAINER" != "true" ]; then
@@ -7685,7 +7752,7 @@ output_directory_tree_excel_report() {
   fi
 
   DIRECTORY_TREE_EXCEL_FILE="$excel_path"
-  DIRECTORY_TREE_EXCEL_SUMMARY="対象 ${DIRECTORY_TREE_EXCEL_SERVICES} サービス (${target_services:-なし})、ディレクトリ ${DIRECTORY_TREE_EXCEL_DIRECTORIES} 件、最大深さ ${DIRECTORY_TREE_EXCEL_MAX_DEPTH}"
+  DIRECTORY_TREE_EXCEL_SUMMARY="対象 ${DIRECTORY_TREE_EXCEL_SERVICES} サービス (${target_services:-なし})、ディレクトリ ${DIRECTORY_TREE_EXCEL_DIRECTORIES} 件、シンボリックリンク ${DIRECTORY_TREE_EXCEL_LINKS} 件、最大深さ ${DIRECTORY_TREE_EXCEL_MAX_DEPTH}"
   log "ディレクトリツリーの Excel ブックを出力しました: $DIRECTORY_TREE_EXCEL_FILE"
   log "  ${DIRECTORY_TREE_EXCEL_SUMMARY}"
   log "  対象の選び方: ${target_mode}"
@@ -7696,10 +7763,10 @@ output_directory_tree_excel_report() {
 # 同じ情報を別形式で開けることが、レポートだけを見た人にも分かるようにする。
 directory_tree_excel_note_lines() {
   if [ -n "$DIRECTORY_TREE_EXCEL_FILE" ]; then
-    printf 'ディレクトリのみの Excel : %s\n' "$DIRECTORY_TREE_EXCEL_FILE"
+    printf 'ディレクトリ構成の Excel : %s\n' "$DIRECTORY_TREE_EXCEL_FILE"
     printf '  出力内容               : %s\n' "$DIRECTORY_TREE_EXCEL_SUMMARY"
   elif [ -n "$DIRECTORY_TREE_EXCEL_SKIP_REASON" ]; then
-    printf 'ディレクトリのみの Excel : %s\n' "$DIRECTORY_TREE_EXCEL_SKIP_REASON"
+    printf 'ディレクトリ構成の Excel : %s\n' "$DIRECTORY_TREE_EXCEL_SKIP_REASON"
   fi
   return 0
 }
@@ -7749,26 +7816,58 @@ def read_meta(path):
     return meta
 
 
-class ContainerTree(object):
-    """1 コンテナ分のディレクトリ集合。"""
+KIND_DIR = "dir"
+KIND_LINK = "link"
+KIND_LABELS = {KIND_DIR: "ディレクトリ", KIND_LINK: "シンボリックリンク"}
+# -printf を持たない find では、リンクの存在だけが分かってリンク先は取れない。
+# 空欄のままだとディレクトリの行と見分けが付かないため、列にはその旨を入れる。
+LINK_TARGET_UNKNOWN = "(取得できませんでした)"
 
-    __slots__ = ("service", "container", "paths", "seen")
+
+def target_cell_value(tree, path):
+    if tree.kind_of(path) != KIND_LINK:
+        return ""
+    return tree.target_of(path) or LINK_TARGET_UNKNOWN
+
+
+class ContainerTree(object):
+    """1 コンテナ分のディレクトリとシンボリックリンクの集合。"""
+
+    __slots__ = ("service", "container", "paths", "kinds", "targets")
 
     def __init__(self, service, container):
         self.service = service
         self.container = container
         self.paths = []
-        self.seen = set()
+        self.kinds = {}
+        self.targets = {}
 
-    def add(self, path):
-        if path in self.seen:
+    def add(self, path, kind, target):
+        if path in self.kinds:
+            # 同じパスが両方の find に出ることは無いが、出たときはディレクトリを
+            # 優先する (ツリーの親子関係が壊れないほうを残す)。
+            if self.kinds[path] == KIND_DIR or kind != KIND_DIR:
+                return
+            self.kinds[path] = kind
+            self.targets[path] = target
             return
-        self.seen.add(path)
+        self.kinds[path] = kind
+        self.targets[path] = target
         self.paths.append(path)
+
+    def kind_of(self, path):
+        return self.kinds.get(path, KIND_DIR)
+
+    def target_of(self, path):
+        return self.targets.get(path, "")
+
+    def count(self, kind):
+        return sum(1 for path in self.paths if self.kinds.get(path) == kind)
 
 
 def read_facts(path):
-    """"サービス<TAB>コンテナ<TAB>ディレクトリ" の行を、コンテナ単位へまとめる。"""
+    """"サービス<TAB>コンテナ<TAB>種別<TAB>パス<TAB>リンク先" の行を、
+    コンテナ単位へまとめる。リンク先はタブを含み得るため最後の欄に置く。"""
     trees = []
     index = {}
     if not path or not os.path.isfile(path):
@@ -7778,19 +7877,24 @@ def read_facts(path):
             line = line.rstrip("\n")
             if not line:
                 continue
-            fields = line.split("\t")
-            if len(fields) < 3:
+            fields = line.split("\t", 4)
+            if len(fields) < 4:
                 continue
-            service, container, directory = fields[0], fields[1], fields[2]
-            if not directory.startswith("/"):
+            service, container, kind, entry = fields[0], fields[1], fields[2], fields[3]
+            target = fields[4] if len(fields) > 4 else ""
+            if not entry.startswith("/"):
                 continue
+            if kind not in (KIND_DIR, KIND_LINK):
+                kind = KIND_DIR
+            if kind != KIND_LINK:
+                target = ""
             key = (service, container)
             tree = index.get(key)
             if tree is None:
                 tree = ContainerTree(service, container)
                 index[key] = tree
                 trees.append(tree)
-            tree.add(directory)
+            tree.add(entry, kind, target)
     return trees
 
 
@@ -7813,13 +7917,14 @@ def parent_path(path):
     return parent or "/"
 
 
-def build_children(paths):
-    """親パス -> 子パス一覧 (名前順) を返す。"""
+def build_children(tree):
+    """親パス -> 子パス一覧 (名前順) を返す。シンボリックリンクは葉として扱うため
+    親にはならない (find もリンクの先へは降りない)。"""
     children = {}
-    known = set(paths)
-    for path in paths:
+    directories = set(path for path in tree.paths if tree.kind_of(path) == KIND_DIR)
+    for path in tree.paths:
         parent = parent_path(path)
-        if not parent or parent not in known:
+        if not parent or parent not in directories:
             # 枝刈りで親が欠けている経路は、ツリーの根として扱う。
             continue
         children.setdefault(parent, []).append(path)
@@ -7828,32 +7933,45 @@ def build_children(paths):
     return children
 
 
-def tree_roots(paths):
+def tree_roots(tree):
     """親が集合内に無いパス (= ツリーの根) を名前順で返す。"""
-    known = set(paths)
-    roots = [path for path in paths
-             if not parent_path(path) or parent_path(path) not in known]
+    directories = set(path for path in tree.paths if tree.kind_of(path) == KIND_DIR)
+    roots = [path for path in tree.paths
+             if not parent_path(path) or parent_path(path) not in directories]
     roots.sort()
     return roots
 
 
-def walk_tree(node, prefix, children, out):
+def node_label(tree, path, root=False):
+    """ツリーへ出す 1 ノードの表示。リンクは tree コマンドと同じ
+    "名前 -> リンク先" とし、リンク先を辿れることを罫線側でも分かるようにする。"""
+    if root and path == "/":
+        name = "/"
+    else:
+        name = path.rsplit("/", 1)[-1]
+    if tree.kind_of(path) == KIND_LINK:
+        target = tree.target_of(path)
+        return "%s -> %s" % (name, target) if target else name
+    return name if name == "/" else name + "/"
+
+
+def walk_tree(tree, node, prefix, children, out):
     """罫線付きのツリー行を、深さ優先で out へ積む。"""
     kids = children.get(node, [])
     for index, kid in enumerate(kids):
         last = index == len(kids) - 1
         connector = "└── " if last else "├── "
-        out.append((kid, prefix + connector + kid.rsplit("/", 1)[-1] + "/"))
-        walk_tree(kid, prefix + ("    " if last else "│   "), children, out)
+        out.append((kid, prefix + connector + node_label(tree, kid)))
+        walk_tree(tree, kid, prefix + ("    " if last else "│   "), children, out)
 
 
-def tree_lines(paths):
+def tree_lines(tree):
     """(パス, 罫線付き表示) の一覧を、ツリーの並び順で返す。"""
-    children = build_children(paths)
+    children = build_children(tree)
     lines = []
-    for root in tree_roots(paths):
-        lines.append((root, root if root == "/" else root.rsplit("/", 1)[-1] + "/"))
-        walk_tree(root, "", children, lines)
+    for root in tree_roots(tree):
+        lines.append((root, node_label(tree, root, root=True)))
+        walk_tree(tree, root, "", children, lines)
     return lines
 
 
@@ -8169,26 +8287,29 @@ def header_row(labels):
 
 def build_hierarchy_sheet(trees, level_columns):
     """階層ごとに列を分けた一覧。オートフィルタで「深さ 3 だけ」「階層 2 が opt の
-    ものだけ」といった絞り込みができる、この出力の主役となるシート。"""
-    labels = ["サービス", "コンテナ", "深さ"]
+    ものだけ」「シンボリックリンクだけ」といった絞り込みができる、この出力の主役と
+    なるシート。リンク先は右端の列へ置く。"""
+    labels = ["サービス", "コンテナ", "種別", "深さ"]
     labels += ["階層%d" % (level + 1) for level in range(level_columns)]
-    labels += ["ディレクトリ名", "親ディレクトリ", "フルパス", "直下ディレクトリ数"]
-    widths = [16, 24, 6] + [18] * level_columns + [24, 40, 52, 16]
+    labels += ["名前", "親ディレクトリ", "フルパス", "直下の項目数", "リンク先"]
+    widths = [16, 24, 18, 6] + [18] * level_columns + [24, 40, 52, 14, 52]
 
     sheet = Sheet("ディレクトリ階層", widths=widths, freeze_rows=1,
                   autofilter_row=1, autofilter_cols=len(labels))
     sheet.add(header_row(labels))
 
     for tree in trees:
-        known = set(tree.paths)
+        directories = set(path for path in tree.paths if tree.kind_of(path) == KIND_DIR)
         child_counts = {}
         for path in tree.paths:
             parent = parent_path(path)
-            if parent and parent in known:
+            if parent and parent in directories:
                 child_counts[parent] = child_counts.get(parent, 0) + 1
-        for path, _display in tree_lines(tree.paths):
+        for path, _display in tree_lines(tree):
             levels = path_levels(path)
+            kind = tree.kind_of(path)
             cells = [Cell(tree.service, S_BODY), Cell(tree.container, S_BODY),
+                     Cell(KIND_LABELS.get(kind, kind), S_BODY),
                      Cell(len(levels), S_CENTER, numeric=True)]
             for index in range(level_columns):
                 cells.append(Cell(levels[index] if index < len(levels) else "", S_BODY))
@@ -8196,32 +8317,38 @@ def build_hierarchy_sheet(trees, level_columns):
             cells.append(Cell(parent_path(path) if levels else "", S_MONO))
             cells.append(Cell(path, S_MONO))
             cells.append(Cell(child_counts.get(path, 0), S_CENTER, numeric=True))
+            cells.append(Cell(target_cell_value(tree, path), S_MONO))
             sheet.add(cells)
     return sheet
 
 
 def build_tree_sheet(trees):
-    """罫線で描いたディレクトリのみのツリー。階層一覧では掴みにくい「入れ子の形」を
-    そのまま見るためのシート。"""
-    widths = [16, 24, 8, 96, 52]
+    """罫線で描いたツリー。階層一覧では掴みにくい「入れ子の形」をそのまま見るための
+    シート。シンボリックリンクは tree コマンドと同じ "名前 -> リンク先" で描き、
+    リンク先だけを追いたいときのために右端の列へも並べる。"""
+    widths = [16, 24, 18, 8, 96, 52, 52]
     sheet = Sheet("ディレクトリツリー", widths=widths, freeze_rows=1,
                   autofilter_row=1, autofilter_cols=len(widths))
-    sheet.add(header_row(["サービス", "コンテナ", "深さ", "ツリー", "フルパス"]))
+    sheet.add(header_row(["サービス", "コンテナ", "種別", "深さ", "ツリー",
+                          "フルパス", "リンク先"]))
     for tree in trees:
-        for path, display in tree_lines(tree.paths):
+        for path, display in tree_lines(tree):
+            kind = tree.kind_of(path)
             sheet.add([
                 Cell(tree.service, S_BODY),
                 Cell(tree.container, S_BODY),
+                Cell(KIND_LABELS.get(kind, kind), S_BODY),
                 Cell(len(path_levels(path)), S_CENTER, numeric=True),
                 Cell(display, S_MONO),
                 Cell(path, S_MONO),
+                Cell(target_cell_value(tree, path), S_MONO),
             ])
     return sheet
 
 
 def build_summary_sheet(meta, trees, level_columns, max_depth, truncated_levels):
     sheet = Sheet("概要", widths=[28, 96, 44], freeze_rows=0)
-    sheet.add([Cell("コンテナ内ディレクトリツリー (ディレクトリのみ) レポート", S_TITLE)])
+    sheet.add([Cell("コンテナ内ディレクトリツリー (ディレクトリ / シンボリックリンク) レポート", S_TITLE)])
     sheet.add([])
 
     def kv(label, value):
@@ -8241,19 +8368,24 @@ def build_summary_sheet(meta, trees, level_columns, max_depth, truncated_levels)
     kv("対象キーワード", meta.get("target_keywords", ""))
     kv("対象サービス", meta.get("target_services", "") or "(なし)")
     kv("対象コンテナ数", "%d 件" % len(trees))
-    kv("収集方法", "コンテナ内で find / -type d を実行し、ディレクトリだけを集めています "
-                   "(通常ファイルは対象外)。深さの上限は設けていません。")
+    kv("収集方法", "コンテナ内で find / -type d と find / -type l を実行し、ディレクトリと "
+                   "シンボリックリンクを集めています (通常ファイルは対象外)。"
+                   "深さの上限は設けていません。リンク先は find の -printf で同時に取得します "
+                   "(-printf を持たない find では、リンクの一覧だけを出します)。")
     kv("探索しないパス", meta.get("prune_paths", "") or "(なし)")
     kv("一覧から除くパス", meta.get("hidden_paths", "") or "(なし)")
     sheet.add([])
 
     sheet.add([Cell("3. 出力内容", S_SECTION)])
     total = sum(len(tree.paths) for tree in trees)
-    kv("ディレクトリ件数", "%d 件" % total)
+    directories = sum(tree.count(KIND_DIR) for tree in trees)
+    links = sum(tree.count(KIND_LINK) for tree in trees)
+    kv("項目数", "%d 件 (ディレクトリ %d 件 / シンボリックリンク %d 件)"
+       % (total, directories, links))
     kv("最大の深さ", "%d 階層" % max_depth)
     kv("階層列の数", "%d 列 (上限 %s 列)" % (level_columns, meta.get("max_level_columns", "")))
     if truncated_levels:
-        kv("階層列の上限超過", "上限を超える深さのディレクトリが %d 件あります。"
+        kv("階層列の上限超過", "上限を超える深さの項目が %d 件あります。"
                                "階層列には途中までしか入らないため、その分は「フルパス」列で確認してください。"
            % truncated_levels)
     kv("フォント", "Meiryo UI (全シート共通)")
@@ -8261,23 +8393,28 @@ def build_summary_sheet(meta, trees, level_columns, max_depth, truncated_levels)
 
     sheet.add([Cell("4. シートの見方", S_SECTION)])
     kv("ディレクトリ階層",
-       "1 行 = 1 ディレクトリ。階層 1・階層 2 … と列が分かれているため、"
-       "オートフィルタで「深さ」や特定の階層名だけに絞り込めます。"
-       "「直下ディレクトリ数」はそのディレクトリが直接持つ子ディレクトリの数です。")
+       "1 行 = 1 ディレクトリまたは 1 シンボリックリンク。階層 1・階層 2 … と列が分かれているため、"
+       "オートフィルタで「深さ」や特定の階層名、「種別」だけに絞り込めます。"
+       "「直下の項目数」はその直下にあるディレクトリとシンボリックリンクの数です。"
+       "「リンク先」(右端) はシンボリックリンクが指す先で、ディレクトリの行では空になります。")
     kv("ディレクトリツリー",
        "同じ内容を罫線 (├── / └──) で描いたツリーです。入れ子の形をそのまま追いたいときに使います。"
-       "サービスで絞り込めるよう、こちらにもオートフィルタを付けています。")
+       "シンボリックリンクは tree コマンドと同じ「名前 -> リンク先」で描き、"
+       "右端の「リンク先」列にも同じ値を入れています。"
+       "サービスや種別で絞り込めるよう、こちらにもオートフィルタを付けています。")
     sheet.add([])
 
     sheet.add([Cell("5. コンテナ別の内訳", S_SECTION)])
     if not trees:
         sheet.add_notice("対象コンテナがありません。")
     else:
-        sheet.add(header_row(["サービス", "コンテナ", "ディレクトリ件数 / 最大の深さ"]))
+        sheet.add(header_row(["サービス", "コンテナ",
+                              "ディレクトリ / シンボリックリンク / 最大の深さ"]))
         for tree in trees:
             depth = max((len(path_levels(path)) for path in tree.paths), default=0)
             sheet.add([Cell(tree.service, S_BODY), Cell(tree.container, S_BODY),
-                       Cell("%d 件 / %d 階層" % (len(tree.paths), depth), S_BODY)])
+                       Cell("%d 件 / %d 件 / %d 階層"
+                            % (tree.count(KIND_DIR), tree.count(KIND_LINK), depth), S_BODY)])
     return sheet
 
 
@@ -8315,11 +8452,14 @@ def main(argv):
         build_tree_sheet(trees),
     ]
     write_xlsx(args.excel_out, sheets,
-               "コンテナ内ディレクトリツリー (ディレクトリのみ)", "build_and_verify.sh")
+               "コンテナ内ディレクトリツリー (ディレクトリ / シンボリックリンク)",
+               "build_and_verify.sh")
 
-    total = sum(len(tree.paths) for tree in trees)
     sys.stderr.write("DIRECTORY_TREE_EXCEL_SERVICES=%d\n" % len(trees))
-    sys.stderr.write("DIRECTORY_TREE_EXCEL_DIRECTORIES=%d\n" % total)
+    sys.stderr.write("DIRECTORY_TREE_EXCEL_DIRECTORIES=%d\n"
+                     % sum(tree.count(KIND_DIR) for tree in trees))
+    sys.stderr.write("DIRECTORY_TREE_EXCEL_LINKS=%d\n"
+                     % sum(tree.count(KIND_LINK) for tree in trees))
     sys.stderr.write("DIRECTORY_TREE_EXCEL_MAX_DEPTH=%d\n" % max_depth)
     return 0
 

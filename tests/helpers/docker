@@ -1775,7 +1775,10 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "cid-adot-collector" ] \
 fi
 
 emit_fake_find_entry() {
-  local entry_path="$1" relative entry_depth=0 pruned_path
+  local entry="$1" entry_path relative entry_depth=0 pruned_path entry_target=""
+  # シンボリックリンクの候補は "パス<TAB>リンク先" で持つ。
+  entry_path="${entry%%$'\t'*}"
+  [ "$entry_path" != "$entry" ] && entry_target="${entry#*$'\t'}"
   for pruned_path in "${fake_find_pruned_paths[@]}"; do
     if [ "$entry_path" = "$pruned_path" ]; then
       [ "$fake_find_type" = "d" ] || return 0
@@ -1802,7 +1805,12 @@ emit_fake_find_entry() {
     esac
   done
   if [ "$fake_find_max_depth" = "all" ] || [ "$entry_depth" -le "$fake_find_max_depth" ]; then
-    printf '%s\0' "$entry_path"
+    # 実物の find と同じく、-printf '%p\037%l\0' を指定されたときだけリンク先を添える。
+    if [ "$fake_find_type" = "l" ] && [ "$fake_find_printf" = "true" ]; then
+      printf '%s\037%s\0' "$entry_path" "$entry_target"
+    else
+      printf '%s\0' "$entry_path"
+    fi
   fi
 }
 
@@ -1816,6 +1824,7 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "find" ]; then
   fake_find_max_depth="all"
   fake_find_root="${4:-/}"
   fake_find_next=""
+  fake_find_printf="false"
   fake_find_pruned_paths=()
   for arg in "$@"; do
     if [ "$fake_find_next" = "type" ]; then
@@ -1837,6 +1846,15 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "find" ]; then
       -type) fake_find_next="type" ;;
       -maxdepth) fake_find_next="maxdepth" ;;
       -path) fake_find_next="path" ;;
+      -printf)
+        # -printf を持たない find (BusyBox 等) の再現。実物と同じく、使い方を
+        # 表示して何も出さずに終わる。
+        if [ "${FAKE_DOCKER_FIND_NO_PRINTF:-false}" = "true" ]; then
+          printf 'find: unrecognized: -printf\n' >&2
+          exit 1
+        fi
+        fake_find_printf="true"
+        ;;
     esac
   done
 
@@ -1902,6 +1920,19 @@ if [ "${1:-}" = "exec" ] && [ "${3:-}" = "find" ]; then
         "/usr/share/public/assets"
         "/usr/share/zoneinfo"
         "/usr/share/zoneinfo/zoneinfo-hidden"
+      )
+      ;;
+    l)
+      # "パス<TAB>リンク先"。相対・絶対の双方と、枝刈り対象配下 (出力されない)
+      # を混ぜてある。
+      fake_find_entries=(
+        "/bin	usr/bin"
+        "/app/current	/app/releases/2026-09-01"
+        "/app/config/active.yaml	application.yaml"
+        "/opt/eap/standalone/deployments/current.war	orders.war"
+        "/opt/eap/standalone/log	/var/log/eap"
+        "/etc/localtime	/usr/share/zoneinfo/Asia/Tokyo"
+        "/usr/lib/libexample.so	libexample.so.1"
       )
       ;;
     f)
