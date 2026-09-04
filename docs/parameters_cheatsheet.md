@@ -222,6 +222,17 @@
 | `--prune-build-cache-keep SIZE` | サイズ (`10GB` / `512MB`) | (なし) | 終了時に `docker builder prune --keep-storage SIZE` を実行 (`--prune-build-cache` も暗黙に有効化) |
 | `--disk-usage-report` | フラグ | `false` | ビルド前と終了時に Docker 管理対象の使用量を測定し、実行前からの増減を表示 (削除は行わない) |
 
+### ホスト側システムログ (`/var/log/messages`) への出力抑制
+
+| オプション | 値 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `--suppress-syslog` | フラグ | **有効** | `/var/log/messages` への docker 関連ログを抑制 (コンテナログのドライバ差し替え + 存在確認を一覧 API へ寄せる) |
+| `--no-suppress-syslog` | フラグ | `false` | 抑制せず従来どおりの動作にする |
+| `--syslog-log-driver DRIVER` | `json-file` / `local` | `json-file` | コンテナログの差し替え先ドライバ |
+| `--syslog-audit` | フラグ | `false` | 実行前後の `/var/log/messages` 増加行数を出力元別に集計して表示 (要 root) |
+| `--no-syslog-audit` | フラグ | **有効** | 増加量の計測を行わない |
+| `--syslog-audit-file FILE` | ファイルパス | `/var/log/messages` | 計測対象のログファイル (指定すると `--syslog-audit` も有効) |
+
 ### その他
 
 | オプション | 値 | 既定 | 説明 |

@@ -7445,4 +7445,245 @@ assert_not_contains "$keep_post_output" "未使用リソースを含めて完全
 [ ! -s "$FAKE_USAGE_CHECK_CALLS" ] \
   || fail "docker-usage-check.sh must not run while --keep-service is in effect"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection\n'
+
+# ---- ホスト側システムログ (/var/log/messages) への出力抑制 -------------------
+# 「実行すると /var/log/messages に大量の docker 関連ログが出る」への対策。
+# 既定で次の 2 つを抑制することを確認する。
+#   (1) コンテナログ: ログドライバが journald / syslog のサービスだけ差し替える
+#   (2) docker デーモンのエラーログ: 存在確認を inspect から一覧 API へ寄せる
+syslog_compose="$TEST_TMP/syslog-compose.yml"
+cat > "$syslog_compose" <<'YML'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+  db:
+    image: mysql:8.4.7
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /app/db
+  cache:
+    image: redis:7
+    logging:
+      driver: journald
+  flow:
+    image: busybox
+    logging: {driver: syslog, options: {tag: flow}}
+YML
+
+# --- (1) デーモン既定が journald: logging 未指定のサービスも差し替える --------
+syslog_journald_output="$TEST_TMP/syslog-journald.out"
+syslog_override_snapshot="$TEST_TMP/syslog-override.yml"
+rm -f "$syslog_override_snapshot"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="journald" \
+  FAKE_COMPOSE_LOGGING_SNAPSHOT="$syslog_override_snapshot" \
+  bash ./build_and_verify.sh --compose-file "$syslog_compose" --compose-service app
+) >"$syslog_journald_output" 2>&1; then
+  cat "$syslog_journald_output" >&2
+  fail "syslog suppression with a journald daemon returned a non-zero status"
+fi
+assert_contains "$syslog_journald_output" "コンテナログを /var/log/messages へ流さないよう、ログドライバを差し替えます。"
+# journald 既定 = logging 未指定の app と、journald / syslog を明示した cache / flow が対象。
+# 別の送り先 (awslogs) を明示している db は触らない。
+assert_contains "$syslog_journald_output" "対象サービス: app cache (ログドライバを json-file へ差し替え)"
+# logging.options を書いている flow は差し替えない (Compose が options を引き継ぐため)。
+assert_contains "$syslog_journald_output" "logging.options を指定しているため、ログドライバを差し替えないサービスがあります: flow"
+assert_contains "$syslog_journald_output" "docker デーモン既定のログドライバ: journald"
+# 元の compose ファイルは書き換えず、上書き定義を -f で重ねて渡す。
+assert_matches "$FAKE_DOCKER_CALLS" 'compose -f [^ ]*syslog-compose\.yml -f [^ ]*logging-override\.yml build'
+assert_not_contains "$syslog_compose" "json-file"
+[ -f "$syslog_override_snapshot" ] || fail "expected the generated logging override file to be captured"
+assert_contains "$syslog_override_snapshot" "driver: json-file"
+assert_contains "$syslog_override_snapshot" "max-size: \"50m\""
+assert_contains "$syslog_override_snapshot" "  app:"
+assert_contains "$syslog_override_snapshot" "  cache:"
+assert_not_contains "$syslog_override_snapshot" "  flow:"
+assert_not_contains "$syslog_override_snapshot" "  db:"
+
+# --- (2) デーモン既定が json-file: 明示している分だけ差し替える ---------------
+syslog_jsonfile_output="$TEST_TMP/syslog-jsonfile.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="json-file" \
+  bash ./build_and_verify.sh --compose-file "$syslog_compose" --compose-service app \
+    --syslog-log-driver local
+) >"$syslog_jsonfile_output" 2>&1; then
+  cat "$syslog_jsonfile_output" >&2
+  fail "syslog suppression with a json-file daemon returned a non-zero status"
+fi
+assert_contains "$syslog_jsonfile_output" "対象サービス: cache (ログドライバを local へ差し替え)"
+
+# --- (3) 差し替えが要らない構成では何もしない --------------------------------
+syslog_none_output="$TEST_TMP/syslog-none.out"
+syslog_plain_compose="$TEST_TMP/syslog-plain-compose.yml"
+cat > "$syslog_plain_compose" <<'YML'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+YML
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="json-file" \
+  bash ./build_and_verify.sh --compose-file "$syslog_plain_compose" --compose-service app
+) >"$syslog_none_output" 2>&1; then
+  cat "$syslog_none_output" >&2
+  fail "syslog suppression without journald returned a non-zero status"
+fi
+assert_contains "$syslog_none_output" "コンテナログはホストのシステムログへ流れません (ログドライバ: json-file)。"
+assert_not_contains "$FAKE_DOCKER_CALLS" "logging-override.yml"
+
+# --- (4) --no-suppress-syslog では従来どおり ---------------------------------
+syslog_off_output="$TEST_TMP/syslog-off.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="journald" \
+  bash ./build_and_verify.sh --compose-file "$syslog_compose" --compose-service app \
+    --no-suppress-syslog
+) >"$syslog_off_output" 2>&1; then
+  cat "$syslog_off_output" >&2
+  fail "--no-suppress-syslog returned a non-zero status"
+fi
+assert_contains "$syslog_off_output" "ホストのシステムログ (/var/log/messages) への出力抑制は行いません (--no-suppress-syslog)。"
+assert_not_contains "$FAKE_DOCKER_CALLS" "logging-override.yml"
+
+# --- (5) 差し替え先ドライバの指定を検証する ----------------------------------
+syslog_bad_driver_output="$TEST_TMP/syslog-bad-driver.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --syslog-log-driver journald
+) >"$syslog_bad_driver_output" 2>&1; then
+  cat "$syslog_bad_driver_output" >&2
+  fail "--syslog-log-driver journald unexpectedly returned zero"
+fi
+assert_contains "$syslog_bad_driver_output" "--syslog-log-driver には json-file または local を指定してください: journald"
+
+# --- (6) 存在確認は inspect ではなく一覧 API で行う --------------------------
+# 存在しないネットワーク・イメージへ docker inspect すると、CLI 側で捨てても
+# docker デーモンが /var/log/messages へエラーを 1 行残す。既定ではその
+# 問い合わせを行わないことを、呼び出し記録で確かめる (点検結果は従来どおり)。
+syslog_probe_output="$TEST_TMP/syslog-probe.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log" \
+  FAKE_STALE_CONTAINERS='cid-mysql|mysql|/mysql|running|healthy|sha256:img-mysql|mysql:8.4.7|net_default=net-old ' \
+  FAKE_STALE_NETWORKS="net_default=net-aaa" \
+  FAKE_STALE_IMAGES="mysql:8.4.7=sha256:img-mysql" \
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs --suppress-removed-logs
+) >"$syslog_probe_output" 2>&1; then
+  cat "$syslog_probe_output" >&2
+  fail "stale container inspection with syslog suppression returned a non-zero status"
+fi
+assert_contains "$syslog_probe_output" "ネットワーク 'net_default' が作り直されており"
+assert_contains "$FAKE_DOCKER_CALLS" "network ls --no-trunc --format {{.Name}}|{{.ID}}"
+assert_not_contains "$FAKE_DOCKER_CALLS" "network inspect"
+assert_contains "$FAKE_DOCKER_CALLS" "image ls -q --no-trunc mysql:8.4.7"
+assert_not_contains "$FAKE_DOCKER_CALLS" "image inspect -f {{.Id}} mysql:8.4.7"
+
+# --- (7) --no-suppress-syslog では従来どおり inspect で確認する --------------
+syslog_probe_legacy_output="$TEST_TMP/syslog-probe-legacy.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log" \
+  FAKE_STALE_CONTAINERS='cid-mysql|mysql|/mysql|running|healthy|sha256:img-mysql|mysql:8.4.7|net_default=net-old ' \
+  FAKE_STALE_NETWORKS="net_default=net-aaa" \
+  FAKE_STALE_IMAGES="mysql:8.4.7=sha256:img-mysql" \
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --no-suppress-syslog \
+    --suppress-startup-logs --suppress-removed-logs
+) >"$syslog_probe_legacy_output" 2>&1; then
+  cat "$syslog_probe_legacy_output" >&2
+  fail "stale container inspection without syslog suppression returned a non-zero status"
+fi
+assert_contains "$syslog_probe_legacy_output" "ネットワーク 'net_default' が作り直されており"
+assert_contains "$FAKE_DOCKER_CALLS" "network inspect"
+
+# --- (8) --syslog-audit は増加量を出力元別に集計する ------------------------
+syslog_audit_log="$TEST_TMP/syslog-audit-messages.log"
+syslog_audit_output="$TEST_TMP/syslog-audit.out"
+printf 'Sep  5 04:00:00 host systemd[1]: Started something.\n' > "$syslog_audit_log"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="json-file" \
+  FAKE_SYSLOG_AUDIT_APPEND="$syslog_audit_log" \
+  bash ./build_and_verify.sh --compose-file "$syslog_plain_compose" --compose-service app \
+    --syslog-audit-file "$syslog_audit_log"
+) >"$syslog_audit_output" 2>&1; then
+  cat "$syslog_audit_output" >&2
+  fail "--syslog-audit returned a non-zero status"
+fi
+assert_contains "$syslog_audit_output" "システムログの増加量チェックを開始します: ${syslog_audit_log} (現在 1 行)"
+assert_contains "$syslog_audit_output" " ホストのシステムログ増加量 (--syslog-audit)"
+assert_contains "$syslog_audit_output" "増えた行数   : 3 行"
+assert_contains "$syslog_audit_output" "docker 関連  : 2 行 (うち level=error / level=warning: 1 行)"
+assert_matches "$syslog_audit_output" '^ +2 dockerd$'
+assert_matches "$syslog_audit_output" '^ +1 app-1$'
+
+# --- (9) 読めないファイルを指定した場合は理由を残して継続する ----------------
+syslog_audit_missing_output="$TEST_TMP/syslog-audit-missing.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="json-file" \
+  bash ./build_and_verify.sh --compose-file "$syslog_plain_compose" --compose-service app \
+    --syslog-audit-file "$TEST_TMP/no-such-messages.log"
+) >"$syslog_audit_missing_output" 2>&1; then
+  cat "$syslog_audit_missing_output" >&2
+  fail "--syslog-audit with a missing file returned a non-zero status"
+fi
+assert_contains "$syslog_audit_missing_output" "システムログの増加量チェックを開始できません。ファイルがありません:"
+assert_contains "$syslog_audit_missing_output" "結果         : 計測できませんでした (ファイルがありません:"
+
+# --- (10) 判定は compose config (解決済みの定義) を優先する -------------------
+# logging は YAML アンカーでまとめる構成が多く、元ファイルを行単位で見るだけでは
+# 取り込み先を追えない。compose config の出力があればそちらを走査すること。
+syslog_anchor_compose="$TEST_TMP/syslog-anchor-compose.yml"
+syslog_anchor_config="$TEST_TMP/syslog-anchor-config.yml"
+cat > "$syslog_anchor_compose" <<'YML'
+x-logging: &default-logging
+  driver: journald
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+  worker:
+    image: worker
+    logging: *default-logging
+YML
+cat > "$syslog_anchor_config" <<'YML'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+  worker:
+    image: worker
+    logging:
+      driver: journald
+YML
+syslog_anchor_output="$TEST_TMP/syslog-anchor.out"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DOCKER_LOG_DRIVER="json-file" \
+  FAKE_COMPOSE_CONFIG_FILE="$syslog_anchor_config" \
+  bash ./build_and_verify.sh --compose-file "$syslog_anchor_compose" --compose-service app
+) >"$syslog_anchor_output" 2>&1; then
+  cat "$syslog_anchor_output" >&2
+  fail "syslog suppression with an anchored logging block returned a non-zero status"
+fi
+# 元ファイルだけを見ると worker の driver は分からない (アンカー参照のため)。
+assert_contains "$syslog_anchor_output" "対象サービス: worker (ログドライバを json-file へ差し替え)"
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, and host syslog (/var/log/messages) output suppression\n'

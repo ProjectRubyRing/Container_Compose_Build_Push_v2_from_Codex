@@ -749,6 +749,90 @@ Docker data root のファイルシステムを参照できる場合は、ホス
   [docs/build_and_verify_disk_usage.xlsx](docs/build_and_verify_disk_usage.xlsx)
   にまとめています。
 
+### `/var/log/messages` への docker 関連ログを抑える (既定で有効)
+
+RHEL では `dockerd` の出力が journald へ入り、rsyslog がそれを `/var/log/messages`
+へ落とします。`build_and_verify.sh` 自体は syslog へ 1 行も書きませんが、実行すると
+docker デーモン経由でホストのシステムログが増えます。増える経路は 2 つです。
+
+| 経路 | 何が書かれるか | 量の目安 |
+| --- | --- | --- |
+| (1) コンテナの標準出力・標準エラー | ログドライバ (docker デーモンの既定、または `compose.yml` の `logging.driver`) が `journald` / `syslog` の場合、コンテナのログがそのまま `/var/log/messages` へ流れる | JBoss EAP は起動するだけで数千行。`--keep-container-mode` で残している間も出続ける |
+| (2) docker デーモンの API エラー | 存在しないイメージ・ネットワークへ `docker inspect` すると、CLI 側で `2>/dev/null` しても、デーモンが `level=error msg="Handler for GET /v1.xx/... returned error: No such ..."` を 1 呼び出しにつき 1 行書く | 起動確認まで行う最小の実行でも docker CLI を **74 回** (ツリー・URL 確認まで行うと 100 回) 呼ぶ。とくに `--keep-service` の保護判定は「Compose v2 形式 (`<プロジェクト>-<サービス>`) と v1 形式 (`<プロジェクト>_<サービス>`) の両方を試す」ため**必ず片方が失敗**し、しかも残っているイメージ 1 件ごとに呼ばれていた (イメージ 60 件 × 保護 3 サービスなら 1 回の後始末で約 180 行) |
+
+既定 (`--suppress-syslog`) では、この両方を抑制します。
+
+- **(1) コンテナログ**: ログドライバが `journald` / `syslog` になるサービスだけ、
+  ホストのシステムログへ流さないドライバ (既定 `json-file`、`--syslog-log-driver`
+  で `local` も選べる) へ差し替えます。差し替えは**一時ファイルを `-f` で重ねて
+  渡す**形で行うため、`compose.yml` は 1 バイトも変更しません (一時ファイルは
+  処理終了時に削除)。`awslogs` / `fluentd` など、ホストのシステムログへ流れない
+  送り先を明示しているサービスには触れません。ログは従来どおり
+  `docker compose logs` で読め、`--verify-startup` の起動判定もそのまま働きます。
+  - `compose.yml` の `logging.options` を書いているサービスは差し替えません。Compose は
+    重ねたファイルの `options` をキー単位でマージするため、`driver` だけ差し替えると
+    元のドライバ専用オプション (`syslog-address` など) が残り、起動に失敗するためです。
+    該当サービスは警告で名前を出し、`compose.yml` 側での変更を案内します。
+- **(2) デーモンのエラーログ**: 存在確認を `docker inspect` から、対象が無くても
+  エラーにならない一覧 API (`docker image ls <参照>` / `docker network ls`) へ
+  置き換えます。
+
+```bash
+# 既定 (何も指定しなくても抑制する)
+./build_and_verify.sh --verify-startup
+
+[... JST] コンテナログを /var/log/messages へ流さないよう、ログドライバを差し替えます。
+[... JST]   対象サービス: frontend backend (ログドライバを json-file へ差し替え)
+[... JST]   docker デーモン既定のログドライバ: journald
+[... JST]   ログは従来どおり docker compose -f compose.yml logs で読めます。
+[... JST]   差し替えない場合: --no-suppress-syslog
+```
+
+抑制の内容は全量レポート ([`--report-dir`](#57---report-dir-全量レポート)) の
+`ホストログ` 行にも残るため、あとから「どの実行で何を出さないようにしたか」を
+突き合わせられます。
+
+#### 本当に大量に出ているのかを測る (`--syslog-audit`)
+
+`--syslog-audit` を付けると、実行の前後で `/var/log/messages` の行数を数え、
+この実行で増えた行を出力元別に集計して最後に表示します。苦情の裏取りと、抑制の
+効果確認 (`--no-suppress-syslog` との比較) に使えます。読み取りに root 権限が
+要るため既定では行いません。
+
+```bash
+sudo ./build_and_verify.sh --verify-startup --syslog-audit
+
+────────────────────────────────────────────────────────────────────
+ ホストのシステムログ増加量 (--syslog-audit)
+────────────────────────────────────────────────────────────────────
+  対象ファイル : /var/log/messages
+  抑制設定     : コンテナログ: frontend backend を json-file へ差し替え (デーモン既定: journald) / docker デーモンのエラーログ: 抑制
+  増えた行数   : 12 行 (1,024 バイト)
+  docker 関連  : 8 行 (うち level=error / level=warning: 0 行)
+  出力元の内訳 (上位 10 件):
+        8 dockerd
+        4 systemd
+────────────────────────────────────────────────────────────────────
+```
+
+- `--syslog-audit-file FILE` で対象ファイルを変えられます (指定すると
+  `--syslog-audit` も有効になります)。読めない場合は理由を出して処理は続けます。
+- 実行中にログローテーションが起きた場合は、その旨を出して増分の計算を行いません。
+
+| オプション | 説明 | 既定値 |
+| --- | --- | --- |
+| `--suppress-syslog` | `/var/log/messages` への docker 関連ログを抑制する | **有効** |
+| `--no-suppress-syslog` | 抑制せず、従来どおりの動作にする | `false` |
+| `--syslog-log-driver DRIVER` | コンテナログの差し替え先ドライバ。`json-file` / `local` のみ (`journald` / `syslog` では抑制にならず、`none` では起動確認のログが読めなくなるため受け付けない) | `json-file` |
+| `--syslog-audit` | 実行前後で `/var/log/messages` の増加行数を出力元別に集計して表示する | `false` |
+| `--no-syslog-audit` | 増加量の計測を行わない | **有効** |
+| `--syslog-audit-file FILE` | 計測対象のログファイル | `/var/log/messages` |
+
+> **ホスト側での恒久対策**: デーモンが書くログそのものを減らしたい場合は、
+> `/etc/docker/daemon.json` の `"log-driver"` を `json-file` / `local` にする、
+> `"log-level": "warn"` を設定する、rsyslog 側で `dockerd` の行を別ファイルへ
+> 振り分ける、といった方法があります。本スクリプトはホストの設定を変更しません。
+
 ### 複数 Compose サービスのビルド・起動
 
 `--compose-service` は繰り返し指定とカンマ区切りの両方に対応しています。複数の

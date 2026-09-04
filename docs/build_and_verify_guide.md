@@ -60,6 +60,7 @@
 | 16 | JBoss EAP Undertow バーチャルホスト (`default-host`) の分析 (`Host` ヘッダーごとの振り分け判定、`default-host` の利用状況、`Host` ヘッダーを差し替えた実リクエストによる確認) | (起動確認時に既定で自動。無効化は `--no-undertow-analysis`。テキスト出力は `--report-dir` / `--undertow-analysis-text` 指定時) |
 | 17 | コピーしたファイル (WAR など) の取り込み検証 (差し替えたファイルが本当にコンテナへ届いているかを SHA-256 で照合し、届いていなければエラー終了) | (**既定では行わない**。`--verify-copy-artifact` で有効化。`--copy-artifact-path` / `--copy-artifact-search-dir` / `--copy-artifact-required` を指定した場合も有効になる) |
 | 18 | 後始末でのボリューム削除 (デプロイ先を覆っているボリュームを残さない) | (対話操作をすべて終えた実行では既定で `compose down -v`。常に削除は `--remove-volumes`、残すのは `--keep-volumes`) |
+| 19 | ホスト側システムログ (`/var/log/messages`) への docker 関連ログの抑制 (コンテナログの journald / syslog 経由の流入を防ぐログドライバ差し替えと、docker デーモンが記録する API エラーを出さない存在確認) | (既定で有効。無効化は `--no-suppress-syslog`。増加量の実測は `--syslog-audit`) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -585,6 +586,22 @@ compose down (削除)
 | `--prune-build-cache` | フラグ | `false` | 終了時に `docker builder prune --all --force` を実行 |
 | `--prune-build-cache-keep SIZE` | サイズ (`10GB` / `512MB`) | (なし) | 終了時に `docker builder prune --force --keep-storage SIZE` を実行。指定すると `--prune-build-cache` も暗黙に有効化 |
 | `--disk-usage-report` | フラグ | `false` | ビルド前と終了時に Docker 管理対象の使用量を測定し、実行前からの増減を表示 (削除は行わない) |
+
+### 4.8-3 ホスト側システムログ (`/var/log/messages`) への出力抑制
+
+このスクリプト自体は syslog へ書きませんが、実行すると docker デーモン経由で
+ホストのシステムログが増えます (コンテナログの `journald` / `syslog` 経由の流入と、
+docker デーモンが記録する API エラー)。既定でその両方を抑制します。
+詳細は [5.14](#514-ホスト側システムログvarlogmessagesへの出力抑制-既定で有効) を参照してください。
+
+| オプション | 値の形式 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `--suppress-syslog` | フラグ | **有効** | `/var/log/messages` への docker 関連ログを抑制する。(1) `journald` / `syslog` になるサービスのログドライバを差し替える (元の compose ファイルは変更しない) (2) 存在確認の `docker inspect` を、エラーにならない一覧 API へ置き換える |
+| `--no-suppress-syslog` | フラグ | `false` | 上記の抑制を行わず、従来どおりの動作にする |
+| `--syslog-log-driver DRIVER` | `json-file` / `local` | `json-file` | コンテナログの差し替え先ドライバ。`journald` / `syslog` は抑制にならず、`none` は起動確認のログが読めなくなるため受け付けない |
+| `--syslog-audit` | フラグ | `false` | 実行前後で `/var/log/messages` の行数を数え、増えた分を出力元別に集計して表示する (読み取りに root 権限が必要) |
+| `--no-syslog-audit` | フラグ | **有効** | 増加量の計測を行わない |
+| `--syslog-audit-file FILE` | ファイルパス | `/var/log/messages` | 計測対象のログファイル。指定すると `--syslog-audit` も有効になる |
 
 ### 4.9 その他
 
@@ -1979,6 +1996,97 @@ RUN --mount=type=secret,id=cacerts \
     --copy-file ./dist/frontend.war:./app \
     --copy-artifact-path /opt/jboss/standalone/deployments/frontend.war
 ```
+
+### 5.14 ホスト側システムログ (`/var/log/messages`) への出力抑制 (既定で有効)
+
+#### 何が `/var/log/messages` を増やしているのか
+
+このスクリプト自体は syslog へ 1 行も書きません (`logger` も使わず、出力先は画面と
+`--report-dir` / `--log-dir` のファイルだけです)。それでもホストのシステムログが
+増えるのは、RHEL では `dockerd` の出力が journald へ入り、rsyslog がそれを
+`/var/log/messages` へ落とすためです。増える経路は 2 つあります。
+
+| 経路 | 何が書かれるか | 量の目安 |
+| --- | --- | --- |
+| (1) コンテナの標準出力・標準エラー | ログドライバ (docker デーモンの既定、または `compose.yml` の `logging.driver`) が `journald` / `syslog` の場合、コンテナのログがそのまま `/var/log/messages` へ流れる | JBoss EAP は起動するだけで数千行。`--keep-container-mode` で残している間も出続ける |
+| (2) docker デーモンの API エラー | 存在しないイメージ・ネットワークへ `docker inspect` すると、CLI 側で `2>/dev/null` しても、デーモンが `level=error msg="Handler for GET /v1.xx/... returned error: No such ..."` を 1 呼び出しにつき 1 行書く | 起動確認まで行う最小の実行でも docker CLI を **74 回** (ツリー・URL 確認まで行うと 100 回) 呼ぶ。とくに `--keep-service` の保護判定は「Compose v2 形式 (`<プロジェクト>-<サービス>`) と v1 形式 (`<プロジェクト>_<サービス>`) の両方を試す」ため**必ず片方が失敗**し、しかも残っているイメージ 1 件ごとに呼ばれていた (イメージ 60 件 × 保護 3 サービスなら 1 回の後始末で約 180 行) |
+
+(2) は「失敗することを前提にした問い合わせ」で起きます。CLI 側でエラー出力を捨てても、
+デーモンは受け取ったリクエストの失敗をそのまま記録するため、実行のたびに同じ行が
+積み上がります。数はスクリプトの呼び出し回数で決まるので、ローカルに残っている
+イメージが多い環境ほど増えます。
+
+#### 抑制の内容 (既定)
+
+- **(1) コンテナログ**: ログドライバが `journald` / `syslog` になるサービスだけを、
+  ホストのシステムログへ流さないドライバ (既定 `json-file`) へ差し替えます。
+  - 差し替えは、対象サービスの `logging` だけを書いた**上書きファイルを一時
+    ディレクトリへ生成し、`-f` を 2 つ渡す**形で行います
+    (`docker compose -f compose.yml -f /tmp/.../logging-override.yml ...`)。
+    元の `compose.yml` は変更しません。生成物は EXIT トラップで削除します。
+  - 相対パスとプロジェクト名は先頭の `-f` を基準に決まるため、後ろへ重ねても
+    ビルドコンテキストの解決先や `ps` / `logs` / `down` の対象は変わりません。
+  - `awslogs` / `fluentd` など、ホストのシステムログへ流れない送り先を明示して
+    いるサービスには触れません (利用者が決めた送り先を変えないため)。
+  - `compose.yml` の `logging.options` を書いているサービスは差し替えません。Compose は
+    重ねたファイルの `options` をキー単位でマージするため、`driver` だけ差し替えると
+    元のドライバ専用オプション (`syslog-address` など) が残り、起動に失敗するためです。
+    該当サービスは警告で名前を出し、`compose.yml` 側での変更を案内します。
+  - どのサービスがどのドライバになるかは、`docker compose config` が出す**解決済みの
+    定義**から判定します (`x-logging: &default-logging` を `<<:` や `logging: *default-logging`
+    で取り込む書き方でも追えるようにするため)。`compose config` を取得できない場合は、
+    元の compose ファイルをそのまま走査します。
+  - `docker info` で既定ドライバを判定できない場合は、差し替えを行わず理由だけを
+    出します (判定できないまま一律に変えると、意図して選んだ構成まで壊すため)。
+  - ログの読み出しは従来どおり `docker compose logs` で、`--verify-startup` の
+    起動判定・起動ログ表示・全量レポートもそのまま働きます。
+- **(2) デーモンのエラーログ**: 存在確認を、対象が無くてもエラーにならない一覧 API
+  へ置き換えます。
+  - イメージ: `docker image inspect <参照>` → `docker image ls -q --no-trunc <参照>`
+  - ネットワーク: `docker network inspect <名前>` → `docker network ls --format ...`
+  - あわせて、保護対象イメージの ID 一覧を実行中にキャッシュし、イメージ 1 件ごとに
+    問い合わせ直さないようにしています。
+
+```
+[... JST] コンテナログを /var/log/messages へ流さないよう、ログドライバを差し替えます。
+[... JST]   対象サービス: frontend backend (ログドライバを json-file へ差し替え)
+[... JST]   docker デーモン既定のログドライバ: journald
+[... JST]   ログは従来どおり docker compose -f compose.yml logs で読めます。
+[... JST]   差し替えない場合: --no-suppress-syslog
+```
+
+抑制の内容は全量レポートのヘッダ (`ホストログ` 行) にも残ります。
+
+#### 増加量を測る (`--syslog-audit`)
+
+`--syslog-audit` を付けると、実行の前後で対象ファイルの行数を数え、増えた行を
+出力元別に集計して最後に表示します。「本当に大量に出ているのか」の確認と、
+`--no-suppress-syslog` との比較による効果確認に使います。`/var/log/messages` の
+読み取りには root 権限が要るため、既定では行いません。
+
+```
+────────────────────────────────────────────────────────────────────
+ ホストのシステムログ増加量 (--syslog-audit)
+────────────────────────────────────────────────────────────────────
+  対象ファイル : /var/log/messages
+  抑制設定     : コンテナログ: frontend backend を json-file へ差し替え (デーモン既定: journald) / docker デーモンのエラーログ: 抑制
+  増えた行数   : 12 行 (1,024 バイト)
+  docker 関連  : 8 行 (うち level=error / level=warning: 0 行)
+  出力元の内訳 (上位 10 件):
+        8 dockerd
+        4 systemd
+────────────────────────────────────────────────────────────────────
+```
+
+- 読み取れない場合 (権限が無い / ファイルが無い) は、理由を出したうえで処理を続けます。
+- 実行中にログローテーションが起きた場合は、その旨を出して増分の計算を行いません。
+
+#### ホスト側での恒久対策
+
+デーモンが書くログそのものを減らしたい場合は、`/etc/docker/daemon.json` の
+`"log-driver"` を `json-file` / `local` にする、`"log-level": "warn"` を設定する、
+rsyslog 側で `dockerd` の行を別ファイルへ振り分ける、といった方法があります。
+本スクリプトはホストの設定 (`/etc/docker/daemon.json` や rsyslog) を変更しません。
 
 ---
 

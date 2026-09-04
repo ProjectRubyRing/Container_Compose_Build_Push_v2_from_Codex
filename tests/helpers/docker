@@ -29,6 +29,20 @@ if [ -n "${FAKE_COMPOSE_FILE_SNAPSHOT:-}" ] && [ "${1:-}" = "compose" ]; then
   done
   unset fake_compose_prev fake_compose_arg
 fi
+
+# ログドライバの差し替えで生成される上書きファイル (2 つ目の -f) の中身を控える。
+# 処理終了時に消えるため、テストではここで控えたものを確かめる。
+if [ -n "${FAKE_COMPOSE_LOGGING_SNAPSHOT:-}" ] && [ "${1:-}" = "compose" ]; then
+  for fake_logging_arg in "$@"; do
+    case "$fake_logging_arg" in
+      *logging-override.yml)
+        [ -f "$fake_logging_arg" ] && cp "$fake_logging_arg" "$FAKE_COMPOSE_LOGGING_SNAPSHOT" 2>/dev/null
+        break
+        ;;
+    esac
+  done
+  unset fake_logging_arg
+fi
 fail() {
   printf 'fake docker: unsupported arguments: %s\n' "$*" >&2
   exit 64
@@ -81,6 +95,15 @@ if [ -n "${FAKE_STALE_CONTAINERS:-}" ]; then
     done
     exit 0
   fi
+  # 実装は既定 (--suppress-syslog) では docker network inspect を使わない。
+  # 存在しないネットワークへ inspect すると docker デーモンが
+  # /var/log/messages へエラーを 1 行残すため、一覧から引くようにしてある。
+  if [ "${1:-}" = "network" ] && [ "${2:-}" = "ls" ] && [[ " $* " == *"{{.Name}}"* ]]; then
+    for stale_entry in ${FAKE_STALE_NETWORKS:-}; do
+      printf '%s|%s\n' "${stale_entry%%=*}" "${stale_entry#*=}"
+    done
+    exit 0
+  fi
   if [ "${1:-}" = "network" ] && [ "${2:-}" = "inspect" ]; then
     stale_target="${!#}"
     for stale_entry in ${FAKE_STALE_NETWORKS:-}; do
@@ -91,6 +114,17 @@ if [ -n "${FAKE_STALE_CONTAINERS:-}" ]; then
     done
     printf 'Error response from daemon: network %s not found\n' "$stale_target" >&2
     exit 1
+  fi
+  # 同じ理由で、イメージの世代確認も docker image ls <参照> で行う。
+  if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ] && [[ " $* " == *" -q "* ]]; then
+    stale_target="${!#}"
+    for stale_entry in ${FAKE_STALE_IMAGES:-}; do
+      if [ "${stale_entry%%=*}" = "$stale_target" ]; then
+        printf '%s\n' "${stale_entry#*=}"
+        exit 0
+      fi
+    done
+    exit 0
   fi
   if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ] && [[ " $* " == *"{{.Id}} "* ]]; then
     stale_target="${!#}"
@@ -133,7 +167,14 @@ if [ "${1:-}" = "compose" ]; then
       printf 'Docker Compose version v2.29.0\n'
       ;;
     config)
+      # --services 以外の呼び出しは「解決済みの compose 定義」の取得。
+      # ログドライバの判定に使うため、FAKE_COMPOSE_CONFIG_FILE を指定したときは
+      # その中身を返す (YAML アンカーを解決した後の姿を再現する)。
       if [[ " $* " != *" --services "* ]]; then
+        if [ -n "${FAKE_COMPOSE_CONFIG_FILE:-}" ] && [ -f "$FAKE_COMPOSE_CONFIG_FILE" ]; then
+          cat "$FAKE_COMPOSE_CONFIG_FILE"
+          exit 0
+        fi
         fail "compose $*"
       fi
       # compose.yml の定義順。コンテナを持たないサービスも含む点が ps との違い。
@@ -142,6 +183,18 @@ if [ "${1:-}" = "compose" ]; then
       done
       ;;
     build)
+      # docker デーモンがホストのシステムログへ書き足す様子の再現。
+      # FAKE_SYSLOG_AUDIT_APPEND を指定すると、ビルド 1 回につき次の 3 行を足す。
+      #   - 存在しないイメージへの問い合わせで出る dockerd のエラー (level=error)
+      #   - dockerd の通常ログ (level=info)
+      #   - journald ログドライバ経由で流れてくるコンテナ自身のログ
+      if [ -n "${FAKE_SYSLOG_AUDIT_APPEND:-}" ]; then
+        {
+          printf 'Sep  5 04:00:01 host dockerd[1234]: time="2026-09-05T04:00:01" level=error msg="Handler for GET /v1.43/images/j1%%2Fbase.local/json returned error: No such image: j1/base.local"\n'
+          printf 'Sep  5 04:00:02 host dockerd[1234]: time="2026-09-05T04:00:02" level=info msg="Layer sha256:abc cleaned up"\n'
+          printf 'Sep  5 04:00:03 host app-1[2345]: 09:17:43,001 INFO  [org.jboss.modules] JBoss Modules version 2.1.5\n'
+        } >> "$FAKE_SYSLOG_AUDIT_APPEND" 2>/dev/null || :
+      fi
       printf '[fake-build] BUILDKIT_PROGRESS=%s\n' "${BUILDKIT_PROGRESS:-unset}"
       if [ "${FAKE_DOCKER_BUILD_FAIL:-false}" = "true" ]; then
         printf 'fake compose build failed\n' >&2
@@ -408,6 +461,12 @@ if [ "${1:-}" = "system" ] && [ "${2:-}" = "prune" ]; then
 fi
 
 if [ "${1:-}" = "info" ]; then
+  # コンテナログの送り先判定に使う既定ログドライバ。
+  # FAKE_DOCKER_LOG_DRIVER を指定したときだけ返す (未指定なら従来どおり取得不可)。
+  if [ -n "${FAKE_DOCKER_LOG_DRIVER:-}" ] && [[ " $* " == *" {{.LoggingDriver}} "* ]]; then
+    printf '%s\n' "$FAKE_DOCKER_LOG_DRIVER"
+    exit 0
+  fi
   # data root は既定では返さない (ホスト側 df の値が環境依存になるため)。
   # FAKE_DOCKER_DATA_ROOT を指定したときだけ、その値を返す。
   if [ -n "${FAKE_DOCKER_DATA_ROOT:-}" ] && [[ " $* " == *" {{.DockerRootDir}} "* ]]; then
@@ -520,6 +579,27 @@ if [ "${1:-}" = "rm" ]; then
 fi
 
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "ls" ]; then
+  # docker image ls <参照> は「その参照のイメージだけ」を返す。実装は既定
+  # (--suppress-syslog) で、存在確認を docker image inspect からこちらへ移して
+  # いる (存在しない参照でも 0 件を返すだけで、docker デーモンのエラーログを
+  # 増やさないため)。返す値は image inspect --format {{.Id}} と同じにする。
+  fake_img_ref=""
+  for fake_arg in "${@:3}"; do
+    case "$fake_arg" in
+      -*) continue ;;
+      *) fake_img_ref="$fake_arg"; break ;;
+    esac
+  done
+  if [ -n "$fake_img_ref" ]; then
+    if ! is_cleaned; then
+      if [ -n "${FAKE_DOCKER_IMAGE_ID_FILE:-}" ] && [ -f "$FAKE_DOCKER_IMAGE_ID_FILE" ]; then
+        cat "$FAKE_DOCKER_IMAGE_ID_FILE"
+      else
+        printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:-sha256:test-image}"
+      fi
+    fi
+    exit 0
+  fi
   if ! is_cleaned; then
     for fake_img in ${FAKE_DOCKER_IMAGES:-sha256:image-one sha256:image-two}; do
       fake_is_removed "${FAKE_DOCKER_IMAGE_RM_FILE:-}" "$fake_img" && continue
@@ -641,7 +721,12 @@ fi
 
 if [ "${1:-}" = "network" ] && [ "${2:-}" = "ls" ]; then
   if ! is_cleaned; then
-    printf 'network-one\n'
+    # 実装は既定でネットワークの存在確認を一覧から行う。
+    if [[ " $* " == *"{{.Name}}"* ]]; then
+      printf 'network-one|network-one-id\n'
+    else
+      printf 'network-one\n'
+    fi
   fi
   exit 0
 fi

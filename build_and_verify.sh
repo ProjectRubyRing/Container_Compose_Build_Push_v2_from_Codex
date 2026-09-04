@@ -104,6 +104,28 @@
 #                          全量レポート [11] への記載も既定では行わず、
 #                          --readonly-analysis-report を指定したときだけ保存する。
 #                          既定で有効。--no-readonly-analysis で無効化できる。
+#  (15) ホスト側システムログ (/var/log/messages) への出力抑制:
+#                          このスクリプト自体は syslog へ 1 行も書かないが、実行
+#                          すると docker デーモン経由でホストのシステムログが
+#                          増える。経路は 2 つある。
+#                            (1) コンテナの標準出力・標準エラー
+#                                ログドライバ (デーモン既定または compose の
+#                                logging.driver) が journald / syslog の場合、
+#                                コンテナのログがそのまま /var/log/messages へ
+#                                流れる。JBoss EAP は起動するだけで数千行を出す
+#                                ため、増加量の大半はこれになる。
+#                            (2) docker デーモンが記録する API エラー
+#                                存在しないイメージ・ネットワークへ docker
+#                                inspect すると、CLI 側で 2>/dev/null しても
+#                                デーモンが level=error の 1 行を必ず書く。
+#                                「あるかどうか」を確かめるだけの問い合わせでも
+#                                出るため、実行のたびに積み上がる。
+#                          既定では両方を抑制する。(1) はログドライバを差し替えた
+#                          定義を -f で重ねて渡し (compose.yml は変更しない)、
+#                          (2) はエラーにならない一覧 API での確認へ置き換える。
+#                          --no-suppress-syslog で従来どおりの動作へ戻せる。
+#                          --syslog-audit を付けると、実行前後で /var/log/messages
+#                          の増加行数を出力元別に集計して表示する (要 root)。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -213,6 +235,46 @@ BUILD_OVERRIDE_SEP=$'\037'        # 走査結果の区切り (compose の値に�
 COMPOSE_FILE_ORIGINAL=""          # 上書きした場合の元 compose ファイル (未使用時は空)
 COMPOSE_FILE_GENERATED=""         # 生成した実効 compose ファイル (EXIT トラップで削除)
 BUILD_OVERRIDE_SUMMARY=""         # 全量レポートへ載せる上書き内容
+
+# ---- ホスト側システムログ (/var/log/messages) への出力抑制 -------------------
+# RHEL では dockerd の出力が journald へ入り、rsyslog がそれを /var/log/messages
+# へ落とす。このスクリプト自体は syslog へ 1 行も書かないが、実行すると次の
+# 2 経路でホストのシステムログが増える。
+#   (1) コンテナの標準出力・標準エラー
+#       ログドライバ (docker デーモンの既定、または compose の logging.driver) が
+#       journald / syslog の場合、コンテナが出したログはそのまま
+#       /var/log/messages へ流れる。JBoss EAP は起動するだけで数千行を出すため、
+#       「大量のログ」の大半はこれになる。
+#   (2) docker デーモンが記録する API エラー
+#       存在しないイメージ・ネットワークへ docker inspect すると、CLI 側で
+#       2>/dev/null しても、デーモンが
+#         level=error msg="Handler for GET /v1.xx/... returned error: No such ..."
+#       を 1 呼び出しにつき 1 行書く。「docker 関連のエラーログ」はこれで、
+#       あるかどうかを確かめるだけの問い合わせでも出てしまう。
+# 既定 (SUPPRESS_SYSLOG=true) では、(1) をホストのシステムログへ流さないドライバ
+# へ差し替え、(2) をエラーにならない一覧 API (docker image ls / docker network ls)
+# での確認へ置き換える。--no-suppress-syslog で従来どおりの動作へ戻せる。
+SUPPRESS_SYSLOG="true"            # false (--no-suppress-syslog): 抑制しない
+SYSLOG_LOG_DRIVER="json-file"     # 差し替え先のログドライバ (json-file / local)
+SYSLOG_LOG_MAX_SIZE="50m"         # 差し替え時に付けるローテーション上限 (無制限にしない)
+SYSLOG_LOG_MAX_FILE="3"           # 同上 (保持するファイル数)
+SYSLOG_SUPPRESS_SUMMARY=""        # 全量レポートへ載せる抑制内容
+HOST_LOG_DRIVER=""                # docker デーモン既定のログドライバ (空 = 取得できず)
+HOST_LOG_DRIVER_RESOLVED="false"  # 上記を取得済みか (docker info は 1 回だけ叩く)
+COMPOSE_LOGGING_OVERRIDE_DIR=""   # ログドライバ上書きファイルの一時ディレクトリ
+COMPOSE_LOGGING_OVERRIDE_FILE=""  # ログドライバ上書きファイル (EXIT トラップで削除)
+COMPOSE_LOGGING_OVERRIDE_SERVICES=()  # 実際に差し替えたサービス名
+COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")  # compose へ渡す -f 引数一式
+# ---- /var/log/messages の増加量チェック (--syslog-audit) --------------------
+# 「本当に大量に出ているのか」を実測するための機能。実行の前後で対象ファイルの
+# 行数を数え、増えた分を出力元 (dockerd / containerd / コンテナ名) 別に集計する。
+# 読み取りに root 権限が要るため、既定では行わない。
+SYSLOG_AUDIT="false"              # true (--syslog-audit): 増加量を計測する
+SYSLOG_AUDIT_FILE="/var/log/messages"  # 計測対象 (--syslog-audit-file)
+SYSLOG_AUDIT_START_LINES=""       # 実行開始時の行数 (空 = 計測できていない)
+SYSLOG_AUDIT_START_BYTES=""       # 実行開始時のバイト数
+SYSLOG_AUDIT_UNAVAILABLE=""       # 計測できない理由 (空なら計測できている)
+SYSLOG_AUDIT_REPORTED="false"     # 結果を出力済みか (二重出力の防止)
 
 # ---- 保護するサービス (--keep-service) --------------------------------------
 # 指定したサービスは、--no-cache の対象から外し (キャッシュを使ってビルドする)、
@@ -2289,6 +2351,36 @@ Jaeger トレースの HTML 出力 (--keep-container-mode logs の操作):
                            取得範囲。Jaeger Query API の lookback へ渡す
                            (例: 30m / 6h / 2d。既定: 6h)
 
+ホスト側システムログ (/var/log/messages) への出力抑制:
+  (このスクリプト自体は syslog へ書かないが、実行すると docker デーモン経由で
+   ホストのシステムログが増える。既定ではその両方を抑制する)
+  --suppress-syslog        /var/log/messages への docker 関連ログを抑制する (既定)。
+                           内訳は次の 2 つ:
+                             (1) コンテナログ: ログドライバが journald / syslog の
+                                 サービスだけ、ホストのシステムログへ流さない
+                                 ドライバ (既定: json-file) へ差し替える。
+                                 差し替えは一時ファイルを -f で重ねて渡す形で行い、
+                                 compose.yml は変更しない。awslogs / fluentd など
+                                 別の送り先を明示しているサービスには触れない
+                             (2) docker デーモンのエラーログ: 存在確認のための
+                                 docker inspect を、対象が無くてもエラーにならない
+                                 一覧 API (docker image ls / docker network ls) へ
+                                 置き換え、"Handler for GET ... returned error" を
+                                 出さないようにする
+                           コンテナログは従来どおり docker compose logs で読める
+  --no-suppress-syslog     上記の抑制を行わず、従来どおりの動作にする
+  --syslog-log-driver DRIVER
+                           コンテナログの差し替え先ドライバ (既定: json-file)。
+                           json-file / local のみ指定できる (journald / syslog では
+                           抑制にならず、none では起動確認のログが読めなくなる)
+  --syslog-audit           実行の前後で /var/log/messages の行数を数え、この実行で
+                           増えた行数を出力元別に集計して最後に表示する
+                           (既定では行わない。読み取りに root 権限が要る)。
+                           「本当に大量に出ているのか」の確認と、抑制の効果確認に使う
+  --no-syslog-audit        増加量の計測を行わない (既定)
+  --syslog-audit-file FILE 計測対象のログファイル (既定: /var/log/messages)。
+                           指定すると --syslog-audit も有効になる
+
 URL 応答確認:
   --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
                            (単独指定でもコンテナを起動して確認する)
@@ -2343,6 +2435,17 @@ need_nonempty_value() {
   err "${1} には空でない値を指定してください"
   err "  使い方は --help を参照してください。"
   exit 2
+}
+
+# compose へ渡す -f 引数を組み立て直す。
+# ログドライバの上書きファイルを作った実行では、元ファイルの後ろへ重ねて渡す
+# (Compose は後から渡したファイルの値で上書きする)。相対パスとプロジェクト名は
+# 先頭のファイルを基準に決まるため、後ろへ足しても解決結果は変わらない。
+refresh_compose_file_args() {
+  COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")
+  if [ -n "$COMPOSE_LOGGING_OVERRIDE_FILE" ]; then
+    COMPOSE_FILE_ARGS+=(-f "$COMPOSE_LOGGING_OVERRIDE_FILE")
+  fi
 }
 
 while [ $# -gt 0 ]; do
@@ -2426,6 +2529,12 @@ while [ $# -gt 0 ]; do
     --jboss-context-root)  need_value "$1" $#; JBOSS_CONTEXT_ROOT="$2"; shift 2 ;;
     --jboss-http-port)     need_value "$1" $#; JBOSS_HTTP_PORT="$2"; shift 2 ;;
     --suppress-removed-logs) SUPPRESS_REMOVED_LOGS="true"; shift ;;
+    --suppress-syslog)     SUPPRESS_SYSLOG="true"; shift ;;
+    --no-suppress-syslog)  SUPPRESS_SYSLOG="false"; shift ;;
+    --syslog-log-driver)   need_nonempty_value "$1" $# "${2-}"; SYSLOG_LOG_DRIVER="$2"; shift 2 ;;
+    --syslog-audit)        SYSLOG_AUDIT="true"; shift ;;
+    --no-syslog-audit)     SYSLOG_AUDIT="false"; shift ;;
+    --syslog-audit-file)   need_nonempty_value "$1" $# "${2-}"; SYSLOG_AUDIT_FILE="$2"; SYSLOG_AUDIT="true"; shift 2 ;;
     --env-list-limit)      need_value "$1" $#; ENV_LIST_LIMIT="$2"; shift 2 ;;
     --env-list-file)       need_value "$1" $#; ENV_LIST_FILE="$2"; shift 2 ;;
     --directory-tree)      DIRECTORY_TREE_DISPLAY="true"; DIRECTORY_TREE_DISPLAY_SET="true"; shift ;;
@@ -2570,6 +2679,20 @@ if [ "$VOLUME_CLEANUP_ALWAYS_SET" = "true" ] && [ "$VOLUME_CLEANUP_NEVER_SET" = 
   err "--remove-volumes と --keep-volumes は同時に指定できません。"
   exit 2
 fi
+# 差し替え先のログドライバは「ホストのシステムログへ流さない」かつ
+# 「docker compose logs で読める」ものに限る。journald / syslog では抑制にならず、
+# none では起動確認に使うログ自体が読めなくなるため、その場で止める。
+case "$SYSLOG_LOG_DRIVER" in
+  json-file|local) ;;
+  *)
+    err "--syslog-log-driver には json-file または local を指定してください: $SYSLOG_LOG_DRIVER"
+    err "  journald / syslog はホストのシステムログへ流れ、none は compose logs が読めなくなります。"
+    exit 2
+    ;;
+esac
+# --compose-file の指定を反映した -f 引数をここで確定させる。
+refresh_compose_file_args
+
 # 取り込み検証を無効にしたうえで、その付随指定を渡すのは指定の取り違えである
 # 可能性が高い (検証しないので、いずれの指定も効かない)。
 if [ "$COPY_ARTIFACT_VERIFY_SET" = "true" ] && [ "$COPY_ARTIFACT_VERIFY" = "false" ] \
@@ -5463,6 +5586,387 @@ compose_build_rewrite() {
       "$(compose_build_rewrite_awk)" "$compose_file"
 }
 
+# =============================================================================
+# ホスト側システムログ (/var/log/messages) への出力抑制
+# -----------------------------------------------------------------------------
+# 抑制は 2 つの経路それぞれに対して行う。
+#   (1) コンテナログ
+#       ログドライバが journald / syslog のサービスだけを、ホストのシステムログ
+#       へ流さないドライバ (既定: json-file) へ差し替える。差し替えは「元の
+#       compose ファイルへ重ねる上書きファイル」を一時ディレクトリへ生成し、
+#       -f を 2 つ渡す形で行うため、元ファイルには一切触れない。awslogs や
+#       fluentd など、ホストのシステムログへ流れないドライバを明示している
+#       サービスは対象にしない (利用者が決めた送り先を変えてしまわないため)。
+#   (2) docker デーモンの API エラー
+#       「あるかどうか」を確かめるだけの docker inspect を、エラーにならない
+#       一覧 API (docker image ls / docker network ls) での確認へ置き換える。
+# =============================================================================
+
+# docker デーモン既定のログドライバを 1 回だけ取得する (取得できない場合は空)。
+detect_host_log_driver() {
+  if [ "$HOST_LOG_DRIVER_RESOLVED" != "true" ]; then
+    HOST_LOG_DRIVER_RESOLVED="true"
+    HOST_LOG_DRIVER="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null | head -n 1 | tr -d '\r')"
+    case "$HOST_LOG_DRIVER" in
+      ''|'<no value>'|*' '*) HOST_LOG_DRIVER="" ;;
+    esac
+  fi
+  printf '%s' "$HOST_LOG_DRIVER"
+}
+
+# そのログドライバは、コンテナのログをホストのシステムログへ書くか。
+# journald は journald のソケットへ、syslog は /dev/log へ書き、どちらも rsyslog を
+# 通って /var/log/messages に載る。それ以外 (json-file / local / awslogs 等) は
+# ホストのシステムログには載らないため、差し替えの対象にしない。
+log_driver_writes_to_host_log() {
+  case "$1" in
+    journald|syslog) return 0 ;;
+  esac
+  return 1
+}
+
+# compose ファイルの services.<名前>.logging.driver を走査する awk。
+# 1 行 1 サービスで "<サービス名><SEP><driver><SEP><options の有無 (1/0)>" を出力する。
+# driver が書かれていなければ空文字 (= デーモン既定を使う) とする。
+# 走査は build.context の上書きと同じ「Compose が実際に使う範囲だけを見る」方式で、
+# YAML パーサは持ち込まない。
+compose_logging_scan_awk() {
+  compose_build_override_awk_common
+  cat <<'AWKLOG'
+# フロー形式 ("{driver: journald, options: {...}}") から driver の値を取り出す。
+function flow_driver(v,   d) {
+  if (v !~ /driver[[:space:]]*:/) return ""
+  d = v
+  sub(/^.*driver[[:space:]]*:[[:space:]]*/, "", d)
+  sub(/[},].*$/, "", d)
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", d)
+  gsub(/^["']|["']$/, "", d)
+  return d
+}
+function flush_svc() {
+  if (cur_svc == "") return
+  printf "%s%s%s%s%s\n", cur_svc, SEP, cur_driver, SEP, cur_options
+  cur_svc = ""
+}
+BEGIN {
+  in_services = 0; services_indent = 0; svc_indent = -1
+  cur_svc = ""; cur_driver = ""; cur_options = 0
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+  match(line, /^[ ]*/)
+  indent = RLENGTH
+  content = substr(line, indent + 1)
+
+  if (!in_services) {
+    if (indent == 0 && ykey(content) == "services") {
+      in_services = 1; services_indent = indent; svc_indent = -1
+    }
+    next
+  }
+  # services ブロックを抜けた
+  if (indent <= services_indent) { flush_svc(); in_services = 0; next }
+  if (svc_indent < 0) svc_indent = indent
+  # サービス名の行
+  if (indent == svc_indent) {
+    if (content ~ /^- /) next
+    k = ykey(content)
+    if (k == "") next
+    flush_svc()
+    cur_svc = k
+    svc_child_indent = -1; in_logging = 0; logging_indent = -1; logging_child_indent = -1
+    # サービス定義そのものがフロー形式 ("name: {logging: {driver: journald}}") の場合。
+    v = yval(content)
+    cur_driver = flow_driver(v)
+    cur_options = (cur_driver != "" && v ~ /options[[:space:]]*:/) ? 1 : 0
+    next
+  }
+  if (cur_svc == "") next
+  if (svc_child_indent < 0) svc_child_indent = indent
+  if (in_logging && indent <= logging_indent) in_logging = 0
+  # サービス直下のキー
+  if (!in_logging && indent == svc_child_indent) {
+    if (ykey(content) != "logging") next
+    v = yval(content)
+    if (v == "") { in_logging = 1; logging_indent = indent; logging_child_indent = -1 }
+    else {
+      cur_driver = flow_driver(v)
+      cur_options = (v ~ /options[[:space:]]*:/) ? 1 : 0
+    }
+    next
+  }
+  # logging ブロック直下のキー
+  if (in_logging && indent > logging_indent) {
+    if (logging_child_indent < 0) logging_child_indent = indent
+    if (indent == logging_child_indent) {
+      k = ykey(content)
+      if (k == "driver") cur_driver = yval(content)
+      else if (k == "options") cur_options = 1
+    }
+  }
+}
+END { flush_svc() }
+AWKLOG
+}
+
+# サービスごとのログドライバを読み取る。
+# 走査対象は「compose config が出す解決済みの定義」を優先する。logging は
+# YAML アンカー (x-logging: &default-logging を <<: で取り込む書き方) でまとめる
+# 構成が多く、元ファイルを行単位で見るだけでは取り込み先を追えないため。
+# compose config を取れない場合 (compose が使えない / 変数が解決できない等) は、
+# 元ファイルをそのまま走査する。
+compose_logging_scan() {
+  local compose_file="$1" config_out=""
+  [ -f "$compose_file" ] || return 1
+  config_out="$("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" config 2>/dev/null)" || config_out=""
+  if [ -n "$config_out" ]; then
+    printf '%s\n' "$config_out" | awk -v SEP="$BUILD_OVERRIDE_SEP" "$(compose_logging_scan_awk)"
+    return 0
+  fi
+  awk -v SEP="$BUILD_OVERRIDE_SEP" "$(compose_logging_scan_awk)" "$compose_file"
+}
+
+# 生成したログドライバ上書きファイルを削除する (EXIT トラップから呼ぶ)。
+# 想定した名前の一時ディレクトリだけを消し、利用者の compose.yml には触れない。
+cleanup_compose_logging_override() {
+  local dir="$COMPOSE_LOGGING_OVERRIDE_DIR"
+  COMPOSE_LOGGING_OVERRIDE_DIR=""
+  COMPOSE_LOGGING_OVERRIDE_FILE=""
+  refresh_compose_file_args
+  [ -n "$dir" ] || return 0
+  case "$(basename -- "$dir")" in
+    build_and_verify_logging.*) rm -rf -- "$dir" ;;
+    *) warn "生成したログ設定ファイルの置き場所が想定と異なるため削除しません: ${dir}" ;;
+  esac
+  return 0
+}
+
+# コンテナログの送り先を差し替える上書きファイルを生成し、compose の -f へ足す。
+apply_compose_logging_overrides() {
+  SYSLOG_SUPPRESS_SUMMARY=""
+  COMPOSE_LOGGING_OVERRIDE_SERVICES=()
+
+  if [ "$SUPPRESS_SYSLOG" != "true" ]; then
+    SYSLOG_SUPPRESS_SUMMARY="抑制しない (--no-suppress-syslog)"
+    log "ホストのシステムログ (/var/log/messages) への出力抑制は行いません (--no-suppress-syslog)。"
+    return 0
+  fi
+
+  local host_driver host_driver_label
+  host_driver="$(detect_host_log_driver)"
+  host_driver_label="${host_driver:-不明}"
+
+  if [ "$DRY_RUN" = "true" ]; then
+    SYSLOG_SUPPRESS_SUMMARY="DRY-RUN のため未実施 (デーモン既定のログドライバ: ${host_driver_label})"
+    log "[DRY-RUN] コンテナログのドライバ差し替えは行いません (デーモン既定: ${host_driver_label})。"
+    return 0
+  fi
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    SYSLOG_SUPPRESS_SUMMARY="コンテナログ: compose ファイルが無いため未実施 / docker デーモンのエラーログ: 抑制"
+    return 0
+  fi
+
+  local -a targets=() skipped=()
+  local svc driver has_options effective
+  while IFS="$BUILD_OVERRIDE_SEP" read -r svc driver has_options; do
+    [ -n "$svc" ] || continue
+    effective="$driver"
+    [ -n "$effective" ] || effective="$host_driver"
+    log_driver_writes_to_host_log "$effective" || continue
+    # logging.options を書いているサービスは差し替えない。Compose は重ねた
+    # ファイルの options をキー単位でマージするため、driver だけ差し替えると
+    # 元のドライバ専用オプション (syslog-address 等) が残り、起動に失敗する。
+    if [ "$has_options" = "1" ]; then
+      skipped+=("$svc")
+      continue
+    fi
+    targets+=("$svc")
+  done < <(compose_logging_scan "$COMPOSE_FILE")
+
+  if [ ${#skipped[@]} -gt 0 ]; then
+    warn "compose ファイルで logging.options を指定しているため、ログドライバを差し替えないサービスがあります: ${skipped[*]}"
+    warn "  これらのコンテナのログは、これまでどおりホストのシステムログへ流れます。"
+    warn "  流したくない場合は、compose ファイル側で logging.driver を ${SYSLOG_LOG_DRIVER} にしてください。"
+  fi
+
+  if [ ${#targets[@]} -eq 0 ]; then
+    if [ ${#skipped[@]} -gt 0 ]; then
+      SYSLOG_SUPPRESS_SUMMARY="コンテナログ: logging.options を持つため差し替えていない (${skipped[*]}) / docker デーモンのエラーログ: 抑制"
+    elif [ -z "$host_driver" ]; then
+      # デーモン既定が分からない場合に一律で差し替えると、ログドライバを
+      # 意図して選んでいる構成まで変えてしまう。判定できない旨だけを残す。
+      SYSLOG_SUPPRESS_SUMMARY="コンテナログ: 判定不可 (docker info を取得できず) / docker デーモンのエラーログ: 抑制"
+      warn "docker デーモンの既定ログドライバを取得できないため、コンテナログの差し替えは行いません。"
+      warn "  journald / syslog を使っている場合は、docker info --format '{{.LoggingDriver}}' を確認してください。"
+    else
+      SYSLOG_SUPPRESS_SUMMARY="コンテナログ: 差し替え不要 (ログドライバ ${host_driver_label}) / docker デーモンのエラーログ: 抑制"
+      log "コンテナログはホストのシステムログへ流れません (ログドライバ: ${host_driver_label})。"
+    fi
+    return 0
+  fi
+
+  local dir file
+  if ! dir="$(mktemp -d "${TMPDIR:-/tmp}/build_and_verify_logging.XXXXXX" 2>/dev/null)"; then
+    warn "ログ設定の一時ディレクトリを作成できないため、コンテナログの差し替えは行いません。"
+    SYSLOG_SUPPRESS_SUMMARY="コンテナログ: 差し替え失敗 (一時ディレクトリを作成できず) / docker デーモンのエラーログ: 抑制"
+    return 0
+  fi
+  COMPOSE_LOGGING_OVERRIDE_DIR="$dir"
+  file="${dir}/logging-override.yml"
+
+  if ! {
+    printf '# build_and_verify.sh が実行のたびに生成する一時ファイル (終了時に削除する)。\n'
+    printf '# コンテナログが journald / syslog を経由して /var/log/messages へ流れるのを防ぐため、\n'
+    printf '# 対象サービスのログドライバだけを差し替える。元の compose ファイルは変更せず、\n'
+    printf '# この定義を -f で重ねて渡している (--no-suppress-syslog で無効化できる)。\n'
+    printf 'services:\n'
+    for svc in "${targets[@]}"; do
+      printf '  %s:\n' "$svc"
+      printf '    logging:\n'
+      printf '      driver: %s\n' "$SYSLOG_LOG_DRIVER"
+      printf '      options:\n'
+      printf '        max-size: "%s"\n' "$SYSLOG_LOG_MAX_SIZE"
+      printf '        max-file: "%s"\n' "$SYSLOG_LOG_MAX_FILE"
+    done
+  } > "$file" 2>/dev/null; then
+    warn "ログ設定ファイルを書き出せないため、コンテナログの差し替えは行いません: ${file}"
+    cleanup_compose_logging_override
+    SYSLOG_SUPPRESS_SUMMARY="コンテナログ: 差し替え失敗 (ファイルを書き出せず) / docker デーモンのエラーログ: 抑制"
+    return 0
+  fi
+
+  COMPOSE_LOGGING_OVERRIDE_FILE="$file"
+  COMPOSE_LOGGING_OVERRIDE_SERVICES=("${targets[@]}")
+  refresh_compose_file_args
+  SYSLOG_SUPPRESS_SUMMARY="コンテナログ: ${targets[*]} を ${SYSLOG_LOG_DRIVER} へ差し替え (デーモン既定: ${host_driver_label}) / docker デーモンのエラーログ: 抑制"
+  if [ ${#skipped[@]} -gt 0 ]; then
+    SYSLOG_SUPPRESS_SUMMARY="${SYSLOG_SUPPRESS_SUMMARY} / 見送り (logging.options あり): ${skipped[*]}"
+  fi
+  log "コンテナログを /var/log/messages へ流さないよう、ログドライバを差し替えます。"
+  log "  対象サービス: ${targets[*]} (ログドライバを ${SYSLOG_LOG_DRIVER} へ差し替え)"
+  log "  docker デーモン既定のログドライバ: ${host_driver_label}"
+  log "  ログは従来どおり ${COMPOSE_CMD[*]} -f $(compose_file_display) logs で読めます。"
+  log "  差し替えない場合: --no-suppress-syslog"
+  return 0
+}
+
+# ---- 存在確認でデーモンのエラーログを増やさないための問い合わせ --------------
+# docker inspect は対象が無いと、CLI 側で 2>/dev/null しても必ずデーモン側に
+# エラーを 1 行残す。一覧 API は対象が無くても 0 件を返すだけでエラーにならない
+# ため、抑制時は一覧 API での確認へ寄せる。
+
+# イメージ参照 (名前:タグ など) からローカルの image ID を引く。
+# 見つからない場合は何も出力しない (docker image inspect が失敗したときと同じ扱い)。
+# docker image ls は参照を引数で絞り込め、存在しなければ 0 件を返すだけで
+# エラーにならないため、docker デーモンのエラーログを増やさない。
+local_image_id() {
+  local ref="$1"
+  [ -n "$ref" ] || return 0
+  if [ "$SUPPRESS_SYSLOG" != "true" ]; then
+    docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true
+    return 0
+  fi
+  docker image ls -q --no-trunc "$ref" 2>/dev/null | head -n 1
+  return 0
+}
+
+# ---- /var/log/messages の増加量チェック (--syslog-audit) --------------------
+# 実行の前後で行数を数え、増えた分を出力元別に集計する。「本当に大量に出ているか」
+# と「抑制が効いているか」を、同じ物差しで確かめられるようにする。
+syslog_audit_begin() {
+  [ "$SYSLOG_AUDIT" = "true" ] || return 0
+  local file="$SYSLOG_AUDIT_FILE"
+  SYSLOG_AUDIT_START_LINES=""
+  SYSLOG_AUDIT_START_BYTES=""
+  SYSLOG_AUDIT_UNAVAILABLE=""
+  if [ ! -e "$file" ]; then
+    SYSLOG_AUDIT_UNAVAILABLE="ファイルがありません: ${file}"
+  elif [ ! -r "$file" ]; then
+    SYSLOG_AUDIT_UNAVAILABLE="読み取り権限がありません: ${file} (root で実行するか sudo を使ってください)"
+  else
+    SYSLOG_AUDIT_START_LINES="$(wc -l < "$file" 2>/dev/null | tr -d '[:space:]')"
+    SYSLOG_AUDIT_START_BYTES="$(wc -c < "$file" 2>/dev/null | tr -d '[:space:]')"
+    case "${SYSLOG_AUDIT_START_LINES}:${SYSLOG_AUDIT_START_BYTES}" in
+      *[!0-9:]*|:*|*:)
+        SYSLOG_AUDIT_UNAVAILABLE="行数を数えられませんでした: ${file}"
+        SYSLOG_AUDIT_START_LINES=""
+        SYSLOG_AUDIT_START_BYTES=""
+        ;;
+    esac
+  fi
+  if [ -n "$SYSLOG_AUDIT_UNAVAILABLE" ]; then
+    warn "システムログの増加量チェックを開始できません。${SYSLOG_AUDIT_UNAVAILABLE}"
+    return 0
+  fi
+  log "システムログの増加量チェックを開始します: ${file} (現在 ${SYSLOG_AUDIT_START_LINES} 行)"
+  return 0
+}
+
+# 開始時点より後に追記された行だけを取り出す。
+syslog_audit_tail() {
+  tail -n "+$(( SYSLOG_AUDIT_START_LINES + 1 ))" "$SYSLOG_AUDIT_FILE" 2>/dev/null
+}
+
+syslog_audit_report() {
+  [ "$SYSLOG_AUDIT" = "true" ] || return 0
+  [ "$SYSLOG_AUDIT_REPORTED" = "true" ] && return 0
+  SYSLOG_AUDIT_REPORTED="true"
+  local file="$SYSLOG_AUDIT_FILE"
+  diag ""
+  diag "────────────────────────────────────────────────────────────────────"
+  diag " ホストのシステムログ増加量 (--syslog-audit)"
+  diag "────────────────────────────────────────────────────────────────────"
+  diag "  対象ファイル : ${file}"
+  diag "  抑制設定     : ${SYSLOG_SUPPRESS_SUMMARY:-(未判定)}"
+  if [ -z "$SYSLOG_AUDIT_START_LINES" ]; then
+    diag "  結果         : 計測できませんでした (${SYSLOG_AUDIT_UNAVAILABLE:-開始時の行数を取得できていません})"
+    diag "────────────────────────────────────────────────────────────────────"
+    diag ""
+    return 0
+  fi
+  local end_lines end_bytes added added_bytes docker_lines error_lines report_line
+  end_lines="$(wc -l < "$file" 2>/dev/null | tr -d '[:space:]')"
+  end_bytes="$(wc -c < "$file" 2>/dev/null | tr -d '[:space:]')"
+  case "${end_lines}:${end_bytes}" in
+    *[!0-9:]*|:*|*:)
+      diag "  結果         : 終了時の行数を取得できませんでした (権限・ローテーションを確認してください)"
+      diag "────────────────────────────────────────────────────────────────────"
+      diag ""
+      return 0
+      ;;
+  esac
+  if [ "$end_lines" -lt "$SYSLOG_AUDIT_START_LINES" ]; then
+    diag "  結果         : 実行中にログローテーションされたため、増分を数えられませんでした。"
+    diag "                 (開始時 ${SYSLOG_AUDIT_START_LINES} 行 → 終了時 ${end_lines} 行)"
+    diag "────────────────────────────────────────────────────────────────────"
+    diag ""
+    return 0
+  fi
+  added=$(( end_lines - SYSLOG_AUDIT_START_LINES ))
+  added_bytes=$(( end_bytes - SYSLOG_AUDIT_START_BYTES ))
+  diag "  増えた行数   : ${added} 行 (${added_bytes} バイト)"
+  if [ "$added" -eq 0 ]; then
+    diag "  → この実行では ${file} へ 1 行も出ていません。"
+    diag "────────────────────────────────────────────────────────────────────"
+    diag ""
+    return 0
+  fi
+  docker_lines="$(syslog_audit_tail | grep -cE 'dockerd|containerd|docker\[' 2>/dev/null || true)"
+  error_lines="$(syslog_audit_tail | grep -cE 'level=(error|warning)' 2>/dev/null || true)"
+  diag "  docker 関連  : ${docker_lines:-0} 行 (うち level=error / level=warning: ${error_lines:-0} 行)"
+  diag "  出力元の内訳 (上位 10 件):"
+  while IFS= read -r report_line; do
+    [ -n "$report_line" ] && diag "    ${report_line}"
+  done < <(syslog_audit_tail \
+      | awk '{ prog = $5; sub(/\[[0-9]+\]:?$/, "", prog); sub(/:$/, "", prog); if (prog != "") print prog }' \
+      | sort | uniq -c | sort -rn | head -n 10)
+  diag "────────────────────────────────────────────────────────────────────"
+  diag ""
+  return 0
+}
+
 # キーワード (base/frontend/backend) と種別 (context/dockerfile) に対応する指定値を返す。
 build_override_value() {
   case "${1}:${2}" in
@@ -5704,6 +6208,7 @@ apply_compose_build_overrides() {
 
   COMPOSE_FILE_ORIGINAL="$COMPOSE_FILE"
   COMPOSE_FILE="$generated_file"
+  refresh_compose_file_args
   log "上書きを反映した compose ファイルを生成しました: ${generated_file}"
   log "  元ファイル (変更していません): ${COMPOSE_FILE_ORIGINAL}"
   log "  以降のビルド・起動・停止はこの実効ファイルで行い、処理終了時に自動削除します。"
@@ -5958,14 +6463,18 @@ resolve_keep_service_targets() {
 }
 
 # 保護対象イメージの image ID を集める (存在しないものは黙って飛ばす)。
+# 参照ごとに docker image inspect すると、必ず存在しない方の名前 (Compose v1 形式
+# など) で失敗し、その都度 docker デーモンが /var/log/messages へエラーを 1 行残す。
+# local_image_id は抑制時に一覧 API で引くため、存在しなくてもエラーにならない。
 keep_service_image_ids() {
   local ref id
   keep_service_protection_active || return 0
   resolve_keep_service_targets
   for ref in ${KEEP_SERVICE_IMAGE_REFS[@]+"${KEEP_SERVICE_IMAGE_REFS[@]}"}; do
-    id="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    id="$(local_image_id "$ref")"
     [ -n "$id" ] && printf '%s\n' "$id"
   done
+  return 0
 }
 
 # 指定のイメージ参照が保護対象か。
@@ -6001,13 +6510,29 @@ keep_service_summary() {
     "${KEEP_SERVICES[*]}" "$images" "$volumes"
 }
 
+# 保護対象の image ID 一覧のキャッシュ。image_id_is_kept はイメージ 1 件ごとに
+# 呼ばれるため、都度 docker へ問い合わせると件数分だけ呼び出しが増える。
+KEEP_SERVICE_IMAGE_ID_CACHE=""
+KEEP_SERVICE_IMAGE_ID_CACHED="false"
+
+# キャッシュを捨てる。イメージが増減する処理 (削除・ビルド) の前に呼ぶ。
+reset_keep_service_image_id_cache() {
+  KEEP_SERVICE_IMAGE_ID_CACHE=""
+  KEEP_SERVICE_IMAGE_ID_CACHED="false"
+}
+
 # 指定の image ID が保護対象か。
 image_id_is_kept() {
   local target="$1" id
   keep_service_protection_active || return 1
+  if [ "$KEEP_SERVICE_IMAGE_ID_CACHED" != "true" ]; then
+    KEEP_SERVICE_IMAGE_ID_CACHE="$(keep_service_image_ids)"
+    KEEP_SERVICE_IMAGE_ID_CACHED="true"
+  fi
   while IFS= read -r id; do
+    [ -n "$id" ] || continue
     [ "$id" = "$target" ] && return 0
-  done < <(keep_service_image_ids)
+  done <<< "$KEEP_SERVICE_IMAGE_ID_CACHE"
   return 1
 }
 
@@ -6045,7 +6570,7 @@ run_compose_build() {
   # 分割が要らない実行 (--no-cache 無し / --keep-service 無し) は従来どおり 1 回。
   if [ "$NO_CACHE" != "true" ] || ! keep_service_protection_active; then
     run_build_with_watchdog "$label" "${COMPOSE_CMD[@]}" \
-      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
       ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} ${targets[@]+"${targets[@]}"}
     return $?
@@ -6081,14 +6606,14 @@ run_compose_build() {
   if [ ${#nocache_group[@]} -gt 0 ]; then
     log "  キャッシュを破棄してビルド (--no-cache): ${nocache_group[*]}"
     run_build_with_watchdog "${label} / --no-cache" "${COMPOSE_CMD[@]}" \
-      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
       ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"} "${nocache_group[@]}" || return $?
   fi
   if [ ${#cached_group[@]} -gt 0 ]; then
     log "  キャッシュを使ってビルド (--keep-service で no-cache から除外): ${cached_group[*]}"
     run_build_with_watchdog "${label} / キャッシュ利用" "${COMPOSE_CMD[@]}" \
-      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} -f "$COMPOSE_FILE" build \
+      ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
       ${BUILD_OPTS_CACHED[@]+"${BUILD_OPTS_CACHED[@]}"} "${cached_group[@]}" || return $?
   fi
@@ -6407,9 +6932,9 @@ CONTAINER_LOG_SINCE=""             # 今回の起動より前のコンテナロ�
 # ps -q は実行中のコンテナのみを返す。
 compose_container_ids() {
   if [ $# -gt 0 ]; then
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -q "$@" 2>/dev/null
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -q "$@" 2>/dev/null
   else
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -q ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"} 2>/dev/null
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -q ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"} 2>/dev/null
   fi
 }
 
@@ -6417,9 +6942,9 @@ compose_container_ids() {
 # こちらを使う (ps -q は終了したコンテナを返さないため、消えた = 正常と誤判定する)。
 compose_container_ids_all() {
   if [ $# -gt 0 ]; then
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -aq "$@" 2>/dev/null
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -aq "$@" 2>/dev/null
   else
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -aq ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"} 2>/dev/null
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -aq ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"} 2>/dev/null
   fi
 }
 
@@ -6438,7 +6963,7 @@ verification_target_container_ids() {
 
 # ログを取得する (スナップショット)。引数でサービスを指定、未指定なら対象サービス全体。
 compose_logs() {
-  local -a log_args=(-f "$COMPOSE_FILE" logs --no-color)
+  local -a log_args=("${COMPOSE_FILE_ARGS[@]}" logs --no-color)
   if [ -n "$CONTAINER_LOG_SINCE" ]; then
     log_args+=(--since "$CONTAINER_LOG_SINCE")
   fi
@@ -6551,7 +7076,7 @@ show_startup_logs() {
 # フォールバックする。
 compose_started_services() {
   local services cid service_name
-  services="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps --services 2>/dev/null || true)"
+  services="$("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps --services 2>/dev/null || true)"
   if [ -n "$services" ]; then
     printf '%s\n' "$services" | awk 'NF && !seen[$0]++'
     return 0
@@ -6638,8 +7163,8 @@ show_companion_service_logs() {
 # 定義順を優先し、profiles などで定義側に現れないサービスは ps の結果で補う。
 compose_all_service_names() {
   {
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" config --services 2>/dev/null || true
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -a --services 2>/dev/null || true
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" config --services 2>/dev/null || true
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -a --services 2>/dev/null || true
   } | awk 'NF && !seen[$0]++'
 }
 
@@ -9171,7 +9696,7 @@ pull_required_images() {
     return 0
   fi
 
-  local -a pull_args=(-f "$COMPOSE_FILE" pull)
+  local -a pull_args=("${COMPOSE_FILE_ARGS[@]}" pull)
   local policy_note=""
   # build セクションを持つサービスのイメージは、今回のビルドで作ったローカル
   # イメージでレジストリには存在しない。取得対象から外す。
@@ -9246,7 +9771,7 @@ pull_required_images() {
 # compose_container_ids_all は起動対象サービスに絞るため、依存サービスまで
 # まとめて点検したいこの用途では使えない。
 compose_project_container_ids_all() {
-  "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -aq 2>/dev/null
+  "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -aq 2>/dev/null
 }
 
 # docker inspect が返した状態行が、想定した書式かどうか (区切りの数で判定する)。
@@ -9266,7 +9791,20 @@ stale_inspect_line_is_valid() {
 #   1: そのネットワークは存在しない
 #   2: 判定できなかった (docker が使えない等)。この場合は何も報告しない。
 stale_network_current_id() {
-  local network_name="$1" out status
+  local network_name="$1" out status name id
+  if [ "$SUPPRESS_SYSLOG" = "true" ]; then
+    # 一覧から引く。存在しないネットワークでもエラーにならないため、
+    # docker デーモンのエラーログ (= /var/log/messages) を増やさない。
+    out="$(docker network ls --no-trunc --format '{{.Name}}|{{.ID}}' 2>/dev/null)" || return 2
+    [ -n "$out" ] || return 2
+    while IFS='|' read -r name id; do
+      if [ "$name" = "$network_name" ]; then
+        printf '%s' "$id"
+        return 0
+      fi
+    done <<< "$out"
+    return 1
+  fi
   out="$(docker network inspect -f '{{.Id}}' "$network_name" 2>&1)"
   status=$?
   if [ "$status" -eq 0 ]; then
@@ -9403,7 +9941,7 @@ inspect_stale_containers() {
         cache_index=$(( cache_index + 1 ))
       done
       if [ -z "$cache_hit" ]; then
-        current_image="$(docker image inspect -f '{{.Id}}' "$image_ref" 2>/dev/null)" || current_image=""
+        current_image="$(local_image_id "$image_ref")"
         cache_hit="id:${current_image}"
         img_cache_key+=("$image_ref")
         img_cache_val+=("$cache_hit")
@@ -9461,7 +9999,7 @@ diagnose_broken_data_volume() {
   local svc logs hits line found="false"
   for svc in "${services[@]}"; do
     [ -n "$svc" ] || continue
-    logs="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" logs --no-color --tail 200 "$svc" 2>/dev/null | strip_ansi_codes)"
+    logs="$("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" logs --no-color --tail 200 "$svc" 2>/dev/null | strip_ansi_codes)"
     [ -n "$logs" ] || continue
     hits="$(printf '%s\n' "$logs" | grep -Ei -- "$BROKEN_DATA_VOLUME_LOG_PATTERN" | tail -n 3)"
     [ -n "$hits" ] || continue
@@ -9709,7 +10247,7 @@ start_container() {
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*[+-][0-9][0-9]:[0-9][0-9]) ;;
     *) CONTAINER_LOG_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" ;;
   esac
-  local up_args=(-f "$COMPOSE_FILE" up -d --no-build)
+  local up_args=("${COMPOSE_FILE_ARGS[@]}" up -d --no-build)
   if [ "$FORCE_RECREATE" = "true" ]; then
     up_args+=(--force-recreate)
   fi
@@ -9802,7 +10340,7 @@ teardown_container() {
   # 次回以降は down -v するまで DB が起動できず、接続側には「ホストが見つからない」
   # (UnknownHostException) だけが出る、という追いにくい壊れ方をする。
   resolve_down_volume_removal
-  local -a down_args=(-f "$COMPOSE_FILE" down -t "$SHUTDOWN_LOG_TIMEOUT")
+  local -a down_args=("${COMPOSE_FILE_ARGS[@]}" down -t "$SHUTDOWN_LOG_TIMEOUT")
   local remove_volumes_selectively="false"
   if [ "$DOWN_REMOVE_VOLUMES" = "true" ]; then
     # ボリュームを残すと、デプロイ先やログ出力先を覆っているボリュームの中身が
@@ -9913,9 +10451,9 @@ capture_shutdown_logs() {
   SHUTDOWN_STOP_EXECUTED="true"
   local stop_status=0
   if [ "$SUPPRESS_REMOVED_LOGS" = "true" ]; then
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" stop -t "$SHUTDOWN_LOG_TIMEOUT" > /dev/null 2>&1 || stop_status=$?
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" stop -t "$SHUTDOWN_LOG_TIMEOUT" > /dev/null 2>&1 || stop_status=$?
   else
-    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" stop -t "$SHUTDOWN_LOG_TIMEOUT" || stop_status=$?
+    "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" stop -t "$SHUTDOWN_LOG_TIMEOUT" || stop_status=$?
   fi
   if [ "$stop_status" -ne 0 ]; then
     warn "SIGTERM による停止に失敗しました (compose stop, exit=${stop_status})。終了処理のログが欠けている可能性があります。"
@@ -16490,7 +17028,7 @@ cwagent_service_is_defined() {
   while IFS= read -r service; do
     [ -n "$service" ] || continue
     COMPOSE_DEFINED_SERVICES["$service"]="true"
-  done < <("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" config --services 2>/dev/null || true)
+  done < <("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" config --services 2>/dev/null || true)
   [ -n "${COMPOSE_DEFINED_SERVICES[$CWAGENT_SERVICE]:-}" ]
 }
 
@@ -22001,6 +22539,8 @@ run_docker_cleanup_step() {
 # 保護対象を除く全ローカルイメージを削除する。
 remove_all_images_except_kept() {
   local id keep_id kept
+  # 一覧のスナップショットは削除の直前に取り直す (前の段階の結果を使わない)。
+  reset_keep_service_image_id_cache
   local -a keep_ids=() remove_ids=()
   while IFS= read -r id; do
     [ -n "$id" ] && keep_ids+=("$id")
@@ -22059,6 +22599,8 @@ remove_all_volumes_except_kept() {
 # 引数: <表示名> <image|volume> <一覧を出すコマンド...>
 verify_docker_list_only_kept() {
   local description="$1" kind="$2" remaining item project="" unexpected=0
+  # 削除後の状態で突き合わせるため、保護対象の一覧をここで取り直す。
+  reset_keep_service_image_id_cache
   shift 2
   if ! remaining="$("$@" 2>/dev/null)"; then
     warn "クリーンアップ後の確認に失敗しました: $description"
@@ -31773,6 +32315,9 @@ write_build_report() {
     else
       printf '起動対象     : 全サービス\n'
     fi
+    # ホストの /var/log/messages へ何を出さないようにした実行なのか。
+    # 苦情のあったログ量と突き合わせられるよう、抑制の内容も残す。
+    printf 'ホストログ   : %s\n' "${SYSLOG_SUPPRESS_SUMMARY:-(未判定)}"
     printf '\n[1] ビルド結果\n'
     printf '結果          : %s\n' "$build_status"
     printf '詳細          : %s\n' "${BUILD_RESULT_DETAIL:-(なし)}"
@@ -32043,6 +32588,12 @@ cleanup_all() {
   # teardown_container (compose down) を終えたここで消す。元の compose ファイルは
   # 生成時から一切触っていないため、ここで消えるのは生成物だけになる。
   cleanup_generated_compose_file
+  # コンテナログのドライバ差し替えに使った一時ファイルも、compose down を
+  # 終えたここで消す (残しても害はないが、実行ごとに増えるため)。
+  cleanup_compose_logging_override
+
+  # 今回の実行でホストのシステムログが何行増えたかを、後始末まで含めて数える。
+  syslog_audit_report
 
   # 完全クリアの結果を確認できるよう、最後に各ディレクトリの空き容量を並べる。
   show_post_interaction_disk_free
@@ -32056,6 +32607,11 @@ cleanup_all() {
 # ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に後始末する
 trap cleanup_all EXIT
 
+# ---- ホスト側システムログの増加量チェック (--syslog-audit) ------------------
+# 指定時のみ、この時点の /var/log/messages の行数を控える。実行後の行数との差が
+# 「このスクリプトの実行で増えた行数」になる。
+syslog_audit_begin
+
 # ---- build コンテキスト / Dockerfile の上書きを compose へ反映 ---------------
 # --base-context / --frontend-dockerfile などの指定を反映した実効 compose ファイルを
 # 生成し、以降の COMPOSE_FILE をそれへ差し替える。指定が無ければ何もしない。
@@ -32064,6 +32620,13 @@ trap cleanup_all EXIT
 # 定義確認・ビルド・起動) はすべてこの後にあるため、どこから見ても上書き後の
 # 内容で一貫する。
 apply_compose_build_overrides
+
+# ---- ホスト側システムログ (/var/log/messages) への出力抑制 -------------------
+# コンテナログが journald / syslog を経由して /var/log/messages へ流れる構成では、
+# ログドライバを差し替えた実効定義を重ねて渡す (元の compose ファイルは触らない)。
+# ビルド上書きで COMPOSE_FILE を差し替えた後に行うことで、どちらの指定も同じ
+# -f 引数 (COMPOSE_FILE_ARGS) へまとまり、以降の compose 実行はすべて一貫する。
+apply_compose_logging_overrides
 
 # ---- --keep-service の指定を compose ファイルと突き合わせる ------------------
 # 実在しないサービス名のまま進むと、残すつもりだったイメージ・ボリュームが
