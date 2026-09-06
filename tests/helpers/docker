@@ -196,6 +196,38 @@ if [ "${1:-}" = "compose" ]; then
         } >> "$FAKE_SYSLOG_AUDIT_APPEND" 2>/dev/null || :
       fi
       printf '[fake-build] BUILDKIT_PROGRESS=%s\n' "${BUILDKIT_PROGRESS:-unset}"
+      # BuildKit (--progress=plain) がサービスごとに出す行の再現。
+      # "#<番号> [<サービス名> <段>]" と、同じ番号で続く出力・DONE 行を出し、
+      # サービス別ビルドログの切り分けを検証できるようにする。
+      # 既定では出さない (従来の出力のままにする)。
+      if [ "${FAKE_DOCKER_BUILD_SERVICE_LOG:-false}" = "true" ]; then
+        fake_build_targets=""
+        fake_after_build="false"
+        for fake_build_arg in "$@"; do
+          if [ "$fake_after_build" != "true" ]; then
+            [ "$fake_build_arg" = "build" ] && fake_after_build="true"
+            continue
+          fi
+          # --no-cache などのオプションはビルド対象ではない。
+          case "$fake_build_arg" in
+            -*) continue ;;
+          esac
+          fake_build_targets="${fake_build_targets:+${fake_build_targets} }${fake_build_arg}"
+        done
+        # 対象を省略した呼び出し (全サービス) は compose 定義のサービスを使う。
+        [ -n "$fake_build_targets" ] \
+          || fake_build_targets="${FAKE_COMPOSE_CONFIG_SERVICES:-${FAKE_COMPOSE_PS_SERVICES:-app}}"
+        fake_build_vertex=0
+        for fake_build_target in $fake_build_targets; do
+          fake_build_vertex=$(( fake_build_vertex + 1 ))
+          printf '#%s [%s internal] load build definition from Dockerfile\n' \
+            "$fake_build_vertex" "$fake_build_target"
+          printf '#%s [%s 2/2] RUN /build.sh\n' "$fake_build_vertex" "$fake_build_target"
+          printf '#%s 0.123 building %s\n' "$fake_build_vertex" "$fake_build_target"
+          printf '#%s DONE 1.2s\n' "$fake_build_vertex"
+        done
+        unset fake_build_targets fake_after_build fake_build_arg fake_build_vertex fake_build_target
+      fi
       if [ "${FAKE_DOCKER_BUILD_FAIL:-false}" = "true" ]; then
         printf 'fake compose build failed\n' >&2
         exit 42

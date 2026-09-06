@@ -126,6 +126,16 @@
 #                          --no-suppress-syslog で従来どおりの動作へ戻せる。
 #                          --syslog-audit を付けると、実行前後で /var/log/messages
 #                          の増加行数を出力元別に集計して表示する (要 root)。
+#  (16) サービス別ビルドログ:
+#                          docker compose build の出力をサービス単位へ切り分け、
+#                          base / frontend / backend などサービスごとに 1 ファイル
+#                          ずつ、全量レポートとは別に書き出す。出力先は
+#                          --report-dir 配下 (指定が無ければ一時ディレクトリ) で、
+#                          他のレポートと同じように画面へ表示する。
+#                          ビルドエラーで終了する実行では、対話ダイアログ
+#                          (--keep-container-mode logs) の手前で終わってしまうため、
+#                          base / frontend / backend を含む各サービスのビルドログを
+#                          画面へも全量表示する。
 #
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
@@ -329,6 +339,31 @@ BUILD_WATCHDOG_SUMMARY=""         # 全量レポートへ載せる監視結果
 BUILD_WATCHDOG_DATA_ROOT=""       # docker data root (ローカル接続時のみ特定できる)
 BUILD_WATCHDOG_DATA_ROOT_RESOLVED="false"
 BUILD_TIMED_OUT="false"           # 上限時間で中断したか
+
+# ---- サービス別ビルドログ (base / frontend / backend) ------------------------
+# compose build の出力は、ベースサービスを先行ビルドしたあと残りを並列ビルドする
+# ため、1 つの画面へ複数サービス分が混ざって流れる。BuildKit の tty 形式では行が
+# 上書きされて後から読み返せず、ビルドエラーで終了する実行では対話ダイアログ
+# (--keep-container-mode logs) の手前で終わるため、ログを確認する手段が無い。
+# そこでビルド出力は常に控えておき、サービス単位に切り分けたログを
+#   - ビルドエラーで終了する実行では、画面へサービスごとに全量表示する
+#   - 全量レポートとは別のファイルへ必ず書き出し、その出力先を画面へ示す
+# ようにする。切り分けは BuildKit の plain 形式が行頭へ出す
+# "#<番号> [<サービス名> <段>]" の対応を覚えて行い、対象サービスが 1 つだけの
+# ビルド (ベースサービスの先行ビルド等) では、出力の全行をそのサービスへ紐付ける。
+# 出力先は --report-dir 配下 > 一時ディレクトリ の順に決める (証明書チェックと同じ)。
+BUILD_SERVICE_LOG_KEYWORDS=("base" "frontend" "backend")  # 必ず見出しを立てるサービス
+BUILD_SERVICE_LOG_CAPTURE_DIR=""   # 生ログを溜める一時ディレクトリ (EXIT で削除)
+BUILD_SERVICE_LOG_CAPTURE_COUNT=0  # 生ログの数 (ビルドの実行 1 回につき 1 つ)
+BUILD_SERVICE_LOG_CURRENT=""       # 実行中のビルドの記録先 (空なら記録しない)
+BUILD_SERVICE_LOG_TARGETS=()       # 次に実行するビルドの対象サービス (空なら全サービス)
+BUILD_SERVICE_LOG_SERVICES=()      # 切り分けたサービス名 (ビルド順)
+BUILD_SERVICE_LOG_BUILT=()         # 上記が今回のビルド対象だったか (同じ並び)
+BUILD_SERVICE_LOG_OUTPUT_SERVICES=()  # 書き出したサービス名
+BUILD_SERVICE_LOG_OUTPUT_FILES=()     # 書き出したファイル (同じ並び)
+BUILD_SERVICE_LOG_OUTPUT_LINES=()     # 各サービスのビルドログ行数 (同じ並び)
+BUILD_SERVICE_LOG_FINISHED="false" # 書き出しと画面表示を済ませたか
+BUILD_SERVICE_LOG_NOTE=""          # 書き出さなかった理由 (全量レポートへ載せる)
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-1}}"  # パラメータストア参照時に使用
 
@@ -2003,7 +2038,13 @@ JBoss マスターパスワードの伝搬検証:
                            DIR/build_and_verify_<日時>_readonly_filesystem.txt へ、
                            Undertow バーチャルホスト分析を
                            DIR/build_and_verify_<日時>_undertow_virtual_host.txt へ
-                           追加出力する (Excel とテキストは同じ内容)
+                           追加出力する (Excel とテキストは同じ内容)。
+                           さらに docker compose build の出力をサービス単位へ
+                           切り分けたビルドログを
+                           DIR/build_and_verify_<日時>_build_log_<サービス名>.txt へ
+                           サービスごとに出力する。--report-dir が無い実行では
+                           一時ディレクトリへ出力し、どちらの場合も出力先を
+                           画面へ表示する
   --cert-check-text FILE   証明書チェック (--keep-container-mode logs の操作) の
                            結果を FILE へ出力する。受領した自己証明書の詳細
                            (種別・X.509 バージョン・トラストアンカー可否・全項目) と
@@ -6569,6 +6610,8 @@ run_compose_build() {
 
   # 分割が要らない実行 (--no-cache 無し / --keep-service 無し) は従来どおり 1 回。
   if [ "$NO_CACHE" != "true" ] || ! keep_service_protection_active; then
+    # この実行の対象サービス。サービス別ビルドログの切り分けに使う。
+    BUILD_SERVICE_LOG_TARGETS=(${targets[@]+"${targets[@]}"})
     run_build_with_watchdog "$label" "${COMPOSE_CMD[@]}" \
       ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
@@ -6605,6 +6648,7 @@ run_compose_build() {
 
   if [ ${#nocache_group[@]} -gt 0 ]; then
     log "  キャッシュを破棄してビルド (--no-cache): ${nocache_group[*]}"
+    BUILD_SERVICE_LOG_TARGETS=("${nocache_group[@]}")
     run_build_with_watchdog "${label} / --no-cache" "${COMPOSE_CMD[@]}" \
       ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
@@ -6612,6 +6656,7 @@ run_compose_build() {
   fi
   if [ ${#cached_group[@]} -gt 0 ]; then
     log "  キャッシュを使ってビルド (--keep-service で no-cache から除外): ${cached_group[*]}"
+    BUILD_SERVICE_LOG_TARGETS=("${cached_group[@]}")
     run_build_with_watchdog "${label} / キャッシュ利用" "${COMPOSE_CMD[@]}" \
       ${COMPOSE_PARALLEL_OPTS[@]+"${COMPOSE_PARALLEL_OPTS[@]}"} "${COMPOSE_FILE_ARGS[@]}" build \
       ${COMPOSE_BUILD_PARALLEL_OPTS[@]+"${COMPOSE_BUILD_PARALLEL_OPTS[@]}"} \
@@ -23428,7 +23473,22 @@ build_watchdog_load_phase() {
 # 「中断したのにプロンプトが戻らない」という当初の症状に逆戻りしてしまう。
 # 時間制限で定期的に目を覚まし、中断指示 (abort) が出ていれば読むのをやめる。
 build_watchdog_reader() {
-  local state="$1" chunk="" pending="" now="" last_stamp="" current_phase="" status
+  local state="$1" capture="${2:-}"
+  # 記録先が渡された実行では、fd 9 を開いたまま読み進める (行ごとに開き直すと、
+  # 出力の多いビルドで無視できない遅さになる)。開けない場合は記録だけをあきらめ、
+  # 画面表示は従来どおり続ける。
+  if [ -n "$capture" ] && { : >> "$capture"; } 2>/dev/null; then
+    build_watchdog_reader_loop "$state" "true" 9>>"$capture"
+    return $?
+  fi
+  build_watchdog_reader_loop "$state" "false"
+}
+
+# 読み取りの本体。capture が true の実行では、画面へ流す行をそのまま fd 9 の
+# 記録先へも書く (サービス別ビルドログの元になる)。
+build_watchdog_reader_loop() {
+  local state="$1" capture="$2"
+  local chunk="" pending="" now="" last_stamp="" current_phase="" status
   while :; do
     if IFS= read -r -t "$BUILD_WATCHDOG_READ_TIMEOUT" chunk; then
       : # 1 行読めた (下で処理する)
@@ -23444,6 +23504,7 @@ build_watchdog_reader() {
       # EOF。読み残しがあれば最後に 1 行として出す。
       if [ -n "${pending}${chunk}" ]; then
         printf '%s\n' "${pending}${chunk}"
+        [ "$capture" = "true" ] && printf '%s\n' "${pending}${chunk}" >&9
       fi
       break
     fi
@@ -23451,6 +23512,7 @@ build_watchdog_reader() {
     chunk="${pending}${chunk}"
     pending=""
     printf '%s\n' "$chunk"
+    [ "$capture" = "true" ] && printf '%s\n' "$chunk" >&9
     set_epoch_now now
     if [ "$now" != "$last_stamp" ]; then
       printf '%s\n' "$now" > "${state}/last_output"
@@ -23721,19 +23783,25 @@ run_build_with_watchdog() {
   local desc="$1"
   shift
   local state status=0 monitor_pid outcome="" max_silence="" max_silence_phase=""
+  local capture=""
 
   if [ "$DRY_RUN" = "true" ]; then
     printf '[%s] [DRY-RUN] %s\n' "$(now_display_time)" "$*"
     return 0
   fi
+  # ビルド出力はサービス単位へ切り分けて残すため、監視の有無にかかわらず控える。
+  # 記録先を用意できなかった場合は空のままとし、従来どおりビルドを実行する
+  # (ログを残せないことでビルドそのものを止めない)。
+  build_service_log_begin_capture || true
+  capture="$BUILD_SERVICE_LOG_CURRENT"
   if ! build_watchdog_enabled; then
-    "$@"
+    build_service_log_run_plain "$capture" "$@"
     return $?
   fi
   if ! state="$(mktemp -d "${TMPDIR:-/tmp}/build-watchdog.XXXXXX" 2>/dev/null)" \
       || [ -z "$state" ]; then
     warn "ビルド監視用の一時ディレクトリを作成できないため、監視なしでビルドします。"
-    "$@"
+    build_service_log_run_plain "$capture" "$@"
     return $?
   fi
   BUILD_WATCHDOG_DIR="$state"
@@ -23749,7 +23817,7 @@ run_build_with_watchdog() {
   {
     printf '%s\n' "$BASHPID" > "${state}/build.pid"
     exec "$@"
-  } 2>&1 | build_watchdog_reader "$state"
+  } 2>&1 | build_watchdog_reader "$state" "$capture"
   status="${PIPESTATUS[0]}"
 
   rm -f "${state}/running"
@@ -23786,6 +23854,438 @@ run_build_with_watchdog() {
   esac
   BUILD_WATCHDOG_DIR=""
   return "$status"
+}
+
+# =============================================================================
+# サービス別ビルドログ
+# -----------------------------------------------------------------------------
+# docker compose build の出力を控え、サービス単位へ切り分けて 1 ファイルずつ
+# 書き出す。ビルドエラーで終了する実行では、対話ダイアログ
+# (--keep-container-mode logs) の手前で終わってしまい、後からログを見る手段が
+# 無いため、画面へもサービスごとに全量を出す。
+# =============================================================================
+
+# ビルド 1 回分の出力を記録するファイルを用意する。用意できない場合は
+# BUILD_SERVICE_LOG_CURRENT を空にして 1 を返し、呼び出し側は記録なしで
+# 従来どおりビルドする (ログを残せないことでビルドそのものを止めない)。
+build_service_log_begin_capture() {
+  local dir path
+  BUILD_SERVICE_LOG_CURRENT=""
+  [ "$DRY_RUN" = "true" ] && return 1
+  if [ -z "$BUILD_SERVICE_LOG_CAPTURE_DIR" ]; then
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/build-service-log.XXXXXX" 2>/dev/null)" || dir=""
+    if [ -z "$dir" ]; then
+      BUILD_SERVICE_LOG_NOTE="ビルドログ用の一時ディレクトリを作成できなかったため出力していません。"
+      warn "サービス別ビルドログ用の一時ディレクトリを作成できないため、ビルドログのファイル出力を行いません。"
+      return 1
+    fi
+    BUILD_SERVICE_LOG_CAPTURE_DIR="$dir"
+  fi
+  BUILD_SERVICE_LOG_CAPTURE_COUNT=$((BUILD_SERVICE_LOG_CAPTURE_COUNT + 1))
+  path="$(printf '%s/build.%03d.log' "${BUILD_SERVICE_LOG_CAPTURE_DIR%/}" \
+      "$BUILD_SERVICE_LOG_CAPTURE_COUNT")"
+  if ! : > "$path" 2>/dev/null; then
+    BUILD_SERVICE_LOG_NOTE="ビルドログの記録ファイルを作成できなかったため出力していません。"
+    warn "サービス別ビルドログを記録できませんでした: ${path}"
+    return 1
+  fi
+  # 対象サービスを控える。1 サービスだけのビルド (ベースサービスの先行ビルド等)
+  # では、出力の全行がそのサービスのものだと確定できる。
+  if [ ${#BUILD_SERVICE_LOG_TARGETS[@]} -gt 0 ]; then
+    printf '%s\n' "${BUILD_SERVICE_LOG_TARGETS[@]}" > "${path}.targets" 2>/dev/null || true
+  else
+    : > "${path}.targets" 2>/dev/null || true
+  fi
+  BUILD_SERVICE_LOG_CURRENT="$path"
+  return 0
+}
+
+# 監視を行わない実行 (--no-build-watchdog 等) でも、ビルド出力を記録しながら
+# 画面へ流す。記録先が無い場合は従来どおりそのまま実行する。
+build_service_log_run_plain() {
+  local capture="$1"
+  shift
+  if [ -z "$capture" ]; then
+    "$@"
+    return $?
+  fi
+  "$@" 2>&1 | tee -a -- "$capture"
+  return "${PIPESTATUS[0]}"
+}
+
+# 記録した生ログをサービス単位へ切り分ける。BuildKit の plain 形式は
+#   #12 [frontend build 3/8] RUN ...
+# のように行頭へ "#<番号>" と "[<サービス名> ...]" を出すため、番号とサービスの
+# 対応を覚えておけば、同じ番号で続く行 (RUN の出力や DONE 行) も同じサービスへ
+# 振り分けられる。サービス名として受け付けるのはそのビルドの対象サービス名と
+# 完全に一致するものだけとし、"[internal]" のような見出しを取り違えない。
+# tty 形式 (--progress=auto) では番号が付かず "=> [frontend 2/6] RUN ..." と
+# 出るため、直前に見出しが出たサービスへ続けて振り分ける。
+# 振り分けられなかった行 (compose 自身のエラー行など) は共通の出力として扱い、
+# 各サービスのログの末尾へ添える。"ERROR: failed to solve" のようにサービス名を
+# 含まない行を、どのサービスのログからも読めるようにするため。
+build_service_log_split() {
+  local work="${BUILD_SERVICE_LOG_CAPTURE_DIR%/}/split"
+  local capture targets_file line name keyword map slot
+  local -a known=() all_services=()
+  local -A slot_of=()
+
+  mkdir -p -- "$work" 2>/dev/null || return 1
+  : > "${work}/common" 2>/dev/null || return 1
+  BUILD_SERVICE_LOG_SERVICES=()
+  BUILD_SERVICE_LOG_BUILT=()
+
+  # 対象を省略したビルド (全サービス) では、compose 定義のサービス名を候補にする。
+  mapfile -t all_services < <(compose_all_service_names 2>/dev/null || true)
+
+  for capture in "${BUILD_SERVICE_LOG_CAPTURE_DIR%/}"/build.*.log; do
+    [ -f "$capture" ] || continue
+    known=()
+    targets_file="${capture}.targets"
+    if [ -f "$targets_file" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] && known+=("$line")
+      done < "$targets_file"
+    fi
+    if [ ${#known[@]} -eq 0 ]; then
+      known=(${all_services[@]+"${all_services[@]}"})
+    fi
+
+    map=""
+    for name in ${known[@]+"${known[@]}"}; do
+      if [ -z "${slot_of[$name]:-}" ]; then
+        BUILD_SERVICE_LOG_SERVICES+=("$name")
+        BUILD_SERVICE_LOG_BUILT+=("true")
+        slot_of["$name"]=${#BUILD_SERVICE_LOG_SERVICES[@]}
+      fi
+      map="${map:+${map} }${name}:${slot_of[$name]}"
+    done
+
+    if [ ${#known[@]} -eq 1 ]; then
+      # 対象が 1 サービスだけのビルド。全行をそのサービスのログとして扱う。
+      slot="${slot_of[${known[0]}]}"
+      strip_ansi_codes < "$capture" >> "${work}/svc.${slot}" || true
+      continue
+    fi
+    if [ -z "$map" ]; then
+      # サービス名を 1 つも特定できないビルド。全行を共通の出力として残す。
+      strip_ansi_codes < "$capture" >> "${work}/common" || true
+      continue
+    fi
+    strip_ansi_codes < "$capture" \
+      | awk -v map="$map" -v dir="$work" '
+        BEGIN {
+          n = split(map, entries, " ")
+          for (i = 1; i <= n; i++) {
+            pos = index(entries[i], ":")
+            if (pos > 1) slot[substr(entries[i], 1, pos - 1)] = substr(entries[i], pos + 1)
+          }
+        }
+        {
+          line = $0
+          sub(/\r$/, "", line)
+          if (match(line, /^#[0-9]+[ \t]/)) {
+            id = substr(line, 2, RLENGTH - 2)
+            rest = substr(line, RLENGTH + 1)
+            if (substr(rest, 1, 1) == "[") {
+              closing = index(rest, "]")
+              if (closing > 2) {
+                split(substr(rest, 2, closing - 2), parts, " ")
+                if (parts[1] in slot) owner[id] = parts[1]
+              }
+            }
+            if (id in owner) {
+              last = owner[id]
+              print line >> (dir "/svc." slot[owner[id]])
+              next
+            }
+            print line >> (dir "/common")
+            next
+          }
+          if (match(line, /^[ ]*=> /)) {
+            rest = substr(line, RLENGTH + 1)
+            sub(/^=>[ ]+/, "", rest)
+            if (substr(rest, 1, 1) == "[") {
+              closing = index(rest, "]")
+              if (closing > 2) {
+                split(substr(rest, 2, closing - 2), parts, " ")
+                if (parts[1] in slot) last = parts[1]
+              }
+            }
+            if (last != "" && last in slot) {
+              print line >> (dir "/svc." slot[last])
+              next
+            }
+          }
+          print line >> (dir "/common")
+        }' || true
+  done
+
+  # base / frontend / backend は、ビルドが 1 度も実行されなかった場合でも
+  # 見出しを立てる。ベースサービスの先行ビルドで落ちた実行では frontend /
+  # backend のビルドまで到達しないが、「ログが空」なのか「そこまで進んで
+  # いない」のかは、見出しが無いと画面からもファイルからも分からない。
+  # (サービス名がキーワードを含むもので判定する。--frontend-context と同じ規則)
+  for keyword in "${BUILD_SERVICE_LOG_KEYWORDS[@]}"; do
+    for name in ${all_services[@]+"${all_services[@]}"}; do
+      case "$name" in
+        *"$keyword"*) ;;
+        *) continue ;;
+      esac
+      [ -n "${slot_of[$name]:-}" ] && continue
+      BUILD_SERVICE_LOG_SERVICES+=("$name")
+      BUILD_SERVICE_LOG_BUILT+=("false")
+      slot_of["$name"]=${#BUILD_SERVICE_LOG_SERVICES[@]}
+    done
+  done
+
+  # サービスを 1 つも特定できなかった実行でも、記録したビルド出力そのものは残す。
+  if [ ${#BUILD_SERVICE_LOG_SERVICES[@]} -eq 0 ]; then
+    BUILD_SERVICE_LOG_SERVICES+=("(サービス未特定)")
+    BUILD_SERVICE_LOG_BUILT+=("true")
+  fi
+  return 0
+}
+
+# サービス別ビルドログの出力先を決める。
+#   --report-dir 配下 > 一時ディレクトリ
+# --report-dir を使い回した実行で前回の結果を上書きしないよう、既存ファイルが
+# あれば連番を足す (証明書チェックのテキストと同じ決め方)。
+resolve_build_service_log_path() {
+  local service_name="$1"
+  local safe_name base dir_part base_name prefix extension candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  case "$safe_name" in
+    *[!_]*) ;;
+    # 英数字が 1 文字も残らない名前 (サービスを特定できなかった場合など)。
+    *) safe_name="all" ;;
+  esac
+  if [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_build_log_${safe_name}.txt"
+  else
+    # 出力先の指定が無くても、ビルドログは後から読み返したくなる情報なので
+    # 一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_build_log_${safe_name}.txt"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  base_name="$(basename -- "$base")"
+  case "$base_name" in
+    ?*.*) prefix="${base_name%.*}"; extension=".${base_name##*.}" ;;
+    *)    prefix="$base_name";      extension="" ;;
+  esac
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 画面へ出すものと同じ内容を、どのサービスのビルドかが分かる見出しを付けて残す。
+# ビルド引数や環境変数が出力へ混ざることがあるため、他ユーザーからは読めない
+# 権限で作る (証明書チェックのテキストと同じ扱い)。
+build_service_log_write_one() {
+  local path="$1" name="$2" built="$3" body="$4" body_lines="$5"
+  local common="$6" common_lines="$7" dir_path
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "サービス別ビルドログの出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "サービス別ビルドログを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf 'サービス別ビルドログ (build_and_verify.sh)\n'
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf '処理開始日時     : %s\n' "$RUN_STARTED_AT"
+    printf 'Compose サービス : %s\n' "$name"
+    printf 'compose ファイル : %s\n' "$(compose_file_display)"
+    printf 'ビルド結果       : %s\n' "${BUILD_RESULT_STATUS:-(不明)}"
+    printf 'ビルドログ行数   : %s 行 (末尾に共通の出力 %s 行)\n' "$body_lines" "$common_lines"
+    printf '記載内容         : docker compose build の出力のうち、このサービスの\n'
+    printf '                   ものとして切り分けた行を全量。切り分けは BuildKit の\n'
+    printf '                   "#<番号> [<サービス名> ...]" の対応で行い、サービスを\n'
+    printf '                   特定できなかった行は末尾の共通の出力へまとめる。\n'
+    printf '===================================================================\n'
+  } >> "$path"
+  if [ "$body_lines" -gt 0 ]; then
+    cat -- "$body" >> "$path" || true
+  elif [ "$built" = "true" ]; then
+    printf '(このサービスに切り分けられたビルド出力はありません)\n' >> "$path"
+  else
+    printf '(ビルドが始まる前に終了したか、今回のビルド対象ではないため、\n' >> "$path"
+    printf ' このサービスのビルド出力はありません)\n' >> "$path"
+  fi
+  {
+    printf '\n'
+    printf '───────────────────────────────────────────────────────────────────\n'
+    printf '共通の出力 (サービスを特定できなかった行, %s 行)\n' "$common_lines"
+    printf '───────────────────────────────────────────────────────────────────\n'
+  } >> "$path"
+  if [ "$common_lines" -gt 0 ]; then
+    cat -- "$common" >> "$path" || true
+  else
+    printf '(サービスを特定できなかった行はありません)\n' >> "$path"
+  fi
+  return 0
+}
+
+# 切り分けたログを、サービスごとに 1 ファイルずつ書き出す。
+build_service_log_write_files() {
+  local work="${BUILD_SERVICE_LOG_CAPTURE_DIR%/}/split"
+  local common="${work}/common"
+  local i count slot body path name built body_lines common_lines
+
+  count=${#BUILD_SERVICE_LOG_SERVICES[@]}
+  BUILD_SERVICE_LOG_OUTPUT_SERVICES=()
+  BUILD_SERVICE_LOG_OUTPUT_FILES=()
+  BUILD_SERVICE_LOG_OUTPUT_LINES=()
+  [ "$count" -gt 0 ] || return 1
+
+  common_lines=0
+  if [ -s "$common" ]; then
+    common_lines="$(awk 'END { print NR }' < "$common" 2>/dev/null || printf '0')"
+  fi
+
+  for ((i = 0; i < count; i++)); do
+    name="${BUILD_SERVICE_LOG_SERVICES[$i]}"
+    built="${BUILD_SERVICE_LOG_BUILT[$i]}"
+    slot=$((i + 1))
+    body="${work}/svc.${slot}"
+    body_lines=0
+    if [ -s "$body" ]; then
+      body_lines="$(awk 'END { print NR }' < "$body" 2>/dev/null || printf '0')"
+    fi
+    path="$(resolve_build_service_log_path "$name")"
+    build_service_log_write_one "$path" "$name" "$built" "$body" "$body_lines" \
+        "$common" "$common_lines" || continue
+    BUILD_SERVICE_LOG_OUTPUT_SERVICES+=("$name")
+    BUILD_SERVICE_LOG_OUTPUT_FILES+=("$path")
+    BUILD_SERVICE_LOG_OUTPUT_LINES+=("$body_lines")
+  done
+  [ ${#BUILD_SERVICE_LOG_OUTPUT_FILES[@]} -gt 0 ] || return 1
+  return 0
+}
+
+# ビルドログをサービスごとに全量表示する。ビルドエラーで終了する実行では、
+# 対話ダイアログ (--keep-container-mode logs) まで進めないため、ここでしか
+# ログを読めない。行数の上限 (--startup-log-lines) は適用しない。
+show_build_service_logs() {
+  local i count name path lines
+
+  count=${#BUILD_SERVICE_LOG_OUTPUT_FILES[@]}
+  [ "$count" -gt 0 ] || return 0
+  diag ""
+  diag "==================================================================="
+  diag " サービス別ビルドログ (全量)"
+  diag "==================================================================="
+  diag "ビルドエラーで終了するため、ビルドログをサービス単位で全量表示します。"
+  diag "対話ダイアログ (--keep-container-mode logs) はコンテナを起動できた実行で"
+  diag "しか始まらないため、ここで全量を出しておきます。"
+  for ((i = 0; i < count; i++)); do
+    name="${BUILD_SERVICE_LOG_OUTPUT_SERVICES[$i]}"
+    path="${BUILD_SERVICE_LOG_OUTPUT_FILES[$i]}"
+    lines="${BUILD_SERVICE_LOG_OUTPUT_LINES[$i]}"
+    diag ""
+    diag "───────────────────────────────────────────────────────────────────"
+    diag "ビルドログ: Compose サービス ${name} (${lines} 行)"
+    diag "───────────────────────────────────────────────────────────────────"
+    cat -- "$path" >&2 || true
+  done
+  diag "───────────────────────────────────────────────────────────────────"
+  return 0
+}
+
+# 出力先を、他のレポートと同じように画面へ示す。
+build_service_log_show_outputs() {
+  local i count
+
+  count=${#BUILD_SERVICE_LOG_OUTPUT_FILES[@]}
+  if [ "$count" -eq 0 ]; then
+    [ -n "$BUILD_SERVICE_LOG_NOTE" ] && log "サービス別ビルドログ: ${BUILD_SERVICE_LOG_NOTE}"
+    return 0
+  fi
+  for ((i = 0; i < count; i++)); do
+    log "サービス別ビルドログを出力しました (${BUILD_SERVICE_LOG_OUTPUT_SERVICES[$i]}): ${BUILD_SERVICE_LOG_OUTPUT_FILES[$i]}"
+  done
+  if [ -z "$BUILD_REPORT_DIR" ]; then
+    log "  (--report-dir を指定すると、全量レポートと同じディレクトリへ出力します)"
+  fi
+  return 0
+}
+
+# ビルドが失敗して終了する実行かどうか。ビルドエラー時だけ画面へ全量を出す。
+build_service_log_build_failed() {
+  [ "$BUILD_TIMED_OUT" = "true" ] && return 0
+  case "${BUILD_RESULT_STATUS:-}" in
+    失敗*) return 0 ;;
+  esac
+  return 1
+}
+
+# 切り分け・ファイル出力・(ビルドエラー時の) 画面表示をまとめて行う。
+# ビルドの成否によらず 1 度だけ実行する (成功経路と EXIT 経路の二重実行を防ぐ)。
+finish_build_service_logs() {
+  [ "$BUILD_SERVICE_LOG_FINISHED" = "true" ] && return 0
+  BUILD_SERVICE_LOG_FINISHED="true"
+  BUILD_SERVICE_LOG_OUTPUT_SERVICES=()
+  BUILD_SERVICE_LOG_OUTPUT_FILES=()
+  BUILD_SERVICE_LOG_OUTPUT_LINES=()
+
+  if [ "$DRY_RUN" = "true" ]; then
+    BUILD_SERVICE_LOG_NOTE="DRY-RUN のため出力していません。"
+    return 0
+  fi
+  if [ "$BUILD_SERVICE_LOG_CAPTURE_COUNT" -eq 0 ] || [ -z "$BUILD_SERVICE_LOG_CAPTURE_DIR" ]; then
+    [ -n "$BUILD_SERVICE_LOG_NOTE" ] \
+      || BUILD_SERVICE_LOG_NOTE="ビルドを実行していないため出力していません。"
+    return 0
+  fi
+  if ! build_service_log_split; then
+    BUILD_SERVICE_LOG_NOTE="ビルドログを切り分けられなかったため出力していません。"
+    warn "サービス別ビルドログを切り分けられませんでした: ${BUILD_SERVICE_LOG_CAPTURE_DIR}"
+    return 1
+  fi
+  if ! build_service_log_write_files; then
+    [ -n "$BUILD_SERVICE_LOG_NOTE" ] \
+      || BUILD_SERVICE_LOG_NOTE="ビルドログを書き出せなかったため出力していません。"
+    build_service_log_show_outputs
+    return 1
+  fi
+  build_service_log_build_failed && show_build_service_logs
+  build_service_log_show_outputs
+  return 0
+}
+
+# 全量レポート [1] へ、サービス別ビルドログの出力先を添える。
+# レポート本体とは別ファイルのため、どこへ出したのかをここへ残す。
+print_build_service_log_report_lines() {
+  local i count
+
+  count=${#BUILD_SERVICE_LOG_OUTPUT_FILES[@]}
+  if [ "$count" -eq 0 ]; then
+    printf 'ビルドログ    : %s\n' "${BUILD_SERVICE_LOG_NOTE:-(未出力)}"
+    return 0
+  fi
+  for ((i = 0; i < count; i++)); do
+    if [ "$i" -eq 0 ]; then
+      printf 'ビルドログ    : %s (サービス: %s, %s 行)\n' \
+        "${BUILD_SERVICE_LOG_OUTPUT_FILES[$i]}" "${BUILD_SERVICE_LOG_OUTPUT_SERVICES[$i]}" \
+        "${BUILD_SERVICE_LOG_OUTPUT_LINES[$i]}"
+    else
+      printf '                %s (サービス: %s, %s 行)\n' \
+        "${BUILD_SERVICE_LOG_OUTPUT_FILES[$i]}" "${BUILD_SERVICE_LOG_OUTPUT_SERVICES[$i]}" \
+        "${BUILD_SERVICE_LOG_OUTPUT_LINES[$i]}"
+    fi
+  done
+  return 0
 }
 
 # ---- 全量ビルドレポート ------------------------------------------------------
@@ -32323,6 +32823,9 @@ write_build_report() {
     printf '詳細          : %s\n' "${BUILD_RESULT_DETAIL:-(なし)}"
     printf 'イメージ      : %s\n' "${BUILD_IMAGE_INFO:-(未確認)}"
     printf 'ビルド監視    : %s\n' "${BUILD_WATCHDOG_SUMMARY:-(未実行)}"
+    # サービス別ビルドログは、このレポートとは別のファイルへ出している。
+    # どこへ出したのかが分からないと後から突き合わせられないため、ここへ残す。
+    print_build_service_log_report_lines
     # 想定した提供元が全て入ったかを、あとから突き合わせられるようにする
     # (並んでいなければ --cacert-dir の指定漏れ)。
     printf 'CA 証明書     : %s\n' "${CACERT_SUMMARY:-(未指定)}"
@@ -32514,6 +33017,10 @@ cleanup_all() {
   # コンテナの停止・Docker 全体削除より前に、取得可能な全量情報を保存する。
   # (エラー時の終了ログ取得は、レポート内でログ本文を集める直前に実行される)
   #
+  # サービス別ビルドログも、全量レポートへ出力先を載せるため先に確定させる。
+  # ビルドを始める前に終了した実行や、ビルド以外で失敗した実行では、ここで
+  # ファイルへ書き出すだけとなる (画面への全量表示はビルドエラー時のみ)。
+  finish_build_service_logs
   # WAR デプロイ時の Java 例外解析は、全量レポートへ結果を載せるため、
   # レポート出力より先に実行する。成功経路では主処理の末尾で実行済みのため、
   # ここでの呼び出しは何もしない (二重実行の防止は関数側で行う)。
@@ -32581,6 +33088,11 @@ cleanup_all() {
   # ビルド中に中断した場合、監視用の一時ディレクトリが残るためここで片付ける。
   case "${BUILD_WATCHDOG_DIR:-}" in
     */build-watchdog.*) rm -rf -- "$BUILD_WATCHDOG_DIR" ;;
+  esac
+  # サービス別ビルドログの生ログも、ファイルへ書き出し終えたここで片付ける。
+  # 書き出したログ (レポートとは別ファイル) はそのまま残る。
+  case "${BUILD_SERVICE_LOG_CAPTURE_DIR:-}" in
+    */build-service-log.*) rm -rf -- "$BUILD_SERVICE_LOG_CAPTURE_DIR" ;;
   esac
   # CA 証明書をまとめた tar (と作業ディレクトリ) も、ここで確実に消す。
   cleanup_cacert_work_dir
@@ -32764,6 +33276,10 @@ if [ ${#COMPOSE_SERVICES[@]} -gt 1 ]; then
       BUILD_RESULT_DETAIL="ベースサービス '${BASE_SERVICE}' の先行ビルドに失敗しました。"
     fi
     err "ベースサービス '${BASE_SERVICE}' の先行ビルドに失敗しました"
+    # ビルドエラーで終了する実行は、対話ダイアログ (--keep-container-mode logs)
+    # の手前で終わってしまう。サービス別ビルドログを画面へ全量出し、ファイルの
+    # 出力先も示してから終了する。
+    finish_build_service_logs
     exit 1
   fi
   [ "$DRY_RUN" = "true" ] || log "compose build に成功しました (対象サービス: ${BASE_SERVICE})。"
@@ -32789,6 +33305,7 @@ if [ ${#COMPOSE_SERVICES[@]} -gt 1 ]; then
         BUILD_RESULT_DETAIL="ベースサービス以外の compose build に失敗しました: ${REMAINING_SERVICES[*]}"
       fi
       err "ベースサービス以外の compose build に失敗しました (対象サービス: ${REMAINING_SERVICES[*]})"
+      finish_build_service_logs
       exit 1
     fi
     [ "$DRY_RUN" = "true" ] || log "compose build に成功しました (対象サービス: ${REMAINING_SERVICES[*]})。"
@@ -32811,6 +33328,7 @@ else
       BUILD_RESULT_DETAIL="compose build に失敗しました。"
     fi
     err "compose build に失敗しました"
+    finish_build_service_logs
     exit 1
   fi
   if [ "$DRY_RUN" != "true" ]; then
@@ -32833,6 +33351,11 @@ else
   BUILD_RESULT_STATUS="成功"
   BUILD_RESULT_DETAIL="docker compose build とローカルイメージ確認が完了しました。"
 fi
+
+# ---- サービス別ビルドログの書き出し -----------------------------------------
+# ビルドが終わった時点で、サービスごとのビルドログをファイルへ残し、出力先を
+# 画面へ示す (ビルドが失敗した実行では、この時点までに画面へ全量を出している)。
+finish_build_service_logs
 
 # ---- BuildKit シークレットがビルド中コンテナへ届いた値の検証 ------------------
 # ビルド済みイメージをベースにしたプローブビルドで /run/secrets の内容を取り出す。

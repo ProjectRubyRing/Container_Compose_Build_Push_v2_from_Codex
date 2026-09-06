@@ -54,7 +54,9 @@ assert_matches() {
 # モジュール一覧 (build_and_verify_<日時>_jboss_modules_<サービス名>.txt)、
 # トラストストア一覧
 # (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt) も出力される
-# ため、素の glob では件数が増えてしまう。レポートの件数を数えるテストは
+# ため、素の glob では件数が増えてしまう。サービス別ビルドログ
+# (build_and_verify_<日時>_build_log_<サービス名>.txt) はビルドを実行した
+# 実行では必ず出るため、こちらも除外する。レポートの件数を数えるテストは
 # この関数を使う。Java 例外解析のテキスト (_java_exceptions.txt) は
 # --deploy-exception-text 指定時にしか作られないが、除外は残しておく。
 collect_report_files() {
@@ -66,6 +68,7 @@ collect_report_files() {
       *_cert_check_*.txt) continue ;;
       *_jboss_modules_*.txt) continue ;;
       *_truststore_inventory_*.txt) continue ;;
+      *_build_log_*.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -1449,6 +1452,105 @@ if ! grep -Fq "Java 例外解析をスキップしました: Python 3 が見つ�
   [ ! -e "${build_failure_texts[0]}" ] \
     || fail "did not expect a java exception text file without --deploy-exception-text"
 fi
+
+
+# ---- サービス別ビルドログ (base / frontend / backend) -----------------------
+# ビルドエラーで終了する実行は、対話ダイアログ (--keep-container-mode logs) の
+# 手前で終わってしまう。そこで、サービスごとのビルドログを画面へ全量表示し、
+# 全量レポートとは別のファイルへ書き出して出力先を画面へ示す。
+# ベースサービスの先行ビルドで落ちるため frontend / backend のビルドまでは
+# 到達しないが、見出しとファイルは必ず作る。
+build_log_failure_output="$TEST_TMP/build-log-failure.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_DOCKER_BUILD_FAIL="true"
+export FAKE_DOCKER_BUILD_SERVICE_LOG="true"
+export FAKE_COMPOSE_CONFIG_SERVICES="base frontend backend adot-collector"
+export FAKE_COMPOSE_NO_CONTAINERS="true"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service base --compose-service frontend --compose-service backend \
+    --keep-container-mode logs \
+    --report-dir "$TEST_TMP/build-log-failure-reports"
+) >"$build_log_failure_output" 2>&1; then
+  unset FAKE_DOCKER_BUILD_FAIL FAKE_DOCKER_BUILD_SERVICE_LOG \
+      FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
+  cat "$build_log_failure_output" >&2
+  fail "failed base build unexpectedly returned zero"
+fi
+unset FAKE_DOCKER_BUILD_FAIL FAKE_DOCKER_BUILD_SERVICE_LOG \
+    FAKE_COMPOSE_CONFIG_SERVICES FAKE_COMPOSE_NO_CONTAINERS
+assert_contains "$build_log_failure_output" "ベースサービス 'base' の先行ビルドに失敗しました"
+# 画面へは、サービスごとにビルドログの全量を出す。
+assert_contains "$build_log_failure_output" "サービス別ビルドログ (全量)"
+assert_contains "$build_log_failure_output" "ビルドログ: Compose サービス base"
+assert_contains "$build_log_failure_output" "ビルドログ: Compose サービス frontend"
+assert_contains "$build_log_failure_output" "ビルドログ: Compose サービス backend"
+assert_contains "$build_log_failure_output" "#1 [base 2/2] RUN /build.sh"
+assert_contains "$build_log_failure_output" "fake compose build failed"
+# 出力先も、他のレポートと同じように画面へ示す。
+assert_matches "$build_log_failure_output" \
+  'サービス別ビルドログを出力しました \(base\): .*_build_log_base\.txt'
+assert_matches "$build_log_failure_output" \
+  'サービス別ビルドログを出力しました \(frontend\): .*_build_log_frontend\.txt'
+assert_matches "$build_log_failure_output" \
+  'サービス別ビルドログを出力しました \(backend\): .*_build_log_backend\.txt'
+# ファイルは全量レポートとは別に、サービスごとに 1 つずつ作る。
+build_log_base_files=("$TEST_TMP/build-log-failure-reports"/build_and_verify_*_build_log_base.txt)
+build_log_front_files=("$TEST_TMP/build-log-failure-reports"/build_and_verify_*_build_log_frontend.txt)
+build_log_back_files=("$TEST_TMP/build-log-failure-reports"/build_and_verify_*_build_log_backend.txt)
+[ -f "${build_log_base_files[0]}" ] || fail "expected a build log file for base"
+[ -f "${build_log_front_files[0]}" ] || fail "expected a build log file for frontend"
+[ -f "${build_log_back_files[0]}" ] || fail "expected a build log file for backend"
+assert_contains "${build_log_base_files[0]}" "Compose サービス : base"
+assert_contains "${build_log_base_files[0]}" "ビルド結果       : 失敗"
+assert_contains "${build_log_base_files[0]}" "#1 [base 2/2] RUN /build.sh"
+assert_contains "${build_log_base_files[0]}" "fake compose build failed"
+# 先行ビルドで落ちたため、frontend / backend はビルドまで到達していない。
+assert_contains "${build_log_front_files[0]}" "ビルドが始まる前に終了したか、今回のビルド対象ではないため、"
+assert_not_contains "${build_log_front_files[0]}" "RUN /build.sh"
+# 全量レポートは 1 つのまま (ビルドログはレポートとは別ファイル)。
+collect_report_files "$TEST_TMP/build-log-failure-reports"
+build_log_failure_reports=("${REPORT_FILES[@]}")
+[ ${#build_log_failure_reports[@]} -eq 1 ] && [ -f "${build_log_failure_reports[0]}" ] \
+  || fail "expected one report for the failed base build"
+# レポートの [1] には、ビルドログの出力先を残す。
+assert_matches "${build_log_failure_reports[0]}" \
+  'ビルドログ    : .*_build_log_base\.txt \(サービス: base, [0-9]+ 行\)'
+assert_matches "${build_log_failure_reports[0]}" \
+  '_build_log_frontend\.txt \(サービス: frontend, [0-9]+ 行\)'
+
+# ビルドが成功した実行では、画面への全量表示は行わず、ファイルへの書き出しと
+# 出力先の表示だけを行う。ベースサービス以外は 1 回の compose build で並列に
+# ビルドされるため、BuildKit の "#<番号> [<サービス名> ...]" でサービスごとへ
+# 切り分けられていることを確かめる。
+build_log_success_output="$TEST_TMP/build-log-success.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_DOCKER_BUILD_SERVICE_LOG="true"
+export FAKE_COMPOSE_CONFIG_SERVICES="base frontend backend adot-collector"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service base --compose-service frontend --compose-service backend \
+    --report-dir "$TEST_TMP/build-log-success-reports"
+) >"$build_log_success_output" 2>&1; then
+  unset FAKE_DOCKER_BUILD_SERVICE_LOG FAKE_COMPOSE_CONFIG_SERVICES
+  cat "$build_log_success_output" >&2
+  fail "build-only run with per-service build logs failed"
+fi
+unset FAKE_DOCKER_BUILD_SERVICE_LOG FAKE_COMPOSE_CONFIG_SERVICES
+assert_not_contains "$build_log_success_output" "サービス別ビルドログ (全量)"
+assert_matches "$build_log_success_output" \
+  'サービス別ビルドログを出力しました \(frontend\): .*_build_log_frontend\.txt'
+build_log_ok_front=("$TEST_TMP/build-log-success-reports"/build_and_verify_*_build_log_frontend.txt)
+build_log_ok_back=("$TEST_TMP/build-log-success-reports"/build_and_verify_*_build_log_backend.txt)
+[ -f "${build_log_ok_front[0]}" ] || fail "expected a build log file for frontend"
+[ -f "${build_log_ok_back[0]}" ] || fail "expected a build log file for backend"
+assert_contains "${build_log_ok_front[0]}" "ビルド結果       : 成功"
+assert_contains "${build_log_ok_front[0]}" "building frontend"
+assert_not_contains "${build_log_ok_front[0]}" "building backend"
+assert_contains "${build_log_ok_back[0]}" "building backend"
+assert_not_contains "${build_log_ok_back[0]}" "building frontend"
 
 # JVM を実行しないコンテナ (OTel Collector / DB など) でも、Java プロセス無しを
 # 明示したうえで OpenTelemetry の環境変数側は同じ形式で一覧化する。

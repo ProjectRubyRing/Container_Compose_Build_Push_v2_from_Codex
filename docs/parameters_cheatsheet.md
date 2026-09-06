@@ -176,7 +176,7 @@
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | ツリーの最大深さ (指定すると画面表示を自動で有効化) |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 通常ファイルも表示する (N 件超過時は拡張子別の件数)。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名<br>(繰り返し可) | (なし) | ディレクトリパスを値に持つ環境変数。その配下を階層表示 (画面表示を自動で有効化) |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 (読み取り専用 FS 分析の Excel / テキストも同じ場所へ) |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 (サービス別ビルドログ `..._build_log_<サービス名>.txt` と読み取り専用 FS 分析の Excel / テキストも同じ場所へ) |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | WAR デプロイ時 Java 例外解析の結果を画面へ表示する |
 | `--no-deploy-exception-display` | フラグ | — | 画面表示を行わない (既定と同じ) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 全量レポートの `[10]` へ解析結果を出力する (`--report-dir` と併用) |

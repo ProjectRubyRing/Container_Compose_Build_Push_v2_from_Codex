@@ -227,7 +227,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を、WAR デプロイ時 Java 例外解析 `[10]` は `--deploy-exception-report` を、読み取り専用ファイルシステム分析 `[11]` は `--readonly-analysis-report` を併用したときだけ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を、WAR デプロイ時 Java 例外解析 `[10]` は `--deploy-exception-report` を、読み取り専用ファイルシステム分析 `[11]` は `--readonly-analysis-report` を併用したときだけ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する。あわせて `docker compose build` の出力をサービス単位へ切り分けたビルドログを `..._build_log_<サービス名>.txt` としてサービスごとに出力する (指定が無い実行では一時ディレクトリへ出力し、どちらの場合も出力先を画面へ表示する) | (なし) |
 | `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない | `false` (非表示) |
 | `--no-deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--deploy-exception-display` を打ち消す) | `true` (既定) |
 | `--deploy-exception-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[10]` へ解析結果を出力する。**指定したときだけ出力**し、既定では見出しの下に未出力である旨だけを残す | `false` (記載しない) |
@@ -658,6 +658,66 @@ ECR 関連オプションを除いた引数がそのまま渡されます。ECR 
 
 # 何が実行されるかだけ確認 (ビルドも行わない)
 ./build_and_verify.sh --dry-run
+```
+
+### サービス別ビルドログ (base / frontend / backend)
+
+`docker compose build` の出力は、ベースサービスを先行ビルドしたあと残りを並列
+ビルドするため、1 つの画面へ複数サービス分が混ざって流れます。ビルドエラーで
+終了する実行では [起動状態を維持した対話操作](#起動状態を維持した対話操作---keep-container-mode)
+の `logs` (`--keep-container-mode logs`) まで進めないため、後からログを読み返す
+手段もありません。そこでビルド出力は常に控えておき、**サービス単位へ切り分けた
+ビルドログ**を残します。
+
+- **ビルドエラーで終了する実行では、`base` / `frontend` / `backend` を含む各
+  サービスのビルドログを、行数の制限なしで画面へ全量表示します**。
+  `--keep-container-mode logs` を指定していても、対話ダイアログはコンテナを
+  起動できた実行でしか始まりません。ビルドが失敗した実行で全量のログを読めるのは
+  この表示だけです。
+- **ビルドログは全量レポートとは別のファイルへ、サービスごとに 1 つずつ出力
+  します**。出力先は他のレポートと同じように画面へ表示します。
+
+| 指定 | 出力先 |
+| --- | --- |
+| `--report-dir DIR` あり | `DIR/build_and_verify_<日時>_build_log_<サービス名>.txt` |
+| `--report-dir` なし | 一時ディレクトリ (`TMPDIR`) 配下の同じ名前のファイル |
+
+出力先は全量レポートの `[1] ビルド結果` の「ビルドログ」欄にも記録します。
+
+切り分けは、BuildKit が `--progress=plain` で行頭へ出す
+`#<番号> [<サービス名> <段>]` の対応で行います。同じ番号で続く行 (`RUN` の出力や
+`DONE` 行) も同じサービスへ振り分けます。対象サービスが 1 つだけのビルド
+(ベースサービスの先行ビルドなど) は、出力の全行をそのサービスのものとして
+扱います。どのサービスにも紐付かなかった行 (`ERROR: failed to solve` など) は
+「共通の出力」として各サービスのログの末尾へ添えるため、どのファイルを開いても
+失敗そのものの行は読めます。
+
+`base` の先行ビルドで失敗した実行では `frontend` / `backend` のビルドまで到達
+しませんが、見出しとファイルは必ず作り、「ビルドが始まる前に終了したか、今回の
+ビルド対象ではない」ことを明示します。
+
+```text
+[2026-09-05 04:12:01 JST] [ERROR] ベースサービス 'base' の先行ビルドに失敗しました
+
+===================================================================
+ サービス別ビルドログ (全量)
+===================================================================
+ビルドエラーで終了するため、ビルドログをサービス単位で全量表示します。
+対話ダイアログ (--keep-container-mode logs) はコンテナを起動できた実行で
+しか始まらないため、ここで全量を出しておきます。
+
+───────────────────────────────────────────────────────────────────
+ビルドログ: Compose サービス base (128 行)
+───────────────────────────────────────────────────────────────────
+  … (base のビルドログ全量) …
+───────────────────────────────────────────────────────────────────
+ビルドログ: Compose サービス frontend (0 行)
+───────────────────────────────────────────────────────────────────
+  … (ビルドが始まる前に終了したため出力なし) …
+
+[2026-09-05 04:12:02 JST] サービス別ビルドログを出力しました (base): ./build-reports/build_and_verify_20260905041145_build_log_base.txt
+[2026-09-05 04:12:02 JST] サービス別ビルドログを出力しました (frontend): ./build-reports/build_and_verify_20260905041145_build_log_frontend.txt
+[2026-09-05 04:12:02 JST] サービス別ビルドログを出力しました (backend): ./build-reports/build_and_verify_20260905041145_build_log_backend.txt
 ```
 
 ### 終了時の Docker 完全クリーンアップ
