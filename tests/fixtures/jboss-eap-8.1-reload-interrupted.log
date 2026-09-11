@@ -1,0 +1,10 @@
+app-1  | 09:17:43,001 INFO  [org.jboss.as] (Controller Boot Thread) WFLYSRV0049: JBoss EAP 8.1.0.GA (WildFly Core 27.1.0.Final-redhat-00010) starting
+app-1  | 09:17:43,200 INFO  [org.jboss.as.connector] (MSC service thread 1-1) WFLYJCA0009: Starting Jakarta Connectors Subsystem (WildFly/IronJacamar 3.0.9.Final-redhat-00001)
+app-1  | 09:17:43,400 INFO  [org.jboss.as.connector.subsystems.datasources] (MSC service thread 1-1) WFLYJCA0001: Bound data source [java:jboss/datasources/Orders#Primary]
+app-1  | 09:17:44,000 INFO  [org.jboss.as.server.deployment] (MSC service thread 1-2) WFLYSRV0027: Starting deployment of "orders.war" (runtime-name: "orders.war")
+app-1  | 09:17:45,100 INFO  [org.jboss.as.server] (management-handler-thread - 1) WFLYSRV0211: Suspending server with no timeout.
+app-1  | 09:17:45,300 INFO  [org.jboss.as.server] (management-handler-thread - 1) WFLYSRV0236: Suspending server with no timeout.
+app-1  | 09:17:45,900 INFO  [org.jboss.as.repository] (management-handler-thread - 1) WFLYDR0001: Content added at location /opt/eap/standalone/data/content
+app-1  | 09:17:46,400 INFO  [org.jboss.as] (MSC service thread 1-1) WFLYSRV0212: Resuming server
+app-1  | 09:17:47,000 INFO  [org.jboss.as.connector.subsystems.datasources] (MSC service thread 1-1) WFLYJCA0001: Bound data source [java:jboss/datasources/Orders#Primary]
+app-1  | 09:17:48,500 INFO  [org.wildfly.extension.undertow] (MSC service thread 1-1) WFLYUT0006: Undertow HTTP listener default listening on 0.0.0.0:8080

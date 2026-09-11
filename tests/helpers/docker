@@ -579,6 +579,19 @@ fi
 # 取り込み検証は、起動していないコンテナから docker cp でファイルを取り出して
 # SHA-256 を算出する。FAKE_IMAGE_ARTIFACT_FILE / FAKE_CONTAINER_ARTIFACT_FILE で
 # 「取り出されるファイルの中身」をホスト側の実ファイルとして与える。
+# ---- ECS サーキットブレーカ再現 (docker stop / 終了コード / server.log) -------
+# FAKE_ECS_STOP_MARKER : docker stop が呼ばれたら作るファイル。server.log の
+#                        「停止前 / 停止後」を切り替えるために使う。
+# FAKE_ECS_SERVER_LOG_BEFORE / _AFTER : docker cp で返すホスト側の実ファイル。
+# FAKE_ECS_STOP_EXIT   : docker inspect が返す終了コード (既定 137 = SIGKILL)。
+# FAKE_ECS_CLI_MISSING : true なら jboss-cli.sh が無いコンテナとして振る舞う。
+# FAKE_ECS_RELOAD_FAIL : true なら :reload が停止に巻き込まれて失敗する様子を返す。
+if [ "${1:-}" = "stop" ]; then
+  [ -n "${FAKE_ECS_STOP_MARKER:-}" ] && : > "$FAKE_ECS_STOP_MARKER"
+  printf '%s\n' "${!#}"
+  exit 0
+fi
+
 if [ "${1:-}" = "create" ]; then
   if [ "${FAKE_DOCKER_CREATE_FAIL:-false}" = "true" ]; then
     printf 'Error response from daemon: No command specified\n' >&2
@@ -596,6 +609,15 @@ if [ "${1:-}" = "cp" ]; then
     # ADOT Collector の設定ファイルは distroless のため docker cp で取り出す。
     cid-adot-collector:*)  fake_cp_file="${FAKE_ADOT_CONFIG_FILE:-}" ;;
     *)                     fake_cp_file="${FAKE_CONTAINER_ARTIFACT_FILE:-}" ;;
+  esac
+  case "$fake_cp_src" in
+    *server.log)
+      if [ -n "${FAKE_ECS_STOP_MARKER:-}" ] && [ -f "$FAKE_ECS_STOP_MARKER" ]; then
+        fake_cp_file="${FAKE_ECS_SERVER_LOG_AFTER:-}"
+      else
+        fake_cp_file="${FAKE_ECS_SERVER_LOG_BEFORE:-}"
+      fi
+      ;;
   esac
   if [ -z "$fake_cp_file" ] || [ ! -f "$fake_cp_file" ]; then
     printf 'Error response from daemon: Could not find the file %s\n' "$fake_cp_src" >&2
@@ -770,6 +792,11 @@ fi
 
 if [ "${1:-}" = "inspect" ]; then
   case "$*" in
+    # ECS サーキットブレーカ再現の停止判定 (終了コード)。
+    # .State.ExitCode は既存の分岐に無いため、専用の目印で先に拾う。
+    *"ecs-cb-exit:"*)
+      printf 'ecs-cb-exit:%s\n' "${FAKE_ECS_STOP_EXIT:-137}"
+      ;;
     # ADOT Collector の設定チェック: ENTRYPOINT + CMD を 1 行 1 引数で返す。
     # 実装側は otel-argv: の目印付きで問い合わせるので、.Config.Entrypoint の
     # 分岐に吸い込まれないよう、必ずここで先に拾う。
@@ -1510,6 +1537,31 @@ if [ "${1:-}" = "exec" ]; then
 
   case "$fake_exec_script" in
     '') ;;
+    *'ecs-cb-server-log'*)
+      # server.log のパス探索。FAKE_ECS_SERVER_LOG_BEFORE が無ければ「見つからない」。
+      [ -n "${FAKE_ECS_SERVER_LOG_BEFORE:-}" ] || exit 1
+      printf '%s/standalone/log/server.log' "$(fake_jboss_home)"
+      exit 0
+      ;;
+    *'ecs-cb-cli-probe'*)
+      # jboss-cli.sh の探索
+      [ "${FAKE_ECS_CLI_MISSING:-false}" = "true" ] && exit 1
+      [ -n "$(fake_jboss_home)" ] || exit 1
+      printf '%s/bin/jboss-cli.sh' "$(fake_jboss_home)"
+      exit 0
+      ;;
+    *'ecs-cb-reload'*)
+      # 停止と重ねる :reload。停止に巻き込まれて落ちる様子も再現できるようにする。
+      printf '実行: %s -c --command=:reload\n' "${7:-}"
+      if [ "${FAKE_ECS_RELOAD_FAIL:-true}" = "true" ]; then
+        printf 'The controller is not available at localhost:9990\n'
+        printf 'exit=1\n'
+        exit 1
+      fi
+      printf '{"outcome" => "success"}\n'
+      printf 'exit=0\n'
+      exit 0
+      ;;
     *'copy-artifact-probe'*)
       # コピーしたファイルの取り込み検証。コンテナ内の探索結果を差し替える。
       #   FAKE_COPY_ARTIFACT_PROBE : 全コンテナ共通で返す "種別|パス|バイト数|SHA-256" の行

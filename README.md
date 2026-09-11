@@ -89,6 +89,9 @@ xlsx は標準ライブラリだけで組み立てます)。
 tmpfs やバインドマウントを割り当てるべきディレクトリを判定して、Excel ブックと
 テキストファイルへ出力。画面表示は `--readonly-analysis-display`、
 全量レポートへの記載は `--readonly-analysis-report` の指定時のみ)、
+**ECS サーキットブレーカによるタスク停止の再現** (必須コンテナの healthcheck 失敗 →
+SIGTERM → `stopTimeout` → SIGKILL を `jboss-cli` の `:reload` と重ね、`server.log` が
+途中で切れる事象を再現・判定する。既定で有効、無効化は `--no-ecs-circuit-breaker`)、
 **JBoss マスターパスワードの伝搬検証** (取得元から実行時に利用される値までの一致確認)、
 **CloudWatch Agent (cwagent) のログ送信検証** (設定ファイルのチェックと、
 `--cwagent-delivery-report` 指定時の設定済みロググループへの送達確認)、
@@ -251,6 +254,15 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-undertow-analysis-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析の画面出力を抑制する (既定と同じ。`--undertow-analysis-display` を打ち消す。テキストと全量レポートへは出力する) | `true` (既定) |
 | `--no-undertow-analysis-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト分析のテキスト出力だけを抑制する (画面へは出力する) | `false` |
 | `--no-undertow-analysis` | **`build_and_verify.sh` / `--build-only` 委譲時**。Undertow バーチャルホスト (`default-host`) の分析と出力を一切行わない | `false` |
+| `--no-ecs-circuit-breaker` | **`build_and_verify.sh` / `--build-only` 委譲時**。ECS サーキットブレーカによるタスク停止の再現を一切行わない (従来どおり、`unhealthy` でもコンテナを止めない) | `false` |
+| `--ecs-essential-service NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。必須コンテナ (`essential=true` 相当) として停止するサービス (カンマ区切り / 繰り返し可) | (`--startup-service` → `--compose-service` → 起動中の全サービス) |
+| `--ecs-circuit-breaker-threshold N` | **`build_and_verify.sh` / `--build-only` 委譲時**。サーキットブレーカが開くまでの失敗タスク数 | `3` |
+| `--ecs-stop-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時**。SIGTERM から SIGKILL までの猶予秒数 (ECS の `stopTimeout` 既定と同じ) | `30` |
+| `--ecs-circuit-breaker-reload-delay SEC` | **`build_and_verify.sh` / `--build-only` 委譲時**。`jboss-cli` の `:reload` を実行してから停止を始めるまでの秒数 | `1` |
+| `--no-ecs-circuit-breaker-reload` | **`build_and_verify.sh` / `--build-only` 委譲時**。`:reload` を挟まず、停止だけを再現する | `false` |
+| `--ecs-server-log PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。`server.log` のコンテナ内パス | (自動検出) |
+| `--ecs-circuit-breaker-drill` | **`build_and_verify.sh` / `--build-only` 委譲時**。正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する | `false` |
+| `--ecs-circuit-breaker-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。ECS サーキットブレーカ再現のテキスト出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--cert-check-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。受領した自己証明書の詳細と HTTPS 接続の結果を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-cert-check-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック結果のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--jboss-module-list-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。`module-info` が `success` となったモジュール名・スロット・jar ファイル名を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
@@ -1384,7 +1396,8 @@ Compose が付ける既定名 (`<プロジェクト>-<サービス>` / `<プロ�
   `[10] WAR デプロイ時 Java 例外解析` /
   `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` /
   `[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析` /
-  `[13] コピーしたファイル (--copy-file) の取り込み検証` です。
+  `[13] コピーしたファイル (--copy-file) の取り込み検証` /
+  `[14] ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)` です。
   ヘッダーの `コピー取込検証` 行には、差し替えたファイルがコンテナへ届いたかの
   要約 (一致 / 不一致 / 未検出の件数) を残します。
 - WAR のデプロイ処理で発生した Java 例外の解析結果は、`--report-dir` に加えて
@@ -2059,6 +2072,106 @@ Undertow の振り分けは `NameVirtualHostHandler` が次の順で決めます
   **コンテナを削除する前**です。
 - **`要確認` を検出しても終了コードは変わりません**。
 - `--dry-run` では分析しません (全量レポートの `[12]` へ理由を記録します)。
+
+### ECS サーキットブレーカによるタスク停止の再現 (`server.log` が途中で切れる事象)
+
+ECS では、タスク定義の `healthCheck` が `retries` 回続けて失敗すると
+**必須コンテナ (`essential=true`) が UNHEALTHY** になり、ECS がそのタスクを停止します
+(**SIGTERM → `stopTimeout` (既定 30 秒) → SIGKILL**)。サービスはタスクを置き換え、
+置き換えた先も失敗し続けると、**デプロイのサーキットブレーカ**が開いて
+デプロイを失敗と判定し、直前の安定版へロールバックします。
+
+この停止が **JBoss EAP の `jboss-cli` による `:reload`** と重なると、
+**`server.log` が途中で切れます**。compose には「unhealthy になったコンテナを止めて
+置き換える」仕組みが無いため、ローカルではこの経路が再現しません
+(unhealthy のまま動き続けます)。そこで **既定で** ECS と同じ判定・停止手順を行い、
+停止前後の `server.log` を突き合わせて切れ方まで判定します。
+**無効化は `--no-ecs-circuit-breaker`** です。
+
+動くのは **起動確認 (`--verify-startup`) の最中に必須コンテナが `unhealthy` になった
+とき**だけで、正常に起動する実行では何も起きません
+(ECS のデプロイサーキットブレーカもデプロイ中にだけ働くため、期間を合わせています)。
+正常な構成でも事象を手元で起こしたいときは `--ecs-circuit-breaker-drill` を指定します
+(動作確認をすべて終えた後に 1 回だけ停止し、タスクの置き換えは行いません)。
+
+#### `server.log` が切れる 3 つの仕組み
+
+| 切れ方 | 仕組み | 直し方 |
+| --- | --- | --- |
+| 再オープンによる切り詰め | `:reload` は logging subsystem を作り直すため、file handler をいったん閉じて開き直す。`append="false"` の handler はこの再オープンでファイルを切り詰めるため、reload より前の内容がまるごと消える | file handler を `append="true"` にする |
+| 未フラッシュ分の消失 | `autoflush="false"` の handler や `async-handler` は書き込みをバッファ・キューへ溜める。SIGKILL はシャットダウンフックを走らせないため、溜まっていた分は書き出されない | `autoflush="true"` にする / `stopTimeout` を延ばす |
+| 書きかけの行の途切れ | SIGKILL は書き込みの途中でもプロセスを落とすため、最後の 1 行が改行の手前で終わる | `stopTimeout` を延ばす / 調査は標準出力側のログを正とする |
+
+いずれの場合も標準出力 (`CONSOLE` handler) 側は docker / CloudWatch Logs が
+受け取っているため、**「標準出力にはあるのに `server.log` には無い行」** という差が残ります。
+
+#### 判定の根拠
+
+停止の前後で `server.log` を `docker cp` で取り出し (停止済みのコンテナからも読めます)、
+次の 4 点を突き合わせます。1 つでも当てはまれば「途中で切れている」と判定します。
+
+| 根拠 | 示していること |
+| --- | --- |
+| 停止後のファイルが停止前より小さい | 再オープンで切り詰められた (`append="false"`) |
+| 末尾が改行で終わっていない | 書きかけの行が SIGKILL で途切れた |
+| 標準出力に `server.log` の最終時刻より後の行が残っている | 未フラッシュ分が失われた |
+| 停止完了のログ (`WFLYSRV0050`) が無い | 終了処理を完走できていない |
+
+あわせて `standalone.xml` の logging subsystem を読み、file handler の
+`append` / `autoflush` と `async-handler` のキュー設定を、切れ方の根拠として出力します。
+**切れたままの `server.log` は `--report-dir` 配下へそのまま保存する**ため、
+ファイルそのものを開いて確認できます。
+
+#### 出力例
+
+```
+===================================================================
+ECS サーキットブレーカによるタスク停止の再現
+===================================================================
+契機              : 必須コンテナ 'app' の healthcheck が unhealthy (連続失敗 3 回)
+必須コンテナ      : app
+サーキットブレーカ: 失敗タスク 3 回でデプロイ失敗と判定 (ECS の最小値と同じ)
+停止手順          : SIGTERM → 30s (stopTimeout) → SIGKILL
+reload の注入     : 有効 (jboss-cli.sh -c --command=:reload を停止の 1s 前に実行)
+
+[logging subsystem の設定] (サービス app の standalone.xml)
+  periodic-rotating-file-handler FILE : autoflush=true append=false path=server.log
+    → append="false" のため、reload による再オープンでファイルが切り詰められます。
+
+[失敗タスク 1/3] ECS はこのタスクを停止して置き換えます
+  サービス app (コンテナ: myapp-app-1)
+    healthcheck   : unhealthy / 連続失敗 3 回
+    reload        : /opt/jboss-eap/bin/jboss-cli.sh -c --command=:reload を実行しました
+    停止          : SIGTERM では終了せず SIGKILL で落とされました (経過 30s, exit=137)
+    停止前        : 1016 bytes / 7 行 / 末尾の改行 あり
+    停止後        : 353 bytes / 3 行 / 末尾の改行 なし
+    判定の根拠    :
+      - 停止後のファイルが停止前より 663 bytes 小さい
+      - 末尾が改行で終わっていない
+      - 標準出力には server.log の最終時刻より後の行が 2 行ある
+    判定          : server.log が途中で切れています
+    保存          : ./reports/build_and_verify_<日時>_ecs_circuit_breaker_app_1.log
+
+[サーキットブレーカ]
+  失敗タスク 3 / 閾値 3 → サーキットブレーカが開きました。
+総合判定          : 再現しました (停止 3 回のうち 3 回で server.log が途中で切れました)
+```
+
+#### 主なオプション
+
+| オプション | 既定 | 説明 |
+| --- | --- | --- |
+| `--no-ecs-circuit-breaker` | `false` | 再現を一切行わない (従来どおり、`unhealthy` でも止めない) |
+| `--ecs-essential-service NAME` | `--startup-service` → `--compose-service` → 起動中の全サービス | 必須コンテナとして停止するサービス (ECS はタスク内の全コンテナを止めるが、ここでは DB やモックを巻き込まないよう、この一覧だけを停止する) |
+| `--ecs-circuit-breaker-threshold N` | `3` | サーキットブレーカが開くまでの失敗タスク数 (ECS の「必要数の 0.5 倍・最小 3・最大 200」に合わせた既定値) |
+| `--ecs-stop-timeout SEC` | `30` | SIGTERM から SIGKILL までの猶予 (ECS の `stopTimeout` 既定と同じ) |
+| `--ecs-circuit-breaker-reload-delay SEC` | `1` | `:reload` を実行してから停止を始めるまでの秒数 |
+| `--no-ecs-circuit-breaker-reload` | `false` | `:reload` を挟まず、停止だけを再現する (要因の切り分け) |
+| `--ecs-server-log PATH` | (自動検出) | `server.log` のコンテナ内パス |
+| `--ecs-circuit-breaker-drill` | `false` | 正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する |
+
+詳細は [`docs/build_and_verify_guide.md`](docs/build_and_verify_guide.md) の
+「5.15 ECS サーキットブレーカによるタスク停止の再現」を参照してください。
 
 ### CloudWatch Logs 送信検証 (cwagent)
 

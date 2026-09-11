@@ -56,7 +56,9 @@ assert_matches() {
 # (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。サービス別ビルドログ
 # (build_and_verify_<日時>_build_log_<サービス名>.txt) はビルドを実行した
-# 実行では必ず出るため、こちらも除外する。レポートの件数を数えるテストは
+# 実行では必ず出るため、こちらも除外する。ECS サーキットブレーカ再現の
+# テキスト (_ecs_circuit_breaker.txt) も同様に除く (採取した server.log は
+# .log のため、この glob には掛からない)。レポートの件数を数えるテストは
 # この関数を使う。Java 例外解析のテキスト (_java_exceptions.txt) は
 # --deploy-exception-text 指定時にしか作られないが、除外は残しておく。
 collect_report_files() {
@@ -65,6 +67,7 @@ collect_report_files() {
   for path in "$dir"/build_and_verify_*.txt; do
     case "$path" in
       *_java_exceptions.txt|*_readonly_filesystem.txt|*_undertow_virtual_host.txt) continue ;;
+      *_ecs_circuit_breaker.txt) continue ;;
       *_cert_check_*.txt) continue ;;
       *_jboss_modules_*.txt) continue ;;
       *_truststore_inventory_*.txt) continue ;;
@@ -7788,4 +7791,176 @@ if ! (
 fi
 # 元ファイルだけを見ると worker の driver は分からない (アンカー参照のため)。
 assert_contains "$syslog_anchor_output" "対象サービス: worker (ログドライバを json-file へ差し替え)"
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, and host syslog (/var/log/messages) output suppression\n'
+
+# ---- ECS サーキットブレーカによるタスク停止の再現 -----------------------------
+# ECS では、必須コンテナの healthcheck が retries 回続けて失敗するとタスクが停止され
+# (SIGTERM → stopTimeout → SIGKILL)、失敗タスクが閾値に達するとデプロイの
+# サーキットブレーカが開く。この停止が jboss-cli の :reload と重なると server.log が
+# 途中で切れる。compose には同じ仕組みが無いため、既定でこの経路を再現する。
+#   (1) 既定 (有効) : unhealthy を検出したら停止・置き換え・切断判定まで行う
+#   (2) --no-ecs-circuit-breaker : 何もしない (従来どおり)
+#   (3) --ecs-circuit-breaker-drill : 正常起動でも 1 回だけ意図的に再現する
+#   (4) 指定の矛盾は exit 2 で止める
+ecs_cb_reports="$TEST_TMP/ecs-cb-reports"
+ecs_cb_output="$TEST_TMP/ecs-circuit-breaker.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-reload-interrupted.log"
+export FAKE_HEALTHCHECK_STATE_FAIL="true"
+export FAKE_ECS_STOP_MARKER="$TEST_TMP/ecs-cb-stopped"
+export FAKE_ECS_SERVER_LOG_BEFORE="$TEST_DIR/fixtures/ecs-circuit-breaker-server-log-before.log"
+export FAKE_ECS_SERVER_LOG_AFTER="$TEST_DIR/fixtures/ecs-circuit-breaker-server-log-after.log"
+export FAKE_JBOSS_STANDALONE_XML="$TEST_DIR/fixtures/standalone-logging-append-false.xml"
+export FAKE_JBOSS_HOME="/opt/jboss-eap"
+rm -f "$FAKE_ECS_STOP_MARKER"
+# 必須コンテナが unhealthy のままのため、起動確認は失敗して終わる (exit 1)。
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --ecs-circuit-breaker-threshold 2 \
+    --ecs-stop-timeout 2 \
+    --ecs-circuit-breaker-reload-delay 0 \
+    --ecs-circuit-breaker-replace-timeout 2 \
+    --suppress-startup-logs \
+    --report-dir "$ecs_cb_reports"
+) >"$ecs_cb_output" 2>&1; then
+  cat "$ecs_cb_output" >&2
+  fail "an unhealthy essential container must fail the startup verification"
+fi
+
+# 契機と、ECS と同じ停止手順を再現したこと。
+assert_contains "$ecs_cb_output" "必須コンテナ 'app' の healthcheck が unhealthy になりました (連続失敗 3 回)。"
+assert_contains "$ecs_cb_output" "ECS ではこの時点でタスクが停止され、サーキットブレーカによりデプロイがロールバックされます。"
+assert_contains "$ecs_cb_output" "停止手順          : SIGTERM → 2s (stopTimeout) → SIGKILL"
+assert_contains "$ecs_cb_output" "SIGTERM では終了せず SIGKILL で落とされました"
+assert_contains "$ecs_cb_output" "判断の根拠: 終了コード 137 (128 + SIGKILL)"
+# jboss-cli の :reload を停止と重ね、巻き込まれて中断したことまで記録する。
+assert_contains "$ecs_cb_output" "/opt/jboss-eap/bin/jboss-cli.sh -c --command=:reload を実行しました"
+assert_contains "$ecs_cb_output" "reload 結果   : 停止に巻き込まれて中断しました"
+# server.log の切れ方を、4 つの根拠で判定する。
+assert_contains "$ecs_cb_output" "停止後のファイルが停止前より 663 bytes 小さい"
+assert_contains "$ecs_cb_output" "末尾が改行で終わっていない"
+assert_contains "$ecs_cb_output" "標準出力には server.log の最終時刻より後の行が 2 行ある"
+assert_contains "$ecs_cb_output" "停止完了のログ (WFLYSRV0050) が server.log に無い"
+assert_contains "$ecs_cb_output" "判定          : server.log が途中で切れています"
+# standalone.xml の logging subsystem から、切り詰めの原因になる設定を挙げる。
+assert_contains "$ecs_cb_output" 'append="false" のため、reload による再オープンでファイルが切り詰められます。'
+assert_contains "$ecs_cb_output" "async-handler のキューに残った行は、SIGKILL では書き出されません。"
+# 失敗タスクが閾値に達し、サーキットブレーカが開くこと。
+assert_contains "$ecs_cb_output" "失敗タスク 2 / 閾値 2 → サーキットブレーカが開きました。"
+assert_contains "$ecs_cb_output" "総合判定          : 再現しました (停止 2 回のうち 2 回で server.log が途中で切れました / SIGKILL 2 回)"
+# 停止はタスクの置き換えを挟んで 2 回、いずれも docker stop -t で行う。
+assert_occurrences "$FAKE_DOCKER_CALLS" "stop -t 2 cid-app" 2
+assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up -d --no-build --force-recreate app"
+# 切れたままの server.log を成果物として残す。
+ecs_cb_saved=("$ecs_cb_reports"/build_and_verify_*_ecs_circuit_breaker_app_1.log)
+[ -s "${ecs_cb_saved[0]}" ] || fail "the truncated server.log must be saved under --report-dir"
+assert_contains "${ecs_cb_saved[0]}" "WFLYSRV0212: Resuming ser"
+ecs_cb_texts=("$ecs_cb_reports"/build_and_verify_*_ecs_circuit_breaker.txt)
+[ -s "${ecs_cb_texts[0]}" ] || fail "the circuit breaker text output is missing"
+assert_contains "${ecs_cb_texts[0]}" "build_and_verify.sh ECS サーキットブレーカによるタスク停止の再現"
+collect_report_files "$ecs_cb_reports"
+ecs_cb_full_reports=("${REPORT_FILES[@]}")
+[ ${#ecs_cb_full_reports[@]} -eq 1 ] || fail "expected one report for the circuit breaker scenario"
+assert_contains "${ecs_cb_full_reports[0]}" "[14] ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)"
+assert_contains "${ecs_cb_full_reports[0]}" "総合判定      : 再現しました"
+
+# --- --no-ecs-circuit-breaker: 停止も判定も行わない (従来どおりの動作) ---
+ecs_cb_off_output="$TEST_TMP/ecs-circuit-breaker-off.out"
+ecs_cb_off_reports="$TEST_TMP/ecs-cb-off-reports"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --startup-timeout 4 \
+    --startup-interval 1 \
+    --no-ecs-circuit-breaker \
+    --suppress-startup-logs \
+    --report-dir "$ecs_cb_off_reports"
+) >"$ecs_cb_off_output" 2>&1; then
+  cat "$ecs_cb_off_output" >&2
+  fail "the startup verification must still time out with --no-ecs-circuit-breaker"
+fi
+assert_not_contains "$ecs_cb_off_output" "ECS サーキットブレーカによるタスク停止を再現します"
+# compose stop (終了ログの取得) と紛れないよう、docker stop の行だけを見る。
+if grep -q '^stop ' "$FAKE_DOCKER_CALLS"; then
+  fail "--no-ecs-circuit-breaker must not stop any container"
+fi
+assert_contains "$ecs_cb_off_output" "起動確認がタイムアウトしました"
+collect_report_files "$ecs_cb_off_reports"
+ecs_cb_off_full=("${REPORT_FILES[@]}")
+[ ${#ecs_cb_off_full[@]} -eq 1 ] || fail "expected one report for the --no-ecs-circuit-breaker scenario"
+assert_contains "${ecs_cb_off_full[0]}" "--no-ecs-circuit-breaker が指定されたため再現していません。"
+
+# --- --ecs-circuit-breaker-drill: 正常起動でも最後に 1 回だけ再現する ---
+ecs_cb_drill_output="$TEST_TMP/ecs-circuit-breaker-drill.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_HEALTHCHECK_STATE_FAIL="false"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --ecs-circuit-breaker-drill \
+    --ecs-stop-timeout 2 \
+    --ecs-circuit-breaker-reload-delay 0 \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1
+) >"$ecs_cb_drill_output" 2>&1; then
+  cat "$ecs_cb_drill_output" >&2
+  fail "the circuit breaker drill must not fail a successful run"
+fi
+assert_contains "$ecs_cb_drill_output" "--ecs-circuit-breaker-drill: 動作確認を終えたので、ECS のタスク停止を意図的に再現します。"
+assert_contains "$ecs_cb_drill_output" "契機              : --ecs-circuit-breaker-drill による意図的な再現"
+assert_contains "$ecs_cb_drill_output" "サーキットブレーカ: 訓練実行のため、置き換えは行わず 1 回だけ停止します"
+assert_contains "$ecs_cb_drill_output" "判定          : server.log が途中で切れています"
+# 訓練実行では置き換えを行わないため、停止は 1 回だけ。
+assert_occurrences "$FAKE_DOCKER_CALLS" "stop -t 2 cid-app" 1
+assert_not_contains "$FAKE_DOCKER_CALLS" "--force-recreate"
+# 停止はすべての収集を終えた後に行うため、環境変数一覧は通常どおり出る。
+assert_before "$ecs_cb_drill_output" "環境変数一覧 (サービス: app" "ECS のタスク停止を意図的に再現します。"
+
+unset FAKE_COMPOSE_PS_SERVICES FAKE_HEALTHCHECK_STATE_FAIL FAKE_ECS_STOP_MARKER \
+  FAKE_ECS_SERVER_LOG_BEFORE FAKE_ECS_SERVER_LOG_AFTER FAKE_JBOSS_STANDALONE_XML \
+  FAKE_JBOSS_HOME
+
+# --- 指定の矛盾は exit 2 で止める ---
+ecs_cb_conflict_output="$TEST_TMP/ecs-circuit-breaker-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-ecs-circuit-breaker --ecs-circuit-breaker-drill
+) >"$ecs_cb_conflict_output" 2>&1; then
+  fail "--no-ecs-circuit-breaker with --ecs-circuit-breaker-drill must fail"
+fi
+assert_contains "$ecs_cb_conflict_output" "--no-ecs-circuit-breaker と --ecs-circuit-breaker-drill は同時に指定できません。"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --ecs-circuit-breaker-threshold 0
+) >"$ecs_cb_conflict_output" 2>&1; then
+  fail "--ecs-circuit-breaker-threshold 0 must fail"
+fi
+assert_contains "$ecs_cb_conflict_output" "--ecs-circuit-breaker-threshold には 1 以上の整数を指定してください: 0"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --ecs-server-log relative/path
+) >"$ecs_cb_conflict_output" 2>&1; then
+  fail "--ecs-server-log with a relative path must fail"
+fi
+assert_contains "$ecs_cb_conflict_output" "--ecs-server-log にはコンテナ内の絶対パスを指定してください: relative/path"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, and ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log)\n'

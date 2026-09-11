@@ -420,6 +420,9 @@ arg_takes_value() {
     --prune-build-cache-keep) return 0 ;;
     --deploy-exception-excel|--deploy-exception-text|--deploy-exception-limit) return 0 ;;
     --readonly-analysis-excel|--readonly-analysis-text) return 0 ;;
+    --ecs-essential-service|--ecs-circuit-breaker-threshold|--ecs-stop-timeout) return 0 ;;
+    --ecs-circuit-breaker-reload-delay|--ecs-circuit-breaker-replace-timeout) return 0 ;;
+    --ecs-server-log|--ecs-circuit-breaker-text) return 0 ;;
     --cert-check-text) return 0 ;;
     --trace-report-dir|--trace-report-format) return 0 ;;
     --trace-report-limit|--trace-report-lookback) return 0 ;;

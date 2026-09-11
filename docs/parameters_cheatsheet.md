@@ -128,6 +128,28 @@
 | `--suppress-removed-logs` | フラグ | `false` | `compose down` / `compose stop` の `Removed` 等の出力を抑制 |
 | `--keep-container` | フラグ | `false` | 確認後もコンテナを停止・削除しない |
 
+### ECS サーキットブレーカによるタスク停止の再現
+
+> 必須コンテナの healthcheck が `unhealthy` になったときだけ動きます (**既定で有効**)。ECS と同じ手順 (SIGTERM → `stopTimeout` → SIGKILL) で停止し、`jboss-cli` の `:reload` と重ねて `server.log` が途中で切れる事象を再現・判定します。
+
+| オプション | 値 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `--no-ecs-circuit-breaker` | フラグ | `false` | 再現を一切行わない (従来どおり、`unhealthy` でも止めない) |
+| `--ecs-circuit-breaker` | フラグ | — | 再現を行う (既定。`--no-...` の打ち消し) |
+| `--ecs-essential-service NAME` | サービス名<br>(繰り返し / カンマ区切り) | `--startup-service` → `--compose-service` → 起動中の全サービス | 必須コンテナ (`essential=true` 相当) として停止するサービス |
+| `--ecs-circuit-breaker-threshold N` | 1 以上の整数 | `3` | サーキットブレーカが開くまでの失敗タスク数 (ECS の最小値と同じ) |
+| `--ecs-stop-timeout SEC` | 1 以上の整数 (秒) | `30` | SIGTERM から SIGKILL までの猶予 (ECS の `stopTimeout` 既定と同じ) |
+| `--ecs-circuit-breaker-reload-delay SEC` | 0 以上の整数 (秒) | `1` | `:reload` を実行してから停止を始めるまでの秒数 |
+| `--no-ecs-circuit-breaker-reload` | フラグ | `false` | `:reload` を挟まず、停止だけを再現する |
+| `--ecs-circuit-breaker-replace-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 置き換えたタスクの判定を待つ秒数 (`0` は healthcheck 設定から計算) |
+| `--ecs-server-log PATH` | コンテナ内の絶対パス | (自動検出) | `server.log` の場所 |
+| `--ecs-circuit-breaker-drill` | フラグ | `false` | 正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する |
+| `--ecs-circuit-breaker-text FILE` | ファイルパス | (`--report-dir` 配下) | 再現結果のテキスト出力先 |
+| `--no-ecs-circuit-breaker-text` | フラグ | `false` | テキスト出力を行わない |
+| `--ecs-circuit-breaker-display` | フラグ | — | 再現結果を画面へ出す (既定) |
+| `--no-ecs-circuit-breaker-display` | フラグ | `false` | 画面への出力を抑制する |
+| `--no-ecs-circuit-breaker-save-server-log` | フラグ | `false` | 切れたままの `server.log` をファイルとして残さない |
+
 ### URL 応答確認
 
 | オプション | 値 | 既定 | 説明 |

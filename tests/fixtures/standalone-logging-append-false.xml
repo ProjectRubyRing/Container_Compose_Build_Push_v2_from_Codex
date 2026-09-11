@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<server xmlns="urn:jboss:domain:20.0">
+    <profile>
+        <subsystem xmlns="urn:jboss:domain:logging:8.0">
+            <console-handler name="CONSOLE">
+                <level name="INFO"/>
+                <formatter>
+                    <named-formatter name="COLOR-PATTERN"/>
+                </formatter>
+            </console-handler>
+            <periodic-rotating-file-handler name="FILE" autoflush="true">
+                <formatter>
+                    <named-formatter name="PATTERN"/>
+                </formatter>
+                <file relative-to="jboss.server.log.dir" path="server.log"/>
+                <suffix value=".yyyy-MM-dd"/>
+                <append value="false"/>
+            </periodic-rotating-file-handler>
+            <async-handler name="ASYNC" queue-length="512">
+                <overflow-action value="block"/>
+                <subhandlers>
+                    <handler name="FILE"/>
+                </subhandlers>
+            </async-handler>
+            <root-logger>
+                <level name="INFO"/>
+                <handlers>
+                    <handler name="CONSOLE"/>
+                    <handler name="ASYNC"/>
+                </handlers>
+            </root-logger>
+        </subsystem>
+    </profile>
+</server>

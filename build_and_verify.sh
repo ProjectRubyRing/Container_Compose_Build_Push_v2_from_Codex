@@ -137,6 +137,25 @@
 #                          base / frontend / backend を含む各サービスのビルドログを
 #                          画面へも全量表示する。
 #
+#  (17) ECS サーキットブレーカ再現:
+#                          ECS では、タスク定義の healthCheck が retries 回続けて
+#                          失敗すると必須コンテナ (essential=true) が UNHEALTHY に
+#                          なり、ECS がタスクを停止する (SIGTERM → stopTimeout →
+#                          SIGKILL)。置き換えたタスクも失敗し続けると、デプロイの
+#                          サーキットブレーカが開いてロールバックする。
+#                          この停止が jboss-cli の :reload と重なると、server.log が
+#                          途中で切れる (reload の再オープンによる切り詰め /
+#                          未フラッシュ分の消失 / 書きかけの行の途切れ)。
+#                          compose には「unhealthy になったら止めて置き換える」
+#                          仕組みが無いためこの経路が再現しない。既定で ECS と
+#                          同じ判定・停止手順を行い、停止前後の server.log と
+#                          標準出力を突き合わせて切れ方まで判定する。
+#                          動くのは「起動確認の最中に必須コンテナが unhealthy に
+#                          なったとき」だけで、正常に起動する実行では何も起きない。
+#                          正常な実行でも意図的に再現するには
+#                          --ecs-circuit-breaker-drill を指定する。
+#                          --no-ecs-circuit-breaker で機能ごと無効化できる。
+#
 # --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
 # 行って終了する (従来の build_and_push.sh --build-only 相当)。
 #
@@ -697,6 +716,160 @@ ALB_HEALTHCHECK_CLI_DEFAULT="/opt/alb-healthcheck/healthcheck.py"
 # 偽装サービスが状態参照 API を待ち受けるコンテナ側ポート。ホストから叩く URL の
 # 案内にだけ使う (コンテナの ALB_HEALTHCHECK_LISTEN_PORT があればそちらを優先)。
 ALB_HEALTHCHECK_API_PORT="8080"
+
+# ---- ECS サーキットブレーカによるタスク停止の再現 ------------------------------
+# ECS/Fargate では、タスク定義の healthCheck が retries 回続けて失敗すると、その
+# コンテナは UNHEALTHY になる。essential=true (必須コンテナ) が UNHEALTHY になった
+# タスクは ECS に停止され、サービスはタスクを置き換える。置き換えたタスクも同じく
+# 失敗し続けると、デプロイのサーキットブレーカ
+# (deploymentConfiguration.deploymentCircuitBreaker) が開いてデプロイを失敗と判定し、
+# 直前の安定版へロールバックする。閾値は「必要数の 0.5 倍、最小 3・最大 200」で、
+# 必要数が小さい構成では 3 回になる。
+# 停止の手順は ECS 側で決まっており、タスクの各コンテナへ SIGTERM を送り、
+# stopTimeout (既定 30 秒) を過ぎても終了しなければ SIGKILL する。
+#
+# この停止が JBoss EAP の jboss-cli による :reload と重なると、server.log が途中で
+# 切れる。切れ方は 3 通りあり、どれが起きたのかで直し方が変わる。
+#   (a) reload による再オープンでの切り詰め
+#       reload は logging subsystem を作り直すため、file handler をいったん閉じて
+#       開き直す。append="false" の handler はこの再オープンでファイルを切り詰める
+#       ため、reload より前に書かれた内容がまるごと消える。
+#   (b) 未フラッシュ分の消失
+#       autoflush="false" の handler や async-handler は書き込みをバッファ・キューへ
+#       溜める。SIGKILL はシャットダウンフックを走らせないため、溜まっていた分は
+#       書き出されないまま失われる。
+#   (c) 書きかけの行の途切れ
+#       SIGKILL は書き込みの途中でもプロセスを落とすため、最後の 1 行が改行の手前で
+#       終わる。
+# いずれの場合も、標準出力 (CONSOLE handler) 側は docker / CloudWatch Logs が
+# 受け取っているため、「標準出力にはあるのに server.log には無い行」という差が残る。
+#
+# compose には「unhealthy になったコンテナを止めて置き換える」仕組みが無いため、
+# この経路はローカルでは再現しない (unhealthy のまま動き続ける)。そこで既定で
+# ECS と同じ判定・停止手順を行い、停止前後の server.log を突き合わせて切れ方を
+# 判定する。動くのは「起動確認の最中に必須コンテナが unhealthy になったとき」
+# だけで、これは ECS でサーキットブレーカが働く期間 (デプロイ中) と同じである。
+# 正常に起動する実行では何も起きない。正常な実行でも意図的に再現したい場合は
+# --ecs-circuit-breaker-drill を指定する。--no-ecs-circuit-breaker で機能ごと
+# 無効化でき、その場合は従来どおり unhealthy でも何もしない。
+ECS_CIRCUIT_BREAKER="true"        # false (--no-ecs-circuit-breaker): 再現を行わない
+ECS_CB_ESSENTIAL_SERVICES=()      # --ecs-essential-service: 必須コンテナ扱いするサービス
+ECS_CB_THRESHOLD="3"              # --ecs-circuit-breaker-threshold: ブレーカが開く失敗タスク数
+ECS_CB_STOP_TIMEOUT="30"          # --ecs-stop-timeout: SIGTERM から SIGKILL までの猶予秒
+ECS_CB_RELOAD="true"              # false (--no-ecs-circuit-breaker-reload): reload を挟まない
+ECS_CB_RELOAD_DELAY="1"           # --ecs-circuit-breaker-reload-delay: reload 実行から停止までの秒
+ECS_CB_REPLACE_TIMEOUT="0"        # --ecs-circuit-breaker-replace-timeout: 置き換え後の判定待ち (0=自動)
+ECS_CB_DRILL="false"              # true (--ecs-circuit-breaker-drill): 正常時も 1 回だけ再現する
+ECS_CB_SERVER_LOG=""              # --ecs-server-log: server.log のコンテナ内パス (空なら自動検出)
+ECS_CB_DISPLAY="true"             # false (--no-ecs-circuit-breaker-display): 画面へ出さない
+ECS_CB_TEXT_ENABLED="true"        # false (--no-ecs-circuit-breaker-text): テキストへ出さない
+ECS_CB_TEXT=""                    # --ecs-circuit-breaker-text: テキストの出力先
+ECS_CB_TEXT_SET="false"           # 出力先が明示指定されたか
+ECS_CB_TEXT_OUTPUT=""             # 実際に出力したテキストのパス
+ECS_CB_SAVE_SERVER_LOG="true"     # false (--no-ecs-circuit-breaker-save-server-log)
+# 再現の実行状態 (成功経路・失敗経路の双方から呼ばれるため、二重実行を防ぐ)
+ECS_CB_DONE="false"               # 再現を実行済みか
+ECS_CB_TRIGGERED="false"          # 実際に停止まで行ったか
+ECS_CB_DIGEST_FILE=""             # 画面・テキスト・全量レポートで共用する本文
+ECS_CB_SKIP_REASON=""             # 再現しなかった理由 (全量レポートへ記載する)
+ECS_CB_VERDICT=""                 # 総合判定
+ECS_CB_TRIGGER_SUMMARY=""         # 契機の 1 行説明
+ECS_CB_TRIGGER_SERVICE=""         # unhealthy を検出した Compose サービス名
+ECS_CB_TRIGGER_STREAK=""          # 同連続失敗回数
+ECS_CB_ATTEMPTS="0"               # 停止した回数 (= 失敗タスク数)
+ECS_CB_TRUNCATED="0"              # うち server.log が途中で切れた回数
+ECS_CB_KILLED="0"                 # うち SIGKILL まで至った回数
+ECS_CB_RELOADS="0"                # reload を実際に流し込めた回数
+ECS_CB_OPENED="false"             # サーキットブレーカが開いたか
+ECS_CB_SAVED_LOGS=()              # 保存した server.log のパス
+# 停止の記録に使う区切り。ログ本文にもパスにも現れない制御文字を使う。
+ECS_CB_SEPARATOR=$'\037'
+# logging subsystem (standalone.xml) から file handler の append / autoflush と
+# async-handler のキュー設定を取り出す awk。出力は 1 行 1 属性で、
+#   H<SEP><ハンドラの通し番号><SEP><キー><SEP><値>
+# の形にする。キーは type / name / autoflush / append / path / relative-to /
+# suffix / queue-length / overflow-action / subhandler。
+# 名前空間の版 (urn:jboss:domain:logging:8.0 など) は EAP のバージョンごとに
+# 変わるため、版の部分は問わない。
+ECS_CB_LOGGING_XML_AWK="$(cat <<'ECS_CB_LOGGING_XML_AWK_END'
+function attr_value(tag, key,   pattern, rest, quote, position) {
+  pattern = "(^|[ \t\r\n])" key "[ \t]*="
+  if (!match(tag, pattern)) return ABSENT
+  rest = substr(tag, RSTART + RLENGTH)
+  sub(/^[ \t]*/, "", rest)
+  quote = substr(rest, 1, 1)
+  if (quote != "\"" && quote != "'") return ABSENT
+  rest = substr(rest, 2)
+  position = index(rest, quote)
+  if (position == 0) return ABSENT
+  return substr(rest, 1, position - 1)
+}
+function emit(key, value) {
+  if (handler_id > 0 && value != ABSENT && value != "")
+    printf "H%s%s%s%s%s%s\n", SEP, handler_id, SEP, key, SEP, value
+}
+BEGIN {
+  RS = "<"
+  ABSENT = "\002"
+  depth = 0
+  handler_id = 0
+  handler_depth = 0
+  in_logging = 0
+  logging_depth = 0
+}
+{
+  record = $0
+  if (record == "") next
+  close_position = index(record, ">")
+  if (close_position == 0) next
+  tag = substr(record, 1, close_position - 1)
+  if (tag == "") next
+  first = substr(tag, 1, 1)
+  if (first == "/") {
+    if (handler_id > 0 && depth == handler_depth) { handler_id = 0; handler_depth = 0 }
+    if (in_logging && depth == logging_depth) in_logging = 0
+    if (depth > 0) depth--
+    next
+  }
+  if (first == "?" || first == "!") next
+  element_name = tag
+  sub(/[ \t\r\n\/].*$/, "", element_name)
+  if (element_name == "") next
+  self_closing = (substr(tag, length(tag), 1) == "/")
+  depth++
+  if (!in_logging && element_name == "subsystem" && tag ~ /urn:jboss:domain:logging:/) {
+    in_logging = 1
+    logging_depth = depth
+  }
+  if (in_logging) {
+    if (element_name ~ /-file-handler$/ || element_name == "file-handler" \
+        || element_name == "async-handler") {
+      handler_count++
+      handler_id = handler_count
+      handler_depth = depth
+      emit("type", element_name)
+      emit("name", attr_value(tag, "name"))
+      emit("autoflush", attr_value(tag, "autoflush"))
+      emit("queue-length", attr_value(tag, "queue-length"))
+    } else if (handler_id > 0) {
+      if (element_name == "append" || element_name == "suffix" \
+          || element_name == "overflow-action" || element_name == "level")
+        emit(element_name, attr_value(tag, "value"))
+      else if (element_name == "file") {
+        emit("path", attr_value(tag, "path"))
+        emit("relative-to", attr_value(tag, "relative-to"))
+      } else if (element_name == "handler")
+        emit("subhandler", attr_value(tag, "name"))
+    }
+  }
+  if (self_closing) {
+    if (handler_id > 0 && depth == handler_depth) { handler_id = 0; handler_depth = 0 }
+    if (in_logging && depth == logging_depth) in_logging = 0
+    depth--
+  }
+}
+ECS_CB_LOGGING_XML_AWK_END
+)"
 
 # ---- 偽装バッチサーバー経由の EFS マウント伝播確認 ----------------------------
 # ECS/EFS 構成では、同じ EFS を frontend / backend / バッチサーバーが同時に
@@ -2296,6 +2469,90 @@ JBoss EAP Undertow バーチャルホスト (default-host) の分析:
                          (画面・テキスト・全量レポートの [12] のすべてを止める。
                           全量レポートには止めた理由だけを残す)
 
+ECS サーキットブレーカによるタスク停止の再現 (既定で有効):
+  (オプション指定不要。起動確認の最中に必須コンテナの healthcheck が unhealthy に
+   なったときだけ動く。正常に起動する実行では何も起きない)
+  再現する内容           ECS では、タスク定義の healthCheck が retries 回続けて
+                         失敗すると必須コンテナ (essential=true) が UNHEALTHY に
+                         なり、ECS がそのタスクを停止する
+                         (SIGTERM → stopTimeout → SIGKILL)。サービスはタスクを
+                         置き換え、置き換えた先も失敗し続けると、デプロイの
+                         サーキットブレーカが開いてロールバックする。
+                         この停止が jboss-cli の :reload と重なると、server.log が
+                         途中で切れる。compose には「unhealthy になったら止めて
+                         置き換える」仕組みが無くこの経路が再現しないため、
+                         同じ判定と停止手順を行い、停止前後の server.log を
+                         突き合わせて切れ方まで判定する。
+                         判定の根拠は次の 4 つ。
+                           - 停止後のファイルが停止前より小さい
+                             → reload の再オープンで切り詰め (append="false")
+                           - 末尾が改行で終わっていない
+                             → 書きかけの行が SIGKILL で途切れた
+                           - 標準出力に server.log の最終時刻より後の行が残る
+                             → 未フラッシュ分の消失
+                               (autoflush="false" / async-handler のキュー)
+                           - 停止完了のログ (WFLYSRV0050) が無い
+                             → 終了処理を完走できていない
+                         併せて standalone.xml の logging subsystem を読み、
+                         file handler の append / autoflush と async-handler の
+                         キュー設定を、切れ方の根拠として出力する。
+                         切れたままの server.log は --report-dir 配下へ
+                         そのまま保存する。
+  --no-ecs-circuit-breaker
+                         この再現を一切行わない (従来どおり、unhealthy のままでも
+                         コンテナを止めない)。画面・テキスト・全量レポート [14] の
+                         すべてを止め、レポートには止めた理由だけを残す
+  --ecs-circuit-breaker  再現を行う (既定と同じ。--no-ecs-circuit-breaker を打ち消す)
+  --ecs-essential-service NAME
+                         必須コンテナ (essential=true 相当) として扱う Compose
+                         サービス名。繰り返し指定またはカンマ区切りで複数指定できる
+                         (既定: --startup-service → --compose-service →
+                          起動中の全サービス の順で決める)。
+                         ECS はタスク内の全コンテナを止めるが、ここでは DB や
+                         モックを巻き込まないよう、この一覧だけを停止する
+  --ecs-circuit-breaker-threshold N
+                         サーキットブレーカが開くまでの失敗タスク数 (既定: 3)。
+                         ECS の閾値「必要数の 0.5 倍・最小 3・最大 200」に合わせて
+                         いる。1 を指定すると 1 回の停止でロールバック相当にする
+  --ecs-stop-timeout SEC SIGTERM から SIGKILL までの猶予秒 (既定: 30)。ECS の
+                         stopTimeout / ECS_CONTAINER_STOP_TIMEOUT の既定と同じ。
+                         短くすると SIGKILL が早くなり、reload との重なりを
+                         作りやすくなる
+  --ecs-circuit-breaker-reload-delay SEC
+                         :reload を実行してから停止を始めるまでの秒数 (既定: 1)。
+                         0 を指定すると reload と同時に停止する
+  --no-ecs-circuit-breaker-reload
+                         :reload を挟まず、停止だけを再現する
+                         (切断の要因を切り分けたいときに使う)
+  --ecs-circuit-breaker-replace-timeout SEC
+                         置き換えたタスクが healthy / unhealthy のどちらになるかを
+                         待つ秒数 (既定: 0 = healthcheck の設定から
+                         start_period + interval × (retries + 1) を計算し、
+                         30〜300 秒へ収める)
+  --ecs-server-log PATH  server.log のコンテナ内パス
+                         (既定: $JBOSS_HOME/standalone/log/server.log を自動検出)
+  --ecs-circuit-breaker-drill
+                         必須コンテナが unhealthy にならなくても、動作確認を
+                         すべて終えた後に 1 回だけ意図的に再現する
+                         (タスクの置き換えは行わない)。事象そのものを手元で
+                         起こしたいときに使う
+  --ecs-circuit-breaker-text FILE
+                         再現結果をテキストファイルとして FILE へ出力する。
+                         --report-dir 指定時は未指定でも
+                         DIR/build_and_verify_<日時>_ecs_circuit_breaker.txt へ
+                         自動出力する。内容は画面表示と同一
+  --no-ecs-circuit-breaker-text
+                         テキストファイルへの出力を行わない
+  --ecs-circuit-breaker-display
+                         再現結果を画面へ出力する (既定)
+  --no-ecs-circuit-breaker-display
+                         画面への出力を抑制する (テキストと全量レポートへは出す)
+  --no-ecs-circuit-breaker-save-server-log
+                         切れたままの server.log をファイルとして残さない
+                         (既定は --report-dir 配下へ
+                          build_and_verify_<日時>_ecs_circuit_breaker_<サービス>_<回数>.log
+                          として保存する)
+
 CloudWatch Agent (cwagent) のログ送信検証:
   (compose.yml に cwagent サービスが定義されていれば自動で実行する)
   設定ファイルのチェック   ビルド前に、compose.yml の cwagent 定義とマウントする
@@ -2625,6 +2882,24 @@ while [ $# -gt 0 ]; do
     --no-undertow-analysis-display) UNDERTOW_ANALYSIS_DISPLAY="false"; UNDERTOW_ANALYSIS_DISPLAY_SET="true"; shift ;;
     --no-undertow-analysis-text)    UNDERTOW_ANALYSIS_TEXT_ENABLED="false"; shift ;;
     --no-undertow-analysis)         UNDERTOW_ANALYSIS="false"; shift ;;
+    --ecs-circuit-breaker)          ECS_CIRCUIT_BREAKER="true"; shift ;;
+    --no-ecs-circuit-breaker)       ECS_CIRCUIT_BREAKER="false"; shift ;;
+    --ecs-essential-service) need_value "$1" $#; append_services ECS_CB_ESSENTIAL_SERVICES "$2"; shift 2 ;;
+    --ecs-circuit-breaker-threshold) need_value "$1" $#; ECS_CB_THRESHOLD="$2"; shift 2 ;;
+    --ecs-stop-timeout)     need_value "$1" $#; ECS_CB_STOP_TIMEOUT="$2"; shift 2 ;;
+    --ecs-circuit-breaker-reload)       ECS_CB_RELOAD="true"; shift ;;
+    --no-ecs-circuit-breaker-reload)    ECS_CB_RELOAD="false"; shift ;;
+    --ecs-circuit-breaker-reload-delay) need_value "$1" $#; ECS_CB_RELOAD_DELAY="$2"; shift 2 ;;
+    --ecs-circuit-breaker-replace-timeout) need_value "$1" $#; ECS_CB_REPLACE_TIMEOUT="$2"; shift 2 ;;
+    --ecs-server-log)       need_value "$1" $#; ECS_CB_SERVER_LOG="$2"; shift 2 ;;
+    --ecs-circuit-breaker-drill)    ECS_CB_DRILL="true"; shift ;;
+    --no-ecs-circuit-breaker-drill) ECS_CB_DRILL="false"; shift ;;
+    --ecs-circuit-breaker-text) need_value "$1" $#; ECS_CB_TEXT="$2"; ECS_CB_TEXT_SET="true"; shift 2 ;;
+    --no-ecs-circuit-breaker-text)  ECS_CB_TEXT_ENABLED="false"; shift ;;
+    --ecs-circuit-breaker-display)    ECS_CB_DISPLAY="true"; shift ;;
+    --no-ecs-circuit-breaker-display) ECS_CB_DISPLAY="false"; shift ;;
+    --ecs-circuit-breaker-save-server-log)    ECS_CB_SAVE_SERVER_LOG="true"; shift ;;
+    --no-ecs-circuit-breaker-save-server-log) ECS_CB_SAVE_SERVER_LOG="false"; shift ;;
     --verify-cwagent)      VERIFY_CWAGENT="true"; shift ;;
     --no-verify-cwagent)   VERIFY_CWAGENT="false"; shift ;;
     --cwagent-service)     need_value "$1" $#; CWAGENT_SERVICE="$2"; shift 2 ;;
@@ -3005,6 +3280,37 @@ for _undertow_host_header in "${UNDERTOW_HOST_HEADERS[@]}"; do
 done
 unset _undertow_host_header
 
+# ---- ECS サーキットブレーカ再現オプションの検証 ------------------------------
+validate_positive_integer "$ECS_CB_THRESHOLD" "--ecs-circuit-breaker-threshold" || exit 2
+validate_positive_integer "$ECS_CB_STOP_TIMEOUT" "--ecs-stop-timeout" || exit 2
+validate_non_negative_integer "$ECS_CB_RELOAD_DELAY" "--ecs-circuit-breaker-reload-delay" || exit 2
+validate_non_negative_integer "$ECS_CB_REPLACE_TIMEOUT" "--ecs-circuit-breaker-replace-timeout" || exit 2
+# 再現ごと行わない指定と、再現の細部を変える指定が同時に来た場合、どちらを
+# 優先しても利用者の意図とずれる。ここで指定の矛盾として止める。
+if [ "$ECS_CIRCUIT_BREAKER" != "true" ]; then
+  if [ "$ECS_CB_DRILL" = "true" ]; then
+    err "--no-ecs-circuit-breaker と --ecs-circuit-breaker-drill は同時に指定できません。"
+    exit 2
+  fi
+  if [ ${#ECS_CB_ESSENTIAL_SERVICES[@]} -gt 0 ] || [ "$ECS_CB_TEXT_SET" = "true" ]; then
+    err "--no-ecs-circuit-breaker と --ecs-essential-service / --ecs-circuit-breaker-text は同時に指定できません。"
+    err "  再現ごと行わない場合は --no-ecs-circuit-breaker だけを指定してください。"
+    exit 2
+  fi
+fi
+if [ "$ECS_CB_TEXT_SET" = "true" ] && [ "$ECS_CB_TEXT_ENABLED" != "true" ]; then
+  err "--ecs-circuit-breaker-text と --no-ecs-circuit-breaker-text は同時に指定できません。"
+  exit 2
+fi
+if [ "$ECS_CB_TEXT_SET" = "true" ]; then
+  case "$ECS_CB_TEXT" in
+    ''|*/)
+      err "--ecs-circuit-breaker-text にはファイルパスを指定してください: $ECS_CB_TEXT"
+      exit 2
+      ;;
+  esac
+fi
+
 # ---- cwagent 検証オプションの検証 -------------------------------------------
 validate_positive_integer "$CWAGENT_DELIVERY_TIMEOUT" "--cwagent-delivery-timeout" || exit 2
 validate_positive_integer "$CWAGENT_DELIVERY_INTERVAL" "--cwagent-delivery-interval" || exit 2
@@ -3241,7 +3547,8 @@ for _jboss_path_opt in \
     "--jboss-config-file:$JBOSS_CONFIG_FILE" \
     "--jboss-cli-path:$JBOSS_CLI_PATH" \
     "--jboss-elytron-tool:$JBOSS_ELYTRON_TOOL_PATH" \
-    "--jboss-credential-store:$JBOSS_CREDENTIAL_STORE_FILE"; do
+    "--jboss-credential-store:$JBOSS_CREDENTIAL_STORE_FILE" \
+    "--ecs-server-log:$ECS_CB_SERVER_LOG"; do
   _jboss_path_name="${_jboss_path_opt%%:*}"
   _jboss_path_value="${_jboss_path_opt#*:}"
   [ -n "$_jboss_path_value" ] || continue
@@ -10577,6 +10884,14 @@ wait_for_startup() {
         show_companion_service_logs
         return 0
       fi
+    fi
+    # 必須コンテナが unhealthy になっていないかを見る。ECS ではこの時点でタスクが
+    # 停止され、失敗タスクが閾値に達するとサーキットブレーカが開いてデプロイが
+    # ロールバックされる。compose には同じ仕組みが無いため、ここで再現する
+    # (--no-ecs-circuit-breaker で無効化できる)。置き換えで healthy になった場合は
+    # ECS と同じくデプロイ続行とみなし、起動確認を続ける。
+    if ! ecs_cb_check_during_startup; then
+      return 1
     fi
     # コンテナが途中で停止していないか確認する (起動失敗の早期検知)。
     if ! containers_all_running ${pending[@]+"${pending[@]}"}; then
@@ -32742,6 +33057,1041 @@ append_jboss_password_report() {
 # EXIT トラップからコンテナ停止前に呼び、画面表示の制限にかかわらず環境変数は
 # 全件保存する。ディレクトリツリーと JBoss EAP デプロイ構造は
 # --directory-tree-report を指定したときだけ、全深度・全ファイル名で保存する。
+# =============================================================================
+# ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)
+# =============================================================================
+# 再現する連鎖は次の 4 段で、compose には 2 と 3 が無いためローカルでは起きない。
+#   1. タスク定義の healthCheck が retries 回続けて失敗し、必須コンテナ
+#      (essential=true) が UNHEALTHY になる
+#   2. ECS がそのタスクを停止する (SIGTERM → stopTimeout → SIGKILL)
+#   3. サービスがタスクを置き換える。置き換えた先も失敗し続けると、デプロイの
+#      サーキットブレーカが開いてロールバックする
+#   4. 2 の停止が jboss-cli の :reload と重なると server.log が途中で切れる
+# ここでは 2 と 3 を compose 上で行い、4 の切れ方を停止前後の server.log と
+# 標準出力の差から判定する。判定の根拠は次の 4 つ。
+#   - 停止後のファイルが停止前より小さい        → reload の再オープンで切り詰め
+#   - 末尾が改行で終わっていない                → 書きかけの行が SIGKILL で途切れた
+#   - 標準出力に server.log より後の行が残る    → 未フラッシュ分が失われた
+#   - 停止ログ (WFLYSRV0050) が出ていない       → 終了処理を完走できていない
+
+# 再現を実行できる状態かを返す。
+ecs_circuit_breaker_enabled() {
+  [ "$ECS_CIRCUIT_BREAKER" = "true" ] || return 1
+  [ "$DRY_RUN" != "true" ] || return 1
+  [ "$STARTED_CONTAINER" = "true" ] || return 1
+  return 0
+}
+
+# 必須コンテナ (ECS の essential=true 相当) として扱う Compose サービス名を並べる。
+# --ecs-essential-service の明示指定 > 起動確認対象 > 起動対象 > 起動中の全サービス。
+# ECS はタスク内の全コンテナを止めるが、compose では DB やモックまで巻き込まないよう、
+# ここで挙がったサービスだけを停止対象にする。
+ecs_cb_essential_services() {
+  if [ ${#ECS_CB_ESSENTIAL_SERVICES[@]} -gt 0 ]; then
+    printf '%s\n' "${ECS_CB_ESSENTIAL_SERVICES[@]}"
+  elif [ ${#STARTUP_SERVICES[@]} -gt 0 ]; then
+    printf '%s\n' "${STARTUP_SERVICES[@]}"
+  elif [ ${#COMPOSE_TARGET_SERVICES[@]} -gt 0 ]; then
+    printf '%s\n' "${COMPOSE_TARGET_SERVICES[@]}"
+  else
+    compose_started_services
+  fi
+}
+
+# healthcheck の現在状態を "状態|連続失敗回数" で返す。healthcheck 未定義なら空。
+ecs_cb_health_state() {
+  docker inspect -f \
+    '{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{end}}' \
+    "$1" 2>/dev/null
+}
+
+# healthcheck の設定 (interval / timeout / retries / start_period) を 1 行ずつ返す。
+# ECS のタスク定義 healthCheck と同じ 4 項目で、unhealthy 判定の根拠になる。
+ecs_cb_health_settings() {
+  docker inspect -f \
+    '{{if .Config.Healthcheck}}interval={{.Config.Healthcheck.Interval}}{{"\n"}}timeout={{.Config.Healthcheck.Timeout}}{{"\n"}}retries={{.Config.Healthcheck.Retries}}{{"\n"}}start_period={{.Config.Healthcheck.StartPeriod}}{{end}}' \
+    "$1" 2>/dev/null
+}
+
+# healthcheck 設定を 1 行へまとめる (取得できない場合は空)。
+ecs_cb_health_settings_line() {
+  local line text=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ -n "$text" ] && text="${text} "
+    text="${text}${line}"
+  done < <(ecs_cb_health_settings "$1")
+  printf '%s' "$text"
+}
+
+# Go の期間表記 (30s / 2m0s / 1h0m0s / 500ms) と、docker inspect が返すナノ秒の
+# 整数の双方を秒へ直す。解釈できない場合は何も返さない。
+ecs_cb_duration_seconds() {
+  local value="$1"
+  [ -n "$value" ] || return 1
+  printf '%s' "$value" | awk '
+    {
+      v = $0
+      if (v ~ /^[0-9]+$/) { printf "%d\n", int(v / 1000000000); exit }
+      total = 0
+      matched = 0
+      while (match(v, /^[0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h)/)) {
+        token = substr(v, RSTART, RLENGTH)
+        v = substr(v, RSTART + RLENGTH)
+        if (!match(token, /[a-z]+$/)) break
+        unit = substr(token, RSTART, RLENGTH)
+        num = substr(token, 1, RSTART - 1) + 0
+        matched = 1
+        if (unit == "ns")      total += num / 1000000000
+        else if (unit == "us") total += num / 1000000
+        else if (unit == "ms") total += num / 1000
+        else if (unit == "s")  total += num
+        else if (unit == "m")  total += num * 60
+        else if (unit == "h")  total += num * 3600
+      }
+      if (matched) printf "%d\n", int(total + 0.5)
+    }
+  '
+}
+
+# 置き換えたタスクの判定を待つ秒数を決める。明示指定が無ければ healthcheck の
+# 設定から「start_period + interval × (retries + 1)」を求め、30〜300 秒へ収める
+# (ECS が UNHEALTHY と判定するまでに必要な時間と同じ考え方)。
+ecs_cb_replace_wait_seconds() {
+  local container_id="$1" line key value
+  local interval="" retries="" start_period="" total=""
+
+  if [ "$ECS_CB_REPLACE_TIMEOUT" != "0" ]; then
+    printf '%s' "$ECS_CB_REPLACE_TIMEOUT"
+    return 0
+  fi
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      interval)     interval="$(ecs_cb_duration_seconds "$value")" ;;
+      retries)      retries="$value" ;;
+      start_period) start_period="$(ecs_cb_duration_seconds "$value")" ;;
+    esac
+  done < <(ecs_cb_health_settings "$container_id")
+  case "$retries" in
+    ''|*[!0-9]*) retries=3 ;;
+  esac
+  [ -n "$interval" ] || interval=30
+  [ -n "$start_period" ] || start_period=0
+  total=$(( start_period + interval * (retries + 1) ))
+  [ "$total" -lt 30 ] && total=30
+  [ "$total" -gt 300 ] && total=300
+  printf '%s' "$total"
+}
+
+# コンテナ内の server.log のパスを決める。--ecs-server-log > 検出した JBOSS_HOME
+# 配下 > よくある固定パス の順で探す。
+ecs_cb_resolve_server_log() {
+  local container_id="$1" home="$2"
+  if [ -n "$ECS_CB_SERVER_LOG" ]; then
+    printf '%s' "$ECS_CB_SERVER_LOG"
+    return 0
+  fi
+  jboss_container_exec "$container_id" '
+    # ecs-cb-server-log: server.log のパスを探す
+    ecs_home="$1"
+    shift
+    if [ -n "$ecs_home" ] && [ -f "$ecs_home/standalone/log/server.log" ]; then
+      printf "%s" "$ecs_home/standalone/log/server.log"
+      exit 0
+    fi
+    for ecs_candidate in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+      [ -n "$ecs_candidate" ] || continue
+      if [ -f "$ecs_candidate/standalone/log/server.log" ]; then
+        printf "%s" "$ecs_candidate/standalone/log/server.log"
+        exit 0
+      fi
+    done
+    for ecs_candidate in /var/log/jboss/server.log /var/log/eap/server.log; do
+      if [ -f "$ecs_candidate" ]; then
+        printf "%s" "$ecs_candidate"
+        exit 0
+      fi
+    done
+    exit 1
+  ' "$home" "${JBOSS_HOME_CANDIDATES[@]}"
+}
+
+# コンテナ内の jboss-cli.sh を探す。停止と重ねる :reload の実行可否を、停止を
+# 始める前に確かめるために使う。
+ecs_cb_resolve_cli() {
+  local container_id="$1"
+  jboss_container_exec "$container_id" '
+    # ecs-cb-cli-probe: jboss-cli.sh を探す
+    ecs_hint="$1"
+    shift
+    if [ -n "$ecs_hint" ] && [ -x "$ecs_hint" ]; then
+      printf "%s" "$ecs_hint"
+      exit 0
+    fi
+    for ecs_candidate in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+      [ -n "$ecs_candidate" ] || continue
+      if [ -x "$ecs_candidate/bin/jboss-cli.sh" ]; then
+        printf "%s" "$ecs_candidate/bin/jboss-cli.sh"
+        exit 0
+      fi
+    done
+    exit 1
+  ' "$JBOSS_CLI_PATH" "${JBOSS_HOME_CANDIDATES[@]}"
+}
+
+# server.log をホストへ取り出す。docker cp は停止済みのコンテナからも読めるため、
+# SIGKILL された後の「切れたままのファイル」もそのまま採取できる。
+ecs_cb_copy_server_log() {
+  local container_id="$1" path="$2" out_file="$3"
+  rm -f -- "$out_file"
+  docker cp "${container_id}:${path}" "$out_file" >/dev/null 2>&1 || return 1
+  [ -f "$out_file" ] || return 1
+  return 0
+}
+
+# 採取した server.log の状態を "バイト数<SEP>行数<SEP>末尾改行(yes/no)<SEP>最終行" で返す。
+ecs_cb_log_stats() {
+  local file="$1" bytes lines newline="no" last_line=""
+  if [ ! -f "$file" ]; then
+    printf '0%s0%sno%s' "$ECS_CB_SEPARATOR" "$ECS_CB_SEPARATOR" "$ECS_CB_SEPARATOR"
+    return 1
+  fi
+  bytes="$(host_file_size "$file" 2>/dev/null || printf '0')"
+  case "$bytes" in
+    ''|*[!0-9]*) bytes=0 ;;
+  esac
+  lines="$(awk 'END { print NR + 0 }' "$file" 2>/dev/null || printf '0')"
+  case "$lines" in
+    ''|*[!0-9]*) lines=0 ;;
+  esac
+  if [ "$bytes" -gt 0 ]; then
+    if [ "$(tail -c 1 "$file" 2>/dev/null | wc -l | tr -d '[:space:]')" = "1" ]; then
+      newline="yes"
+    fi
+    last_line="$(tail -n 1 "$file" 2>/dev/null | strip_ansi_codes | cut -c 1-160)"
+  fi
+  printf '%s%s%s%s%s%s%s' \
+    "$bytes" "$ECS_CB_SEPARATOR" "$lines" "$ECS_CB_SEPARATOR" \
+    "$newline" "$ECS_CB_SEPARATOR" "$last_line"
+}
+
+# JBoss のログ行に必ず入る時刻 (HH:MM:SS,mmm) の、最後のものを返す。
+# 標準出力側には Compose のサービス名接頭辞が付くため、行頭に固定せず拾う。
+ecs_cb_last_log_time() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3}' "$file" 2>/dev/null | tail -n 1
+}
+
+# 指定した時刻より後の行数を数える。server.log の最終時刻を渡し、標準出力側に
+# 何行残っているか (= server.log から失われた行数) を求めるために使う。
+# 日付をまたぐログでは数え過ぎることがあるため、判定では「差がある」ことだけを見る。
+ecs_cb_count_lines_after() {
+  local file="$1" since="$2"
+  [ -f "$file" ] || { printf '0'; return 1; }
+  [ -n "$since" ] || { printf '0'; return 1; }
+  awk -v since="$since" '
+    {
+      if (match($0, /[0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9][0-9][0-9]/)) {
+        stamp = substr($0, RSTART, RLENGTH)
+        if (stamp > since) count++
+      }
+    }
+    END { print count + 0 }
+  ' "$file" 2>/dev/null || printf '0'
+}
+
+# standalone.xml の logging subsystem を読み、file handler の append / autoflush と
+# async-handler のキュー設定を digest へ書き出す。server.log が「どう切れるのか」の
+# 根拠になるため、切断を検出したかどうかに関わらず 1 回だけ出す。
+ecs_cb_report_logging_config() {
+  local container_id="$1" service_name="$2" out_file="$3"
+  local home config_file xml_b64 xml_file record kind id key value
+  local -a ids=() types=() names=() autoflush=() append=() paths=() relatives=()
+  local -a suffixes=() queues=() overflows=() subhandlers=()
+  local current_id="" slot=-1 index=0 detail line_written="false"
+
+  printf '\n[logging subsystem の設定] (サービス %s の standalone.xml)\n' "$service_name" >> "$out_file"
+
+  home="$(jboss_detect_home "$container_id")"
+  if ! config_file="$(jboss_detect_config_file "$container_id" "$home")" || [ -z "$config_file" ]; then
+    printf '  standalone.xml を特定できませんでした (--jboss-config-file で指定できます)。\n' >> "$out_file"
+    return 0
+  fi
+  xml_b64="$(jboss_container_read_file "$container_id" "$config_file")"
+  if [ -z "$xml_b64" ]; then
+    printf '  設定ファイルを読み出せませんでした: %s\n' "$config_file" >> "$out_file"
+    return 0
+  fi
+  if ! xml_file="$(mktemp 2>/dev/null)"; then
+    printf '  設定ファイルの展開用一時ファイルを作成できませんでした。\n' >> "$out_file"
+    return 0
+  fi
+  if ! printf '%s' "$xml_b64" | base64 -d > "$xml_file" 2>/dev/null; then
+    rm -f -- "$xml_file"
+    printf '  設定ファイルを復号できませんでした: %s\n' "$config_file" >> "$out_file"
+    return 0
+  fi
+
+  printf '  ファイル : %s\n' "$config_file" >> "$out_file"
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    kind="${record%%"$ECS_CB_SEPARATOR"*}"
+    [ "$kind" = "H" ] || continue
+    record="${record#*"$ECS_CB_SEPARATOR"}"
+    id="${record%%"$ECS_CB_SEPARATOR"*}"
+    record="${record#*"$ECS_CB_SEPARATOR"}"
+    key="${record%%"$ECS_CB_SEPARATOR"*}"
+    value="${record#*"$ECS_CB_SEPARATOR"}"
+    # awk は 1 ハンドラ分の属性をまとめて続けて出すため、通し番号が変わったところで
+    # 新しい枠を足せばよい (毎回配列を線形探索しなくて済む)。
+    if [ "$id" != "$current_id" ]; then
+      current_id="$id"
+      ids+=("$id"); types+=(""); names+=(""); autoflush+=(""); append+=("")
+      paths+=(""); relatives+=(""); suffixes+=(""); queues+=(""); overflows+=(""); subhandlers+=("")
+      slot=$(( ${#ids[@]} - 1 ))
+    fi
+    [ "$slot" -ge 0 ] || continue
+    case "$key" in
+      type)            types[$slot]="$value" ;;
+      name)            names[$slot]="$value" ;;
+      autoflush)       autoflush[$slot]="$value" ;;
+      append)          append[$slot]="$value" ;;
+      path)            paths[$slot]="$value" ;;
+      relative-to)     relatives[$slot]="$value" ;;
+      suffix)          suffixes[$slot]="$value" ;;
+      queue-length)    queues[$slot]="$value" ;;
+      overflow-action) overflows[$slot]="$value" ;;
+      subhandler)
+        if [ -n "${subhandlers[$slot]}" ]; then
+          subhandlers[$slot]="${subhandlers[$slot]},${value}"
+        else
+          subhandlers[$slot]="$value"
+        fi
+        ;;
+    esac
+  done < <(awk -v SEP="$ECS_CB_SEPARATOR" "$ECS_CB_LOGGING_XML_AWK" "$xml_file" 2>/dev/null)
+  rm -f -- "$xml_file"
+
+  if [ ${#ids[@]} -eq 0 ]; then
+    printf '  logging subsystem に file handler / async-handler が見つかりませんでした。\n' >> "$out_file"
+    return 0
+  fi
+
+  index=0
+  while [ "$index" -lt ${#ids[@]} ]; do
+    detail=""
+    [ -n "${autoflush[$index]}" ] && detail="${detail} autoflush=${autoflush[$index]}"
+    [ -n "${append[$index]}" ]    && detail="${detail} append=${append[$index]}"
+    [ -n "${paths[$index]}" ]     && detail="${detail} path=${paths[$index]}"
+    [ -n "${relatives[$index]}" ] && detail="${detail} relative-to=${relatives[$index]}"
+    [ -n "${suffixes[$index]}" ]  && detail="${detail} suffix=${suffixes[$index]}"
+    [ -n "${queues[$index]}" ]    && detail="${detail} queue-length=${queues[$index]}"
+    [ -n "${overflows[$index]}" ] && detail="${detail} overflow-action=${overflows[$index]}"
+    [ -n "${subhandlers[$index]}" ] && detail="${detail} subhandler=${subhandlers[$index]}"
+    printf '  %s %s :%s\n' "${types[$index]}" "${names[$index]:-(無名)}" "${detail:- (属性なし)}" >> "$out_file"
+    case "${append[$index]}" in
+      false|FALSE|False)
+        printf '    → append="false" のため、reload による再オープンでファイルが切り詰められます。\n' >> "$out_file"
+        printf '       reload を挟むなら append="true" にしてください。\n' >> "$out_file"
+        line_written="true"
+        ;;
+    esac
+    case "${autoflush[$index]}" in
+      false|FALSE|False)
+        printf '    → autoflush="false" のため、SIGKILL 時にバッファの内容が失われます。\n' >> "$out_file"
+        line_written="true"
+        ;;
+    esac
+    if [ "${types[$index]}" = "async-handler" ]; then
+      printf '    → async-handler のキューに残った行は、SIGKILL では書き出されません。\n' >> "$out_file"
+      line_written="true"
+    fi
+    index=$(( index + 1 ))
+  done
+  if [ "$line_written" != "true" ]; then
+    printf '  切り詰め・未フラッシュにつながる設定 (append="false" / autoflush="false" / async-handler) はありません。\n' >> "$out_file"
+    printf '  それでも切れる場合は、SIGKILL による書きかけの行の途切れが原因です。\n' >> "$out_file"
+  fi
+  return 0
+}
+
+# 停止と重ねる :reload をバックグラウンドで流し込む。reload は数秒かかるため、
+# 先に投げてから ECS_CB_RELOAD_DELAY 秒後に停止を始めることで、ECS 上で
+# 「reload の最中に停止が入る」のと同じ重なりを作る。
+ECS_CB_RELOAD_PID=""
+ECS_CB_RELOAD_OUTPUT=""
+ecs_cb_start_reload() {
+  local container_id="$1" cli_path="$2"
+  ECS_CB_RELOAD_PID=""
+  ECS_CB_RELOAD_OUTPUT=""
+  [ -n "$cli_path" ] || return 1
+  if ! ECS_CB_RELOAD_OUTPUT="$(mktemp 2>/dev/null)"; then
+    ECS_CB_RELOAD_OUTPUT=""
+    return 1
+  fi
+  docker exec "$container_id" /bin/sh -c '
+    # ecs-cb-reload: 停止と重ねる :reload
+    ecs_cli="$1"
+    printf "実行: %s -c --command=:reload\n" "$ecs_cli"
+    "$ecs_cli" -c --command=:reload 2>&1
+    ecs_status=$?
+    printf "exit=%s\n" "$ecs_status"
+    exit "$ecs_status"
+  ' _ "$cli_path" > "$ECS_CB_RELOAD_OUTPUT" 2>&1 &
+  ECS_CB_RELOAD_PID="$!"
+  return 0
+}
+
+# 流し込んだ :reload の結果を回収する。停止に巻き込まれて失敗するのが正常な経路の
+# ため、失敗しても警告にはしない (そのことも再現結果として記録する)。
+ecs_cb_collect_reload_result() {
+  local out_file="$1" status=0 text=""
+  [ -n "$ECS_CB_RELOAD_PID" ] || return 0
+  wait "$ECS_CB_RELOAD_PID" 2>/dev/null || status=$?
+  ECS_CB_RELOAD_PID=""
+  if [ -n "$ECS_CB_RELOAD_OUTPUT" ] && [ -s "$ECS_CB_RELOAD_OUTPUT" ]; then
+    text="$(tr '\n' ' ' < "$ECS_CB_RELOAD_OUTPUT" | sed -e 's/  */ /g' -e 's/ $//' | cut -c 1-300)"
+  fi
+  [ -n "$ECS_CB_RELOAD_OUTPUT" ] && rm -f -- "$ECS_CB_RELOAD_OUTPUT"
+  ECS_CB_RELOAD_OUTPUT=""
+  if [ "$status" -eq 0 ]; then
+    printf '    reload 結果   : 完了しました (%s)\n' "${text:-(出力なし)}" >> "$out_file"
+  else
+    printf '    reload 結果   : 停止に巻き込まれて中断しました (exit=%s, %s)\n' \
+        "$status" "${text:-(出力なし)}" >> "$out_file"
+  fi
+  return 0
+}
+
+# ECS と同じ手順でコンテナを停止する (SIGTERM → stopTimeout → SIGKILL)。
+# 経過時間と終了コードから、SIGKILL まで至ったかどうかを判定する。
+ECS_CB_STOP_ELAPSED="0"
+ECS_CB_STOP_EXIT=""
+ECS_CB_STOP_KILLED="false"
+ECS_CB_STOP_REASON=""
+ecs_cb_stop_task() {
+  local container_id="$1" started ended status=0 state exit_code=""
+  ECS_CB_STOP_ELAPSED="0"
+  ECS_CB_STOP_EXIT=""
+  ECS_CB_STOP_KILLED="false"
+  ECS_CB_STOP_REASON=""
+  started="$(date +%s)"
+  docker stop -t "$ECS_CB_STOP_TIMEOUT" "$container_id" >/dev/null 2>&1 || status=$?
+  ended="$(date +%s)"
+  ECS_CB_STOP_ELAPSED=$(( ended - started ))
+  [ "$ECS_CB_STOP_ELAPSED" -ge 0 ] || ECS_CB_STOP_ELAPSED=0
+  state="$(docker inspect -f 'ecs-cb-exit:{{.State.ExitCode}}' "$container_id" 2>/dev/null || true)"
+  case "$state" in
+    ecs-cb-exit:*) exit_code="${state#ecs-cb-exit:}" ;;
+  esac
+  ECS_CB_STOP_EXIT="$exit_code"
+  # 137 = 128 + 9 (SIGKILL)。stopTimeout を待ち切った場合も SIGKILL 扱いとする。
+  # どちらで判断したのかは表示に出す (経過時間と食い違って見えないようにする)。
+  if [ "$exit_code" = "137" ]; then
+    ECS_CB_STOP_KILLED="true"
+    ECS_CB_STOP_REASON="終了コード 137 (128 + SIGKILL)"
+  elif [ "$ECS_CB_STOP_ELAPSED" -ge "$ECS_CB_STOP_TIMEOUT" ]; then
+    ECS_CB_STOP_KILLED="true"
+    ECS_CB_STOP_REASON="stopTimeout ${ECS_CB_STOP_TIMEOUT}s を過ぎても終了しなかったため"
+  fi
+  return "$status"
+}
+
+# 停止前後の server.log を突き合わせ、切れているかどうかと切れ方を判定する。
+# 判定できた根拠を digest へ書き出し、切れていれば 0 を返す。
+ecs_cb_judge_truncation() {
+  local before_file="$1" after_file="$2" stdout_file="$3" out_file="$4"
+  local before_stats after_stats
+  local before_bytes before_lines before_newline before_last
+  local after_bytes after_lines after_newline after_last
+  local last_time stdout_last_time missing=0 truncated="false"
+
+  before_stats="$(ecs_cb_log_stats "$before_file")"
+  after_stats="$(ecs_cb_log_stats "$after_file")"
+  before_bytes="${before_stats%%"$ECS_CB_SEPARATOR"*}"
+  before_stats="${before_stats#*"$ECS_CB_SEPARATOR"}"
+  before_lines="${before_stats%%"$ECS_CB_SEPARATOR"*}"
+  before_stats="${before_stats#*"$ECS_CB_SEPARATOR"}"
+  before_newline="${before_stats%%"$ECS_CB_SEPARATOR"*}"
+  before_last="${before_stats#*"$ECS_CB_SEPARATOR"}"
+  after_bytes="${after_stats%%"$ECS_CB_SEPARATOR"*}"
+  after_stats="${after_stats#*"$ECS_CB_SEPARATOR"}"
+  after_lines="${after_stats%%"$ECS_CB_SEPARATOR"*}"
+  after_stats="${after_stats#*"$ECS_CB_SEPARATOR"}"
+  after_newline="${after_stats%%"$ECS_CB_SEPARATOR"*}"
+  after_last="${after_stats#*"$ECS_CB_SEPARATOR"}"
+
+  printf '    停止前        : %s bytes / %s 行 / 末尾の改行 %s\n' \
+      "$before_bytes" "$before_lines" "$([ "$before_newline" = "yes" ] && printf 'あり' || printf 'なし')" >> "$out_file"
+  [ -n "$before_last" ] && printf '      最終行      : %s\n' "$before_last" >> "$out_file"
+  printf '    停止後        : %s bytes / %s 行 / 末尾の改行 %s\n' \
+      "$after_bytes" "$after_lines" "$([ "$after_newline" = "yes" ] && printf 'あり' || printf 'なし')" >> "$out_file"
+  [ -n "$after_last" ] && printf '      最終行      : %s\n' "$after_last" >> "$out_file"
+
+  printf '    判定の根拠    :\n' >> "$out_file"
+  if [ "$after_bytes" -lt "$before_bytes" ]; then
+    printf '      - 停止後のファイルが停止前より %s bytes 小さい\n' \
+        "$(( before_bytes - after_bytes ))" >> "$out_file"
+    printf '        → reload が file handler を開き直したときに切り詰められています\n' >> "$out_file"
+    printf '          (logging subsystem の append="false")。\n' >> "$out_file"
+    truncated="true"
+  fi
+  if [ "$after_bytes" -gt 0 ] && [ "$after_newline" != "yes" ]; then
+    printf '      - 末尾が改行で終わっていない\n' >> "$out_file"
+    printf '        → 書きかけの 1 行が SIGKILL で途切れています。\n' >> "$out_file"
+    truncated="true"
+  fi
+  last_time="$(ecs_cb_last_log_time "$after_file" || true)"
+  stdout_last_time="$(ecs_cb_last_log_time "$stdout_file" || true)"
+  if [ -n "$last_time" ] && [ -n "$stdout_last_time" ]; then
+    printf '    最終時刻      : server.log %s / 標準出力 %s\n' "$last_time" "$stdout_last_time" >> "$out_file"
+    if [ "$stdout_last_time" \> "$last_time" ]; then
+      missing="$(ecs_cb_count_lines_after "$stdout_file" "$last_time")"
+      printf '      - 標準出力には server.log の最終時刻より後の行が %s 行ある\n' "$missing" >> "$out_file"
+      printf '        → file handler のバッファ / async-handler のキューに残った分が\n' >> "$out_file"
+      printf '          書き出されないまま失われています。\n' >> "$out_file"
+      truncated="true"
+    fi
+  fi
+  # WFLYSRV0050 はサーバーの停止完了。これが無いまま終わっていれば、終了処理を
+  # 完走できずに落とされたことがログからも裏付けられる。
+  if [ -s "$after_file" ] && ! grep -q 'WFLYSRV0050' "$after_file" 2>/dev/null; then
+    printf '      - 停止完了のログ (WFLYSRV0050) が server.log に無い\n' >> "$out_file"
+    printf '        → 終了処理を完走できないまま落とされています。\n' >> "$out_file"
+  fi
+  if [ "$truncated" != "true" ]; then
+    printf '      - 切断を示す差は見つかりませんでした。\n' >> "$out_file"
+    printf '        (reload が停止より先に終わった / append="true" かつ autoflush="true" の場合)\n' >> "$out_file"
+    printf '    判定          : 切れていません\n' >> "$out_file"
+    return 1
+  fi
+  printf '    判定          : server.log が途中で切れています\n' >> "$out_file"
+  return 0
+}
+
+# 切れた server.log を成果物として残す。--report-dir も出力先指定も無い実行では
+# 保存しない (一時ファイルへ置いても後始末で消えるため)。
+# 保存先はコマンド置換で受け取れないため (配列への追記が失われる)、グローバルへ入れる。
+ECS_CB_LAST_SAVED_PATH=""
+ecs_cb_save_server_log() {
+  local after_file="$1" service_name="$2" attempt="$3" safe_name path
+  ECS_CB_LAST_SAVED_PATH=""
+  [ "$ECS_CB_SAVE_SERVER_LOG" = "true" ] || return 1
+  [ -s "$after_file" ] || return 1
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  path="$(prepare_analysis_output "" "false" "log" "ファイル" \
+      "_ecs_circuit_breaker_${safe_name}_${attempt}" "ECS サーキットブレーカ再現の server.log")"
+  [ -n "$path" ] || return 1
+  cp -- "$after_file" "$path" 2>/dev/null || return 1
+  ECS_CB_SAVED_LOGS+=("$path")
+  ECS_CB_LAST_SAVED_PATH="$path"
+  return 0
+}
+
+# 停止したタスクを置き換える (ECS のタスク置き換えに相当)。
+ecs_cb_replace_task() {
+  local -a services=("$@")
+  local status=0
+  [ ${#services[@]} -gt 0 ] || return 1
+  "${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" up -d --no-build --force-recreate \
+      "${services[@]}" >/dev/null 2>&1 || status=$?
+  return "$status"
+}
+
+# 置き換えたタスクが healthy になるか unhealthy になるかを待つ。
+#   0 : healthy になった (ECS ならデプロイ成功。サーキットブレーカは開かない)
+#   1 : unhealthy になった (次の失敗タスクとして数える)
+#   2 : 期限内に判定がつかなかった
+ecs_cb_wait_after_replace() {
+  local service_name="$1" wait_seconds="$2" out_file="$3"
+  local deadline now cid state status
+  now="$(date +%s)"
+  deadline=$(( now + wait_seconds ))
+  while :; do
+    cid="$(compose_container_ids "$service_name" | head -n 1)"
+    if [ -n "$cid" ]; then
+      state="$(ecs_cb_health_state "$cid")"
+      status="${state%%|*}"
+      case "$status" in
+        healthy)
+          printf '    置き換え後    : healthy になりました (ECS ならデプロイ成功)\n' >> "$out_file"
+          return 0
+          ;;
+        unhealthy)
+          printf '    置き換え後    : 再び unhealthy になりました (連続失敗 %s 回)\n' \
+              "${state#*|}" >> "$out_file"
+          return 1
+          ;;
+      esac
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      printf '    置き換え後    : %ss 以内に healthy / unhealthy のどちらにもなりませんでした\n' \
+          "$wait_seconds" >> "$out_file"
+      return 2
+    fi
+    sleep "$STARTUP_INTERVAL"
+  done
+}
+
+# 1 回分の停止 (SIGTERM → stopTimeout → SIGKILL) を行い、server.log の切断を判定する。
+# reload の注入・採取・保存までを含む。切断を検出したら 0 を返す。
+ecs_cb_run_stop_cycle() {
+  local service_name="$1" attempt="$2" out_file="$3"
+  local cid container_name state home server_log cli_path
+  local before_file after_file stdout_file truncated=1
+
+  cid="$(compose_container_ids "$service_name" | head -n 1)"
+  if [ -z "$cid" ]; then
+    printf '  サービス %s : 実行中のコンテナが見つからないため停止できません。\n' \
+        "$service_name" >> "$out_file"
+    return 1
+  fi
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+  state="$(ecs_cb_health_state "$cid")"
+
+  printf '  サービス %s (コンテナ: %s)\n' "$service_name" "$container_name" >> "$out_file"
+  if [ -n "$state" ]; then
+    printf '    healthcheck   : %s / 連続失敗 %s 回\n' "${state%%|*}" "${state#*|}" >> "$out_file"
+  else
+    printf '    healthcheck   : 未定義 (ECS では healthCheck の無いコンテナは UNHEALTHY になりません)\n' >> "$out_file"
+  fi
+  printf '    healthcheck 設定: %s\n' "$(ecs_cb_health_settings_line "$cid")" >> "$out_file"
+
+  home="$(jboss_detect_home "$cid")"
+  server_log="$(ecs_cb_resolve_server_log "$cid" "$home")"
+  before_file=""
+  after_file=""
+  stdout_file=""
+  if [ -n "$server_log" ]; then
+    printf '    server.log    : %s\n' "$server_log" >> "$out_file"
+    before_file="$(mktemp 2>/dev/null || printf '')"
+    after_file="$(mktemp 2>/dev/null || printf '')"
+    stdout_file="$(mktemp 2>/dev/null || printf '')"
+    if [ -n "$before_file" ] && ! ecs_cb_copy_server_log "$cid" "$server_log" "$before_file"; then
+      printf '    停止前        : 取り出せませんでした (docker cp)\n' >> "$out_file"
+      rm -f -- "$before_file"
+      before_file=""
+    fi
+  else
+    printf '    server.log    : 見つかりませんでした (--ecs-server-log で指定できます)\n' >> "$out_file"
+  fi
+
+  # reload を先に投げてから停止を始める。ECS 上で「reload の最中に停止が入る」のと
+  # 同じ重なりを作るのがこの機能の核で、ここで初めて server.log が切れる条件が整う。
+  cli_path=""
+  if [ "$ECS_CB_RELOAD" = "true" ]; then
+    cli_path="$(ecs_cb_resolve_cli "$cid")"
+    if [ -n "$cli_path" ] && ecs_cb_start_reload "$cid" "$cli_path"; then
+      ECS_CB_RELOADS=$(( ECS_CB_RELOADS + 1 ))
+      printf '    reload        : %s -c --command=:reload を実行しました (%ss 後に停止します)\n' \
+          "$cli_path" "$ECS_CB_RELOAD_DELAY" >> "$out_file"
+      [ "$ECS_CB_RELOAD_DELAY" != "0" ] && sleep "$ECS_CB_RELOAD_DELAY"
+    else
+      printf '    reload        : jboss-cli.sh が無いため注入できませんでした\n' >> "$out_file"
+      printf '                    (JBoss EAP 以外のコンテナでは、停止だけを再現します)\n' >> "$out_file"
+    fi
+  else
+    printf '    reload        : 注入しません (--no-ecs-circuit-breaker-reload)\n' >> "$out_file"
+  fi
+
+  # 標準出力側のログは停止前に控えておく。停止後に取り直すと、SIGTERM 以降の
+  # 終了ログまで入って「server.log に無い行」が多く見えてしまう。
+  if [ -n "$stdout_file" ]; then
+    compose_logs "$service_name" 2>/dev/null | strip_ansi_codes > "$stdout_file" || true
+  fi
+
+  ecs_cb_stop_task "$cid" || true
+  ECS_CB_ATTEMPTS=$(( ECS_CB_ATTEMPTS + 1 ))
+  if [ "$ECS_CB_STOP_KILLED" = "true" ]; then
+    ECS_CB_KILLED=$(( ECS_CB_KILLED + 1 ))
+    printf '    停止          : SIGTERM では終了せず SIGKILL で落とされました (経過 %ss, exit=%s)\n' \
+        "$ECS_CB_STOP_ELAPSED" "${ECS_CB_STOP_EXIT:-不明}" >> "$out_file"
+    printf '                    判断の根拠: %s / 猶予は stopTimeout %ss\n' \
+        "${ECS_CB_STOP_REASON:-不明}" "$ECS_CB_STOP_TIMEOUT" >> "$out_file"
+  else
+    printf '    停止          : SIGTERM で終了しました (経過 %ss, exit=%s)\n' \
+        "$ECS_CB_STOP_ELAPSED" "${ECS_CB_STOP_EXIT:-不明}" >> "$out_file"
+  fi
+  ecs_cb_collect_reload_result "$out_file"
+
+  if [ -n "$after_file" ]; then
+    if [ -n "$server_log" ] && ecs_cb_copy_server_log "$cid" "$server_log" "$after_file"; then
+      if [ -n "$before_file" ]; then
+        if ecs_cb_judge_truncation "$before_file" "$after_file" "$stdout_file" "$out_file"; then
+          truncated=0
+          ECS_CB_TRUNCATED=$(( ECS_CB_TRUNCATED + 1 ))
+        fi
+      else
+        printf '    判定          : 停止前を取り出せなかったため比較できません\n' >> "$out_file"
+      fi
+      if ecs_cb_save_server_log "$after_file" "$service_name" "$attempt"; then
+        printf '    保存          : %s\n' "$ECS_CB_LAST_SAVED_PATH" >> "$out_file"
+      fi
+    else
+      printf '    停止後        : 取り出せませんでした (docker cp)\n' >> "$out_file"
+    fi
+  fi
+
+  [ -n "$before_file" ] && rm -f -- "$before_file"
+  [ -n "$after_file" ] && rm -f -- "$after_file"
+  [ -n "$stdout_file" ] && rm -f -- "$stdout_file"
+  return "$truncated"
+}
+
+# ECS サーキットブレーカによるタスク停止を再現する。
+#   第 1 引数 : 契機 ("unhealthy" = 必須コンテナが unhealthy / "drill" = 意図的な再現)
+# 戻り値:
+#   0 : サーキットブレーカは開かなかった (置き換えで復旧した / 訓練実行が終わった)
+#   1 : サーキットブレーカが開いた (ECS ならロールバック。呼び出し側は失敗として扱う)
+run_ecs_circuit_breaker() {
+  local trigger="${1:-unhealthy}"
+  local attempts attempt=0 svc wait_seconds cid replace_status
+  local opened="false" recovered="false"
+  local -a services=()
+
+  [ "$ECS_CB_DONE" = "true" ] && return 0
+  if ! ecs_circuit_breaker_enabled; then
+    ECS_CB_DONE="true"
+    if [ "$ECS_CIRCUIT_BREAKER" != "true" ]; then
+      ECS_CB_SKIP_REASON="--no-ecs-circuit-breaker が指定されたため再現していません。"
+    elif [ "$DRY_RUN" = "true" ]; then
+      ECS_CB_SKIP_REASON="DRY-RUN のため再現していません。"
+    else
+      ECS_CB_SKIP_REASON="コンテナを起動していないため再現していません。"
+    fi
+    return 0
+  fi
+  ECS_CB_DONE="true"
+
+  mapfile -t services < <(ecs_cb_essential_services)
+  if [ ${#services[@]} -eq 0 ]; then
+    ECS_CB_SKIP_REASON="必須コンテナとして扱う Compose サービスを特定できませんでした。"
+    return 0
+  fi
+  if ! ECS_CB_DIGEST_FILE="$(mktemp 2>/dev/null)"; then
+    ECS_CB_DIGEST_FILE=""
+    ECS_CB_SKIP_REASON="再現結果の保存用一時ファイルを作成できませんでした。"
+    warn "ECS サーキットブレーカ再現用の一時ファイルを作成できませんでした。"
+    return 0
+  fi
+  : > "$ECS_CB_DIGEST_FILE"
+
+  attempts="$ECS_CB_THRESHOLD"
+  if [ "$trigger" = "drill" ]; then
+    # 訓練実行は正常なタスクを止めるため、置き換えの往復はせず 1 回で終える。
+    attempts=1
+    ECS_CB_TRIGGER_SUMMARY="--ecs-circuit-breaker-drill による意図的な再現 (healthcheck の失敗を注入)"
+  elif [ -n "$ECS_CB_TRIGGER_SERVICE" ]; then
+    ECS_CB_TRIGGER_SUMMARY="必須コンテナ '${ECS_CB_TRIGGER_SERVICE}' の healthcheck が unhealthy (連続失敗 ${ECS_CB_TRIGGER_STREAK} 回)"
+  else
+    ECS_CB_TRIGGER_SUMMARY="必須コンテナの healthcheck が unhealthy"
+  fi
+
+  {
+    printf '契機              : %s\n' "$ECS_CB_TRIGGER_SUMMARY"
+    printf '必須コンテナ      : %s\n' "${services[*]}"
+    printf '                    (ECS はタスク内の全コンテナを止めますが、ここでは DB や\n'
+    printf '                     モックを巻き込まないよう上のサービスだけを停止します。\n'
+    printf '                     --ecs-essential-service で追加できます)\n'
+    if [ "$trigger" = "drill" ]; then
+      printf 'サーキットブレーカ: 訓練実行のため、置き換えは行わず 1 回だけ停止します\n'
+    elif [ "$ECS_CB_THRESHOLD" = "3" ]; then
+      printf 'サーキットブレーカ: 失敗タスク %s 回でデプロイ失敗と判定 (ECS の閾値の最小値と同じ)\n' "$ECS_CB_THRESHOLD"
+    else
+      printf 'サーキットブレーカ: 失敗タスク %s 回でデプロイ失敗と判定 (--ecs-circuit-breaker-threshold での指定)\n' "$ECS_CB_THRESHOLD"
+    fi
+    printf '停止手順          : SIGTERM → %ss (stopTimeout) → SIGKILL\n' "$ECS_CB_STOP_TIMEOUT"
+    if [ "$ECS_CB_RELOAD" = "true" ]; then
+      printf 'reload の注入     : 有効 (jboss-cli.sh -c --command=:reload を停止の %ss 前に実行)\n' \
+          "$ECS_CB_RELOAD_DELAY"
+    else
+      printf 'reload の注入     : 無効 (--no-ecs-circuit-breaker-reload)\n'
+    fi
+  } >> "$ECS_CB_DIGEST_FILE"
+
+  ECS_CB_TRIGGERED="true"
+  log "ECS サーキットブレーカによるタスク停止を再現します (${ECS_CB_TRIGGER_SUMMARY}) ..."
+  log "  停止手順: SIGTERM → ${ECS_CB_STOP_TIMEOUT}s → SIGKILL / 対象サービス: ${services[*]}"
+
+  # logging subsystem の設定は、停止前の起動中コンテナからしか読めない。
+  # server.log が「どう切れるのか」の根拠になるため、停止を始める前に採取する。
+  for svc in "${services[@]}"; do
+    [ -n "$svc" ] || continue
+    cid="$(compose_container_ids "$svc" | head -n 1)"
+    if [ -n "$cid" ] && [ -n "$(jboss_detect_home "$cid")" ]; then
+      ecs_cb_report_logging_config "$cid" "$svc" "$ECS_CB_DIGEST_FILE"
+      break
+    fi
+  done
+
+  while :; do
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -le "$attempts" ] || break
+    if [ "$trigger" = "drill" ]; then
+      printf '\n[停止 %s/%s] ECS と同じ手順でタスクを停止します\n' "$attempt" "$attempts" >> "$ECS_CB_DIGEST_FILE"
+    else
+      printf '\n[失敗タスク %s/%s] ECS はこのタスクを停止して置き換えます\n' \
+          "$attempt" "$attempts" >> "$ECS_CB_DIGEST_FILE"
+    fi
+    log "  [${attempt}/${attempts}] タスクを停止します ..."
+
+    for svc in "${services[@]}"; do
+      [ -n "$svc" ] || continue
+      ecs_cb_run_stop_cycle "$svc" "$attempt" "$ECS_CB_DIGEST_FILE" || true
+    done
+
+    if [ "$attempt" -ge "$attempts" ]; then
+      break
+    fi
+    # ECS はタスクを置き換える。置き換えた先が healthy になればデプロイは成功し、
+    # サーキットブレーカは開かない。ここでも同じ判定を行う。
+    log "  タスクを置き換えます (compose up -d --force-recreate ${services[*]}) ..."
+    printf '  置き換え      : compose up -d --force-recreate %s\n' "${services[*]}" >> "$ECS_CB_DIGEST_FILE"
+    replace_status=0
+    ecs_cb_replace_task "${services[@]}" || replace_status=$?
+    if [ "$replace_status" -ne 0 ]; then
+      printf '    置き換え後    : 置き換えに失敗しました (compose up, exit=%s)\n' \
+          "$replace_status" >> "$ECS_CB_DIGEST_FILE"
+      continue
+    fi
+    cid="$(compose_container_ids "${services[0]}" | head -n 1)"
+    wait_seconds="$(ecs_cb_replace_wait_seconds "${cid:-${services[0]}}")"
+    log "  置き換えたタスクの判定を待ちます (最大 ${wait_seconds}s) ..."
+    ecs_cb_wait_after_replace "${services[0]}" "$wait_seconds" "$ECS_CB_DIGEST_FILE" || replace_status=$?
+    if [ "$replace_status" -eq 0 ]; then
+      recovered="true"
+      break
+    fi
+  done
+
+  if [ "$recovered" = "true" ]; then
+    printf '\n[サーキットブレーカ]\n' >> "$ECS_CB_DIGEST_FILE"
+    printf '  失敗タスク %s / 閾値 %s。置き換えたタスクが healthy になったため、\n' \
+        "$ECS_CB_ATTEMPTS" "$ECS_CB_THRESHOLD" >> "$ECS_CB_DIGEST_FILE"
+    printf '  サーキットブレーカは開きません (ECS ならデプロイは成功として続きます)。\n' >> "$ECS_CB_DIGEST_FILE"
+  elif [ "$trigger" = "drill" ]; then
+    printf '\n[サーキットブレーカ]\n' >> "$ECS_CB_DIGEST_FILE"
+    printf '  訓練実行のため、失敗タスクとしては数えていません。\n' >> "$ECS_CB_DIGEST_FILE"
+  else
+    opened="true"
+    ECS_CB_OPENED="true"
+    printf '\n[サーキットブレーカ]\n' >> "$ECS_CB_DIGEST_FILE"
+    printf '  失敗タスク %s / 閾値 %s → サーキットブレーカが開きました。\n' \
+        "$ECS_CB_ATTEMPTS" "$ECS_CB_THRESHOLD" >> "$ECS_CB_DIGEST_FILE"
+    printf '  ECS はデプロイを失敗と判定し、直前の安定版へロールバックします。\n' >> "$ECS_CB_DIGEST_FILE"
+  fi
+
+  ecs_cb_write_remedy "$ECS_CB_DIGEST_FILE"
+
+  if [ "$ECS_CB_TRUNCATED" -gt 0 ]; then
+    ECS_CB_VERDICT="再現しました (停止 ${ECS_CB_ATTEMPTS} 回のうち ${ECS_CB_TRUNCATED} 回で server.log が途中で切れました / SIGKILL ${ECS_CB_KILLED} 回)"
+  elif [ "$ECS_CB_ATTEMPTS" -gt 0 ]; then
+    ECS_CB_VERDICT="停止は再現しましたが、server.log の切断は起きませんでした (停止 ${ECS_CB_ATTEMPTS} 回 / SIGKILL ${ECS_CB_KILLED} 回)"
+  else
+    ECS_CB_VERDICT="停止できるコンテナがありませんでした"
+  fi
+  printf '\n総合判定          : %s\n' "$ECS_CB_VERDICT" >> "$ECS_CB_DIGEST_FILE"
+
+  # テキストへの出力。--report-dir も出力先指定も無い実行では出さない。
+  if [ "$ECS_CB_TEXT_ENABLED" = "true" ] && [ -s "$ECS_CB_DIGEST_FILE" ]; then
+    local text_path
+    text_path="$(prepare_analysis_output \
+        "$ECS_CB_TEXT" "$ECS_CB_TEXT_SET" "txt" "テキスト" \
+        "_ecs_circuit_breaker" "ECS サーキットブレーカ再現")"
+    if [ -n "$text_path" ]; then
+      if ecs_cb_write_text "$text_path" && [ -s "$text_path" ]; then
+        ECS_CB_TEXT_OUTPUT="$text_path"
+      else
+        warn "ECS サーキットブレーカ再現のテキストを出力できませんでした: $text_path"
+      fi
+    fi
+  fi
+
+  show_ecs_circuit_breaker_result
+  [ "$opened" = "true" ] && return 1
+  return 0
+}
+
+# 事象への対処方法を書き出す。再現できたかどうかに関わらず、同じ並びで残す。
+ecs_cb_write_remedy() {
+  local out_file="$1"
+  {
+    printf '\n[この事象への対処]\n'
+    printf '  1. 停止と reload を重ねない\n'
+    printf '     起動時の設定変更を entrypoint の jboss-cli で行っている場合、reload が\n'
+    printf '     終わるまで healthcheck を成功させない (start_period を reload の所要時間\n'
+    printf '     より長くする) か、設定をイメージへ焼き込んで reload そのものを無くす。\n'
+    printf '  2. logging subsystem を切り詰めない設定にする\n'
+    printf '     file handler は append="true" / autoflush="true" にする。append="false"\n'
+    printf '     の handler は reload の再オープンでファイルを切り詰める。\n'
+    printf '  3. SIGKILL までの猶予を延ばす\n'
+    printf '     タスク定義の stopTimeout (既定 30 秒) を、reload と停止処理が終わる長さ\n'
+    printf '     まで延ばす。ECS_CONTAINER_STOP_TIMEOUT (コンテナエージェント) も同じ。\n'
+    printf '  4. server.log に頼らず標準出力を残す\n'
+    printf '     CONSOLE handler の出力は awslogs / CloudWatch Agent 経由で残るため、\n'
+    printf '     SIGKILL されても切れない。調査に使うログはこちらを正とする。\n'
+    printf '  5. サーキットブレーカが開く前に気付く\n'
+    printf '     healthcheck の command / start_period / retries を実際の起動時間に\n'
+    printf '     合わせる。起動が間に合わないだけで UNHEALTHY になり、タスクが\n'
+    printf '     置き換わり続ける。\n'
+  } >> "$out_file"
+}
+
+# 再現結果を画面へ出す。既定では出す (事象そのものの再現であり、ここを省くと
+# 何が起きたのか分からなくなるため)。--no-ecs-circuit-breaker-display で止められる。
+show_ecs_circuit_breaker_result() {
+  if [ "$ECS_CB_DISPLAY" != "true" ]; then
+    if [ -n "$ECS_CB_TEXT_OUTPUT" ]; then
+      log "ECS サーキットブレーカ再現のテキストを出力しました (画面表示は --no-ecs-circuit-breaker-display により省略): $ECS_CB_TEXT_OUTPUT"
+    else
+      log "ECS サーキットブレーカによるタスク停止を再現しました (画面表示は --no-ecs-circuit-breaker-display により省略)。"
+    fi
+    return 0
+  fi
+  if [ -n "$ECS_CB_DIGEST_FILE" ] && [ -s "$ECS_CB_DIGEST_FILE" ]; then
+    diag ""
+    diag "==================================================================="
+    diag "ECS サーキットブレーカによるタスク停止の再現"
+    diag "==================================================================="
+    cat -- "$ECS_CB_DIGEST_FILE" >&2
+    diag "==================================================================="
+  elif [ -n "$ECS_CB_SKIP_REASON" ]; then
+    log "ECS サーキットブレーカ再現: ${ECS_CB_SKIP_REASON}"
+    return 0
+  fi
+  if [ "$ECS_CB_TRUNCATED" -gt 0 ]; then
+    warn "ECS サーキットブレーカ再現: ${ECS_CB_VERDICT}"
+  else
+    log "ECS サーキットブレーカ再現: ${ECS_CB_VERDICT}"
+  fi
+  if [ -n "$ECS_CB_TEXT_OUTPUT" ]; then
+    log "ECS サーキットブレーカ再現のテキストを出力しました: $ECS_CB_TEXT_OUTPUT"
+  elif [ "$ECS_CB_TEXT_ENABLED" != "true" ]; then
+    log "ECS サーキットブレーカ再現のテキスト出力は --no-ecs-circuit-breaker-text により行いません。"
+  elif [ -z "$BUILD_REPORT_DIR" ]; then
+    log "ECS サーキットブレーカ再現のファイル出力は、--report-dir または --ecs-circuit-breaker-text の指定時に行います。"
+  fi
+  local saved
+  for saved in ${ECS_CB_SAVED_LOGS[@]+"${ECS_CB_SAVED_LOGS[@]}"}; do
+    log "  切れたままの server.log を保存しました: $saved"
+  done
+  return 0
+}
+
+# 再現結果をテキストファイルへ書き出す (画面表示と同じ内容)。
+ecs_cb_write_text() {
+  local path="$1"
+  {
+    printf '===================================================================\n'
+    printf 'build_and_verify.sh ECS サーキットブレーカによるタスク停止の再現\n'
+    printf '===================================================================\n'
+    printf '処理開始日時 : %s\n' "$RUN_STARTED_AT"
+    printf '出力日時     : %s\n' "$(now_display_time)"
+    printf 'Compose 定義 : %s\n' "$COMPOSE_FILE"
+    printf '\n'
+    cat -- "$ECS_CB_DIGEST_FILE"
+  } > "$path" 2>/dev/null || return 1
+  return 0
+}
+
+# 全量レポートへ ECS サーキットブレーカ再現の結果を追記する。
+append_ecs_circuit_breaker_report() {
+  local report_file="$1"
+
+  if [ "$ECS_CB_TRIGGERED" != "true" ] || [ -z "$ECS_CB_DIGEST_FILE" ] \
+      || [ ! -s "$ECS_CB_DIGEST_FILE" ]; then
+    if [ -n "$ECS_CB_SKIP_REASON" ]; then
+      printf '%s\n' "$ECS_CB_SKIP_REASON" >> "$report_file"
+    elif [ "$ECS_CIRCUIT_BREAKER" = "true" ]; then
+      printf '%s\n' "必須コンテナが unhealthy にならなかったため、再現は行っていません (ECS でもタスクは停止されません)。" >> "$report_file"
+      printf '%s\n' "正常な実行でも意図的に再現するには --ecs-circuit-breaker-drill を指定してください。" >> "$report_file"
+    else
+      printf '%s\n' "--no-ecs-circuit-breaker が指定されたため再現していません。" >> "$report_file"
+    fi
+    return 0
+  fi
+  if [ -n "$ECS_CB_TEXT_OUTPUT" ]; then
+    printf 'テキスト      : %s (この節と同じ内容)\n' "$ECS_CB_TEXT_OUTPUT" >> "$report_file"
+  else
+    printf 'テキスト      : (未出力)\n' >> "$report_file"
+  fi
+  local saved
+  for saved in ${ECS_CB_SAVED_LOGS[@]+"${ECS_CB_SAVED_LOGS[@]}"}; do
+    printf '採取した server.log : %s\n' "$saved" >> "$report_file"
+  done
+  printf '停止した回数  : %s 回 (うち SIGKILL %s 回 / reload 注入 %s 回 / 切断を検出 %s 回)\n' \
+      "$ECS_CB_ATTEMPTS" "$ECS_CB_KILLED" "$ECS_CB_RELOADS" "$ECS_CB_TRUNCATED" >> "$report_file"
+  if [ "$ECS_CB_OPENED" = "true" ]; then
+    printf 'サーキットブレーカ: 開きました (ECS ならデプロイを失敗と判定してロールバック)\n' >> "$report_file"
+  else
+    printf 'サーキットブレーカ: 開いていません\n' >> "$report_file"
+  fi
+  printf '総合判定      : %s\n' "${ECS_CB_VERDICT:-(なし)}" >> "$report_file"
+  cat -- "$ECS_CB_DIGEST_FILE" >> "$report_file"
+  return 0
+}
+
+# 起動確認の最中に、必須コンテナが unhealthy になっていないかを見る。
+# 見つけたら ECS_CB_TRIGGER_* へ 1 件目を記録して 0 を返す。ECS はこの時点で
+# タスクを停止するため、compose でも同じ判定にする。
+ecs_cb_find_unhealthy_essential() {
+  local svc cid state status
+  ecs_circuit_breaker_enabled || return 1
+  [ "$ECS_CB_DONE" = "true" ] && return 1
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    while IFS= read -r cid; do
+      [ -n "$cid" ] || continue
+      state="$(ecs_cb_health_state "$cid")"
+      [ -n "$state" ] || continue
+      status="${state%%|*}"
+      [ "$status" = "unhealthy" ] || continue
+      ECS_CB_TRIGGER_SERVICE="$svc"
+      ECS_CB_TRIGGER_STREAK="${state#*|}"
+      return 0
+    done < <(compose_container_ids "$svc")
+  done < <(ecs_cb_essential_services)
+  return 1
+}
+
+# 起動確認のループから呼ぶ。必須コンテナが unhealthy なら ECS と同じ停止を再現し、
+# サーキットブレーカが開いたときだけ 1 を返す (呼び出し側は起動確認失敗として扱う)。
+ecs_cb_check_during_startup() {
+  ecs_cb_find_unhealthy_essential || return 0
+  err "必須コンテナ '${ECS_CB_TRIGGER_SERVICE}' の healthcheck が unhealthy になりました (連続失敗 ${ECS_CB_TRIGGER_STREAK} 回)。"
+  err "  ECS ではこの時点でタスクが停止され、サーキットブレーカによりデプロイがロールバックされます。"
+  err "  同じ挙動を再現します (無効化するには --no-ecs-circuit-breaker)。"
+  if run_ecs_circuit_breaker unhealthy; then
+    return 0
+  fi
+  return 1
+}
+
+# 正常な実行の最後に、意図的に 1 回だけ再現する (--ecs-circuit-breaker-drill)。
+# 環境変数・ツリー・JVM パラメータの収集をすべて終えた後に呼ぶこと
+# (停止したコンテナからは収集できないため)。
+run_ecs_circuit_breaker_drill() {
+  [ "$ECS_CB_DRILL" = "true" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] --ecs-circuit-breaker-drill: ECS のタスク停止 (SIGTERM → ${ECS_CB_STOP_TIMEOUT}s → SIGKILL) を reload と重ねて再現します。"
+    return 0
+  fi
+  if ! ecs_circuit_breaker_enabled; then
+    warn "--ecs-circuit-breaker-drill を指定しましたが、再現できる状態ではありません。"
+    return 0
+  fi
+  if [ "$KEEP_CONTAINER" = "true" ]; then
+    warn "--keep-container を指定していますが、訓練実行では必須コンテナを停止します (停止したまま残します)。"
+  fi
+  log "--ecs-circuit-breaker-drill: 動作確認を終えたので、ECS のタスク停止を意図的に再現します。"
+  run_ecs_circuit_breaker drill || true
+  return 0
+}
+
 write_build_report() {
   local exit_status="$1" overall_status build_status report_dir report_base candidate
   local counter=1 report_tmp report_finished_at cid service_name container_name
@@ -32869,6 +34219,7 @@ write_build_report() {
     printf '                (Excel とテキストは指定が無くても出力。コンテナ未起動でも compose.yml から判定)\n'
     printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
     printf '                コピーしたファイルの取り込み検証は [13] に記載\n'
+    printf '                ECS サーキットブレーカによるタスク停止の再現は [14] に記載\n'
     printf '                (テキストも併せて出力。Host ヘッダーごとの振り分けと実測結果を含む)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
@@ -32996,6 +34347,11 @@ write_build_report() {
   # ここではその明細を書き出すだけとする。
   printf '\n[13] コピーしたファイル (--copy-file) の取り込み検証\n' >> "$report_tmp"
   append_copy_artifact_report "$report_tmp"
+
+  # ECS サーキットブレーカによるタスク停止の再現。停止と採取は検出した時点で
+  # 済ませてあり、ここではその結果を書き出すだけとする。
+  printf '\n[14] ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)\n' >> "$report_tmp"
+  append_ecs_circuit_breaker_report "$report_tmp"
 
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
@@ -33493,6 +34849,12 @@ show_verified_jboss_password_stages
 
 # cwagent の検証結果を終了コードへ反映する (--cwagent-required 指定時のみ)。
 finish_cwagent_verification
+
+# --ecs-circuit-breaker-drill 指定時は、ここまでの収集をすべて終えた後に、
+# ECS のタスク停止 (SIGTERM → stopTimeout → SIGKILL) を jboss-cli の :reload と
+# 重ねて意図的に再現する。コンテナを停止するため、環境変数・ツリー・JVM
+# パラメータの収集より後でなければならない。
+run_ecs_circuit_breaker_drill
 
 if [ "$DRY_RUN" = "true" ]; then
   log "DRY-RUN が完了しました (実際の変更は行われていません)。"

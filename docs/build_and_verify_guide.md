@@ -62,6 +62,7 @@
 | 18 | 後始末でのボリューム削除 (デプロイ先を覆っているボリュームを残さない) | (対話操作をすべて終えた実行では既定で `compose down -v`。常に削除は `--remove-volumes`、残すのは `--keep-volumes`) |
 | 19 | ホスト側システムログ (`/var/log/messages`) への docker 関連ログの抑制 (コンテナログの journald / syslog 経由の流入を防ぐログドライバ差し替えと、docker デーモンが記録する API エラーを出さない存在確認) | (既定で有効。無効化は `--no-suppress-syslog`。増加量の実測は `--syslog-audit`) |
 | 20 | サービス別ビルドログ (`base` / `frontend` / `backend` などサービスごとに切り分けたビルドログのファイル出力と、ビルドエラー時の画面への全量表示) | (既定で自動。出力先は `--report-dir` 配下、指定が無ければ一時ディレクトリ) |
+| 21 | ECS サーキットブレーカによるタスク停止の再現 (必須コンテナの healthcheck 失敗 → SIGTERM → `stopTimeout` → SIGKILL を `jboss-cli` の `:reload` と重ね、`server.log` が途中で切れる事象を再現・判定する) | (起動確認時に既定で自動。必須コンテナが `unhealthy` になったときだけ動く。無効化は `--no-ecs-circuit-breaker`、正常時に意図的に再現するには `--ecs-circuit-breaker-drill`) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -105,6 +106,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | 後半 | ビルドの停滞検知・進捗表示 | ビルド出力の読み手、監視プロセス、停滞診断、上限時間での中断 |
 | 後半 | WAR デプロイ時 Java 例外解析 | 解析ヘルパー (Python 3) の埋め込みと、ログ収集・実行・表示・レポート追記 |
 | 後半 | 読み取り専用ファイルシステム分析 | 分析ヘルパー (Python 3) の埋め込みと、`compose.yml` / `Dockerfile` (ビルド時) / 起動スクリプト・実行状況 (実行時) の収集・実行・表示・レポート追記 |
+| 後半 | ECS サーキットブレーカ再現 | 必須コンテナの healthcheck 判定、ECS と同じ停止手順 (SIGTERM → `stopTimeout` → SIGKILL)、`jboss-cli` の `:reload` の注入、`server.log` の切断判定と保存 |
 | 後半 | 全量レポート | `write_build_report` |
 | 後半 | 後始末 (`cleanup_all`) | EXIT トラップ本体 |
 | 末尾 | メイン処理 | ビルド → 起動 → 起動確認 → URL 確認 → 対話 → 情報表示 |
@@ -132,6 +134,7 @@ ECR 権限チェック / ECR ログイン / タグ付け / プッシュ / `image
 | cwagent ロググループ準備 | `prepare_cwagent_log_groups` / `cwagent_ensure_log_groups` / `cwagent_resolve_delivery_target` | 設定ファイルの `log_group_name` が実 CloudWatch Logs に無ければ作成 |
 | Java 例外解析 | `analyze_war_deploy_exceptions` / `deploy_exception_output_requested` / `collect_deploy_exception_logs` / `resolve_analysis_output_path` / `show_war_deploy_exception_analysis` / `show_war_deploy_exception_outputs` / `append_deploy_exception_report` | デプロイ処理ログの収集、解析ヘルパーの実行、出力先の要否判定、画面表示 (`--deploy-exception-display` 指定時)、全量レポートへの記載 (`--deploy-exception-report` 指定時)、Excel / テキスト出力 |
 | 読み取り専用 FS 分析 | `analyze_readonly_filesystem` / `readonly_collect_compose_facts` / `readonly_collect_dockerfile_facts` / `readonly_parse_dockerfile` / `readonly_shell_write_targets` / `readonly_scan_context_script` / `readonly_collect_runtime_facts` / `readonly_container_probe` / `readonly_collect_container_scripts` / `show_readonly_filesystem_analysis` / `show_readonly_analysis_outputs` / `append_readonly_analysis_report` | `compose.yml` の `read_only` / `tmpfs` / `volumes` の解析、`Dockerfile` からのビルド時の書き込み先の収集、起動スクリプトからの実行時の書き込み先の収集、コンテナの書き込み状況の収集、判定結果の表示 (`--readonly-analysis-display` 指定時)、全量レポートへの記載 (`--readonly-analysis-report` 指定時)、Excel / テキスト出力 |
+| ECS サーキットブレーカ再現 | `ecs_cb_check_during_startup` / `ecs_cb_find_unhealthy_essential` / `run_ecs_circuit_breaker` / `ecs_cb_run_stop_cycle` / `ecs_cb_stop_task` / `ecs_cb_start_reload` / `ecs_cb_judge_truncation` / `ecs_cb_report_logging_config` / `ecs_cb_replace_task` / `run_ecs_circuit_breaker_drill` / `append_ecs_circuit_breaker_report` | 起動確認中の `unhealthy` 判定、ECS と同じ停止手順、`:reload` の重ね合わせ、停止前後の `server.log` の突き合わせ、logging subsystem の設定の読み取り、タスクの置き換え、画面・テキスト・全量レポートへの出力 (→ 5.15) |
 | レポート | `write_build_report` / `append_compose_service_logs_report` / `append_jboss_password_report` / `append_cwagent_report` / `append_deploy_exception_report` / `append_readonly_analysis_report` | 全量レポートの生成 |
 | パスワード伝搬検証 | `verify_jboss_password_host_stages` / `verify_jboss_password_build_secret` / `verify_jboss_password_container_stages` / `jboss_xml_attributes` / `jboss_xml_unescape` / `jboss_wildfly_literal` | 各段の値の取得、XML と WildFly 式のエスケープ解除、原本との突き合わせ |
 
@@ -293,7 +296,12 @@ flowchart TD
     F -- 検出 --> G[起動ログを色分け表示 → 成功]
     F -- なし --> H{対象コンテナが停止?}
     H -- 停止 --> I[起動失敗として扱いログを表示]
-    H -- 稼働中 --> J{他の起動対象が停止?}
+    H -- 稼働中 --> N{必須コンテナが unhealthy?<br/>ECS の essential=true 相当}
+    N -- unhealthy --> O[ECS と同じ停止を再現<br/>:reload と重ねて SIGTERM → SIGKILL<br/>server.log の切断を判定]
+    O --> P{置き換えたタスクが healthy?}
+    P -- healthy --> C
+    P -- いいえ --> Q[サーキットブレーカが開く → return 1]
+    N -- それ以外 --> J{他の起動対象が停止?}
     J -- 停止 --> K[停止サービス名とログを表示<br/>--allow-service-exit で除外可]
     J -- 稼働中 --> L{タイムアウト?}
     L -- 到達 --> M[タイムアウトとしてログを表示]
@@ -306,6 +314,9 @@ flowchart TD
 - 既存コンテナを再利用した場合に前回の `WFLYSRV0025` を誤検出しないよう、
   `compose up` の直前時刻を `--since` の基準にします
 - 失敗時は `--suppress-startup-logs` を指定していてもログを表示します (原因を隠さないため)
+- ポーリングのたびに、必須コンテナ (既定は `--startup-service` の対象) の healthcheck を見ます。
+  `unhealthy` になっていれば ECS はタスクを停止するため、同じ停止手順を再現します (→ 5.15)。
+  この判定は起動完了ログの確認より後に行うため、起動が先に完了した実行では動きません
 
 ### 3.4 URL 応答確認フェーズの詳細
 
@@ -495,6 +506,26 @@ compose down (削除)
 | `--no-shutdown-logs` | フラグ | `false` | — | エラー終了時の SIGTERM 停止と終了ログ取得を行わない |
 | `--suppress-removed-logs` | フラグ | `false` | — | `compose down` / `compose stop` の `Removed` 等の出力を抑制 |
 | `--keep-container` | フラグ | `false` | — | 確認後もコンテナを停止・削除しない |
+
+### 4.4-2 ECS サーキットブレーカによるタスク停止の再現
+
+| オプション | 値の形式 | 既定値 | 複数 | 説明 |
+| --- | --- | --- | --- | --- |
+| `--no-ecs-circuit-breaker` | フラグ | `false` | — | 再現を一切行わない (従来どおり、`unhealthy` でもコンテナを止めない)。画面・テキスト・全量レポート `[14]` のすべてを止める |
+| `--ecs-circuit-breaker` | フラグ | (既定で有効) | — | 再現を行う (`--no-ecs-circuit-breaker` の打ち消し) |
+| `--ecs-essential-service NAME` | サービス名 | `--startup-service` → `--compose-service` → 起動中の全サービス | **可** (繰り返し / カンマ区切り) | 必須コンテナ (`essential=true` 相当) として扱うサービス。ECS はタスク内の全コンテナを止めるが、ここではこの一覧だけを停止する |
+| `--ecs-circuit-breaker-threshold N` | 1 以上の整数 | `3` | 不可 | サーキットブレーカが開くまでの失敗タスク数 (ECS の「必要数の 0.5 倍・最小 3・最大 200」に合わせた既定値) |
+| `--ecs-stop-timeout SEC` | 1 以上の整数 (秒) | `30` | 不可 | SIGTERM から SIGKILL までの猶予 (ECS の `stopTimeout` / `ECS_CONTAINER_STOP_TIMEOUT` の既定と同じ)。短くすると reload との重なりを作りやすい |
+| `--ecs-circuit-breaker-reload-delay SEC` | 0 以上の整数 (秒) | `1` | 不可 | `:reload` を実行してから停止を始めるまでの秒数。`0` で同時 |
+| `--no-ecs-circuit-breaker-reload` | フラグ | `false` | — | `:reload` を挟まず停止だけを再現する (切断の要因を切り分けるとき) |
+| `--ecs-circuit-breaker-replace-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 不可 | 置き換えたタスクの `healthy` / `unhealthy` 判定を待つ秒数。`0` なら `start_period + interval × (retries + 1)` を計算し 30〜300 秒へ収める |
+| `--ecs-server-log PATH` | コンテナ内の絶対パス | (自動検出) | 不可 | `server.log` の場所。既定は `$JBOSS_HOME/standalone/log/server.log` を探す |
+| `--ecs-circuit-breaker-drill` | フラグ | `false` | — | 必須コンテナが `unhealthy` にならなくても、動作確認をすべて終えた後に 1 回だけ意図的に再現する (置き換えは行わない) |
+| `--ecs-circuit-breaker-text FILE` | ファイルパス | (`--report-dir` 配下へ自動命名) | 不可 | 再現結果のテキスト出力先 |
+| `--no-ecs-circuit-breaker-text` | フラグ | `false` | — | テキストファイルへの出力を行わない |
+| `--ecs-circuit-breaker-display` | フラグ | (既定で有効) | — | 再現結果を画面へ出す |
+| `--no-ecs-circuit-breaker-display` | フラグ | `false` | — | 画面への出力を抑制する (テキストと全量レポートへは出す) |
+| `--no-ecs-circuit-breaker-save-server-log` | フラグ | `false` | — | 切れたままの `server.log` をファイルとして残さない |
 
 ### 4.5 URL 応答確認
 
@@ -2165,6 +2196,111 @@ rsyslog 側で `dockerd` の行を別ファイルへ振り分ける、といっ�
 
 ---
 
+### 5.15 ECS サーキットブレーカによるタスク停止の再現 (既定で有効)
+
+ECS で起きるが compose では起きない事象を、ローカルで再現するための機能です。
+**必須コンテナの healthcheck が失敗している実行でだけ動き**、正常に起動する実行では
+何も起きません。無効化は `--no-ecs-circuit-breaker` です。
+
+#### 何が起きている事象なのか
+
+```mermaid
+flowchart TD
+    A[タスク定義の healthCheck が retries 回連続で失敗] --> B[必須コンテナ essential=true が UNHEALTHY]
+    B --> C[ECS がタスクを停止<br/>SIGTERM → stopTimeout 既定 30 秒 → SIGKILL]
+    C --> D[サービスがタスクを置き換える]
+    D --> E{置き換えた先も失敗?}
+    E -- はい --> F[失敗タスクが閾値 最小 3 に到達<br/>サーキットブレーカが開く → ロールバック]
+    E -- いいえ --> G[デプロイ成功]
+    C --> H[停止が jboss-cli の :reload と重なる]
+    H --> I[server.log が途中で切れる]
+```
+
+`server.log` の切れ方は 3 通りあり、どれが起きたのかで直し方が変わります。
+
+| 切れ方 | 仕組み | 直し方 |
+| --- | --- | --- |
+| 再オープンによる切り詰め | `:reload` は logging subsystem を作り直すため、file handler をいったん閉じて開き直す。`append="false"` の handler はこの再オープンでファイルを切り詰めるため、reload より前の内容がまるごと消える | file handler を `append="true"` にする |
+| 未フラッシュ分の消失 | `autoflush="false"` の handler や `async-handler` は書き込みをバッファ・キューに溜める。SIGKILL はシャットダウンフックを走らせないため、溜まっていた分は書き出されない | `autoflush="true"` にする / `stopTimeout` を延ばす |
+| 書きかけの行の途切れ | SIGKILL は書き込みの途中でもプロセスを落とすため、最後の 1 行が改行の手前で終わる | `stopTimeout` を延ばす / 調査は標準出力側のログを正とする |
+
+いずれの場合も、標準出力 (`CONSOLE` handler) 側は docker / CloudWatch Logs が
+受け取っているため、**「標準出力にはあるのに `server.log` には無い行」** という差が
+残ります。この差が、事象を切り分けるいちばん確実な手掛かりになります。
+
+#### compose で何をするのか
+
+compose には「unhealthy になったコンテナを止めて置き換える」仕組みがありません
+(unhealthy のまま動き続けます)。そこでこの機能が、ECS と同じ判定・停止手順を行います。
+
+| 段 | ECS | このスクリプト |
+| --- | --- | --- |
+| 判定 | `healthCheck` が `retries` 回連続失敗 → UNHEALTHY | `docker inspect` の `State.Health.Status` が `unhealthy` (= 同じ条件) |
+| 対象 | タスク内の全コンテナ | **必須コンテナとして挙げたサービスだけ** (DB やモックを巻き込まないため。`--ecs-essential-service` で追加) |
+| 停止 | SIGTERM → `stopTimeout` (既定 30 秒) → SIGKILL | `docker stop -t <--ecs-stop-timeout>` (同じ手順) |
+| 重なり | 実運用では entrypoint の `jboss-cli` による `:reload` と重なることがある | 停止の `--ecs-circuit-breaker-reload-delay` 秒前に `jboss-cli.sh -c --command=:reload` を流し込み、**必ず重ねる** |
+| 置き換え | サービスがタスクを置き換える | `compose up -d --force-recreate <サービス>` |
+| 打ち切り | 失敗タスクが閾値 (必要数の 0.5 倍・最小 3・最大 200) に到達 → ロールバック | `--ecs-circuit-breaker-threshold` (既定 3) に到達 → 起動確認を失敗として終了 |
+
+監視するのは**起動確認 (`--verify-startup`) の最中だけ**です。ECS のデプロイ
+サーキットブレーカもデプロイ中にだけ働き、定常状態に入った後は関与しないため、
+働く期間を合わせています。
+
+#### 切断の判定
+
+停止の前後で `server.log` を `docker cp` で取り出し (停止済みのコンテナからも読める)、
+次の 4 点を突き合わせます。1 つでも当てはまれば「途中で切れている」と判定します。
+
+| 根拠 | 示していること |
+| --- | --- |
+| 停止後のファイルが停止前より小さい | 再オープンで切り詰められた (`append="false"`) |
+| 末尾が改行で終わっていない | 書きかけの行が SIGKILL で途切れた |
+| 標準出力に `server.log` の最終時刻より後の行が残っている | 未フラッシュ分が失われた |
+| 停止完了のログ (`WFLYSRV0050`) が無い | 終了処理を完走できていない |
+
+あわせて `standalone.xml` の logging subsystem を読み、file handler の
+`append` / `autoflush` と `async-handler` のキュー設定を、切れ方の根拠として出力します。
+切れたままの `server.log` は `--report-dir` 配下へそのまま保存するため、
+手元でファイルそのものを開いて確認できます。
+
+#### 使い方
+
+```bash
+# 既定 (何も指定しない)。必須コンテナが unhealthy になったときだけ再現する
+./build_and_verify.sh --verify-startup --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# 正常に起動する構成でも、事象を手元で起こしてみる (最後に 1 回だけ停止する)
+./build_and_verify.sh --verify-startup --compose-service app --startup-service app \
+    --ecs-circuit-breaker-drill --report-dir ./reports
+
+# 再現を行わない (従来どおり、unhealthy でも止めない)
+./build_and_verify.sh --verify-startup --no-ecs-circuit-breaker
+
+# SIGKILL を早めて reload との重なりを作りやすくする
+./build_and_verify.sh --verify-startup \
+    --ecs-stop-timeout 5 --ecs-circuit-breaker-reload-delay 0
+
+# 切断の要因を切り分ける (reload を挟まず、停止だけを再現する)
+./build_and_verify.sh --verify-startup --no-ecs-circuit-breaker-reload
+```
+
+`--ecs-circuit-breaker-drill` は、**環境変数・ツリー・JVM パラメータの収集をすべて
+終えた後**に実行されます (停止したコンテナからは収集できないため)。訓練実行では
+タスクの置き換えを行わず、1 回だけ停止します。
+
+#### 注意
+
+- 再現は**コンテナを実際に停止します**。`--keep-container` を併用している場合、
+  訓練実行では停止したうえでコンテナを残します (警告を出します)
+- `healthcheck` が定義されていないコンテナは対象外です
+  (ECS でも `healthCheck` の無いコンテナは UNHEALTHY になりません)
+- `jboss-cli.sh` が無いコンテナでは reload を挟めないため、停止だけを再現します
+- 置き換えたタスクが `healthy` になった場合、ECS と同じくデプロイ続行とみなし、
+  サーキットブレーカは開かずに起動確認を続けます
+
+---
+
 ## 6. 出力される情報
 
 ### 6.1 画面出力の構成
@@ -2216,6 +2352,9 @@ rsyslog 側で `dockerd` の行を別ファイルへ振り分ける、といっ�
 | `--report-dir/build_and_verify_<日時>_jboss_modules_<サービス名>.txt` | `--keep-container-mode logs` で JBoss モジュール一覧を実行したとき (`--no-jboss-module-list-text` で抑制) | `module-info` が `success` となったモジュール名・スロット・jar ファイル名の一覧と TSV |
 | `--report-dir/build_and_verify_<日時>_truststore_inventory_<サービス名>.txt` | `--keep-container-mode logs` でトラストストア一覧を実行したとき (`--no-truststore-inventory-text` で抑制) | 有効なトラストストアのフルパスと有効性、登録証明書の種別・ドメイン URL、カスタム証明書の強調一覧、接続確認コマンド、TSV |
 | `--cert-check-text` / `--jboss-module-list-text` / `--truststore-inventory-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker.txt` | ECS サーキットブレーカ再現を実行したとき (`--no-ecs-circuit-breaker-text` で抑制) | 再現結果 (契機・停止手順・reload の結果・切断の判定と根拠・logging subsystem の設定・対処) |
+| `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker_<サービス名>_<回数>.log` | 同上 (`--no-ecs-circuit-breaker-save-server-log` で抑制) | 停止直後に取り出した `server.log` そのもの (切れたままの状態) |
+| `--ecs-circuit-breaker-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
 
 全量レポートのセクション構成は次のとおりです。
 
@@ -2234,6 +2373,7 @@ rsyslog 側で `dockerd` の行を別ファイルへ振り分ける、といっ�
 | `[11] 読み取り専用ファイルシステム (read_only) の書き込み先分析` | **`--readonly-analysis-report` 指定時のみ**、サービスごとの判定と、書き込み先が必要なディレクトリの一覧 (要約)、ビルド時にだけ書き込むディレクトリの一覧、`情報の取得状況`。指定が無い場合は未出力である旨と、出力した Excel ブック / テキストのパスだけ | **分析は必ず実行**。`compose.yml` と `Dockerfile` の定義だけで判定し、その旨を記録 |
 | `[12] JBoss EAP Undertow バーチャルホスト (default-host) の分析` | `subsystem` の既定値、`server` とリスナー、バーチャルホストと受け付けるホスト名、`Host` ヘッダーごとの振り分け、実リクエストによる確認、要確認 | 「未取得」として理由を記録 |
 | `[13] コピーしたファイル (--copy-file) の取り込み検証` | コピー元の SHA-256 / サイズ、コンテナ内で見つかったパスと一致・不一致、不一致時の原因診断 (覆っているマウント / イメージ側との突き合わせ)、判定 (OK / NG)。`--verify-copy-artifact` を指定していない実行では `未実施 (--verify-copy-artifact 未指定)` と記録 | 「コンテナを起動していません」と記録 |
+| `[14] ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)` | 契機・必須コンテナ・停止手順・`:reload` の結果・停止前後の `server.log` の比較と切断の判定根拠・logging subsystem の設定・サーキットブレーカの開閉・対処。再現しなかった実行では、その理由を 1 行で記録 | 「再現していません」と記録 |
 
 一時ファイル (URL 応答本文、対話 HTTP のボディ、healthcheck 診断結果) は
 終了時に自動削除されます。
@@ -3088,6 +3228,30 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 
 # 19) 30 分を超えたらビルドを中断して確実にプロンプトを戻す
 ./build_and_verify.sh --build-timeout 1800
+
+# 20) ECS サーキットブレーカによるタスク停止の再現 (既定で有効)
+#     必須コンテナの healthcheck が unhealthy になった実行でだけ動く。
+#     SIGTERM → stopTimeout → SIGKILL を jboss-cli の :reload と重ね、
+#     停止前後の server.log を突き合わせて切れ方まで判定する
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --report-dir ./reports
+
+# 20-2) 正常に起動する構成でも、事象を手元で起こしてみる
+#       (動作確認をすべて終えた後に 1 回だけ停止する。置き換えは行わない)
+./build_and_verify.sh --verify-startup \
+    --compose-service app --startup-service app \
+    --ecs-circuit-breaker-drill --report-dir ./reports
+
+# 20-3) SIGKILL を早めて reload との重なりを作りやすくする
+./build_and_verify.sh --verify-startup \
+    --ecs-stop-timeout 5 --ecs-circuit-breaker-reload-delay 0
+
+# 20-4) 切断の要因を切り分ける (reload を挟まず、停止だけを再現する)
+./build_and_verify.sh --verify-startup --no-ecs-circuit-breaker-reload
+
+# 20-5) 再現を行わない (従来どおり、unhealthy でも止めない)
+./build_and_verify.sh --verify-startup --no-ecs-circuit-breaker
 ```
 
 ---
@@ -3128,6 +3292,8 @@ export JBOSS_MASTER_PASSWORD='pa$w#o"r`d&x'
 | `SIGTERM による停止に失敗しました (compose stop, exit=…)` | `compose stop` が失敗 (daemon 応答なし等) | 終了処理のログが欠ける場合がある。`docker ps -a` で状態を確認 |
 | `起動対象の Compose サービスが停止しました` | 依存サービスの準備不足など | `--wait-healthy` の利用、`--allow-service-exit` での除外を検討 |
 | `起動確認がタイムアウトしました` | 起動が遅い / パターン不一致 | `--startup-timeout` を延長、`--startup-log-pattern` を確認 |
+| `必須コンテナ '…' の healthcheck が unhealthy になりました` | `healthCheck` が `retries` 回連続で失敗している。ECS ではタスクが停止され、サーキットブレーカでロールバックされる状態 | 続けて表示される再現結果で `server.log` の切れ方を確認する。healthcheck の `command` / `start_period` / `retries` が実際の起動時間に合っているかを見直す (→ 5.15)。再現そのものを止めるなら `--no-ecs-circuit-breaker` |
+| `総合判定 : 再現しました (… server.log が途中で切れました)` | 停止と `:reload` が重なり、`server.log` が切り詰め・未フラッシュ・行の途切れのいずれかで切れた | 表示された判定の根拠と logging subsystem の設定を見る。`append="true"` / `autoflush="true"` へ直し、`stopTimeout` を延ばす (→ 5.15) |
 | `URL 応答の確認に失敗しました` | ポート・パス・期待ステータスの誤り | 表示された最後の応答コードと本文を確認 |
 | `全量ビルドレポートの出力先を作成できませんでした` | `--report-dir` の権限不足 | 書き込み可能なパスを指定 |
 | `Java プロセスを検出できませんでした。` | 対象コンテナが JVM を実行していない、または `/proc` / `/bin/sh` を読み取れない | JVM を持たないコンテナ (DB / Collector など) なら想定どおり。JBoss のコンテナで出る場合は起動状態と `docker exec <cid> /bin/sh` の可否を確認 |
