@@ -262,6 +262,9 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-ecs-circuit-breaker-reload` | **`build_and_verify.sh` / `--build-only` 委譲時**。`:reload` を挟まず、停止だけを再現する | `false` |
 | `--ecs-server-log PATH` | **`build_and_verify.sh` / `--build-only` 委譲時**。`server.log` のコンテナ内パス | (自動検出) |
 | `--ecs-circuit-breaker-drill` | **`build_and_verify.sh` / `--build-only` 委譲時**。正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する | `false` |
+| `--ecs-circuit-breaker-watch` | **`build_and_verify.sh` / `--build-only` 委譲時**。起動完了ログの後も、必須コンテナの healthcheck の判定 (`healthy` / `unhealthy`) を待つ | `--ecs-essential-service` 指定時は有効 |
+| `--ecs-circuit-breaker-watch-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時**。判定を待つ秒数 | `0` (自動) |
+| `--ecs-circuit-breaker-ignore-start-period` | **`build_and_verify.sh` / `--build-only` 委譲時**。`start_period` の間の healthcheck 失敗も数えて `unhealthy` とみなす | `false` |
 | `--ecs-circuit-breaker-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。ECS サーキットブレーカ再現のテキスト出力先を明示する | (`--report-dir` 配下へ自動命名) |
 | `--cert-check-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。受領した自己証明書の詳細と HTTPS 接続の結果を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-cert-check-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。証明書チェック結果のテキスト出力を行わない (画面表示だけにする) | `false` |
@@ -2088,11 +2091,54 @@ ECS では、タスク定義の `healthCheck` が `retries` 回続けて失敗�
 停止前後の `server.log` を突き合わせて切れ方まで判定します。
 **無効化は `--no-ecs-circuit-breaker`** です。
 
-動くのは **起動確認 (`--verify-startup`) の最中に必須コンテナが `unhealthy` になった
-とき**だけで、正常に起動する実行では何も起きません
+動くのは **起動確認 (`--verify-startup`) とその判定待ちの最中に必須コンテナが
+`unhealthy` になったとき**だけで、正常に起動する実行では何も起きません
 (ECS のデプロイサーキットブレーカもデプロイ中にだけ働くため、期間を合わせています)。
 正常な構成でも事象を手元で起こしたいときは `--ecs-circuit-breaker-drill` を指定します
 (動作確認をすべて終えた後に 1 回だけ停止し、タスクの置き換えは行いません)。
+
+#### `start_period` が長いと「何事もなく起動して終わる」
+
+**healthcheck をわざと失敗させても再現しない場合、まずここを確認してください。**
+docker は `start_period` の間、healthcheck が失敗しても `unhealthy` にせず、
+連続失敗回数 (`FailingStreak`) も数えません (失敗は `.State.Health.Log` の終了コードに
+しか現れません)。
+
+| | `start_period` の間 | 経過後 |
+| --- | --- | --- |
+| `.State.Health.Status` | `starting` のまま | `retries` 回連続失敗で `unhealthy` |
+| `.State.Health.FailingStreak` | `0` のまま | 失敗のたびに増える |
+| `.State.Health.Log[].ExitCode` | **失敗がそのまま出る** (`127` = スクリプトが無い) | 同じ |
+
+そのため `start_period=180s` / `interval=30s` / `retries=3` では、`unhealthy` になるのは
+**起動から約 240〜270 秒後**です (`start_period` の経過後に連続失敗を `retries` 回
+数えるため)。JBoss EAP の起動完了ログ (`WFLYSRV0025`) はその何倍も前に出るため、
+起動確認だけを見ていると先に成功してしまいます
+(`--startup-timeout` の既定 120 秒は `start_period` より短い点にも注意)。
+
+このため、**`--ecs-essential-service` を指定した実行では、起動完了ログを検出した後も
+healthcheck の判定が出るまで待ちます** (`--ecs-circuit-breaker-watch` /
+`--no-ecs-circuit-breaker-watch` で切り替え、待つ秒数は既定で
+`start_period の残り + interval × retries` から自動計算)。待たない実行でも、判定が
+出ていない事実は警告と全量レポート `[14]` に残します。
+`start_period` の経過を待たずに再現するには
+`--ecs-circuit-breaker-ignore-start-period` を指定します。
+
+```bash
+# 必須コンテナを明示し、判定が出るまで待ってから再現する
+./build_and_verify.sh --verify-startup --compose-service frontend \
+    --startup-service frontend --ecs-essential-service frontend --report-dir ./reports
+
+# start_period の経過を待たずに再現する
+./build_and_verify.sh --verify-startup --compose-service frontend \
+    --startup-service frontend --ecs-essential-service frontend \
+    --ecs-circuit-breaker-ignore-start-period --ecs-circuit-breaker-threshold 1 \
+    --ecs-stop-timeout 5 --ecs-circuit-breaker-reload-delay 0 --report-dir ./reports
+```
+
+なお `server.log` の切断まで確認するには、必須コンテナが **JBoss EAP のコンテナ**
+(`jboss-cli.sh` と `server.log` を持つコンテナ) である必要があります。静的配信だけの
+フロントコンテナでは、停止とサーキットブレーカは再現できますが切断の判定は行えません。
 
 #### `server.log` が切れる 3 つの仕組み
 
@@ -2169,6 +2215,9 @@ reload の注入     : 有効 (jboss-cli.sh -c --command=:reload を停止の 1s
 | `--no-ecs-circuit-breaker-reload` | `false` | `:reload` を挟まず、停止だけを再現する (要因の切り分け) |
 | `--ecs-server-log PATH` | (自動検出) | `server.log` のコンテナ内パス |
 | `--ecs-circuit-breaker-drill` | `false` | 正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する |
+| `--ecs-circuit-breaker-watch` / `--no-ecs-circuit-breaker-watch` | `--ecs-essential-service` 指定時は有効 | 起動完了ログの後も healthcheck の判定 (`healthy` / `unhealthy`) を待つかどうか |
+| `--ecs-circuit-breaker-watch-timeout SEC` | `0` (自動) | 判定を待つ秒数 (`0` なら `start_period の残り + interval × retries` を 30〜900 秒へ収める) |
+| `--ecs-circuit-breaker-ignore-start-period` | `false` | `start_period` の間の healthcheck 失敗も数え、`retries` 回続けて失敗した時点で `unhealthy` とみなす |
 
 詳細は [`docs/build_and_verify_guide.md`](docs/build_and_verify_guide.md) の
 「5.15 ECS サーキットブレーカによるタスク停止の再現」を参照してください。

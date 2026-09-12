@@ -792,6 +792,25 @@ fi
 
 if [ "${1:-}" = "inspect" ]; then
   case "$*" in
+    # ECS サーキットブレーカ再現の healthcheck 判定 (probe 一件ごとの終了コード)。
+    # start_period の間は .State.Health.Status が starting のままで失敗が現れない
+    # ため、実装は probe の履歴を読む。.State.Health.Log の分岐へ吸い込まれないよう
+    # 専用の目印で先に拾う。FAKE_HEALTHCHECK_PROBE_EXITS は古い順の終了コード。
+    *"ecs-cb-hc-exit:"*)
+      for fake_probe_exit in ${FAKE_HEALTHCHECK_PROBE_EXITS:-0 0}; do
+        printf 'ecs-cb-hc-exit:%s\n' "$fake_probe_exit"
+      done
+      ;;
+    # 直近の probe の出力 (healthcheck が何で落ちているかの表示に使う)。
+    *"ecs-cb-hc-output:"*)
+      printf 'ecs-cb-hc-output:%s\n' \
+          "${FAKE_HEALTHCHECK_PROBE_OUTPUT:-healthcheck request completed}"
+      ;;
+    # コンテナの起動時刻 (start_period の残りの算出に使う)。
+    *"ecs-cb-hc-started:"*)
+      printf 'ecs-cb-hc-started:%s\n' \
+          "${FAKE_CONTAINER_STARTED_AT:-2026-07-24T01:00:00.000000000Z}"
+      ;;
     # ECS サーキットブレーカ再現の停止判定 (終了コード)。
     # .State.ExitCode は既存の分岐に無いため、専用の目印で先に拾う。
     *"ecs-cb-exit:"*)
@@ -863,14 +882,32 @@ PATH=/usr/bin}"
       esac
       ;;
     *".Config.Healthcheck.Interval"*)
-      printf 'interval=30s\n'
+      printf 'interval=%s\n' "${FAKE_HEALTHCHECK_INTERVAL:-30s}"
       printf 'timeout=5s\n'
-      printf 'retries=3\n'
-      printf 'start_period=2m0s\n'
+      printf 'retries=%s\n' "${FAKE_HEALTHCHECK_RETRIES:-3}"
+      printf 'start_period=%s\n' "${FAKE_HEALTHCHECK_START_PERIOD:-2m0s}"
       ;;
     *".State.Health.Status"*)
-      if [ "${FAKE_HEALTHCHECK_STATE_FAIL:-false}" = "true" ]; then
+      # FAKE_HEALTHCHECK_STARTING_TIMES : 先頭 N 回は starting、その後 unhealthy。
+      # start_period の間は starting のままで、経過後に unhealthy になる docker の
+      # 振る舞いを再現する (起動確認後に判定を待つ経路の検証に使う)。
+      if [ -n "${FAKE_HEALTHCHECK_STARTING_TIMES:-}" ] \
+          && [ -n "${FAKE_HEALTHCHECK_STATE_COUNTER:-}" ]; then
+        fake_hc_count="$(cat "$FAKE_HEALTHCHECK_STATE_COUNTER" 2>/dev/null || printf '0')"
+        case "$fake_hc_count" in
+          ''|*[!0-9]*) fake_hc_count=0 ;;
+        esac
+        fake_hc_count=$(( fake_hc_count + 1 ))
+        printf '%s\n' "$fake_hc_count" > "$FAKE_HEALTHCHECK_STATE_COUNTER"
+        if [ "$fake_hc_count" -le "$FAKE_HEALTHCHECK_STARTING_TIMES" ]; then
+          printf 'starting|0\n'
+        else
+          printf 'unhealthy|3\n'
+        fi
+      elif [ "${FAKE_HEALTHCHECK_STATE_FAIL:-false}" = "true" ]; then
         printf 'unhealthy|3\n'
+      elif [ "${FAKE_HEALTHCHECK_STATE_STARTING:-false}" = "true" ]; then
+        printf 'starting|0\n'
       else
         printf 'healthy|0\n'
       fi

@@ -7935,9 +7935,144 @@ assert_not_contains "$FAKE_DOCKER_CALLS" "--force-recreate"
 # 停止はすべての収集を終えた後に行うため、環境変数一覧は通常どおり出る。
 assert_before "$ecs_cb_drill_output" "環境変数一覧 (サービス: app" "ECS のタスク停止を意図的に再現します。"
 
+# --- 起動完了ログの後に unhealthy になる構成 (start_period が長い taskdef) ---
+# 起動確認は起動完了ログを見つけた時点で終わるため、healthcheck の判定が
+# それより後に出る構成では、unhealthy のまま最後まで通ってしまっていた。
+# docker は start_period の間 unhealthy にせず連続失敗も数えないため、
+# start_period=180s / interval=30s / retries=3 なら判定は起動から最短 270s 後になる。
+#   (1) --ecs-essential-service を明示した実行では、判定が出るまで待って再現する
+#   (2) 明示していない実行では従来どおり待たないが、見逃しを警告として残す
+#   (3) start_period 中でも --ecs-circuit-breaker-ignore-start-period で再現できる
+ecs_cb_late_output="$TEST_TMP/ecs-circuit-breaker-late.out"
+ecs_cb_late_reports="$TEST_TMP/ecs-cb-late-reports"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_HEALTHCHECK_STATE_FAIL="true"
+export FAKE_HEALTHCHECK_START_PERIOD="3m0s"
+export FAKE_HEALTHCHECK_PROBE_EXITS="127 127 127"
+export FAKE_HEALTHCHECK_PROBE_OUTPUT="/bin/sh: /opt/app/bin/healthcheck.sh: not found"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --ecs-essential-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --ecs-circuit-breaker-threshold 1 \
+    --ecs-stop-timeout 2 \
+    --ecs-circuit-breaker-reload-delay 0 \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$ecs_cb_late_reports"
+) >"$ecs_cb_late_output" 2>&1; then
+  cat "$ecs_cb_late_output" >&2
+  fail "an essential container that is unhealthy after the startup log must fail the run"
+fi
+# 起動完了ログの後でも判定を見に行き、失敗している理由 (probe の終了コードと出力) を出す。
+assert_contains "$ecs_cb_late_output" "必須コンテナの healthcheck の判定が出ていません (起動完了ログの方が先に出ています)。"
+assert_contains "$ecs_cb_late_output" "probe は直近 3 回続けて失敗 / interval=30s timeout=5s retries=3 start_period=3m0s"
+assert_contains "$ecs_cb_late_output" "probe の出力 : /bin/sh: /opt/app/bin/healthcheck.sh: not found"
+assert_contains "$ecs_cb_late_output" "必須コンテナの healthcheck の判定 (healthy / unhealthy) を待ちます (対象: app"
+assert_contains "$ecs_cb_late_output" "必須コンテナ 'app' の healthcheck が unhealthy になりました (連続失敗 3 回)。"
+assert_contains "$ecs_cb_late_output" "失敗タスク 1 / 閾値 1 → サーキットブレーカが開きました。"
+assert_contains "$ecs_cb_late_output" "判定          : server.log が途中で切れています"
+assert_contains "$ecs_cb_late_output" "必須コンテナの healthcheck が unhealthy になったため、デプロイ失敗として終了します。"
+# 切れたままの server.log は --report-dir 配下へ残す。
+ecs_cb_late_saved=("$ecs_cb_late_reports"/build_and_verify_*_ecs_circuit_breaker_app_1.log)
+[ -s "${ecs_cb_late_saved[0]}" ] || fail "the truncated server.log must be saved for the late-unhealthy scenario"
+
+# --- --ecs-essential-service を指定しない実行は待たない (従来どおり) ---
+ecs_cb_nowatch_output="$TEST_TMP/ecs-circuit-breaker-nowatch.out"
+ecs_cb_nowatch_reports="$TEST_TMP/ecs-cb-nowatch-reports"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$ecs_cb_nowatch_reports"
+) >"$ecs_cb_nowatch_output" 2>&1; then
+  cat "$ecs_cb_nowatch_output" >&2
+  fail "without --ecs-essential-service the run must keep the previous behaviour"
+fi
+assert_contains "$ecs_cb_nowatch_output" "判定が出るまで待つには --ecs-essential-service SERVICE か --ecs-circuit-breaker-watch を指定してください。"
+assert_not_contains "$ecs_cb_nowatch_output" "ECS サーキットブレーカによるタスク停止を再現します"
+collect_report_files "$ecs_cb_nowatch_reports"
+ecs_cb_nowatch_full=("${REPORT_FILES[@]}")
+[ ${#ecs_cb_nowatch_full[@]} -eq 1 ] || fail "expected one report for the no-watch scenario"
+# 「unhealthy にならなかった」と書いてしまうと、実際は unhealthy である事実を隠す。
+assert_contains "${ecs_cb_nowatch_full[0]}" "起動確認を終えた時点で必須コンテナの healthcheck の判定が出ていなかったため、再現していません"
+assert_not_contains "${ecs_cb_nowatch_full[0]}" "必須コンテナが unhealthy にならなかったため、再現は行っていません"
+
+# --- start_period の間は unhealthy にならない (待っても判定が出ない) ---
+ecs_cb_starting_output="$TEST_TMP/ecs-circuit-breaker-starting.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+export FAKE_HEALTHCHECK_STATE_FAIL="false"
+export FAKE_HEALTHCHECK_STATE_STARTING="true"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --ecs-essential-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --ecs-circuit-breaker-watch-timeout 2 \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1
+) >"$ecs_cb_starting_output" 2>&1; then
+  cat "$ecs_cb_starting_output" >&2
+  fail "a container still inside start_period must not fail the run"
+fi
+assert_contains "$ecs_cb_starting_output" "必須コンテナの healthcheck は 2s 以内に healthy / unhealthy のどちらにもなりませんでした。"
+assert_not_contains "$ecs_cb_starting_output" "ECS サーキットブレーカによるタスク停止を再現します"
+
+# --- --ecs-circuit-breaker-ignore-start-period なら start_period 中でも再現する ---
+ecs_cb_ignore_output="$TEST_TMP/ecs-circuit-breaker-ignore-start-period.out"
+: > "$FAKE_DOCKER_CALLS"
+rm -f "$FAKE_ECS_STOP_MARKER"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup \
+    --compose-service app \
+    --startup-service app \
+    --ecs-essential-service app \
+    --startup-timeout 10 \
+    --startup-interval 1 \
+    --ecs-circuit-breaker-ignore-start-period \
+    --ecs-circuit-breaker-threshold 1 \
+    --ecs-stop-timeout 2 \
+    --ecs-circuit-breaker-reload-delay 0 \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1
+) >"$ecs_cb_ignore_output" 2>&1; then
+  cat "$ecs_cb_ignore_output" >&2
+  fail "--ecs-circuit-breaker-ignore-start-period must reproduce the stop during start_period"
+fi
+assert_contains "$ecs_cb_ignore_output" "必須コンテナ 'app' の healthcheck が unhealthy になりました (連続失敗 3 回)。"
+assert_contains "$ecs_cb_ignore_output" "判定          : server.log が途中で切れています"
+assert_contains "$ecs_cb_ignore_output" "失敗タスク 1 / 閾値 1 → サーキットブレーカが開きました。"
+
 unset FAKE_COMPOSE_PS_SERVICES FAKE_HEALTHCHECK_STATE_FAIL FAKE_ECS_STOP_MARKER \
   FAKE_ECS_SERVER_LOG_BEFORE FAKE_ECS_SERVER_LOG_AFTER FAKE_JBOSS_STANDALONE_XML \
-  FAKE_JBOSS_HOME
+  FAKE_JBOSS_HOME FAKE_HEALTHCHECK_STATE_STARTING FAKE_HEALTHCHECK_START_PERIOD \
+  FAKE_HEALTHCHECK_PROBE_EXITS FAKE_HEALTHCHECK_PROBE_OUTPUT
 
 # --- 指定の矛盾は exit 2 で止める ---
 ecs_cb_conflict_output="$TEST_TMP/ecs-circuit-breaker-conflict.out"
@@ -7962,5 +8097,19 @@ if (
   fail "--ecs-server-log with a relative path must fail"
 fi
 assert_contains "$ecs_cb_conflict_output" "--ecs-server-log にはコンテナ内の絶対パスを指定してください: relative/path"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-ecs-circuit-breaker --ecs-circuit-breaker-watch
+) >"$ecs_cb_conflict_output" 2>&1; then
+  fail "--no-ecs-circuit-breaker with --ecs-circuit-breaker-watch must fail"
+fi
+assert_contains "$ecs_cb_conflict_output" "--no-ecs-circuit-breaker と --ecs-circuit-breaker-watch / --ecs-circuit-breaker-watch-timeout / --ecs-circuit-breaker-ignore-start-period は同時に指定できません。"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --ecs-circuit-breaker-watch-timeout abc
+) >"$ecs_cb_conflict_output" 2>&1; then
+  fail "--ecs-circuit-breaker-watch-timeout with a non-numeric value must fail"
+fi
+assert_contains "$ecs_cb_conflict_output" "--ecs-circuit-breaker-watch-timeout には 0 以上の整数を指定してください: abc"
 
 printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, and ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log)\n'

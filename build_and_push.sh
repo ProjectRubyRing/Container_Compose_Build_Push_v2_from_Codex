@@ -423,6 +423,7 @@ arg_takes_value() {
     --ecs-essential-service|--ecs-circuit-breaker-threshold|--ecs-stop-timeout) return 0 ;;
     --ecs-circuit-breaker-reload-delay|--ecs-circuit-breaker-replace-timeout) return 0 ;;
     --ecs-server-log|--ecs-circuit-breaker-text) return 0 ;;
+    --ecs-circuit-breaker-watch-timeout) return 0 ;;
     --cert-check-text) return 0 ;;
     --trace-report-dir|--trace-report-format) return 0 ;;
     --trace-report-limit|--trace-report-lookback) return 0 ;;

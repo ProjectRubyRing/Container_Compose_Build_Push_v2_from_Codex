@@ -131,6 +131,8 @@
 ### ECS サーキットブレーカによるタスク停止の再現
 
 > 必須コンテナの healthcheck が `unhealthy` になったときだけ動きます (**既定で有効**)。ECS と同じ手順 (SIGTERM → `stopTimeout` → SIGKILL) で停止し、`jboss-cli` の `:reload` と重ねて `server.log` が途中で切れる事象を再現・判定します。
+>
+> **`start_period` の間は、healthcheck が失敗していても docker は `unhealthy` にしません** (連続失敗も数えません)。`start_period=180s` / `interval=30s` / `retries=3` なら判定が出るのは起動から約 240〜270 秒後で、起動完了ログの方が先に出ます。`--ecs-essential-service` を指定した実行では、起動完了ログの後も判定が出るまで待ちます (`--no-ecs-circuit-breaker-watch` で無効化)。待たずに再現するには `--ecs-circuit-breaker-ignore-start-period` を指定します。
 
 | オプション | 値 | 既定 | 説明 |
 | --- | --- | --- | --- |
@@ -142,6 +144,10 @@
 | `--ecs-circuit-breaker-reload-delay SEC` | 0 以上の整数 (秒) | `1` | `:reload` を実行してから停止を始めるまでの秒数 |
 | `--no-ecs-circuit-breaker-reload` | フラグ | `false` | `:reload` を挟まず、停止だけを再現する |
 | `--ecs-circuit-breaker-replace-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 置き換えたタスクの判定を待つ秒数 (`0` は healthcheck 設定から計算) |
+| `--ecs-circuit-breaker-watch` | フラグ | `--ecs-essential-service` 指定時は有効 | 起動完了ログの後も healthcheck の判定 (`healthy` / `unhealthy`) を待つ |
+| `--no-ecs-circuit-breaker-watch` | フラグ | `false` | 判定を待たない (`--ecs-essential-service` 指定時の既定を打ち消す) |
+| `--ecs-circuit-breaker-watch-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 判定を待つ秒数 (`0` は `start_period の残り + interval × retries` を 30〜900 秒へ収める) |
+| `--ecs-circuit-breaker-ignore-start-period` | フラグ | `false` | `start_period` 中の失敗も数え、`retries` 回続けて失敗した時点で `unhealthy` とみなす |
 | `--ecs-server-log PATH` | コンテナ内の絶対パス | (自動検出) | `server.log` の場所 |
 | `--ecs-circuit-breaker-drill` | フラグ | `false` | 正常起動でも、動作確認をすべて終えた後に 1 回だけ意図的に再現する |
 | `--ecs-circuit-breaker-text FILE` | ファイルパス | (`--report-dir` 配下) | 再現結果のテキスト出力先 |

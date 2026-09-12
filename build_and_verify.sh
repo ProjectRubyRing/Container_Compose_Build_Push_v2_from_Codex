@@ -767,6 +767,18 @@ ECS_CB_TEXT=""                    # --ecs-circuit-breaker-text: テキストの�
 ECS_CB_TEXT_SET="false"           # 出力先が明示指定されたか
 ECS_CB_TEXT_OUTPUT=""             # 実際に出力したテキストのパス
 ECS_CB_SAVE_SERVER_LOG="true"     # false (--no-ecs-circuit-breaker-save-server-log)
+# 起動確認 (起動完了ログの検出) を終えた後も、必須コンテナの healthcheck の判定を
+# 見届けるか。docker は start_period の間、healthcheck が失敗しても UNHEALTHY に
+# せず、連続失敗回数 (FailingStreak) も増やさない。そのため start_period を長めに
+# 取った構成では「起動完了ログの方が先に出て、判定が出る前に起動確認が終わる」
+# ことになり、必須コンテナが最初から失敗していてもこの再現が始まらない。
+ECS_CB_WATCH="auto"               # auto: --ecs-essential-service 指定時だけ待つ
+                                  # true (--ecs-circuit-breaker-watch) /
+                                  # false (--no-ecs-circuit-breaker-watch)
+ECS_CB_WATCH_TIMEOUT="0"          # --ecs-circuit-breaker-watch-timeout: 0=自動算出
+ECS_CB_IGNORE_START_PERIOD="false" # true (--ecs-circuit-breaker-ignore-start-period)
+ECS_CB_STARTING_NOTICE="false"    # start_period 中の失敗を通知済みか (1 度だけ出す)
+ECS_CB_OBSERVED=""                # 観測した必須コンテナの healthcheck 状態 (レポート用)
 # 再現の実行状態 (成功経路・失敗経路の双方から呼ばれるため、二重実行を防ぐ)
 ECS_CB_DONE="false"               # 再現を実行済みか
 ECS_CB_TRIGGERED="false"          # 実際に停止まで行ったか
@@ -2529,6 +2541,27 @@ ECS サーキットブレーカによるタスク停止の再現 (既定で有�
                          待つ秒数 (既定: 0 = healthcheck の設定から
                          start_period + interval × (retries + 1) を計算し、
                          30〜300 秒へ収める)
+  --ecs-circuit-breaker-watch
+                         起動完了ログを検出した後も、必須コンテナの healthcheck が
+                         healthy / unhealthy のどちらになるかを待つ。
+                         docker は start_period の間、healthcheck が失敗しても
+                         UNHEALTHY にせず連続失敗回数も数えないため、start_period
+                         を長く取った構成では判定が出る前に起動確認が終わり、
+                         再現が始まらない。その取りこぼしを防ぐ。
+                         --ecs-essential-service を指定した実行では既定で有効
+  --no-ecs-circuit-breaker-watch
+                         判定を待たない (起動完了ログを検出した時点で先へ進む。
+                         --ecs-essential-service 指定時の既定を打ち消す)
+  --ecs-circuit-breaker-watch-timeout SEC
+                         判定を待つ秒数 (既定: 0 = healthcheck の設定から
+                         「start_period の残り + interval × retries」を計算し、
+                         30〜900 秒へ収める)
+  --ecs-circuit-breaker-ignore-start-period
+                         start_period の間の healthcheck 失敗も数え、retries 回
+                         続けて失敗した時点で unhealthy とみなす
+                         (.State.Health.Log の終了コードで数える)。
+                         docker / ECS の仕様より早く判定するため、start_period が
+                         長い構成でも待たずに再現できる
   --ecs-server-log PATH  server.log のコンテナ内パス
                          (既定: $JBOSS_HOME/standalone/log/server.log を自動検出)
   --ecs-circuit-breaker-drill
@@ -2891,6 +2924,11 @@ while [ $# -gt 0 ]; do
     --no-ecs-circuit-breaker-reload)    ECS_CB_RELOAD="false"; shift ;;
     --ecs-circuit-breaker-reload-delay) need_value "$1" $#; ECS_CB_RELOAD_DELAY="$2"; shift 2 ;;
     --ecs-circuit-breaker-replace-timeout) need_value "$1" $#; ECS_CB_REPLACE_TIMEOUT="$2"; shift 2 ;;
+    --ecs-circuit-breaker-watch)    ECS_CB_WATCH="true"; shift ;;
+    --no-ecs-circuit-breaker-watch) ECS_CB_WATCH="false"; shift ;;
+    --ecs-circuit-breaker-watch-timeout)
+      need_value "$1" $#; ECS_CB_WATCH_TIMEOUT="$2"; ECS_CB_WATCH="true"; shift 2 ;;
+    --ecs-circuit-breaker-ignore-start-period) ECS_CB_IGNORE_START_PERIOD="true"; shift ;;
     --ecs-server-log)       need_value "$1" $#; ECS_CB_SERVER_LOG="$2"; shift 2 ;;
     --ecs-circuit-breaker-drill)    ECS_CB_DRILL="true"; shift ;;
     --no-ecs-circuit-breaker-drill) ECS_CB_DRILL="false"; shift ;;
@@ -3285,6 +3323,7 @@ validate_positive_integer "$ECS_CB_THRESHOLD" "--ecs-circuit-breaker-threshold" 
 validate_positive_integer "$ECS_CB_STOP_TIMEOUT" "--ecs-stop-timeout" || exit 2
 validate_non_negative_integer "$ECS_CB_RELOAD_DELAY" "--ecs-circuit-breaker-reload-delay" || exit 2
 validate_non_negative_integer "$ECS_CB_REPLACE_TIMEOUT" "--ecs-circuit-breaker-replace-timeout" || exit 2
+validate_non_negative_integer "$ECS_CB_WATCH_TIMEOUT" "--ecs-circuit-breaker-watch-timeout" || exit 2
 # 再現ごと行わない指定と、再現の細部を変える指定が同時に来た場合、どちらを
 # 優先しても利用者の意図とずれる。ここで指定の矛盾として止める。
 if [ "$ECS_CIRCUIT_BREAKER" != "true" ]; then
@@ -3294,6 +3333,11 @@ if [ "$ECS_CIRCUIT_BREAKER" != "true" ]; then
   fi
   if [ ${#ECS_CB_ESSENTIAL_SERVICES[@]} -gt 0 ] || [ "$ECS_CB_TEXT_SET" = "true" ]; then
     err "--no-ecs-circuit-breaker と --ecs-essential-service / --ecs-circuit-breaker-text は同時に指定できません。"
+    err "  再現ごと行わない場合は --no-ecs-circuit-breaker だけを指定してください。"
+    exit 2
+  fi
+  if [ "$ECS_CB_WATCH" = "true" ] || [ "$ECS_CB_IGNORE_START_PERIOD" = "true" ]; then
+    err "--no-ecs-circuit-breaker と --ecs-circuit-breaker-watch / --ecs-circuit-breaker-watch-timeout / --ecs-circuit-breaker-ignore-start-period は同時に指定できません。"
     err "  再現ごと行わない場合は --no-ecs-circuit-breaker だけを指定してください。"
     exit 2
   fi
@@ -33154,6 +33198,173 @@ ecs_cb_duration_seconds() {
   '
 }
 
+# healthcheck の probe 履歴 (.State.Health.Log) を読むための補助。
+#
+# docker は start_period の間、healthcheck が失敗しても次の 2 つを行わない
+# (moby の handleProbeResult がそう実装されている)。
+#   - 連続失敗回数 (.State.Health.FailingStreak) を増やさない → ずっと 0 のまま
+#   - 状態 (.State.Health.Status) を unhealthy にしない       → ずっと starting
+# つまり healthcheck が 1 回目から失敗していても、start_period が終わるまでは
+# unhealthy にならず、start_period の経過後にさらに retries 回失敗して初めて
+# unhealthy になる (start_period + interval × (retries - 1) 〜 + interval × retries)。
+# start_period を長く取った構成では、
+# 起動完了ログの方がはるかに先に出るため、状態だけを見ていると「healthcheck は
+# 通っている」ようにしか見えない。失敗しているかどうかは probe 一件ごとの終了
+# コードにしか現れないため、ここではその履歴を読む。
+#
+# 問い合わせには必ず目印を付ける。docker inspect の -f は同じフィールドを使う
+# 別の問い合わせと見分けが付かず、目印が無いと取り違えるため。
+
+# probe の終了コードを古い順に 1 行ずつ返す (healthcheck 未定義なら何も返さない)。
+# 0 が成功、0 以外が失敗 (probe を起動できなかった場合は -1)。
+ecs_cb_probe_exit_codes() {
+  docker inspect -f \
+    '{{if .State.Health}}{{range .State.Health.Log}}ecs-cb-hc-exit:{{.ExitCode}}{{"\n"}}{{end}}{{end}}' \
+    "$1" 2>/dev/null | sed -n 's/^ecs-cb-hc-exit://p'
+}
+
+# 直近の probe の出力を 1 行へ畳んで返す (healthcheck が何で落ちているかの表示用)。
+ecs_cb_probe_last_output() {
+  docker inspect -f \
+    '{{if .State.Health}}{{range .State.Health.Log}}ecs-cb-hc-output:{{.Output}}{{end}}{{end}}' \
+    "$1" 2>/dev/null \
+    | tr '\r\n\t' '   ' \
+    | awk -F'ecs-cb-hc-output:' '{ if (NF > 1) printf "%s", $NF }' \
+    | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' \
+    | cut -c1-160
+}
+
+# 直近から連続して失敗している probe の回数を返す。start_period の間は
+# FailingStreak が増えないため、実際に失敗しているかはここでしか分からない。
+ecs_cb_probe_failing_streak() {
+  ecs_cb_probe_exit_codes "$1" | awk '
+    { code[NR] = $0 }
+    END {
+      streak = 0
+      for (i = NR; i >= 1; i--) {
+        if (code[i] + 0 == 0) break
+        streak++
+      }
+      print streak
+    }
+  '
+}
+
+# healthcheck 設定 (interval / timeout / retries / start_period) を 1 項目取り出す。
+ecs_cb_health_setting() {
+  local container_id="$1" want="$2" line key value
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [ "$key" = "$want" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done < <(ecs_cb_health_settings "$container_id")
+  return 1
+}
+
+# コンテナの起動時刻を epoch 秒で返す (解釈できなければ何も返さず 1 を返す)。
+# start_period の残りを求めるために使う。
+ecs_cb_started_epoch() {
+  local raw epoch
+  date_parse_supported || return 1
+  raw="$(docker inspect -f 'ecs-cb-hc-started:{{.State.StartedAt}}' "$1" 2>/dev/null)"
+  raw="${raw#ecs-cb-hc-started:}"
+  case "$raw" in
+    ''|0001-01-01T00:00:00Z) return 1 ;;
+  esac
+  # 小数秒を落とす (環境によっては date -d が解釈できないため)。
+  raw="$(printf '%s' "$raw" | sed -E 's/\.[0-9]+//')"
+  epoch="$(date -d "$raw" '+%s' 2>/dev/null)" || return 1
+  case "$epoch" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$epoch"
+}
+
+# unhealthy と判定されるまでの残り秒数の目安 (上限) を返す。待つ時間の算出に使う。
+#   starting : (start_period の残り) + interval × retries
+#   それ以外 : interval × (retries - 連続失敗回数)
+# 実際は start_period 経過後の最初の probe から数え始めるため、これより
+# interval 1 回分ほど早く判定が出ることがある (待つ側なので上限で見積もる)。
+# start_period の間は連続失敗回数が増えないため、残りは retries 回分として数える。
+ecs_cb_unhealthy_eta_seconds() {
+  local container_id="$1" status="$2" streak="$3"
+  local raw interval retries start_period started_epoch now remaining need eta
+
+  raw="$(ecs_cb_health_setting "$container_id" interval)" || raw=""
+  interval="$(ecs_cb_duration_seconds "$raw")" || interval=""
+  case "$interval" in
+    ''|*[!0-9]*) interval=30 ;;
+  esac
+  [ "$interval" -gt 0 ] || interval=30
+  retries="$(ecs_cb_health_setting "$container_id" retries)" || retries=""
+  case "$retries" in
+    ''|*[!0-9]*) retries=3 ;;
+  esac
+  raw="$(ecs_cb_health_setting "$container_id" start_period)" || raw=""
+  start_period="$(ecs_cb_duration_seconds "$raw")" || start_period=""
+  case "$start_period" in
+    ''|*[!0-9]*) start_period=0 ;;
+  esac
+
+  remaining=0
+  if [ "$status" = "starting" ] && [ "$start_period" -gt 0 ]; then
+    started_epoch="$(ecs_cb_started_epoch "$container_id")" || started_epoch=""
+    if [ -n "$started_epoch" ]; then
+      now="$(date +%s)"
+      remaining=$(( started_epoch + start_period - now ))
+      [ "$remaining" -lt 0 ] && remaining=0
+    else
+      remaining="$start_period"
+    fi
+  fi
+  need="$retries"
+  if [ "$remaining" -eq 0 ]; then
+    case "$streak" in
+      ''|*[!0-9]*) ;;
+      *)
+        need=$(( retries - streak ))
+        [ "$need" -lt 0 ] && need=0
+        ;;
+    esac
+  fi
+  eta=$(( remaining + interval * need ))
+  [ "$eta" -lt 0 ] && eta=0
+  printf '%s' "$eta"
+}
+
+# ECS と同じ「unhealthy か」の判定。unhealthy とみなす場合だけ、その連続失敗回数を
+# 返して 0 を返す。--ecs-circuit-breaker-ignore-start-period 指定時は、start_period
+# の間でも probe が retries 回続けて失敗していれば unhealthy とみなす
+# (docker / ECS の仕様より早いが、start_period を長く取った構成でも待たずに
+#  再現できるようにするための指定)。
+ecs_cb_effective_unhealthy_streak() {
+  local container_id="$1" state status streak retries probe_streak
+  state="$(ecs_cb_health_state "$container_id")"
+  [ -n "$state" ] || return 1
+  status="${state%%|*}"
+  streak="${state#*|}"
+  if [ "$status" = "unhealthy" ]; then
+    printf '%s' "$streak"
+    return 0
+  fi
+  [ "$ECS_CB_IGNORE_START_PERIOD" = "true" ] || return 1
+  [ "$status" = "starting" ] || return 1
+  retries="$(ecs_cb_health_setting "$container_id" retries)" || retries=""
+  case "$retries" in
+    ''|*[!0-9]*) retries=3 ;;
+  esac
+  probe_streak="$(ecs_cb_probe_failing_streak "$container_id")"
+  case "$probe_streak" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$probe_streak" -ge "$retries" ] || return 1
+  printf '%s' "$probe_streak"
+  return 0
+}
+
 # 置き換えたタスクの判定を待つ秒数を決める。明示指定が無ければ healthcheck の
 # 設定から「start_period + interval × (retries + 1)」を求め、30〜300 秒へ収める
 # (ECS が UNHEALTHY と判定するまでに必要な時間と同じ考え方)。
@@ -33819,14 +34030,31 @@ run_ecs_circuit_breaker() {
 
   # logging subsystem の設定は、停止前の起動中コンテナからしか読めない。
   # server.log が「どう切れるのか」の根拠になるため、停止を始める前に採取する。
+  local jboss_found="false"
   for svc in "${services[@]}"; do
     [ -n "$svc" ] || continue
     cid="$(compose_container_ids "$svc" | head -n 1)"
     if [ -n "$cid" ] && [ -n "$(jboss_detect_home "$cid")" ]; then
       ecs_cb_report_logging_config "$cid" "$svc" "$ECS_CB_DIGEST_FILE"
+      jboss_found="true"
       break
     fi
   done
+  # 必須コンテナに JBoss EAP が 1 つも無い場合、停止とサーキットブレーカは再現できるが
+  # server.log の切断は判定できない (reload も server.log もそのコンテナにしか無い)。
+  # 「切れませんでした」と読み違えられないよう、理由を先に書いておく。
+  if [ "$jboss_found" != "true" ]; then
+    {
+      printf '\n[server.log の切断判定]\n'
+      printf '  必須コンテナ (%s) に JBoss EAP のコンテナがありません。\n' "${services[*]}"
+      printf '  jboss-cli.sh と server.log を持たないため、停止とサーキットブレーカは\n'
+      printf '  再現できますが、server.log の切断は判定できません。\n'
+      printf '  切断まで確認するには、--ecs-essential-service へ JBoss EAP のサービスを\n'
+      printf '  指定してください (ECS のタスクでも、切れるのは EAP のコンテナの server.log です)。\n'
+    } >> "$ECS_CB_DIGEST_FILE"
+    warn "必須コンテナに JBoss EAP のコンテナが無いため、server.log の切断は判定できません。"
+    diag "  切断まで確認するには --ecs-essential-service へ JBoss EAP のサービスを指定してください。"
+  fi
 
   while :; do
     attempt=$(( attempt + 1 ))
@@ -34007,6 +34235,9 @@ append_ecs_circuit_breaker_report() {
     if [ -n "$ECS_CB_SKIP_REASON" ]; then
       printf '%s\n' "$ECS_CB_SKIP_REASON" >> "$report_file"
     elif [ "$ECS_CIRCUIT_BREAKER" = "true" ]; then
+      if [ -n "$ECS_CB_OBSERVED" ]; then
+        printf '必須コンテナの healthcheck: %s\n' "$ECS_CB_OBSERVED" >> "$report_file"
+      fi
       printf '%s\n' "必須コンテナが unhealthy にならなかったため、再現は行っていません (ECS でもタスクは停止されません)。" >> "$report_file"
       printf '%s\n' "正常な実行でも意図的に再現するには --ecs-circuit-breaker-drill を指定してください。" >> "$report_file"
     else
@@ -34039,29 +34270,87 @@ append_ecs_circuit_breaker_report() {
 # 見つけたら ECS_CB_TRIGGER_* へ 1 件目を記録して 0 を返す。ECS はこの時点で
 # タスクを停止するため、compose でも同じ判定にする。
 ecs_cb_find_unhealthy_essential() {
-  local svc cid state status
+  local svc cid streak
   ecs_circuit_breaker_enabled || return 1
   [ "$ECS_CB_DONE" = "true" ] && return 1
   while IFS= read -r svc; do
     [ -n "$svc" ] || continue
     while IFS= read -r cid; do
       [ -n "$cid" ] || continue
-      state="$(ecs_cb_health_state "$cid")"
-      [ -n "$state" ] || continue
-      status="${state%%|*}"
-      [ "$status" = "unhealthy" ] || continue
+      streak="$(ecs_cb_effective_unhealthy_streak "$cid")" || continue
       ECS_CB_TRIGGER_SERVICE="$svc"
-      ECS_CB_TRIGGER_STREAK="${state#*|}"
+      ECS_CB_TRIGGER_STREAK="$streak"
       return 0
     done < <(compose_container_ids "$svc")
   done < <(ecs_cb_essential_services)
   return 1
 }
 
+# 必須コンテナの healthcheck が「すべて healthy」になったかを返す。
+# healthcheck を持たないコンテナは ECS でも UNHEALTHY にならないため対象外とする。
+ecs_cb_essential_all_healthy() {
+  local svc cid state found="false"
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    while IFS= read -r cid; do
+      [ -n "$cid" ] || continue
+      state="$(ecs_cb_health_state "$cid")"
+      [ -n "$state" ] || continue
+      found="true"
+      [ "${state%%|*}" = "healthy" ] || return 1
+    done < <(compose_container_ids "$svc")
+  done < <(ecs_cb_essential_services)
+  [ "$found" = "true" ]
+}
+
+# start_period の間に healthcheck が失敗し続けている必須コンテナを、1 度だけ知らせる。
+# この間 docker は unhealthy にせず連続失敗回数も増やさないため、何も出さないと
+# 「healthcheck は通っている」ようにしか見えない。判定が出るのは start_period が
+# 終わってからさらに retries 回失敗した後で、起動確認 (--startup-timeout) の方が
+# 先に終わることが多い。
+ecs_cb_notice_start_period_failures() {
+  local svc cid state status probe_streak eta output
+  [ "$ECS_CB_STARTING_NOTICE" = "true" ] && return 0
+  ecs_circuit_breaker_enabled || return 0
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    cid="$(compose_container_ids "$svc" | head -n 1)"
+    [ -n "$cid" ] || continue
+    state="$(ecs_cb_health_state "$cid")"
+    [ -n "$state" ] || continue
+    status="${state%%|*}"
+    [ "$status" = "starting" ] || continue
+    probe_streak="$(ecs_cb_probe_failing_streak "$cid")"
+    case "$probe_streak" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$probe_streak" -ge 1 ] || continue
+    ECS_CB_STARTING_NOTICE="true"
+    eta="$(ecs_cb_unhealthy_eta_seconds "$cid" "$status" "${state#*|}")"
+    output="$(ecs_cb_probe_last_output "$cid")"
+    warn "必須コンテナ '${svc}' の healthcheck は失敗していますが、start_period の間のため docker はまだ unhealthy にしません。"
+    diag "  healthcheck   : ${status} / 連続失敗 ${state#*|} 回 (start_period 中は数えません) / probe は直近 ${probe_streak} 回続けて失敗"
+    diag "  healthcheck 設定: $(ecs_cb_health_settings_line "$cid")"
+    if [ -n "$output" ]; then
+      diag "  probe の出力  : ${output}"
+    fi
+    diag "  このまま失敗が続くと、あと約 ${eta}s で unhealthy になります (ECS ならそこでタスクが停止されます)。"
+    diag "  起動完了ログの方が先に出る場合、判定を待たずに起動確認が終わります。待たせるには --ecs-essential-service か --ecs-circuit-breaker-watch を指定してください。"
+    diag "  start_period の経過を待たずに再現するには --ecs-circuit-breaker-ignore-start-period を指定してください。"
+    return 0
+  done < <(ecs_cb_essential_services)
+  return 0
+}
+
 # 起動確認のループから呼ぶ。必須コンテナが unhealthy なら ECS と同じ停止を再現し、
 # サーキットブレーカが開いたときだけ 1 を返す (呼び出し側は起動確認失敗として扱う)。
 ecs_cb_check_during_startup() {
-  ecs_cb_find_unhealthy_essential || return 0
+  if ! ecs_cb_find_unhealthy_essential; then
+    # unhealthy ではないが、start_period の間に失敗し続けていることがある。
+    # 黙って通り過ぎると「healthcheck は通っている」ように見えるため知らせる。
+    ecs_cb_notice_start_period_failures
+    return 0
+  fi
   err "必須コンテナ '${ECS_CB_TRIGGER_SERVICE}' の healthcheck が unhealthy になりました (連続失敗 ${ECS_CB_TRIGGER_STREAK} 回)。"
   err "  ECS ではこの時点でタスクが停止され、サーキットブレーカによりデプロイがロールバックされます。"
   err "  同じ挙動を再現します (無効化するには --no-ecs-circuit-breaker)。"
@@ -34069,6 +34358,137 @@ ecs_cb_check_during_startup() {
     return 0
   fi
   return 1
+}
+
+# 起動確認後も healthcheck の判定を待つかどうかを返す。
+#   --ecs-circuit-breaker-watch    : 待つ
+#   --no-ecs-circuit-breaker-watch : 待たない
+#   既定 (auto)                    : --ecs-essential-service を明示した実行だけ待つ
+# 既定を「明示したときだけ」にしているのは、必須コンテナを指定していない実行では
+# 対象が起動中の全サービスまで広がり、DB やモックの healthcheck までデプロイの
+# 成否に持ち込むことになるため (ECS でも essential=true は明示の指定である)。
+ecs_cb_watch_enabled() {
+  case "$ECS_CB_WATCH" in
+    true)  return 0 ;;
+    false) return 1 ;;
+  esac
+  [ ${#ECS_CB_ESSENTIAL_SERVICES[@]} -gt 0 ]
+}
+
+ecs_cb_record_observation() {
+  ECS_CB_OBSERVED="${ECS_CB_OBSERVED}${ECS_CB_OBSERVED:+, }$1"
+}
+
+# 起動完了ログを確認した後に、必須コンテナの healthcheck の判定を見届ける。
+#
+# 起動確認 (wait_for_startup) は起動完了ログを見つけた時点で抜けるため、そこだけを
+# 見ていると「healthcheck は失敗し続けているのに、起動確認は成功してそのまま最後まで
+# 通る」ことになる。docker は start_period の間 unhealthy にしないため、start_period
+# を長く取った構成ではこれが常態になる (例: start_period=180s / interval=30s /
+# retries=3 なら、unhealthy になるのは起動から約 240〜270s 後で、JBoss EAP の
+# 起動完了ログはその何倍も前に出る)。
+# ECS では healthcheck の判定はデプロイ中ずっと続き、UNHEALTHY になった時点で
+# タスクが停止されるため、ここで判定が出るまで待つ。
+verify_essential_container_health() {
+  local -a services=() pending_svc=() pending_desc=()
+  local svc cid state status streak probe_streak eta output settings
+  local timeout deadline now max_eta=0 idx attention="false"
+
+  ecs_circuit_breaker_enabled || return 0
+  [ "$ECS_CB_DONE" = "true" ] && return 0
+  mapfile -t services < <(ecs_cb_essential_services)
+  [ ${#services[@]} -gt 0 ] || return 0
+
+  ECS_CB_OBSERVED=""
+  for svc in ${services[@]+"${services[@]}"}; do
+    [ -n "$svc" ] || continue
+    cid="$(compose_container_ids "$svc" | head -n 1)"
+    [ -n "$cid" ] || continue
+    state="$(ecs_cb_health_state "$cid")"
+    if [ -z "$state" ]; then
+      ecs_cb_record_observation "${svc}=healthcheck 未定義"
+      continue
+    fi
+    status="${state%%|*}"
+    streak="${state#*|}"
+    probe_streak="$(ecs_cb_probe_failing_streak "$cid")"
+    case "$probe_streak" in
+      ''|*[!0-9]*) probe_streak=0 ;;
+    esac
+    ecs_cb_record_observation "${svc}=${status} (連続失敗 ${streak} 回 / probe 連続失敗 ${probe_streak} 回)"
+    [ "$status" = "healthy" ] && continue
+    # unhealthy か、probe が実際に失敗しているときだけ「異常」として扱う。
+    # 1 度も probe が走っていない starting は、判定がまだ出ていないだけで正常。
+    if [ "$status" = "unhealthy" ] || [ "$probe_streak" -ge 1 ]; then
+      attention="true"
+    fi
+    eta="$(ecs_cb_unhealthy_eta_seconds "$cid" "$status" "$streak")"
+    case "$eta" in
+      ''|*[!0-9]*) eta=0 ;;
+    esac
+    [ "$eta" -gt "$max_eta" ] && max_eta="$eta"
+    settings="$(ecs_cb_health_settings_line "$cid")"
+    output="$(ecs_cb_probe_last_output "$cid")"
+    pending_svc+=("$svc")
+    pending_desc+=("${svc} : ${status} / 連続失敗 ${streak} 回 / probe は直近 ${probe_streak} 回続けて失敗 / ${settings}")
+    if [ -n "$output" ]; then
+      pending_desc+=("${svc} : probe の出力 : ${output}")
+    fi
+  done
+
+  # 判定が出ている (すべて healthy) 実行では何も出さずに戻る。
+  [ ${#pending_svc[@]} -gt 0 ] || return 0
+
+  if [ "$attention" = "true" ]; then
+    # healthcheck が実際に失敗している。判定が出ていないだけの状態と区別して出す。
+    warn "必須コンテナの healthcheck の判定が出ていません (起動完了ログの方が先に出ています)。"
+    for idx in "${!pending_desc[@]}"; do
+      diag "  ${pending_desc[$idx]}"
+    done
+  elif ! ecs_cb_watch_enabled; then
+    # probe は失敗しておらず、判定がまだ出ていないだけ。従来どおり静かに進む。
+    return 0
+  fi
+
+  if ! ecs_cb_watch_enabled; then
+    diag "  ECS はこの後も healthcheck を見続け、UNHEALTHY になった時点でタスクを停止します。"
+    diag "  判定が出るまで待つには --ecs-essential-service SERVICE か --ecs-circuit-breaker-watch を指定してください。"
+    ECS_CB_SKIP_REASON="起動確認を終えた時点で必須コンテナの healthcheck の判定が出ていなかったため、再現していません (${ECS_CB_OBSERVED})。判定を待つには --ecs-circuit-breaker-watch を指定してください。"
+    return 0
+  fi
+
+  timeout="$ECS_CB_WATCH_TIMEOUT"
+  if [ "$timeout" = "0" ]; then
+    timeout=$(( max_eta + 30 ))
+    [ "$timeout" -lt 30 ] && timeout=30
+    [ "$timeout" -gt 900 ] && timeout=900
+  fi
+  log "必須コンテナの healthcheck の判定 (healthy / unhealthy) を待ちます (対象: ${pending_svc[*]}, 最大 ${timeout}s) ..."
+  now="$(date +%s)"
+  deadline=$(( now + timeout ))
+  while :; do
+    if ecs_cb_find_unhealthy_essential; then
+      err "必須コンテナ '${ECS_CB_TRIGGER_SERVICE}' の healthcheck が unhealthy になりました (連続失敗 ${ECS_CB_TRIGGER_STREAK} 回)。"
+      err "  ECS ではこの時点でタスクが停止され、サーキットブレーカによりデプロイがロールバックされます。"
+      err "  同じ挙動を再現します (無効化するには --no-ecs-circuit-breaker)。"
+      if run_ecs_circuit_breaker unhealthy; then
+        return 0
+      fi
+      return 1
+    fi
+    if ecs_cb_essential_all_healthy; then
+      log "  必須コンテナの healthcheck がすべて healthy になりました。"
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      warn "必須コンテナの healthcheck は ${timeout}s 以内に healthy / unhealthy のどちらにもなりませんでした。"
+      diag "  healthcheck の start_period / interval / retries と、待つ秒数 (--ecs-circuit-breaker-watch-timeout) を確認してください。"
+      ECS_CB_SKIP_REASON="必須コンテナの healthcheck が ${timeout}s 以内に healthy / unhealthy のどちらにもならなかったため、再現していません (${ECS_CB_OBSERVED})。"
+      return 0
+    fi
+    sleep "$STARTUP_INTERVAL"
+  done
 }
 
 # 正常な実行の最後に、意図的に 1 回だけ再現する (--ecs-circuit-breaker-drill)。
@@ -34796,6 +35216,15 @@ if [ "$VERIFY_STARTUP" = "true" ]; then
     handle_deploy_error_investigation
     exit 1
   fi
+fi
+
+# ---- 必須コンテナの healthcheck 判定 ----------------------------------------
+# 起動完了ログは「アプリが起動したか」しか見ていない。ECS はその後も healthcheck を
+# 見続け、UNHEALTHY になった時点でタスクを停止するため、判定が出るまでここで待つ。
+# start_period を長く取った構成では、判定が出るのは起動完了ログよりずっと後になる。
+if ! verify_essential_container_health; then
+  err "必須コンテナの healthcheck が unhealthy になったため、デプロイ失敗として終了します。"
+  exit 1
 fi
 
 # ---- URL 応答確認 -----------------------------------------------------------

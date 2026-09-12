@@ -62,7 +62,7 @@
 | 18 | 後始末でのボリューム削除 (デプロイ先を覆っているボリュームを残さない) | (対話操作をすべて終えた実行では既定で `compose down -v`。常に削除は `--remove-volumes`、残すのは `--keep-volumes`) |
 | 19 | ホスト側システムログ (`/var/log/messages`) への docker 関連ログの抑制 (コンテナログの journald / syslog 経由の流入を防ぐログドライバ差し替えと、docker デーモンが記録する API エラーを出さない存在確認) | (既定で有効。無効化は `--no-suppress-syslog`。増加量の実測は `--syslog-audit`) |
 | 20 | サービス別ビルドログ (`base` / `frontend` / `backend` などサービスごとに切り分けたビルドログのファイル出力と、ビルドエラー時の画面への全量表示) | (既定で自動。出力先は `--report-dir` 配下、指定が無ければ一時ディレクトリ) |
-| 21 | ECS サーキットブレーカによるタスク停止の再現 (必須コンテナの healthcheck 失敗 → SIGTERM → `stopTimeout` → SIGKILL を `jboss-cli` の `:reload` と重ね、`server.log` が途中で切れる事象を再現・判定する) | (起動確認時に既定で自動。必須コンテナが `unhealthy` になったときだけ動く。無効化は `--no-ecs-circuit-breaker`、正常時に意図的に再現するには `--ecs-circuit-breaker-drill`) |
+| 21 | ECS サーキットブレーカによるタスク停止の再現 (必須コンテナの healthcheck 失敗 → SIGTERM → `stopTimeout` → SIGKILL を `jboss-cli` の `:reload` と重ね、`server.log` が途中で切れる事象を再現・判定する) | (起動確認時に既定で自動。必須コンテナが `unhealthy` になったときだけ動く。`--ecs-essential-service` 指定時は起動完了ログの後も判定を待つ。無効化は `--no-ecs-circuit-breaker`、正常時に意図的に再現するには `--ecs-circuit-breaker-drill`) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -519,6 +519,10 @@ compose down (削除)
 | `--ecs-circuit-breaker-reload-delay SEC` | 0 以上の整数 (秒) | `1` | 不可 | `:reload` を実行してから停止を始めるまでの秒数。`0` で同時 |
 | `--no-ecs-circuit-breaker-reload` | フラグ | `false` | — | `:reload` を挟まず停止だけを再現する (切断の要因を切り分けるとき) |
 | `--ecs-circuit-breaker-replace-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 不可 | 置き換えたタスクの `healthy` / `unhealthy` 判定を待つ秒数。`0` なら `start_period + interval × (retries + 1)` を計算し 30〜300 秒へ収める |
+| `--ecs-circuit-breaker-watch` | フラグ | `--ecs-essential-service` 指定時は有効 | — | 起動完了ログを検出した後も、必須コンテナの healthcheck が `healthy` / `unhealthy` のどちらになるかを待つ。`start_period` が長い構成では判定が起動完了ログより後に出るため、待たないと再現が始まらない |
+| `--no-ecs-circuit-breaker-watch` | フラグ | `false` | — | 判定を待たない (`--ecs-essential-service` 指定時の既定を打ち消す) |
+| `--ecs-circuit-breaker-watch-timeout SEC` | 0 以上の整数 (秒) | `0` (自動) | 不可 | 判定を待つ秒数。`0` なら `start_period の残り + interval × retries` を計算し 30〜900 秒へ収める |
+| `--ecs-circuit-breaker-ignore-start-period` | フラグ | `false` | — | `start_period` の間の healthcheck 失敗も数え、`retries` 回続けて失敗した時点で `unhealthy` とみなす (`.State.Health.Log` の終了コードで数える)。docker / ECS の仕様より早く判定するため、`start_period` が長い構成でも待たずに再現できる |
 | `--ecs-server-log PATH` | コンテナ内の絶対パス | (自動検出) | 不可 | `server.log` の場所。既定は `$JBOSS_HOME/standalone/log/server.log` を探す |
 | `--ecs-circuit-breaker-drill` | フラグ | `false` | — | 必須コンテナが `unhealthy` にならなくても、動作確認をすべて終えた後に 1 回だけ意図的に再現する (置き換えは行わない) |
 | `--ecs-circuit-breaker-text FILE` | ファイルパス | (`--report-dir` 配下へ自動命名) | 不可 | 再現結果のテキスト出力先 |
@@ -2242,9 +2246,57 @@ compose には「unhealthy になったコンテナを止めて置き換える�
 | 置き換え | サービスがタスクを置き換える | `compose up -d --force-recreate <サービス>` |
 | 打ち切り | 失敗タスクが閾値 (必要数の 0.5 倍・最小 3・最大 200) に到達 → ロールバック | `--ecs-circuit-breaker-threshold` (既定 3) に到達 → 起動確認を失敗として終了 |
 
-監視するのは**起動確認 (`--verify-startup`) の最中だけ**です。ECS のデプロイ
-サーキットブレーカもデプロイ中にだけ働き、定常状態に入った後は関与しないため、
-働く期間を合わせています。
+#### 判定はいつ出るのか (`start_period` と起動完了ログの前後関係)
+
+**ここを取り違えると「必須コンテナを指定して healthcheck をわざと失敗させたのに、
+何事もなく起動して終わる」ことになります。** docker は `start_period` の間、
+healthcheck が失敗しても次の 2 つを行いません (moby の `handleProbeResult`)。
+
+| 見えるもの | `start_period` の間 | `start_period` の経過後 |
+| --- | --- | --- |
+| `.State.Health.Status` | `starting` のまま (失敗していても `unhealthy` にならない) | `retries` 回連続失敗で `unhealthy` |
+| `.State.Health.FailingStreak` | `0` のまま (数えない) | 失敗のたびに増える |
+| `.State.Health.Log[].ExitCode` | **失敗がそのまま出る** (`127` = スクリプトが無い、`-1` = probe を起動できない) | 同じ |
+
+このため、`start_period=180s` / `interval=30s` / `retries=3` の構成では、
+healthcheck が 1 回目から失敗していても `unhealthy` になるのは**起動から約 240〜270 秒後**
+です (`start_period` の経過後に始まる連続失敗を `retries` 回数えるため、
+`180 + 30 × (3 - 1)` 〜 `180 + 30 × 3` の幅になる)。一方 JBoss EAP の起動完了ログ
+(`WFLYSRV0025`) はその何倍も前に出るため、起動確認は先に成功してしまいます。
+`--startup-timeout` の既定値は 120 秒で、`start_period` (180 秒) より短いことにも
+注意してください (判定が出るどころか、`start_period` の経過すら待てません)。
+
+```
+0s        30s        60s   …     180s      210s      240s
+|----------|----------|---------|--------|---------|
+ コンテナ起動                     start_period 終了       FailingStreak 3
+   probe 失敗  probe 失敗           失敗 1    失敗 2    失敗 3 → UNHEALTHY
+      ↑ Status は starting のまま (FailingStreak は 0 のまま)
+           ↑ 起動完了ログ WFLYSRV0025 (ここで起動確認は成功して先へ進む)
+           ↑ --startup-timeout の既定 120s もこの手前で尽きる
+```
+
+そこでこのスクリプトは、次の 2 か所で判定を見ます。
+
+| 見る場所 | 何をするか |
+| --- | --- |
+| 起動確認 (`wait_for_startup`) のループ | `unhealthy` を見つけたら即座に再現する。`starting` のまま probe が失敗している場合は、**「いまは start_period の間なので unhealthy にならない」「あと約 N 秒で unhealthy になる」を 1 度だけ警告する** |
+| 起動確認を終えた直後 | 必須コンテナの healthcheck の判定 (`healthy` / `unhealthy`) が出るまで待つ。`--ecs-essential-service` を指定した実行では既定で有効 (`--ecs-circuit-breaker-watch` / `--no-ecs-circuit-breaker-watch` で切り替え) |
+
+待つ時間は既定で `start_period の残り + interval × retries` から自動計算し、
+30〜900 秒へ収めます (`--ecs-circuit-breaker-watch-timeout` で明示指定できます)。
+判定を待たない実行 (`--ecs-essential-service` も `--ecs-circuit-breaker-watch` も
+指定しない実行) では従来どおり先へ進みますが、**取りこぼした事実は警告と全量レポート
+`[14]` に残します** (「判定が出ていない」ことを黙って成功にはしません)。
+
+`start_period` の経過を待ちたくない場合は `--ecs-circuit-breaker-ignore-start-period`
+を指定します。`.State.Health.Log` の終了コードを直接数え、`retries` 回続けて失敗して
+いれば `start_period` の間でも `unhealthy` とみなして再現を始めます
+(docker / ECS の仕様より早い判定であり、再現用の指定です)。
+
+ECS のデプロイサーキットブレーカはデプロイ中にだけ働き、定常状態に入った後は
+関与しないため、**再現もデプロイに相当する期間 (起動確認とその判定待ち) に限って**
+行います。
 
 #### 切断の判定
 
@@ -2269,6 +2321,19 @@ compose には「unhealthy になったコンテナを止めて置き換える�
 # 既定 (何も指定しない)。必須コンテナが unhealthy になったときだけ再現する
 ./build_and_verify.sh --verify-startup --compose-service app --startup-service app \
     --report-dir ./reports
+
+# 必須コンテナを明示する (healthcheck の判定が出るまで待ってから再現する)。
+# start_period が長く、起動完了ログの方が先に出る構成ではこの指定が要る
+./build_and_verify.sh --verify-startup --compose-service frontend \
+    --startup-service frontend --ecs-essential-service frontend \
+    --report-dir ./reports
+
+# start_period (例: 180s) の経過を待たずに再現する
+./build_and_verify.sh --verify-startup --compose-service frontend \
+    --startup-service frontend --ecs-essential-service frontend \
+    --ecs-circuit-breaker-ignore-start-period \
+    --ecs-circuit-breaker-threshold 1 --ecs-stop-timeout 5 \
+    --ecs-circuit-breaker-reload-delay 0 --report-dir ./reports
 
 # 正常に起動する構成でも、事象を手元で起こしてみる (最後に 1 回だけ停止する)
 ./build_and_verify.sh --verify-startup --compose-service app --startup-service app \
@@ -2295,6 +2360,14 @@ compose には「unhealthy になったコンテナを止めて置き換える�
   訓練実行では停止したうえでコンテナを残します (警告を出します)
 - `healthcheck` が定義されていないコンテナは対象外です
   (ECS でも `healthCheck` の無いコンテナは UNHEALTHY になりません)
+- `start_period` の間は、healthcheck が失敗していても `unhealthy` になりません
+  (docker の仕様)。判定が出るのは `start_period + interval × retries` 後です。
+  待たずに再現するには `--ecs-circuit-breaker-ignore-start-period` を指定します
+- `server.log` の切断まで確認するには、**必須コンテナが JBoss EAP のコンテナである
+  必要があります** (`jboss-cli.sh` と `server.log` を持つコンテナ)。静的配信だけの
+  フロントコンテナを `--ecs-essential-service` に指定した場合、停止と
+  サーキットブレーカは再現できますが、切断の判定は行えません
+  (「reload: jboss-cli.sh が無いため注入できませんでした」と記録します)
 - `jboss-cli.sh` が無いコンテナでは reload を挟めないため、停止だけを再現します
 - 置き換えたタスクが `healthy` になった場合、ECS と同じくデプロイ続行とみなし、
   サーキットブレーカは開かずに起動確認を続けます
