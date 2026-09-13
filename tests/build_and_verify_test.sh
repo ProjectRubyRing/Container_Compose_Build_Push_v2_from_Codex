@@ -72,6 +72,7 @@ collect_report_files() {
       *_jboss_modules_*.txt) continue ;;
       *_truststore_inventory_*.txt) continue ;;
       *_build_log_*.txt) continue ;;
+      *_deployed_class_*.txt) continue ;;
     esac
     [ -f "$path" ] && REPORT_FILES+=("$path")
   done
@@ -6900,6 +6901,422 @@ fi
 assert_contains "$copy_artifact_reldir_output" \
   "--copy-artifact-search-dir にはコンテナ内の絶対パスを指定してください: opt/eap"
 
+# ---- デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2) -----------------
+# デプロイ実行前の WAR に含まれるファイルの MD5 一覧 (リスト1) と、デプロイ成功後に
+# JBoss EAP が vfs/temp 配下へ展開した中身の MD5 一覧 (リスト2) を作り、差分が無い
+# ことを確認する。取り込み検証 (--verify-copy-artifact) が WAR ファイル 1 個の
+# SHA-256 を見るのに対し、こちらは中身をファイル単位で突き合わせるため、
+# 「一部のクラスだけ古い」状態まで検出できる。
+# 一覧の生成は tools/war_class_digest.sh が行い、リスト2 はそのスクリプトを
+# docker exec の標準入力経由でコンテナへ配って実行する。偽 docker はその
+# スクリプトをそのまま受け取り、--vfs-dir だけをホスト側の代替ディレクトリへ
+# 差し替えて実行するため、実物と同じ実装・同じ書式で検証できる。
+# 起動確認は成功ログの fixture で通す。直前のテストが残した値に依存しないよう、
+# このブロックで使うものはここで明示しておく。
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+
+digest_base="$TEST_TMP/deployed-class"
+digest_src="$digest_base/warsrc"
+mkdir -p "$digest_src/WEB-INF/classes/com/example" "$digest_src/WEB-INF/lib"
+printf 'class-A\n'  > "$digest_src/WEB-INF/classes/com/example/Alpha.class"
+printf 'class-B\n'  > "$digest_src/WEB-INF/classes/com/example/Beta.class"
+printf 'class-C\n'  > "$digest_src/WEB-INF/classes/com/example/Gamma.class"
+printf 'web-xml\n'  > "$digest_src/WEB-INF/web.xml"
+printf 'jar-body\n' > "$digest_src/WEB-INF/lib/dep.jar"
+
+digest_war="$digest_base/orders.war"
+# テスト用の WAR (zip) を作る。使える道具は環境によって違うため、
+#   Python (zipfile) → zip → jar
+# の順に試し、どれも使えなければその場で止める。
+#
+# Python は「PATH に居るのに動かない」ことがある (Windows の Microsoft Store
+# エイリアスは、実行すると案内を出して非ゼロで終わる)。command -v の成否だけで
+# 選ぶと、set -e のせいでスイートが無言で止まってしまうため、簡単な実行まで
+# 試してから採用する。
+digest_python=""
+for digest_py_candidate in python3 python; do
+  if command -v "$digest_py_candidate" >/dev/null 2>&1 \
+      && "$digest_py_candidate" -c 'import zipfile' >/dev/null 2>&1; then
+    digest_python="$digest_py_candidate"
+    break
+  fi
+done
+
+digest_war_made="false"
+if [ -n "$digest_python" ]; then
+  if "$digest_python" - "$digest_src" "$digest_war" <<'DIGEST_ZIP_END'
+import os
+import sys
+import zipfile
+
+src, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            path = os.path.join(root, name)
+            zf.write(path, os.path.relpath(path, src).replace(os.sep, "/"))
+DIGEST_ZIP_END
+  then
+    digest_war_made="true"
+  fi
+fi
+if [ "$digest_war_made" != "true" ] && command -v zip >/dev/null 2>&1; then
+  if ( cd "$digest_src" && zip -qr "$digest_war" . ) >/dev/null 2>&1; then
+    digest_war_made="true"
+  fi
+fi
+if [ "$digest_war_made" != "true" ] && command -v jar >/dev/null 2>&1; then
+  if ( cd "$digest_src" && jar cf "$digest_war" . ) >/dev/null 2>&1; then
+    digest_war_made="true"
+  fi
+fi
+[ "$digest_war_made" = "true" ] && [ -f "$digest_war" ] \
+  || fail "テスト用の WAR を作れませんでした (python3 / python / zip / jar のいずれかが必要です)"
+
+# コンテナ内 vfs/temp の代わりになるホスト側ディレクトリ (展開済みデプロイルート)
+digest_vfs="$digest_base/vfs/temp"
+mkdir -p "$digest_vfs/tempaaa111/content-bbb222"
+cp -r "$digest_src/." "$digest_vfs/tempaaa111/content-bbb222/"
+export FAKE_DEPLOYED_DIGEST_VFS_DIR="$digest_vfs"
+
+digest_ctx="$digest_base/context"
+mkdir -p "$digest_ctx"
+
+# (1) 既定では差分検証を行わない (WAR の展開と MD5 の算出に時間を要するため)。
+digest_default_reports="$TEST_TMP/deployed-class-default-reports"
+digest_default_output="$TEST_TMP/deployed-class-default.out"
+mkdir -p "$digest_default_reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_default_reports" \
+    --copy-file "${digest_war}:${digest_ctx}"
+) >"$digest_default_output" 2>&1; then
+  cat "$digest_default_output" >&2
+  fail "the default run must not verify deployed class digests"
+fi
+assert_not_contains "$digest_default_output" "デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2)"
+if ls "$digest_default_reports"/*_deployed_class_* >/dev/null 2>&1; then
+  fail "the default run must not write digest lists"
+fi
+collect_report_files "$digest_default_reports"
+assert_contains "${REPORT_FILES[0]}" \
+  "差分検証を行っていません (--verify-deployed-classes を指定すると実行します)。"
+
+# (2) 差分が無い場合: リスト1 / リスト2 / 差分レポートを出し、問題なしと判定する。
+digest_ok_reports="$TEST_TMP/deployed-class-ok-reports"
+digest_ok_output="$TEST_TMP/deployed-class-ok.out"
+mkdir -p "$digest_ok_reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_ok_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --verify-deployed-classes
+) >"$digest_ok_output" 2>&1; then
+  cat "$digest_ok_output" >&2
+  fail "deployed class digest verification without differences returned a non-zero status"
+fi
+assert_contains "$digest_ok_output" "デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2)"
+assert_contains "$digest_ok_output" "デプロイ済みファイルの MD5 差分はありませんでした (問題ありません)。"
+assert_contains "$digest_ok_output" "判定         : 差分なし (問題ありません)"
+digest_ok_list1="$(ls "$digest_ok_reports"/*_deployed_class_list1_war.txt)"
+digest_ok_list2="$(ls "$digest_ok_reports"/*_deployed_class_list2_vfs.txt)"
+digest_ok_diff="$(ls "$digest_ok_reports"/*_deployed_class_diff.txt)"
+[ -f "$digest_ok_list1" ] || fail "list 1 was not written"
+[ -f "$digest_ok_list2" ] || fail "list 2 was not written"
+[ -f "$digest_ok_diff" ] || fail "the diff report was not written"
+# 既定の対象は class ファイルのみ。xml / jar は一覧へ載せない。
+assert_contains "$digest_ok_list1" "# entries      : 3"
+assert_contains "$digest_ok_list1" "WEB-INF/classes/com/example/Alpha.class"
+assert_not_contains "$digest_ok_list1" "WEB-INF/web.xml"
+assert_not_contains "$digest_ok_list1" "WEB-INF/lib/dep.jar"
+assert_contains "$digest_ok_list2" "# entries      : 3"
+collect_report_files "$digest_ok_reports"
+assert_contains "${REPORT_FILES[0]}" "[15] デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2)"
+assert_contains "${REPORT_FILES[0]}" \
+  "結果          : 差分なし (リスト1 3 件 / リスト2 3 件、対象拡張子: class)"
+assert_contains "${REPORT_FILES[0]}" "デプロイ済みファイルの MD5 差分検証は [15] に記載"
+
+# (3) リスト1 側に差分がある状態を偽装する (WAR にあるのにデプロイ先に無い)。
+digest_sim1_reports="$TEST_TMP/deployed-class-sim1-reports"
+digest_sim1_output="$TEST_TMP/deployed-class-sim1.out"
+mkdir -p "$digest_sim1_reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_sim1_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-simulate list1
+) >"$digest_sim1_output" 2>&1; then
+  cat "$digest_sim1_output" >&2
+  fail "a simulated difference must stay a warning without --deployed-class-required"
+fi
+assert_contains "$digest_sim1_output" "偽装モード   : list1 (1 件) ※ 動作確認用に差分を作っています"
+assert_contains "$digest_sim1_output" "[A] リスト1 側の差分: リスト1 にのみ存在するファイル (1 件)"
+assert_contains "$digest_sim1_output" "[リスト1のみ] WEB-INF/classes/SIMULATED_LIST1/SimulatedOnly1.class"
+assert_contains "$digest_sim1_output" "[B] リスト2 側の差分: リスト2 にのみ存在するファイル (0 件)"
+assert_contains "$digest_sim1_output" "リスト1のみ 1 件 / リスト2のみ 0 件 / MD5 不一致 0 件"
+assert_contains "$digest_sim1_output" \
+  "※ この実行は --deployed-class-simulate list1 で差分を偽装しています。実際の不一致ではありません。"
+
+# (4) リスト2 側に差分がある状態を偽装する (デプロイ先にだけ余分な物がある)。
+digest_sim2_output="$TEST_TMP/deployed-class-sim2.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --deployed-class-dir "$TEST_TMP/deployed-class-sim2-lists" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-simulate list2
+) >"$digest_sim2_output" 2>&1; then
+  cat "$digest_sim2_output" >&2
+  fail "the list2 simulation returned a non-zero status"
+fi
+assert_contains "$digest_sim2_output" "[A] リスト1 側の差分: リスト1 にのみ存在するファイル (0 件)"
+assert_contains "$digest_sim2_output" "[B] リスト2 側の差分: リスト2 にのみ存在するファイル (1 件)"
+assert_contains "$digest_sim2_output" "[リスト2のみ] WEB-INF/classes/SIMULATED_LIST2/SimulatedOnly1.class"
+assert_contains "$digest_sim2_output" "リスト1のみ 0 件 / リスト2のみ 1 件 / MD5 不一致 0 件"
+# --deployed-class-dir を指定すると、リストと差分レポートはそちらへ出る。
+ls "$TEST_TMP/deployed-class-sim2-lists"/*_deployed_class_list1_war.txt >/dev/null 2>&1 \
+  || fail "--deployed-class-dir did not receive the digest lists"
+
+# (5) 同じパスで MD5 だけが違う状態を偽装する。
+digest_mod_output="$TEST_TMP/deployed-class-modify.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --deployed-class-dir "$TEST_TMP/deployed-class-modify-lists" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-simulate modify
+) >"$digest_mod_output" 2>&1; then
+  cat "$digest_mod_output" >&2
+  fail "the modify simulation returned a non-zero status"
+fi
+assert_contains "$digest_mod_output" "[C] 両方に存在するが MD5 が一致しないファイル (1 件)"
+assert_contains "$digest_mod_output" "[MD5不一致] WEB-INF/classes/com/example/Alpha.class"
+assert_contains "$digest_mod_output" "リスト1のみ 0 件 / リスト2のみ 0 件 / MD5 不一致 1 件"
+
+# (6) both で両側に差分を作り、--deployed-class-required でエラー終了させる。
+digest_req_reports="$TEST_TMP/deployed-class-required-reports"
+digest_req_output="$TEST_TMP/deployed-class-required.out"
+mkdir -p "$digest_req_reports"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_req_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-simulate both --deployed-class-simulate-count 2 \
+    --deployed-class-required
+) >"$digest_req_output" 2>&1; then
+  cat "$digest_req_output" >&2
+  fail "--deployed-class-required did not fail on a detected difference"
+fi
+assert_contains "$digest_req_output" "リスト1のみ 2 件 / リスト2のみ 2 件 / MD5 不一致 0 件"
+assert_contains "$digest_req_output" \
+  "デプロイ済みファイルの MD5 差分を検出しました (--deployed-class-required)。"
+assert_contains "$digest_req_output" "デプロイ済みファイルの MD5 差分検証に失敗しました。"
+collect_report_files "$digest_req_reports"
+assert_contains "${REPORT_FILES[0]}" \
+  "偽装モード    : both (2 件) ※ 動作確認のため意図的に差分を作っています"
+
+# (7) --deployed-class-ext all で class 以外も対象にする
+#     (--verify-deployed-classes を書かなくても、この指定だけで有効になる)。
+digest_ext_output="$TEST_TMP/deployed-class-ext.out"
+digest_ext_lists="$TEST_TMP/deployed-class-ext-lists"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --deployed-class-dir "$digest_ext_lists" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-ext all
+) >"$digest_ext_output" 2>&1; then
+  cat "$digest_ext_output" >&2
+  fail "--deployed-class-ext all returned a non-zero status"
+fi
+digest_ext_list1="$(ls "$digest_ext_lists"/*_deployed_class_list1_war.txt)"
+assert_contains "$digest_ext_list1" "WEB-INF/web.xml"
+assert_contains "$digest_ext_list1" "WEB-INF/lib/dep.jar"
+assert_contains "$digest_ext_output" "対象拡張子: all"
+
+# (8) リスト2 を取得できない場合は、既定では警告に留めて理由をレポートへ残す。
+digest_nolist2_reports="$TEST_TMP/deployed-class-nolist2-reports"
+digest_nolist2_output="$TEST_TMP/deployed-class-nolist2.out"
+mkdir -p "$digest_nolist2_reports"
+if ! (
+  cd "$REPO_ROOT"
+  FAKE_DEPLOYED_DIGEST_VFS_DIR="" \
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_nolist2_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --verify-deployed-classes
+) >"$digest_nolist2_output" 2>&1; then
+  cat "$digest_nolist2_output" >&2
+  fail "a missing vfs temp directory must not fail the run by itself"
+fi
+assert_contains "$digest_nolist2_output" \
+  "デプロイ後の vfs/temp から MD5 一覧 (リスト2) を作成できませんでした。"
+collect_report_files "$digest_nolist2_reports"
+assert_contains "${REPORT_FILES[0]}" "結果          : 未実施 (リスト2 を作成できません"
+
+# (9) --deployed-class-required では、検証を完了できなかった場合もエラーとする。
+digest_reqfail_output="$TEST_TMP/deployed-class-required-fail.out"
+if (
+  cd "$REPO_ROOT"
+  FAKE_DEPLOYED_DIGEST_VFS_DIR="" \
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --deployed-class-dir "$TEST_TMP/deployed-class-reqfail-lists" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --deployed-class-required
+) >"$digest_reqfail_output" 2>&1; then
+  cat "$digest_reqfail_output" >&2
+  fail "--deployed-class-required did not fail when the verification could not run"
+fi
+assert_contains "$digest_reqfail_output" \
+  "デプロイ済みファイルの MD5 差分検証を完了できませんでした (--deployed-class-required)。"
+
+# (10) コンテナを起動しない実行では、リスト1 だけ作って突き合わせは未実施とする。
+digest_build_only_reports="$TEST_TMP/deployed-class-build-only-reports"
+digest_build_only_output="$TEST_TMP/deployed-class-build-only.out"
+mkdir -p "$digest_build_only_reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --report-dir "$digest_build_only_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --verify-deployed-classes
+) >"$digest_build_only_output" 2>&1; then
+  cat "$digest_build_only_output" >&2
+  fail "a build-only run with --verify-deployed-classes returned a non-zero status"
+fi
+assert_contains "$digest_build_only_output" \
+  "デプロイ済みファイルの MD5 差分検証は、コンテナ起動を伴う実行でのみ行えます。--verify-startup または --verify-url を併用してください。"
+assert_contains "$digest_build_only_output" "リスト1 (デプロイ前の WAR) だけは出力しました:"
+ls "$digest_build_only_reports"/*_deployed_class_list1_war.txt >/dev/null 2>&1 \
+  || fail "the build-only run did not write list 1"
+if ls "$digest_build_only_reports"/*_deployed_class_list2_vfs.txt >/dev/null 2>&1; then
+  fail "the build-only run must not write list 2"
+fi
+
+# (11) --dry-run では予定だけを表示し、ファイルは作らない。
+digest_dry_reports="$TEST_TMP/deployed-class-dry-reports"
+digest_dry_output="$TEST_TMP/deployed-class-dry.out"
+mkdir -p "$digest_dry_reports"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --report-dir "$digest_dry_reports" \
+    --copy-file "${digest_war}:${digest_ctx}" \
+    --verify-deployed-classes
+) >"$digest_dry_output" 2>&1; then
+  cat "$digest_dry_output" >&2
+  fail "--dry-run with --verify-deployed-classes returned a non-zero status"
+fi
+assert_contains "$digest_dry_output" \
+  "[DRY-RUN] デプロイ前の WAR から MD5 一覧 (リスト1) を作成します"
+assert_contains "$digest_dry_output" \
+  "[DRY-RUN] デプロイ後の vfs/temp から MD5 一覧 (リスト2) を作成し、リスト1 と突き合わせます。"
+if ls "$digest_dry_reports"/*_deployed_class_* >/dev/null 2>&1; then
+  fail "--dry-run must not write digest lists"
+fi
+
+# (12) 比較元の WAR を特定できない場合は、理由を示して突き合わせを行わない。
+digest_nowar_output="$TEST_TMP/deployed-class-nowar.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --verify-startup --compose-service app --startup-service app \
+    --suppress-startup-logs \
+    --deployed-class-dir "$TEST_TMP/deployed-class-nowar-lists" \
+    --verify-deployed-classes
+) >"$digest_nowar_output" 2>&1; then
+  cat "$digest_nowar_output" >&2
+  fail "a missing WAR must not fail the run by itself"
+fi
+assert_contains "$digest_nowar_output" \
+  "比較元の WAR を特定できませんでした (--copy-file に .war の指定がありません)。"
+assert_contains "$digest_nowar_output" \
+  "リスト1 (デプロイ前の WAR) を作成できていないため、突き合わせを行えません。"
+
+# (13) 埋め込んだ一覧作成スクリプトは tools/war_class_digest.sh と同一で、
+#      --print-war-class-digest で取り出せる。
+digest_print_output="$TEST_TMP/deployed-class-print.sh"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --print-war-class-digest
+) >"$digest_print_output" 2>/dev/null; then
+  fail "--print-war-class-digest returned a non-zero status"
+fi
+if ! diff -q <(tr -d '\r' < "$REPO_ROOT/tools/war_class_digest.sh") \
+    <(tr -d '\r' < "$digest_print_output") >/dev/null; then
+  fail "--print-war-class-digest does not match tools/war_class_digest.sh"
+fi
+bash -n "$digest_print_output" || fail "the embedded digest script is not valid shell"
+
+# (14) 指定の取り違えはその場で止める。
+digest_conflict_output="$TEST_TMP/deployed-class-conflict.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --no-verify-deployed-classes --deployed-class-ext class
+) >"$digest_conflict_output" 2>&1; then
+  fail "--no-verify-deployed-classes with --deployed-class-ext was accepted"
+fi
+assert_contains "$digest_conflict_output" \
+  "--no-verify-deployed-classes と --deployed-class-* は同時に指定できません。"
+
+digest_simulate_bad_output="$TEST_TMP/deployed-class-simulate-bad.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --deployed-class-simulate bogus --report-dir "$TEST_TMP/unused"
+) >"$digest_simulate_bad_output" 2>&1; then
+  fail "--deployed-class-simulate accepted an unknown mode"
+fi
+assert_contains "$digest_simulate_bad_output" \
+  "--deployed-class-simulate には none / list1 / list2 / both / modify / all のいずれかを指定してください: bogus"
+
+digest_nodir_output="$TEST_TMP/deployed-class-nodir.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --verify-deployed-classes
+) >"$digest_nodir_output" 2>&1; then
+  fail "--verify-deployed-classes without an output directory was accepted"
+fi
+assert_contains "$digest_nodir_output" \
+  "デプロイ済みファイルの MD5 差分検証には出力先が必要です。--report-dir または --deployed-class-dir を指定してください。"
+
+digest_vfsrel_output="$TEST_TMP/deployed-class-vfsrel.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --deployed-class-vfs-dir standalone/tmp/vfs/temp \
+    --report-dir "$TEST_TMP/unused"
+) >"$digest_vfsrel_output" 2>&1; then
+  fail "--deployed-class-vfs-dir accepted a relative path"
+fi
+assert_contains "$digest_vfsrel_output" \
+  "--deployed-class-vfs-dir にはコンテナ内の絶対パス、または auto を指定してください: standalone/tmp/vfs/temp"
+
+unset FAKE_DEPLOYED_DIGEST_VFS_DIR
+
 # ---- 後始末でのボリューム削除 ------------------------------------------------
 # デプロイ先やログ出力先を覆っているボリュームが残っていると、イメージを作り直しても
 # 古い中身が使われ続ける。対話操作を最後まで終えた実行では、既定で down -v する。
@@ -8597,4 +9014,4 @@ if (
 fi
 assert_contains "$ecs_cb_conflict_output" "--ecs-circuit-breaker-watch-timeout には 0 以上の整数を指定してください: abc"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, and ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log)\n'
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, deployed class MD5 digest comparison (pre-deploy WAR vs. deployed vfs/temp, with difference simulation), and ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log)\n'

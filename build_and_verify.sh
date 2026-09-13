@@ -500,6 +500,66 @@ COPY_ARTIFACT_REPORT_LINES=()     # 全量レポート用の明細
 COPY_ARTIFACT_MISMATCH="false"    # 1 件でも「今回の中身ではない」を検出したか
 COPY_ARTIFACT_STALE_VOLUME="false"  # 古い成果物を抱えたボリュームを検出したか
 
+# ---- デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2) -----------------
+# 「ビルドした WAR の中身」と「JBoss EAP がデプロイして実際に動かしている中身」を、
+# ファイル単位の MD5 で突き合わせる。
+#   リスト1: デプロイ実行前の WAR に含まれるファイル (ホスト側で WAR を展開して算出)
+#   リスト2: デプロイ成功後、コンテナ内の vfs/temp 配下へ展開された中身
+# 両者に差分が無いことをもって「今回ビルドした成果物がそのまま動いている」と判定する。
+#
+# --verify-copy-artifact がファイル 1 個の同一性を見るのに対し、こちらは WAR の
+# 中身すべて (既定では .class) を一覧にして突き合わせる。そのため
+#   - 一部のクラスだけ古い (差分ビルドの取り込み漏れ)
+#   - デプロイ先に前回の成果物が残っている
+#   - デプロイの途中で失敗して一部しか展開されていない
+# といった「ビルドも起動もデプロイも成功して見えるのに中身が違う」状態まで検出できる。
+#
+# 一覧の生成は tools/war_class_digest.sh へ切り出してあり、ホスト側とコンテナ内の
+# どちらでも同じスクリプト・同じ書式で実行する (--print-war-class-digest で取り出せる)。
+# 探索と MD5 の算出には時間がかかるため、既定では行わず、確認したい実行でだけ
+# パラメータを指定して有効にする。
+DEPLOYED_DIGEST_VERIFY="false"        # true: 差分検証を行う (--verify-deployed-classes)
+DEPLOYED_DIGEST_VERIFY_SET="false"    # 有効・無効を明示指定したか (付随指定との排他判定用)
+DEPLOYED_DIGEST_EXT="class"           # 一覧に載せる拡張子 (カンマ区切り、all ですべて)
+DEPLOYED_DIGEST_EXT_SET="false"
+DEPLOYED_DIGEST_WAR=""                # 比較元の WAR (未指定なら --copy-file から自動判定)
+DEPLOYED_DIGEST_WAR_SET="false"
+DEPLOYED_DIGEST_SERVICE=""            # リスト2 を取るサービス (未指定なら起動確認の対象)
+DEPLOYED_DIGEST_VFS_DIR="auto"        # コンテナ内 vfs/temp のパス (auto で JBOSS_HOME から探索)
+DEPLOYED_DIGEST_VFS_DIR_SET="false"
+DEPLOYED_DIGEST_DEPLOYMENT=""         # 展開済みデプロイルートが複数あるときの絞り込み
+DEPLOYED_DIGEST_OUTPUT_DIR=""         # リスト・レポートの出力先 (既定: --report-dir と同じ)
+DEPLOYED_DIGEST_OUTPUT_DIR_SET="false"
+DEPLOYED_DIGEST_NESTED_JAR="false"    # true: 入れ子 jar の展開結果も一覧へ含める
+DEPLOYED_DIGEST_REQUIRED="false"      # true: 差分・未実施をエラー終了として扱う
+# 差分の偽装 (動作確認用)。none 以外を指定すると、わざと差分のある状態を作る。
+# どちらのリスト側に差分があるのかが分かるよう、偽装はリストごとに分けて適用する。
+#   none   偽装しない (既定)
+#   list1  リスト1 にだけある項目を作る (WAR にあるのにデプロイ先に無い状態)
+#   list2  リスト2 にだけある項目を作る (デプロイ先にだけ余分な物がある状態)
+#   both   list1 と list2 の両方
+#   modify 同じパスで MD5 だけが違う項目を作る (中身の食い違い)
+#   all    list1 / list2 / modify のすべて
+DEPLOYED_DIGEST_SIMULATE="none"
+DEPLOYED_DIGEST_SIMULATE_SET="false"
+DEPLOYED_DIGEST_SIMULATE_COUNT="1"
+# 実行結果 (画面表示・全量レポートで共用)
+DEPLOYED_DIGEST_LIST1_FILE=""         # リスト1 の出力先
+DEPLOYED_DIGEST_LIST2_FILE=""         # リスト2 の出力先
+DEPLOYED_DIGEST_DIFF_FILE=""          # 差分レポートの出力先
+DEPLOYED_DIGEST_SUMMARY=""            # 全量レポート用の 1 行要約
+DEPLOYED_DIGEST_MISMATCH="false"      # 差分を検出したか
+DEPLOYED_DIGEST_LIST1_STATUS="未実施" # リスト1 の結果
+DEPLOYED_DIGEST_LIST2_STATUS="未実施" # リスト2 の結果
+DEPLOYED_DIGEST_WAR_USED=""           # 実際に比較元とした WAR
+DEPLOYED_DIGEST_TARGET_LABEL=""       # リスト2 を取ったサービス / コンテナ
+DEPLOYED_DIGEST_ROOT_LABEL=""         # リスト2 の基準となった展開済みデプロイルート
+DEPLOYED_DIGEST_HOST_SCRIPT=""        # ホスト側へ書き出した一覧作成スクリプト
+# コンテナ内でスクリプトを置く一時ディレクトリの接頭辞 (使い終えたら同じ exec で消す)
+DEPLOYED_DIGEST_CONTAINER_DIR_PREFIX="build-and-verify-digest"
+# 画面へ出す差分レポートの最大行数 (超えた分は出力先のファイルを案内する)
+DEPLOYED_DIGEST_DISPLAY_LINES="80"
+
 # ---- 起動確認 (jbosseap) 関連 ----------------------------------------------
 VERIFY_STARTUP="false"            # true: ビルド後にコンテナを起動し起動完了を確認
 STARTUP_SERVICES=()               # 起動完了チェックの対象サービス (複数指定可)。
@@ -2786,6 +2846,932 @@ VALKEY_SHELL_CLI_SCRIPT_END
 )"
 VALKEY_SHELL_CLI_SCRIPT="${VALKEY_SHELL_CLI_SCRIPT//$'\r'/}"
 
+# ---- ダイジェストリスト作成スクリプト (ホスト / コンテナ双方で使う) ----------
+# 中身は tools/war_class_digest.sh と同一 (--print-war-class-digest で取り出せる)。
+# リスト1 (ホスト側の WAR) とリスト2 (コンテナ内の vfs/temp) を同じ書式で作るため、
+# ホストでは一時ファイルへ書き出して実行し、コンテナへは docker exec の標準入力
+# 経由で渡す (コマンドライン長の上限に掛からない)。CR が混ざったまま渡すと
+# 1 行目から構文エラーになるので落としておく。
+WAR_CLASS_DIGEST_SCRIPT="$(cat <<'WAR_CLASS_DIGEST_SCRIPT_END'
+#!/bin/sh
+# war_class_digest.sh
+#   WAR / 展開済みディレクトリ / JBoss EAP の vfs temp ディレクトリに含まれる
+#   ファイルの MD5 ハッシュ値とパスを「ダイジェストリスト」として書き出し、
+#   2 つのリストを突き合わせて差分レポートを出すためのスクリプト。
+#
+#   build_and_verify.sh から
+#     リスト1 : デプロイ実行前の WAR の中身
+#     リスト2 : デプロイ後に JBoss EAP が展開した vfs/temp 配下の中身
+#   を同じ書式で作り、差分が無いことをもって「正しい成果物で動いている」と
+#   判定するために使う。単体でも動くよう、依存は find / awk / sort / md5sum
+#   (無ければ openssl / md5) と、WAR を読む場合の unzip (無ければ jar / python3)
+#   だけに絞ってある。
+#
+#   使い方の例:
+#     ./war_class_digest.sh --war app.war --output list1.txt
+#     ./war_class_digest.sh --vfs-dir auto --output list2.txt
+#     ./war_class_digest.sh --dir /opt/app/exploded --ext class,jar,xml
+#     ./war_class_digest.sh --compare list1.txt list2.txt --output diff.txt
+#     ./war_class_digest.sh --war app.war --simulate extra --output list1.txt
+#     ./war_class_digest.sh --show-commands
+#
+#   終了コード:
+#     0   正常終了 (--compare では「差分なし」)
+#     1   --compare で差分を検出した
+#     2   使い方の誤り (不正なオプション、入力の指定漏れ)
+#     3   対象が見つからない (WAR が無い / vfs temp が無い / デプロイルートが特定不能)
+#     4   実行環境が足りない (MD5 を計算するコマンドが無い、WAR を展開できない)
+#
+#   動作環境:
+#     POSIX sh (dash / busybox ash / bash) で動作する。コンテナ内へ配って
+#     実行することを前提にしているため、bash 固有の機能は使っていない。
+
+set -u
+
+WCD_VERSION="1.0.0"
+WCD_PROGRAM="${0##*/}"
+
+# ---- 既定値 -----------------------------------------------------------------
+WCD_MODE=""                  # list (一覧の生成) / compare (差分の突き合わせ)
+WCD_SOURCE_TYPE=""           # war / dir / vfs
+WCD_SOURCE=""                # 入力 (WAR ファイル、ディレクトリ、vfs temp ディレクトリ)
+WCD_EXT_SPEC="class"         # 対象拡張子。カンマ区切り。all / '*' ですべて
+WCD_OUTPUT=""                # 出力先 (空なら標準出力)
+WCD_LABEL=""                 # ヘッダへ載せる名前 (例: リスト1 (デプロイ前の WAR))
+WCD_HEADER="true"            # false: 先頭の # ヘッダを出力しない
+WCD_ROOT_MARKER="WEB-INF"    # --vfs-dir でデプロイルートを見分ける目印
+WCD_DEPLOYMENT=""            # デプロイルートの絞り込み (パスに含まれる文字列)
+WCD_EXCLUDES=""              # 除外 glob (改行区切り)
+WCD_DEFAULT_EXCLUDE="true"   # --vfs-dir の既定除外 (入れ子 jar の展開結果) を使うか
+WCD_MD5_COMMAND=""           # MD5 を計算するコマンドの明示指定
+WCD_COMPARE_1=""             # --compare の 1 つめ
+WCD_COMPARE_2=""             # --compare の 2 つめ
+WCD_LIST1_LABEL="リスト1"    # 差分レポートでの呼び名
+WCD_LIST2_LABEL="リスト2"
+
+# 差分の偽装 (動作確認用)。none 以外を指定すると、実際の中身に手を加えた
+# リストを出力する。偽装したことはヘッダと差分レポートへ必ず明記する。
+#   none   偽装しない (既定)
+#   extra  実在しない項目を足す  → そのリストに「だけ」ある差分を作る
+#   drop   先頭から項目を落とす  → もう一方のリストに「だけ」ある差分を作る
+#   modify 先頭から MD5 を書き換える → 同じパスで中身が違う差分を作る
+#   all    extra / drop / modify をすべて行う
+WCD_SIMULATE="none"
+WCD_SIMULATE_COUNT="1"
+WCD_SIMULATE_TAG="SIMULATED"
+
+# 偽装で使う MD5 値の前置き。実在の MD5 と紛れないよう、目で見て分かる値にする。
+WCD_SIMULATE_EXTRA_PREFIX="feedface"
+WCD_SIMULATE_MODIFY_PREFIX="deadbeef"
+
+# --vfs-dir auto で JBOSS_HOME を探す既定の候補 (build_and_verify.sh と同じ並び)。
+WCD_JBOSS_HOME_CANDIDATES="/opt/jboss-eap
+/opt/eap
+/opt/jboss/jboss-eap
+/opt/jboss
+/opt/wildfly
+/usr/local/jboss-eap
+/usr/local/wildfly"
+
+WCD_TMPDIR=""                # 作業用の一時ディレクトリ (終了時に削除)
+WCD_MD5_MODE=""              # md5sum / openssl / md5 / digest
+WCD_RESOLVED_ROOT=""         # 実際に一覧を取ったディレクトリ
+WCD_RESOLVED_ROOT_LABEL=""   # ヘッダへ載せる基準パスの説明
+
+# ---- 後始末 -----------------------------------------------------------------
+wcd_cleanup() {
+  if [ -n "$WCD_TMPDIR" ] && [ -d "$WCD_TMPDIR" ]; then
+    case "$WCD_TMPDIR" in
+      */war-class-digest.*) rm -rf -- "$WCD_TMPDIR" ;;
+      *) printf '%s: 想定外の一時ディレクトリのため削除しません: %s\n' \
+           "$WCD_PROGRAM" "$WCD_TMPDIR" >&2 ;;
+    esac
+  fi
+}
+trap wcd_cleanup EXIT HUP INT TERM
+
+wcd_err() {
+  printf '%s: %s\n' "$WCD_PROGRAM" "$*" >&2
+}
+
+wcd_die() {
+  wcd_exit_code="$1"
+  shift
+  wcd_err "$*"
+  exit "$wcd_exit_code"
+}
+
+# ---- 使い方 -----------------------------------------------------------------
+wcd_usage() {
+  cat <<'WCD_USAGE_END'
+使い方: war_class_digest.sh [オプション]
+
+WAR / 展開済みディレクトリ / JBoss EAP の vfs temp から、含まれるファイルの
+MD5 ハッシュ値とパスの一覧 (ダイジェストリスト) を作る。--compare を使うと、
+2 つのリストを突き合わせて差分レポートを出す。
+
+一覧を作る (いずれか 1 つを指定):
+  --war FILE               WAR / JAR / ZIP を対象にする。一時ディレクトリへ
+                           展開してから MD5 を計算する (元のファイルは変更しない)
+  --dir DIR                展開済みディレクトリを対象にする。DIR 直下を基準に
+                           相対パスへ直す
+  --vfs-dir DIR            JBoss EAP の vfs temp ディレクトリを対象にする。
+                           配下から WEB-INF を持つディレクトリ (展開済みデプロイ
+                           ルート) を探し、そこを基準に相対パスへ直す。
+                           'auto' を指定すると JBOSS_HOME から自動で探す
+
+差分を突き合わせる:
+  --compare LIST1 LIST2    2 つのリストを突き合わせ、差分レポートを出力する。
+                           差分があれば終了コード 1 を返す
+  --list1-label TEXT       差分レポートでのリスト1 の呼び名 (既定: リスト1)
+  --list2-label TEXT       差分レポートでのリスト2 の呼び名 (既定: リスト2)
+
+対象の絞り込み:
+  --ext LIST               対象拡張子をカンマ区切りで指定する (既定: class)。
+                           all または '*' を指定するとすべてのファイルを対象にする
+                           例: --ext class / --ext class,jar,xml / --ext all
+  --exclude GLOB           除外する相対パスの glob (繰り返し可)
+                           例: --exclude 'WEB-INF/lib/*'
+  --no-default-exclude     --vfs-dir の既定除外 (入れ子 jar の展開結果
+                           '*.jar/*') を使わない
+  --deployment NAME        --vfs-dir で候補が複数あるとき、パスに NAME を
+                           含むデプロイルートだけを対象にする
+  --root-marker NAME       --vfs-dir でデプロイルートを見分ける目印
+                           (既定: WEB-INF)
+
+出力:
+  --output FILE            出力先 (既定: 標準出力)
+  --label TEXT             ヘッダへ載せる名前
+  --no-header              先頭の # で始まるヘッダ行を出力しない
+
+差分の偽装 (動作確認用):
+  --simulate MODE          none (既定) / extra / drop / modify / all
+                             extra  実在しない項目を足す
+                                    → このリストに「だけ」ある差分を作る
+                             drop   先頭から項目を落とす
+                                    → もう一方に「だけ」ある差分を作る
+                             modify 先頭から MD5 を書き換える
+                                    → 同じパスで中身が違う差分を作る
+                             all    上記すべて
+  --simulate-count N       偽装する件数 (既定: 1)
+  --simulate-tag TEXT      偽装で作るパスへ入れる目印 (既定: SIMULATED)
+
+その他:
+  --md5-command CMD        MD5 の計算に使うコマンドを明示する
+                           (md5sum / openssl / md5 / digest)
+  --show-commands          同じ一覧を手作業で作るための手順を表示する
+  -h, --help               このヘルプを表示する
+  --version                版数を表示する
+
+終了コード:
+  0  正常終了 (--compare では差分なし)
+  1  --compare で差分を検出した
+  2  使い方の誤り
+  3  対象が見つからない
+  4  実行環境が足りない
+WCD_USAGE_END
+}
+
+# 同じ一覧を手作業で作る手順。スクリプトが使えない環境で、同じ確認を
+# 手で行いたいときのために残す。
+wcd_show_commands() {
+  cat <<'WCD_COMMANDS_END'
+=== war_class_digest.sh が行っていることを手作業で行う手順 ===
+
+[1] デプロイ前の WAR から一覧を作る (リスト1)
+    mkdir -p /tmp/war-expand
+    unzip -q -o app.war -d /tmp/war-expand
+    cd /tmp/war-expand
+    find . -type f -name '*.class' -print | sed 's|^\./||' | LC_ALL=C sort > /tmp/list1.paths
+    ( cd /tmp/war-expand && tr '\n' '\0' < /tmp/list1.paths | xargs -0 md5sum ) \
+      | awk '{ h=substr($0,1,32); p=substr($0,35); printf "%s\t%s\n", h, p }' \
+      | LC_ALL=C sort -t "$(printf '\t')" -k2,2 > /tmp/list1.txt
+
+[2] デプロイ後の vfs/temp から一覧を作る (リスト2)
+    # 展開済みデプロイルート (WEB-INF を持つディレクトリ) を探す
+    docker exec <container> sh -c 'find "$JBOSS_HOME/standalone/tmp/vfs/temp" -type d -name WEB-INF'
+    # 見つかった WEB-INF の親ディレクトリが基準になる
+    docker exec <container> sh -c '
+      cd /opt/jboss-eap/standalone/tmp/vfs/temp/tempXXXX/content-YYYY &&
+      find . -type f -name "*.class" -print | sed "s|^\./||" | LC_ALL=C sort > /tmp/list2.paths &&
+      tr "\n" "\0" < /tmp/list2.paths | xargs -0 md5sum' \
+      | awk '{ h=substr($0,1,32); p=substr($0,35); printf "%s\t%s\n", h, p }' \
+      | LC_ALL=C sort -t "$(printf '\t')" -k2,2 > /tmp/list2.txt
+
+[3] 差分を見る
+    # パスの集合の差
+    LC_ALL=C comm -3 <(cut -f2 /tmp/list1.txt) <(cut -f2 /tmp/list2.txt)
+    # MD5 まで含めた差 (左が list1 のみ、右が list2 のみ)
+    LC_ALL=C diff /tmp/list1.txt /tmp/list2.txt
+
+    差分が 1 行も出なければ、WAR の中身がそのままデプロイされている。
+
+[4] 注意点
+    - JBoss EAP は入れ子の jar を vfs/temp 配下へ展開することがある。
+      その分は WAR 側に相当するファイルが無く「リスト2のみ」として出るため、
+      既定では '*.jar/*' を除外している (--no-default-exclude で無効化できる)。
+    - vfs/temp には過去の実行が残したディレクトリが残っていることがある。
+      WEB-INF を持つディレクトリが複数見つかる場合は --deployment で絞る。
+WCD_COMMANDS_END
+}
+
+# ---- 引数パース -------------------------------------------------------------
+wcd_need_value() {
+  # $1=オプション名 $2=残りの引数の数
+  if [ "$2" -lt 2 ]; then
+    wcd_die 2 "オプションに値が指定されていません: $1"
+  fi
+}
+
+wcd_set_source() {
+  # $1=種別 $2=値。入力の指定は 1 つだけに絞る (取り違えを防ぐため)。
+  if [ -n "$WCD_SOURCE_TYPE" ]; then
+    wcd_die 2 "入力の指定は 1 つだけにしてください (--war / --dir / --vfs-dir)。"
+  fi
+  WCD_SOURCE_TYPE="$1"
+  WCD_SOURCE="$2"
+  WCD_MODE="list"
+}
+
+wcd_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --war)      wcd_need_value "$1" $#; wcd_set_source war "$2"; shift 2 ;;
+      --dir)      wcd_need_value "$1" $#; wcd_set_source dir "$2"; shift 2 ;;
+      --vfs-dir)  wcd_need_value "$1" $#; wcd_set_source vfs "$2"; shift 2 ;;
+      --compare)
+        if [ $# -lt 3 ]; then
+          wcd_die 2 "--compare には 2 つのリストを指定してください。"
+        fi
+        if [ -n "$WCD_MODE" ] && [ "$WCD_MODE" != "compare" ]; then
+          wcd_die 2 "--compare と一覧の生成 (--war / --dir / --vfs-dir) は同時に指定できません。"
+        fi
+        WCD_MODE="compare"
+        WCD_COMPARE_1="$2"
+        WCD_COMPARE_2="$3"
+        shift 3
+        ;;
+      --list1-label) wcd_need_value "$1" $#; WCD_LIST1_LABEL="$2"; shift 2 ;;
+      --list2-label) wcd_need_value "$1" $#; WCD_LIST2_LABEL="$2"; shift 2 ;;
+      --ext)         wcd_need_value "$1" $#; WCD_EXT_SPEC="$2"; shift 2 ;;
+      --exclude)
+        wcd_need_value "$1" $#
+        if [ -n "$WCD_EXCLUDES" ]; then
+          WCD_EXCLUDES="${WCD_EXCLUDES}
+$2"
+        else
+          WCD_EXCLUDES="$2"
+        fi
+        shift 2
+        ;;
+      --no-default-exclude) WCD_DEFAULT_EXCLUDE="false"; shift ;;
+      --deployment)  wcd_need_value "$1" $#; WCD_DEPLOYMENT="$2"; shift 2 ;;
+      --root-marker) wcd_need_value "$1" $#; WCD_ROOT_MARKER="$2"; shift 2 ;;
+      --output)      wcd_need_value "$1" $#; WCD_OUTPUT="$2"; shift 2 ;;
+      --label)       wcd_need_value "$1" $#; WCD_LABEL="$2"; shift 2 ;;
+      --no-header)   WCD_HEADER="false"; shift ;;
+      --simulate)    wcd_need_value "$1" $#; WCD_SIMULATE="$2"; shift 2 ;;
+      --simulate-count) wcd_need_value "$1" $#; WCD_SIMULATE_COUNT="$2"; shift 2 ;;
+      --simulate-tag)   wcd_need_value "$1" $#; WCD_SIMULATE_TAG="$2"; shift 2 ;;
+      --md5-command) wcd_need_value "$1" $#; WCD_MD5_COMMAND="$2"; shift 2 ;;
+      --show-commands) wcd_show_commands; exit 0 ;;
+      -h|--help)     wcd_usage; exit 0 ;;
+      --version)     printf 'war_class_digest.sh %s\n' "$WCD_VERSION"; exit 0 ;;
+      --)            shift; break ;;
+      -*)            wcd_die 2 "不明なオプションです: $1 (--help を参照してください)" ;;
+      *)             wcd_die 2 "余分な引数です: $1 (--help を参照してください)" ;;
+    esac
+  done
+
+  [ -n "$WCD_MODE" ] || wcd_die 2 "入力を指定してください (--war / --dir / --vfs-dir / --compare)。"
+
+  case "$WCD_SIMULATE" in
+    none|extra|drop|modify|all) ;;
+    *) wcd_die 2 "--simulate には none / extra / drop / modify / all のいずれかを指定してください: $WCD_SIMULATE" ;;
+  esac
+  case "$WCD_SIMULATE_COUNT" in
+    ''|*[!0-9]*) wcd_die 2 "--simulate-count には 0 以上の整数を指定してください: $WCD_SIMULATE_COUNT" ;;
+  esac
+  [ -n "$WCD_ROOT_MARKER" ] || wcd_die 2 "--root-marker には名前を指定してください。"
+}
+
+# ---- 一時ディレクトリ -------------------------------------------------------
+wcd_make_tmpdir() {
+  [ -n "$WCD_TMPDIR" ] && return 0
+  WCD_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/war-class-digest.XXXXXX" 2>/dev/null)" \
+    || wcd_die 4 "一時ディレクトリを作成できませんでした (TMPDIR=${TMPDIR:-/tmp})。"
+  return 0
+}
+
+# ---- MD5 を計算する手段の決定 -----------------------------------------------
+# md5sum があれば xargs でまとめて計算する (ファイル数が多くても速い)。
+# 無い場合は openssl / md5 / digest へ落とし、1 ファイルずつ計算する。
+wcd_resolve_md5_mode() {
+  if [ -n "$WCD_MD5_COMMAND" ]; then
+    case "${WCD_MD5_COMMAND##*/}" in
+      md5sum)  WCD_MD5_MODE="md5sum" ;;
+      openssl) WCD_MD5_MODE="openssl" ;;
+      md5)     WCD_MD5_MODE="md5" ;;
+      digest)  WCD_MD5_MODE="digest" ;;
+      *) wcd_die 2 "--md5-command には md5sum / openssl / md5 / digest のいずれかを指定してください: $WCD_MD5_COMMAND" ;;
+    esac
+    command -v "$WCD_MD5_COMMAND" >/dev/null 2>&1 \
+      || wcd_die 4 "指定された MD5 コマンドが見つかりません: $WCD_MD5_COMMAND"
+    return 0
+  fi
+  if command -v md5sum >/dev/null 2>&1; then
+    WCD_MD5_MODE="md5sum"; WCD_MD5_COMMAND="md5sum"; return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    WCD_MD5_MODE="openssl"; WCD_MD5_COMMAND="openssl"; return 0
+  fi
+  if command -v md5 >/dev/null 2>&1; then
+    WCD_MD5_MODE="md5"; WCD_MD5_COMMAND="md5"; return 0
+  fi
+  if command -v digest >/dev/null 2>&1; then
+    WCD_MD5_MODE="digest"; WCD_MD5_COMMAND="digest"; return 0
+  fi
+  wcd_die 4 "MD5 を計算できるコマンドが見つかりません (md5sum / openssl / md5 / digest のいずれかが必要です)。"
+}
+
+# 1 ファイルの MD5 を標準出力へ返す (32 桁の 16 進数のみ)。
+wcd_md5_one() {
+  wcd_md5_target="$1"
+  case "$WCD_MD5_MODE" in
+    md5sum)  md5sum -- "$wcd_md5_target" 2>/dev/null | cut -c1-32 ;;
+    openssl) openssl md5 < "$wcd_md5_target" 2>/dev/null | sed -n 's/^.*[= ]\([0-9a-fA-F]\{32\}\)$/\1/p' ;;
+    md5)     md5 -q -- "$wcd_md5_target" 2>/dev/null | cut -c1-32 ;;
+    digest)  digest -a md5 -- "$wcd_md5_target" 2>/dev/null | cut -c1-32 ;;
+  esac
+}
+
+# ---- 拡張子 / 除外の判定 ----------------------------------------------------
+# 対象拡張子を改行区切り・小文字・先頭の '.' なしへ正規化する。
+# all / '*' のときは空を返し、呼び出し側が「すべて対象」と判断する。
+WCD_EXT_LIST=""      # 改行区切り (ヘッダ表示・偽装の既定拡張子に使う)
+WCD_EXT_MATCH=""     # "|class|jar|" 形式。case の部分一致で判定する
+WCD_EXT_ALL="false"
+wcd_normalize_ext_spec() {
+  case "$WCD_EXT_SPEC" in
+    all|ALL|'*'|'')
+      WCD_EXT_ALL="true"
+      WCD_EXT_LIST=""
+      WCD_EXT_MATCH=""
+      return 0
+      ;;
+  esac
+  WCD_EXT_ALL="false"
+  WCD_EXT_LIST="$(printf '%s\n' "$WCD_EXT_SPEC" \
+    | tr ',' '\n' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\.//' \
+    | tr 'A-Z' 'a-z' \
+    | awk 'NF && !seen[$0]++')"
+  [ -n "$WCD_EXT_LIST" ] \
+    || wcd_die 2 "--ext に有効な拡張子がありません: $WCD_EXT_SPEC"
+  # サブシェルを作らずに判定できるよう、'|' で挟んだ 1 行の文字列にしておく
+  # (拡張子に '|' は使えないため、部分一致で取り違えることはない)。
+  WCD_EXT_MATCH="|$(printf '%s' "$WCD_EXT_LIST" | tr '\n' '|')|"
+  return 0
+}
+
+# 相対パスが対象拡張子かを判定する。
+wcd_match_ext() {
+  [ "$WCD_EXT_ALL" = "true" ] && return 0
+  wcd_me_path="$1"
+  wcd_me_base="${wcd_me_path##*/}"
+  case "$wcd_me_base" in
+    *.*) wcd_me_ext="${wcd_me_base##*.}" ;;
+    *)   return 1 ;;
+  esac
+  # まず、そのままの綴りで判定する。拡張子はほぼ小文字のため、ここでほとんどが
+  # 決まり、1 ファイルごとに tr のプロセスを起こさずに済む
+  # (クラス数の多い WAR では、この差がそのまま所要時間の差になる)。
+  case "$WCD_EXT_MATCH" in
+    *"|${wcd_me_ext}|"*) return 0 ;;
+  esac
+  # 大文字混じり (.CLASS など) のときだけ、小文字へ直して判定し直す。
+  case "$wcd_me_ext" in
+    *[A-Z]*)
+      wcd_me_ext="$(printf '%s' "$wcd_me_ext" | tr 'A-Z' 'a-z')"
+      case "$WCD_EXT_MATCH" in
+        *"|${wcd_me_ext}|"*) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+# 相対パスが除外 glob に当たるかを判定する (当たれば 0)。
+# glob をそのままパターンとして使うため、ループ中はファイル名展開を止める。
+wcd_match_exclude() {
+  [ -n "$WCD_EXCLUDES" ] || return 1
+  wcd_mx_path="$1"
+  wcd_mx_oldifs="$IFS"
+  wcd_mx_hit="false"
+  set -f
+  IFS='
+'
+  for wcd_mx_glob in $WCD_EXCLUDES; do
+    [ -n "$wcd_mx_glob" ] || continue
+    # shellcheck disable=SC2254
+    case "$wcd_mx_path" in
+      $wcd_mx_glob) wcd_mx_hit="true"; break ;;
+    esac
+  done
+  IFS="$wcd_mx_oldifs"
+  set +f
+  [ "$wcd_mx_hit" = "true" ]
+}
+
+# ---- 入力の解決 -------------------------------------------------------------
+# WAR を一時ディレクトリへ展開し、その展開先を基準ディレクトリとして返す。
+wcd_prepare_war_root() {
+  wcd_war="$1"
+  [ -f "$wcd_war" ] || wcd_die 3 "WAR ファイルが見つかりません: $wcd_war"
+  [ -r "$wcd_war" ] || wcd_die 3 "WAR ファイルを読み取れません: $wcd_war"
+  wcd_make_tmpdir
+  wcd_war_root="$WCD_TMPDIR/war"
+  mkdir -p -- "$wcd_war_root" || wcd_die 4 "WAR の展開先を作成できませんでした: $wcd_war_root"
+
+  if command -v unzip >/dev/null 2>&1; then
+    # 展開できない壊れた WAR と、警告 (exit 1) で済むものを区別する。
+    unzip -q -o -- "$wcd_war" -d "$wcd_war_root" >/dev/null 2>&1
+    wcd_unzip_status=$?
+    if [ "$wcd_unzip_status" -gt 1 ]; then
+      wcd_die 3 "WAR を展開できませんでした (unzip exit=${wcd_unzip_status}): $wcd_war"
+    fi
+  elif command -v jar >/dev/null 2>&1; then
+    wcd_war_abs="$(wcd_abspath "$wcd_war")"
+    ( cd "$wcd_war_root" && jar xf "$wcd_war_abs" ) >/dev/null 2>&1 \
+      || wcd_die 3 "WAR を展開できませんでした (jar xf): $wcd_war"
+  elif command -v python3 >/dev/null 2>&1; then
+    wcd_war_abs="$(wcd_abspath "$wcd_war")"
+    python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+      "$wcd_war_abs" "$wcd_war_root" >/dev/null 2>&1 \
+      || wcd_die 3 "WAR を展開できませんでした (python3 zipfile): $wcd_war"
+  else
+    wcd_die 4 "WAR を展開できるコマンドがありません (unzip / jar / python3 のいずれかが必要です)。"
+  fi
+
+  WCD_RESOLVED_ROOT="$wcd_war_root"
+  WCD_RESOLVED_ROOT_LABEL="WAR のルート (一時展開: ${wcd_war_root})"
+  return 0
+}
+
+wcd_abspath() {
+  wcd_ap_path="$1"
+  case "$wcd_ap_path" in
+    /*) printf '%s\n' "$wcd_ap_path" ;;
+    *)  printf '%s/%s\n' "$(pwd -P)" "$wcd_ap_path" ;;
+  esac
+}
+
+# JBOSS_HOME を推定する。環境変数 → 既定候補の順で、standalone/tmp/vfs/temp を
+# 持つものを選ぶ。
+wcd_detect_vfs_temp() {
+  wcd_dv_candidates="${JBOSS_HOME:-}
+${JBOSS_EAP_HOME:-}
+$WCD_JBOSS_HOME_CANDIDATES"
+  printf '%s\n' "$wcd_dv_candidates" | while IFS= read -r wcd_dv_home; do
+    [ -n "$wcd_dv_home" ] || continue
+    if [ -d "$wcd_dv_home/standalone/tmp/vfs/temp" ]; then
+      printf '%s\n' "$wcd_dv_home/standalone/tmp/vfs/temp"
+      exit 0
+    fi
+  done
+}
+
+# vfs temp 配下から「展開済みデプロイルート」を探す。
+# WEB-INF (--root-marker) を持つディレクトリの親がデプロイルートになる。
+wcd_resolve_vfs_root() {
+  wcd_rv_dir="$1"
+  if [ "$wcd_rv_dir" = "auto" ]; then
+    wcd_rv_dir="$(wcd_detect_vfs_temp | head -n 1)"
+    [ -n "$wcd_rv_dir" ] \
+      || wcd_die 3 "JBoss EAP の vfs temp ディレクトリを特定できませんでした (JBOSS_HOME を設定するか --vfs-dir でパスを指定してください)。"
+  fi
+  [ -d "$wcd_rv_dir" ] || wcd_die 3 "vfs temp ディレクトリが見つかりません: $wcd_rv_dir"
+
+  wcd_make_tmpdir
+  wcd_rv_roots="$WCD_TMPDIR/vfs_roots"
+  find "$wcd_rv_dir" -type d -name "$WCD_ROOT_MARKER" -print 2>/dev/null \
+    | sed "s|/${WCD_ROOT_MARKER}\$||" \
+    | awk 'NF && !seen[$0]++' \
+    | LC_ALL=C sort > "$wcd_rv_roots"
+
+  if [ -n "$WCD_DEPLOYMENT" ]; then
+    wcd_rv_filtered="$WCD_TMPDIR/vfs_roots_filtered"
+    grep -F -- "$WCD_DEPLOYMENT" "$wcd_rv_roots" > "$wcd_rv_filtered" 2>/dev/null || :
+    if [ -s "$wcd_rv_filtered" ]; then
+      mv -- "$wcd_rv_filtered" "$wcd_rv_roots"
+    else
+      wcd_die 3 "指定したデプロイ名に一致する展開済みデプロイルートがありません: ${WCD_DEPLOYMENT} (対象: ${wcd_rv_dir})"
+    fi
+  fi
+
+  wcd_rv_count="$(awk 'END { print NR }' "$wcd_rv_roots")"
+  if [ "${wcd_rv_count:-0}" -eq 0 ]; then
+    wcd_die 3 "vfs temp 配下に展開済みデプロイルート (${WCD_ROOT_MARKER} を持つディレクトリ) がありません: ${wcd_rv_dir}"
+  fi
+  if [ "$wcd_rv_count" -gt 1 ]; then
+    wcd_err "展開済みデプロイルートが複数見つかりました (${wcd_rv_count} 件)。--deployment で 1 つに絞ってください:"
+    while IFS= read -r wcd_rv_line; do
+      wcd_err "  ${wcd_rv_line}"
+    done < "$wcd_rv_roots"
+    exit 3
+  fi
+
+  WCD_RESOLVED_ROOT="$(head -n 1 "$wcd_rv_roots")"
+  WCD_RESOLVED_ROOT_LABEL="展開済みデプロイルート (${WCD_RESOLVED_ROOT})"
+
+  # JBoss EAP は入れ子の jar を vfs/temp 配下へ展開することがある。WAR 側には
+  # 対応するファイルが無く「リスト2のみ」として一斉に出てしまうため、既定で除外する。
+  if [ "$WCD_DEFAULT_EXCLUDE" = "true" ]; then
+    if [ -n "$WCD_EXCLUDES" ]; then
+      WCD_EXCLUDES="${WCD_EXCLUDES}
+*.jar/*"
+    else
+      WCD_EXCLUDES="*.jar/*"
+    fi
+  fi
+  return 0
+}
+
+wcd_resolve_dir_root() {
+  wcd_rd_dir="$1"
+  [ -d "$wcd_rd_dir" ] || wcd_die 3 "ディレクトリが見つかりません: $wcd_rd_dir"
+  WCD_RESOLVED_ROOT="$wcd_rd_dir"
+  WCD_RESOLVED_ROOT_LABEL="ディレクトリ (${wcd_rd_dir})"
+  return 0
+}
+
+# ---- 一覧の生成 -------------------------------------------------------------
+# 基準ディレクトリ配下の通常ファイルを、拡張子と除外 glob で絞って
+# 相対パスの一覧 (改行区切り) にする。
+wcd_collect_paths() {
+  wcd_cp_root="$1"
+  wcd_cp_out="$2"
+  wcd_cp_raw="$WCD_TMPDIR/raw_paths"
+
+  ( cd "$wcd_cp_root" 2>/dev/null && find . -type f -print ) > "$wcd_cp_raw" 2>/dev/null \
+    || wcd_die 3 "対象ディレクトリを走査できませんでした: $wcd_cp_root"
+
+  : > "$wcd_cp_out"
+  while IFS= read -r wcd_cp_path; do
+    wcd_cp_path="${wcd_cp_path#./}"
+    [ -n "$wcd_cp_path" ] || continue
+    # 改行やバックスラッシュを含むパスは md5sum の出力書式が変わり、
+    # 一覧の 1 行 = 1 ファイルという前提が崩れるため対象外とする。
+    case "$wcd_cp_path" in
+      *\\*) wcd_err "パスにバックスラッシュを含むため対象外にしました: $wcd_cp_path"; continue ;;
+    esac
+    wcd_match_ext "$wcd_cp_path" || continue
+    wcd_match_exclude "$wcd_cp_path" && continue
+    printf '%s\n' "$wcd_cp_path" >> "$wcd_cp_out"
+  done < "$wcd_cp_raw"
+
+  LC_ALL=C sort -o "$wcd_cp_out" "$wcd_cp_out"
+  return 0
+}
+
+# 相対パスの一覧から "MD5<TAB>相対パス" を作る。
+wcd_hash_paths() {
+  wcd_hp_root="$1"
+  wcd_hp_paths="$2"
+  wcd_hp_out="$3"
+
+  : > "$wcd_hp_out"
+  [ -s "$wcd_hp_paths" ] || return 0
+
+  if [ "$WCD_MD5_MODE" = "md5sum" ]; then
+    # md5sum の出力は "<32 桁>␣␣<パス>" (バイナリ時は "␣*<パス>")。
+    # パスに空白が含まれても壊れないよう、位置で切り出す。
+    ( cd "$wcd_hp_root" && tr '\n' '\0' < "$wcd_hp_paths" | xargs -0 md5sum ) 2>/dev/null \
+      | awk -v OFS='\t' '
+          length($0) > 34 {
+            hash = substr($0, 1, 32)
+            path = substr($0, 35)
+            sub(/^\.\//, "", path)
+            print hash, path
+          }' > "$wcd_hp_out"
+  else
+    while IFS= read -r wcd_hp_path; do
+      [ -n "$wcd_hp_path" ] || continue
+      wcd_hp_hash="$( cd "$wcd_hp_root" && wcd_md5_one "./$wcd_hp_path" )"
+      [ -n "$wcd_hp_hash" ] || continue
+      printf '%s\t%s\n' "$wcd_hp_hash" "$wcd_hp_path" >> "$wcd_hp_out"
+    done < "$wcd_hp_paths"
+  fi
+
+  LC_ALL=C sort -t "$(printf '\t')" -k2,2 -o "$wcd_hp_out" "$wcd_hp_out"
+  return 0
+}
+
+# 差分の偽装を一覧へ適用する。偽装の内容はヘッダと差分レポートへ必ず残す。
+WCD_SIMULATE_NOTE=""
+wcd_apply_simulation() {
+  wcd_as_file="$1"
+  WCD_SIMULATE_NOTE="none"
+  [ "$WCD_SIMULATE" = "none" ] && return 0
+  [ "$WCD_SIMULATE_COUNT" -gt 0 ] || { WCD_SIMULATE_NOTE="none (件数 0)"; return 0; }
+
+  wcd_as_ext="class"
+  [ "$WCD_EXT_ALL" = "true" ] || wcd_as_ext="$(printf '%s\n' "$WCD_EXT_LIST" | head -n 1)"
+  wcd_as_applied=""
+  wcd_as_tmp="$WCD_TMPDIR/simulated"
+
+  case "$WCD_SIMULATE" in
+    drop|all)
+      # 先頭から N 件を落とす。もう一方のリストにだけ残る差分になる。
+      awk -v skip="$WCD_SIMULATE_COUNT" 'NR > skip' "$wcd_as_file" > "$wcd_as_tmp"
+      mv -- "$wcd_as_tmp" "$wcd_as_file"
+      wcd_as_applied="drop(${WCD_SIMULATE_COUNT})"
+      ;;
+  esac
+  case "$WCD_SIMULATE" in
+    modify|all)
+      # 先頭から N 件の MD5 だけを書き換える。同じパスで中身が違う差分になる。
+      awk -v n="$WCD_SIMULATE_COUNT" -v pre="$WCD_SIMULATE_MODIFY_PREFIX" -v OFS='\t' -F'\t' '
+        NR <= n { printf "%s%024x\t%s\n", pre, NR, $2; next }
+        { print $1, $2 }' "$wcd_as_file" > "$wcd_as_tmp"
+      mv -- "$wcd_as_tmp" "$wcd_as_file"
+      if [ -n "$wcd_as_applied" ]; then
+        wcd_as_applied="${wcd_as_applied} + modify(${WCD_SIMULATE_COUNT})"
+      else
+        wcd_as_applied="modify(${WCD_SIMULATE_COUNT})"
+      fi
+      ;;
+  esac
+  case "$WCD_SIMULATE" in
+    extra|all)
+      # 実在しない項目を足す。このリストにだけある差分になる。
+      wcd_as_i=1
+      while [ "$wcd_as_i" -le "$WCD_SIMULATE_COUNT" ]; do
+        printf '%s%024x\tWEB-INF/classes/%s/SimulatedOnly%s.%s\n' \
+          "$WCD_SIMULATE_EXTRA_PREFIX" "$wcd_as_i" \
+          "$WCD_SIMULATE_TAG" "$wcd_as_i" "$wcd_as_ext" >> "$wcd_as_file"
+        wcd_as_i=$((wcd_as_i + 1))
+      done
+      LC_ALL=C sort -t "$(printf '\t')" -k2,2 -o "$wcd_as_file" "$wcd_as_file"
+      if [ -n "$wcd_as_applied" ]; then
+        wcd_as_applied="${wcd_as_applied} + extra(${WCD_SIMULATE_COUNT})"
+      else
+        wcd_as_applied="extra(${WCD_SIMULATE_COUNT})"
+      fi
+      ;;
+  esac
+
+  case "$wcd_as_applied" in
+    *extra*) WCD_SIMULATE_NOTE="$wcd_as_applied (目印: ${WCD_SIMULATE_TAG})" ;;
+    *)       WCD_SIMULATE_NOTE="$wcd_as_applied" ;;
+  esac
+  wcd_err "差分の偽装を有効にして一覧を作りました: ${WCD_SIMULATE_NOTE}"
+  return 0
+}
+
+wcd_write_output() {
+  # $1=中身のファイル。--output があればそこへ、無ければ標準出力へ出す。
+  wcd_wo_body="$1"
+  if [ -n "$WCD_OUTPUT" ]; then
+    wcd_wo_dir="$(dirname -- "$WCD_OUTPUT")"
+    [ -d "$wcd_wo_dir" ] || mkdir -p -- "$wcd_wo_dir" 2>/dev/null \
+      || wcd_die 3 "出力先ディレクトリを作成できませんでした: $wcd_wo_dir"
+    cat -- "$wcd_wo_body" > "$WCD_OUTPUT" \
+      || wcd_die 3 "出力先へ書き込めませんでした: $WCD_OUTPUT"
+  else
+    cat -- "$wcd_wo_body"
+  fi
+  return 0
+}
+
+wcd_now() {
+  date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '(不明)\n'
+}
+
+wcd_run_list() {
+  wcd_resolve_md5_mode
+  wcd_normalize_ext_spec
+  wcd_make_tmpdir
+
+  case "$WCD_SOURCE_TYPE" in
+    war) wcd_prepare_war_root "$WCD_SOURCE" ;;
+    dir) wcd_resolve_dir_root "$WCD_SOURCE" ;;
+    vfs) wcd_resolve_vfs_root "$WCD_SOURCE" ;;
+    *)   wcd_die 2 "入力の種別を特定できません。" ;;
+  esac
+
+  wcd_rl_paths="$WCD_TMPDIR/paths"
+  wcd_rl_list="$WCD_TMPDIR/list"
+  wcd_collect_paths "$WCD_RESOLVED_ROOT" "$wcd_rl_paths"
+  wcd_hash_paths "$WCD_RESOLVED_ROOT" "$wcd_rl_paths" "$wcd_rl_list"
+  wcd_apply_simulation "$wcd_rl_list"
+
+  wcd_rl_count="$(awk 'END { print NR + 0 }' "$wcd_rl_list")"
+  wcd_rl_ext_label="$WCD_EXT_SPEC"
+  [ "$WCD_EXT_ALL" = "true" ] && wcd_rl_ext_label="all (すべてのファイル)"
+
+  wcd_rl_body="$WCD_TMPDIR/body"
+  {
+    if [ "$WCD_HEADER" = "true" ]; then
+      printf '# war_class_digest.sh %s\n' "$WCD_VERSION"
+      printf '# label        : %s\n' "${WCD_LABEL:-(名前なし)}"
+      printf '# generated_at : %s\n' "$(wcd_now)"
+      printf '# source_type  : %s\n' "$WCD_SOURCE_TYPE"
+      printf '# source       : %s\n' "$WCD_SOURCE"
+      printf '# root         : %s\n' "$WCD_RESOLVED_ROOT_LABEL"
+      printf '# extensions   : %s\n' "$wcd_rl_ext_label"
+      printf '# excludes     : %s\n' "$(printf '%s' "$WCD_EXCLUDES" | tr '\n' ' ')"
+      printf '# entries      : %s\n' "$wcd_rl_count"
+      printf '# simulate     : %s\n' "$WCD_SIMULATE_NOTE"
+      printf '# format       : MD5<TAB>相対パス (相対パスで昇順)\n'
+    fi
+    cat -- "$wcd_rl_list"
+  } > "$wcd_rl_body"
+
+  wcd_write_output "$wcd_rl_body"
+
+  # 呼び出し元が件数を機械的に読めるよう、標準エラーへ KEY=VALUE でも出す
+  # (標準出力は --output 未指定時に一覧そのものが流れるため使えない)。
+  printf 'WCD_LIST_ENTRIES=%s\n' "$wcd_rl_count" >&2
+  printf 'WCD_LIST_ROOT=%s\n' "$WCD_RESOLVED_ROOT" >&2
+  printf 'WCD_LIST_SIMULATE=%s\n' "$WCD_SIMULATE_NOTE" >&2
+  return 0
+}
+
+# ---- 差分の突き合わせ -------------------------------------------------------
+# リストのヘッダから項目を読み出す (差分レポートへ載せるため)。
+wcd_header_value() {
+  wcd_hv_file="$1"
+  wcd_hv_key="$2"
+  sed -n "s/^# *${wcd_hv_key} *: *//p" "$wcd_hv_file" 2>/dev/null | head -n 1
+}
+
+wcd_run_compare() {
+  [ -f "$WCD_COMPARE_1" ] || wcd_die 3 "リスト1 のファイルが見つかりません: $WCD_COMPARE_1"
+  [ -f "$WCD_COMPARE_2" ] || wcd_die 3 "リスト2 のファイルが見つかりません: $WCD_COMPARE_2"
+  wcd_make_tmpdir
+
+  wcd_rc_class="$WCD_TMPDIR/classified"
+  # 1 回のパスで分類する。出力は
+  #   only1<TAB>パス<TAB>MD5
+  #   only2<TAB>パス<TAB>MD5
+  #   diff <TAB>パス<TAB>MD5(リスト1)<TAB>MD5(リスト2)
+  #   same <TAB>パス
+  # の 4 種類。並べ替えは後段の sort で行う。
+  awk -F'\t' -v OFS='\t' '
+    FNR == NR {
+      if (substr($0, 1, 1) == "#") next
+      if (NF < 2) next
+      l1[$2] = $1
+      n1++
+      next
+    }
+    {
+      if (substr($0, 1, 1) == "#") next
+      if (NF < 2) next
+      l2[$2] = $1
+      n2++
+    }
+    END {
+      for (p in l2) {
+        if (p in l1) {
+          if (l1[p] == l2[p]) { print "same", p; same++ }
+          else { print "diff", p, l1[p], l2[p]; diff++ }
+        } else {
+          print "only2", p, l2[p]; only2++
+        }
+      }
+      for (p in l1) {
+        if (!(p in l2)) { print "only1", p, l1[p]; only1++ }
+      }
+      printf "count\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+        n1 + 0, n2 + 0, same + 0, only1 + 0, only2 + 0, diff + 0
+    }
+  ' "$WCD_COMPARE_1" "$WCD_COMPARE_2" > "$wcd_rc_class" \
+    || wcd_die 3 "リストを読み取れませんでした。"
+
+  wcd_rc_counts="$(grep '^count	' "$wcd_rc_class" | head -n 1)"
+  wcd_rc_n1="$(printf '%s' "$wcd_rc_counts" | cut -f2)"
+  wcd_rc_n2="$(printf '%s' "$wcd_rc_counts" | cut -f3)"
+  wcd_rc_same="$(printf '%s' "$wcd_rc_counts" | cut -f4)"
+  wcd_rc_only1="$(printf '%s' "$wcd_rc_counts" | cut -f5)"
+  wcd_rc_only2="$(printf '%s' "$wcd_rc_counts" | cut -f6)"
+  wcd_rc_diff="$(printf '%s' "$wcd_rc_counts" | cut -f7)"
+  wcd_rc_total=$((wcd_rc_only1 + wcd_rc_only2 + wcd_rc_diff))
+
+  if [ "$wcd_rc_total" -eq 0 ]; then
+    wcd_rc_verdict="差分なし (問題ありません)"
+  else
+    wcd_rc_verdict="差分あり (${wcd_rc_total} 件)"
+  fi
+
+  wcd_rc_sim1="$(wcd_header_value "$WCD_COMPARE_1" simulate)"
+  wcd_rc_sim2="$(wcd_header_value "$WCD_COMPARE_2" simulate)"
+  [ -n "$wcd_rc_sim1" ] || wcd_rc_sim1="(不明)"
+  [ -n "$wcd_rc_sim2" ] || wcd_rc_sim2="(不明)"
+
+  wcd_rc_body="$WCD_TMPDIR/compare_body"
+  {
+    printf '===================================================================\n'
+    printf 'MD5 ダイジェストリストの差分レポート\n'
+    printf '===================================================================\n'
+    printf '作成日時     : %s\n' "$(wcd_now)"
+    printf '判定         : %s\n' "$wcd_rc_verdict"
+    printf '\n'
+    printf '%s : %s\n' "$WCD_LIST1_LABEL" "$WCD_COMPARE_1"
+    printf '  名前       : %s\n' "$(wcd_header_value "$WCD_COMPARE_1" label)"
+    printf '  対象       : %s\n' "$(wcd_header_value "$WCD_COMPARE_1" root)"
+    printf '  対象拡張子 : %s\n' "$(wcd_header_value "$WCD_COMPARE_1" extensions)"
+    printf '  件数       : %s 件\n' "$wcd_rc_n1"
+    printf '  偽装       : %s\n' "$wcd_rc_sim1"
+    printf '%s : %s\n' "$WCD_LIST2_LABEL" "$WCD_COMPARE_2"
+    printf '  名前       : %s\n' "$(wcd_header_value "$WCD_COMPARE_2" label)"
+    printf '  対象       : %s\n' "$(wcd_header_value "$WCD_COMPARE_2" root)"
+    printf '  対象拡張子 : %s\n' "$(wcd_header_value "$WCD_COMPARE_2" extensions)"
+    printf '  件数       : %s 件\n' "$wcd_rc_n2"
+    printf '  偽装       : %s\n' "$wcd_rc_sim2"
+    printf '\n'
+    printf '%s\n' '--- 内訳 ---------------------------------------------------------'
+    printf '一致                 : %s 件\n' "$wcd_rc_same"
+    printf '%s のみに存在   : %s 件  (%s にあるのに %s に無い)\n' \
+      "$WCD_LIST1_LABEL" "$wcd_rc_only1" "$WCD_LIST1_LABEL" "$WCD_LIST2_LABEL"
+    printf '%s のみに存在   : %s 件  (%s に無いのに %s にある)\n' \
+      "$WCD_LIST2_LABEL" "$wcd_rc_only2" "$WCD_LIST1_LABEL" "$WCD_LIST2_LABEL"
+    printf 'MD5 不一致           : %s 件  (同じパスだが中身が違う)\n' "$wcd_rc_diff"
+    printf '\n'
+
+    printf '[A] %s 側の差分: %s にのみ存在するファイル (%s 件)\n' \
+      "$WCD_LIST1_LABEL" "$WCD_LIST1_LABEL" "$wcd_rc_only1"
+    if [ "$wcd_rc_only1" -eq 0 ]; then
+      printf '    (なし)\n'
+    else
+      grep '^only1	' "$wcd_rc_class" | LC_ALL=C sort -t "$(printf '\t')" -k2,2 \
+        | awk -F'\t' -v l1="$WCD_LIST1_LABEL" '{ printf "    [%sのみ] %s  MD5=%s\n", l1, $2, $3 }'
+    fi
+    printf '\n'
+
+    printf '[B] %s 側の差分: %s にのみ存在するファイル (%s 件)\n' \
+      "$WCD_LIST2_LABEL" "$WCD_LIST2_LABEL" "$wcd_rc_only2"
+    if [ "$wcd_rc_only2" -eq 0 ]; then
+      printf '    (なし)\n'
+    else
+      grep '^only2	' "$wcd_rc_class" | LC_ALL=C sort -t "$(printf '\t')" -k2,2 \
+        | awk -F'\t' -v l2="$WCD_LIST2_LABEL" '{ printf "    [%sのみ] %s  MD5=%s\n", l2, $2, $3 }'
+    fi
+    printf '\n'
+
+    printf '[C] 両方に存在するが MD5 が一致しないファイル (%s 件)\n' "$wcd_rc_diff"
+    if [ "$wcd_rc_diff" -eq 0 ]; then
+      printf '    (なし)\n'
+    else
+      grep '^diff	' "$wcd_rc_class" | LC_ALL=C sort -t "$(printf '\t')" -k2,2 \
+        | awk -F'\t' -v l1="$WCD_LIST1_LABEL" -v l2="$WCD_LIST2_LABEL" '
+            {
+              printf "    [MD5不一致] %s\n", $2
+              printf "        %s MD5: %s\n", l1, $3
+              printf "        %s MD5: %s\n", l2, $4
+            }'
+    fi
+    printf '\n'
+
+    printf '%s\n' '--- 読み方 -------------------------------------------------------'
+    printf '[A] が出る   : ビルドした成果物にあるファイルがデプロイ先へ届いていない。\n'
+    printf '               デプロイ先がボリューム / バインドマウントで覆われている、\n'
+    printf '               デプロイが途中で失敗している、などを疑う。\n'
+    printf '[B] が出る   : デプロイ先にしか無いファイルがある。前回の成果物が残って\n'
+    printf '               いる、別のビルドの成果物が混ざっている、などを疑う。\n'
+    printf '[C] が出る   : 同じパスで中身が違う。古い成果物のまま動いている可能性が\n'
+    printf '               高い。ビルドの取り込み漏れとキャッシュを疑う。\n'
+    printf '差分なし     : WAR の中身がそのままデプロイされている。問題なし。\n'
+  } > "$wcd_rc_body"
+
+  wcd_write_output "$wcd_rc_body"
+
+  # 呼び出し元が件数を機械的に読めるよう、標準エラーへ KEY=VALUE でも出す。
+  printf 'WCD_COMPARE_LIST1=%s\n' "$wcd_rc_n1" >&2
+  printf 'WCD_COMPARE_LIST2=%s\n' "$wcd_rc_n2" >&2
+  printf 'WCD_COMPARE_SAME=%s\n' "$wcd_rc_same" >&2
+  printf 'WCD_COMPARE_ONLY1=%s\n' "$wcd_rc_only1" >&2
+  printf 'WCD_COMPARE_ONLY2=%s\n' "$wcd_rc_only2" >&2
+  printf 'WCD_COMPARE_DIFF=%s\n' "$wcd_rc_diff" >&2
+  printf 'WCD_COMPARE_TOTAL=%s\n' "$wcd_rc_total" >&2
+
+  [ "$wcd_rc_total" -eq 0 ] && return 0
+  return 1
+}
+
+# ---- 実行 -------------------------------------------------------------------
+wcd_parse_args "$@"
+
+case "$WCD_MODE" in
+  list)    wcd_run_list ;;
+  compare) wcd_run_compare ;;
+  *)       wcd_die 2 "処理を特定できません (--help を参照してください)。" ;;
+esac
+WAR_CLASS_DIGEST_SCRIPT_END
+)"
+WAR_CLASS_DIGEST_SCRIPT="${WAR_CLASS_DIGEST_SCRIPT//$'\r'/}"
+
 usage() {
   cat <<'EOF'
 Usage: build_and_verify.sh [OPTIONS]
@@ -3004,6 +3990,83 @@ ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行�
                            指定すると取り込み検証を自動で有効にする
                            (ビルド時にだけ必要なファイルは、イメージへ残らないのが
                             正しいため)
+
+  (既定で無効) デプロイ済みファイルの MD5 差分検証
+                           デプロイ実行前の WAR に含まれるファイルの MD5 一覧
+                           (リスト1) と、デプロイ成功後に JBoss EAP が vfs/temp
+                           配下へ展開した中身の MD5 一覧 (リスト2) を作り、
+                           両者を突き合わせて差分が無いことを確認する。
+                           取り込み検証 (--verify-copy-artifact) がファイル 1 個の
+                           同一性を見るのに対し、こちらは WAR の中身すべてを
+                           一覧にして突き合わせるため、「一部のクラスだけ古い」
+                           「前回の成果物が残っている」「一部しか展開されていない」
+                           といった状態まで検出できる。
+                           リスト1 / リスト2 / 差分レポートは、既定で全量レポートと
+                           同じディレクトリ (--report-dir) へ出力する。
+                           一覧の生成は tools/war_class_digest.sh へ切り出してあり、
+                           ホスト側とコンテナ内で同じスクリプトを使う。
+                           --deployed-class-* を 1 つでも指定すると、
+                           差分検証は自動で有効になる
+                           (--no-verify-deployed-classes との併用は指定の
+                            取り違えとみなし、その場で中止する)。
+  --verify-deployed-classes
+                           差分検証を行う。既定では行わない
+                           (WAR の展開と MD5 の算出に時間を要するため、確認したい
+                            実行で明示的に指定する)
+  --no-verify-deployed-classes
+                           差分検証を行わない (既定と同じ。
+                           --verify-deployed-classes を打ち消す)
+  --deployed-class-ext LIST
+                           一覧へ載せる拡張子をカンマ区切りで指定する
+                           (既定: class = class ファイルのみ)。
+                           all を指定するとすべてのファイルを対象にする。
+                           例: --deployed-class-ext class,jar,xml
+                           指定すると差分検証を自動で有効にする
+  --deployed-class-war PATH
+                           比較元の WAR を明示指定する。未指定の場合は
+                           --copy-file の SRC から .war を自動で選ぶ。
+                           指定すると差分検証を自動で有効にする
+  --deployed-class-service NAME
+                           リスト2 を取得するサービスを指定する
+                           (未指定なら起動確認の対象サービス)
+  --deployed-class-vfs-dir PATH
+                           コンテナ内の vfs temp ディレクトリを絶対パスで明示指定する
+                           (既定: auto = JBOSS_HOME から自動探索)
+  --deployed-class-deployment NAME
+                           展開済みデプロイルート (WEB-INF を持つディレクトリ) が
+                           複数ある場合に、パスへ NAME を含むものだけを対象にする
+  --deployed-class-dir DIR リスト1 / リスト2 / 差分レポートの出力先
+                           (既定: --report-dir と同じディレクトリ)
+  --deployed-class-nested-jar
+                           入れ子 jar の展開結果 (*.jar/ 配下) も一覧へ含める。
+                           既定では WAR 側に対応するファイルが無く差分だらけに
+                           なるため除外している
+  --deployed-class-required
+                           差分を検出した場合、および検証を完了できなかった場合に
+                           エラー終了する (exit 1)。既定では警告に留める
+  --deployed-class-simulate MODE
+                           差分がある状態を偽装して動作確認する (既定: none)。
+                           どちら側に差分があるのかが分かるよう、偽装は
+                           リストごとに分けて適用する。
+                             none   偽装しない
+                             list1  リスト1 にだけある項目を作る
+                                    (WAR にあるのにデプロイ先に無い状態)
+                             list2  リスト2 にだけある項目を作る
+                                    (デプロイ先にだけ余分な物がある状態)
+                             both   list1 と list2 の両方
+                             modify 同じパスで MD5 だけが違う項目を作る
+                                    (中身の食い違い)
+                             all    list1 / list2 / modify のすべて
+                           指定すると差分検証を自動で有効にする
+  --deployed-class-simulate-count N
+                           偽装する件数 (既定: 1)
+  --print-war-class-digest ダイジェストリスト作成スクリプト
+                           (war_class_digest.sh) を標準出力へ書き出して終了する。
+                           リポジトリには tools/war_class_digest.sh として同じものを
+                           置いている。
+                           使い方は tools/war_class_digest.sh --help、
+                           手作業での代替手順は
+                           tools/war_class_digest.sh --show-commands で表示できる
 
 JBoss マスターパスワード (BuildKit シークレット):
   --jboss-password-param NAME
@@ -4043,6 +5106,33 @@ while [ $# -gt 0 ]; do
     --copy-artifact-path)      need_value "$1" $#; COPY_ARTIFACT_PATHS+=("$2"); shift 2 ;;
     --copy-artifact-search-dir) need_value "$1" $#; COPY_ARTIFACT_SEARCH_DIRS+=("$2"); shift 2 ;;
     --copy-artifact-required)  COPY_ARTIFACT_REQUIRED="true"; shift ;;
+    --verify-deployed-classes)
+                           DEPLOYED_DIGEST_VERIFY="true"; DEPLOYED_DIGEST_VERIFY_SET="true"; shift ;;
+    --no-verify-deployed-classes)
+                           DEPLOYED_DIGEST_VERIFY="false"; DEPLOYED_DIGEST_VERIFY_SET="true"; shift ;;
+    --deployed-class-ext)  need_value "$1" $#; DEPLOYED_DIGEST_EXT="$2"; DEPLOYED_DIGEST_EXT_SET="true"; shift 2 ;;
+    --deployed-class-war)  need_value "$1" $#; DEPLOYED_DIGEST_WAR="$2"; DEPLOYED_DIGEST_WAR_SET="true"; shift 2 ;;
+    --deployed-class-service)
+                           need_value "$1" $#; DEPLOYED_DIGEST_SERVICE="$2"; shift 2 ;;
+    --deployed-class-vfs-dir)
+                           need_value "$1" $#; DEPLOYED_DIGEST_VFS_DIR="$2"; DEPLOYED_DIGEST_VFS_DIR_SET="true"; shift 2 ;;
+    --deployed-class-deployment)
+                           need_value "$1" $#; DEPLOYED_DIGEST_DEPLOYMENT="$2"; shift 2 ;;
+    --deployed-class-dir)  need_value "$1" $#; DEPLOYED_DIGEST_OUTPUT_DIR="$2"; DEPLOYED_DIGEST_OUTPUT_DIR_SET="true"; shift 2 ;;
+    --deployed-class-nested-jar) DEPLOYED_DIGEST_NESTED_JAR="true"; shift ;;
+    --deployed-class-required)   DEPLOYED_DIGEST_REQUIRED="true"; shift ;;
+    --deployed-class-simulate)
+                           need_value "$1" $#; DEPLOYED_DIGEST_SIMULATE="$2"; DEPLOYED_DIGEST_SIMULATE_SET="true"; shift 2 ;;
+    --deployed-class-simulate-count)
+                           need_value "$1" $#; DEPLOYED_DIGEST_SIMULATE_COUNT="$2"; shift 2 ;;
+    --print-war-class-digest)
+                           # ダイジェストリスト作成スクリプトを標準出力へ書き出して
+                           # 終了する。コンテナへ配るのと同じ内容なので、別環境へ
+                           # 持ち出して単体で使ったり、中身を読んで手順を確かめたり
+                           # できる。
+                           printf '%s\n' "$WAR_CLASS_DIGEST_SCRIPT"
+                           exit 0
+                           ;;
     --region)              need_value "$1" $#; REGION="$2"; shift 2 ;;
     --jboss-password-param) need_value "$1" $#; JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
     --jboss-password)       need_value "$1" $#; JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
@@ -4763,6 +5853,72 @@ fi
 NEED_CONTAINER="false"
 if [ "$VERIFY_STARTUP" = "true" ] || [ -n "$VERIFY_URL" ]; then
   NEED_CONTAINER="true"
+fi
+
+# ---- デプロイ済みファイルの MD5 差分検証オプションの検証 ---------------------
+# 拡張子・WAR・偽装などの指定は「差分検証をしたい」という意思表示のため、指定する
+# だけで検証を有効にする。ただし --no-verify-deployed-classes を明示している実行で
+# 併用された場合は、指定したつもりの検証が行われない事故になるためその場で止める。
+if [ "$DEPLOYED_DIGEST_EXT_SET" = "true" ] || [ "$DEPLOYED_DIGEST_WAR_SET" = "true" ] \
+    || [ "$DEPLOYED_DIGEST_SIMULATE_SET" = "true" ] || [ "$DEPLOYED_DIGEST_REQUIRED" = "true" ] \
+    || [ -n "$DEPLOYED_DIGEST_SERVICE" ] || [ -n "$DEPLOYED_DIGEST_DEPLOYMENT" ] \
+    || [ "$DEPLOYED_DIGEST_OUTPUT_DIR_SET" = "true" ] || [ "$DEPLOYED_DIGEST_NESTED_JAR" = "true" ] \
+    || [ "$DEPLOYED_DIGEST_VFS_DIR_SET" = "true" ]; then
+  if [ "$DEPLOYED_DIGEST_VERIFY_SET" = "true" ] && [ "$DEPLOYED_DIGEST_VERIFY" != "true" ]; then
+    err "--no-verify-deployed-classes と --deployed-class-* は同時に指定できません。"
+    exit 2
+  fi
+  DEPLOYED_DIGEST_VERIFY="true"
+fi
+if [ "$DEPLOYED_DIGEST_VERIFY" = "true" ]; then
+  case "$DEPLOYED_DIGEST_SIMULATE" in
+    none|list1|list2|both|modify|all) ;;
+    *)
+      err "--deployed-class-simulate には none / list1 / list2 / both / modify / all のいずれかを指定してください: $DEPLOYED_DIGEST_SIMULATE"
+      exit 2
+      ;;
+  esac
+  case "$DEPLOYED_DIGEST_SIMULATE_COUNT" in
+    ''|*[!0-9]*)
+      err "--deployed-class-simulate-count には 0 以上の整数を指定してください: $DEPLOYED_DIGEST_SIMULATE_COUNT"
+      exit 2
+      ;;
+  esac
+  if [ -z "$DEPLOYED_DIGEST_EXT" ]; then
+    err "--deployed-class-ext には拡張子を指定してください (すべてを対象にする場合は all)。"
+    exit 2
+  fi
+  if [ "$DEPLOYED_DIGEST_WAR_SET" = "true" ] \
+      && { [ -z "$DEPLOYED_DIGEST_WAR" ] || [ "$DEPLOYED_DIGEST_WAR" = "-" ]; }; then
+    err "--deployed-class-war には WAR ファイルのパスを指定してください: $DEPLOYED_DIGEST_WAR"
+    exit 2
+  fi
+  if [ "$DEPLOYED_DIGEST_OUTPUT_DIR_SET" = "true" ] \
+      && { [ -z "$DEPLOYED_DIGEST_OUTPUT_DIR" ] || [ "$DEPLOYED_DIGEST_OUTPUT_DIR" = "-" ]; }; then
+    err "--deployed-class-dir にはディレクトリパスを指定してください: $DEPLOYED_DIGEST_OUTPUT_DIR"
+    exit 2
+  fi
+  if [ -z "$DEPLOYED_DIGEST_VFS_DIR" ]; then
+    err "--deployed-class-vfs-dir にはコンテナ内のパス、または auto を指定してください。"
+    exit 2
+  fi
+  case "$DEPLOYED_DIGEST_VFS_DIR" in
+    auto|/*) ;;
+    *)
+      err "--deployed-class-vfs-dir にはコンテナ内の絶対パス、または auto を指定してください: $DEPLOYED_DIGEST_VFS_DIR"
+      exit 2
+      ;;
+  esac
+  # 出力先が決まらないと、リストも差分レポートも書き出す先が無い。
+  if [ "$DEPLOYED_DIGEST_OUTPUT_DIR_SET" != "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+    err "デプロイ済みファイルの MD5 差分検証には出力先が必要です。--report-dir または --deployed-class-dir を指定してください。"
+    exit 2
+  fi
+  # コンテナを起動しない実行ではリスト2 が取れず、突き合わせが成立しない。
+  if [ "$NEED_CONTAINER" != "true" ]; then
+    warn "デプロイ済みファイルの MD5 差分検証は、コンテナ起動を伴う実行でのみ行えます。--verify-startup または --verify-url を併用してください。"
+    warn "  リスト1 (デプロイ前の WAR) だけは作成し、突き合わせは未実施として記録します。"
+  fi
 fi
 
 # URL ボディ指定は JSON / form のどちらか一方のみ許可する。
@@ -6995,6 +8151,571 @@ verify_copied_artifacts() {
     warn "  ボリュームを残したい場合は --keep-volumes を指定してください。"
   fi
   return 1
+}
+
+# ---- デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2) -----------------
+# 「ビルドした WAR の中身」と「JBoss EAP がデプロイして実際に動かしている中身」を
+# ファイル単位の MD5 で突き合わせ、差分が無いことをもって「今回の成果物がそのまま
+# 動いている」と判定する。
+#
+#   リスト1 : デプロイ実行前の WAR に含まれるファイル (ホスト側で WAR を展開して算出)
+#   リスト2 : デプロイ成功後、コンテナ内の vfs/temp 配下へ展開された中身
+#
+# 一覧の生成は tools/war_class_digest.sh (= $WAR_CLASS_DIGEST_SCRIPT) が行う。
+# ホスト側は一時ファイルへ書き出して実行し、コンテナ内へは docker exec の標準入力
+# 経由で配ってから実行するため、コマンドライン長の上限に掛からない。ホストと
+# コンテナで同じスクリプト・同じ書式を使うので、突き合わせの前提 (拡張子の絞り込み・
+# 相対パスの起点・並び順) が食い違うことがない。
+
+deployed_digest_enabled() {
+  [ "$DEPLOYED_DIGEST_VERIFY" = "true" ]
+}
+
+# リスト・差分レポートの出力先を決める。--deployed-class-dir > --report-dir の順。
+deployed_digest_output_dir() {
+  if [ "$DEPLOYED_DIGEST_OUTPUT_DIR_SET" = "true" ]; then
+    printf '%s\n' "${DEPLOYED_DIGEST_OUTPUT_DIR%/}"
+    return 0
+  fi
+  [ -n "$BUILD_REPORT_DIR" ] || return 1
+  printf '%s\n' "${BUILD_REPORT_DIR%/}"
+  return 0
+}
+
+# 出力ファイルのパスを組み立てる。全量レポート (build_and_verify_<日時>.txt) と
+# 対で並ぶよう、同じ日時の後ろへ識別子を付ける。
+deployed_digest_output_path() {
+  local suffix="$1" dir base candidate counter=1
+  dir="$(deployed_digest_output_dir)" || return 1
+  [ -n "$dir" ] || dir="/"
+  base="build_and_verify_${RUN_TIMESTAMP}${suffix}"
+  candidate="${dir}/${base}.txt"
+  while [ -e "$candidate" ]; do
+    candidate="${dir}/${base}_${counter}.txt"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+# ホスト側で使う一覧作成スクリプトを一時ファイルへ書き出す (初回のみ)。
+# 書き出したパスは DEPLOYED_DIGEST_HOST_SCRIPT へ入れ、cleanup_deployed_digest_script
+# で削除する。
+#
+# この関数はパスを標準出力へ返さない。コマンド置換 ($(...)) で呼ぶとサブシェルに
+# なり、DEPLOYED_DIGEST_HOST_SCRIPT への代入が呼び出し元へ戻らないため、後始末で
+# 消す先を見失って一時ファイルが溜まり続ける。呼び出し側は成否だけを見て、
+# パスは変数から取る。
+prepare_deployed_digest_host_script() {
+  local tmp
+  if [ -n "$DEPLOYED_DIGEST_HOST_SCRIPT" ] && [ -f "$DEPLOYED_DIGEST_HOST_SCRIPT" ]; then
+    return 0
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/build-and-verify-digest.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "$WAR_CLASS_DIGEST_SCRIPT" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 700 -- "$tmp" 2>/dev/null || true
+  DEPLOYED_DIGEST_HOST_SCRIPT="$tmp"
+  return 0
+}
+
+cleanup_deployed_digest_script() {
+  [ -n "$DEPLOYED_DIGEST_HOST_SCRIPT" ] || return 0
+  case "$DEPLOYED_DIGEST_HOST_SCRIPT" in
+    */build-and-verify-digest.*) rm -f -- "$DEPLOYED_DIGEST_HOST_SCRIPT" ;;
+  esac
+  DEPLOYED_DIGEST_HOST_SCRIPT=""
+  return 0
+}
+
+# 偽装モードを、一覧作成スクリプトの --simulate へ読み替える。
+#   リスト1 にだけある項目を作る = リスト1 へ実在しない項目を足す (extra)
+#   リスト2 にだけある項目を作る = リスト2 へ実在しない項目を足す (extra)
+#   MD5 だけ違う項目を作る       = リスト2 の MD5 を書き換える     (modify)
+#   all                          = リスト1 は extra、リスト2 は drop + modify + extra
+deployed_digest_simulate_for() {
+  local which="$1"
+  case "$DEPLOYED_DIGEST_SIMULATE" in
+    list1)
+      if [ "$which" = "list1" ]; then printf 'extra\n'; else printf 'none\n'; fi ;;
+    list2)
+      if [ "$which" = "list2" ]; then printf 'extra\n'; else printf 'none\n'; fi ;;
+    both)   printf 'extra\n' ;;
+    modify)
+      if [ "$which" = "list2" ]; then printf 'modify\n'; else printf 'none\n'; fi ;;
+    all)
+      if [ "$which" = "list1" ]; then printf 'extra\n'; else printf 'all\n'; fi ;;
+    *)      printf 'none\n' ;;
+  esac
+  return 0
+}
+
+# 偽装で作るパスへ入れる目印。リスト1 とリスト2 で必ず別の目印を使う。
+# 同じ目印にすると、両方へ足した項目が互いに一致してしまい (パスも偽装 MD5 も
+# 同じになるため)、差分として現れなくなる。
+deployed_digest_simulate_tag_for() {
+  case "$1" in
+    list1) printf 'SIMULATED_LIST1\n' ;;
+    *)     printf 'SIMULATED_LIST2\n' ;;
+  esac
+  return 0
+}
+
+# 一覧ファイルの件数 (# で始まるヘッダを除いた行数) を返す。
+deployed_digest_entry_count() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    printf '0\n'
+    return 0
+  fi
+  awk '!/^#/ && NF { n++ } END { print n + 0 }' "$file"
+}
+
+# 一覧作成スクリプトが標準エラーへ出す KEY=VALUE を読み取る。
+# 画面へ出したい診断 (偽装した旨など) はそのまま警告として出す。
+read_deployed_digest_stderr() {
+  local file="$1" prefix="$2" line
+  [ -n "$file" ] && [ -s "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WCD_LIST_ENTRIES=*)   DEPLOYED_DIGEST_STDERR_ENTRIES="${line#*=}" ;;
+      WCD_LIST_ROOT=*)      DEPLOYED_DIGEST_STDERR_ROOT="${line#*=}" ;;
+      WCD_LIST_SIMULATE=*)  DEPLOYED_DIGEST_STDERR_SIMULATE="${line#*=}" ;;
+      WCD_COMPARE_LIST1=*)  DEPLOYED_DIGEST_CMP_LIST1="${line#*=}" ;;
+      WCD_COMPARE_LIST2=*)  DEPLOYED_DIGEST_CMP_LIST2="${line#*=}" ;;
+      WCD_COMPARE_SAME=*)   DEPLOYED_DIGEST_CMP_SAME="${line#*=}" ;;
+      WCD_COMPARE_ONLY1=*)  DEPLOYED_DIGEST_CMP_ONLY1="${line#*=}" ;;
+      WCD_COMPARE_ONLY2=*)  DEPLOYED_DIGEST_CMP_ONLY2="${line#*=}" ;;
+      WCD_COMPARE_DIFF=*)   DEPLOYED_DIGEST_CMP_DIFF="${line#*=}" ;;
+      WCD_COMPARE_TOTAL=*)  DEPLOYED_DIGEST_CMP_TOTAL="${line#*=}" ;;
+      '') ;;
+      *) warn "${prefix}${line}" ;;
+    esac
+  done < "$file"
+  return 0
+}
+DEPLOYED_DIGEST_STDERR_ENTRIES=""
+DEPLOYED_DIGEST_STDERR_ROOT=""
+DEPLOYED_DIGEST_STDERR_SIMULATE=""
+DEPLOYED_DIGEST_CMP_LIST1="0"
+DEPLOYED_DIGEST_CMP_LIST2="0"
+DEPLOYED_DIGEST_CMP_SAME="0"
+DEPLOYED_DIGEST_CMP_ONLY1="0"
+DEPLOYED_DIGEST_CMP_ONLY2="0"
+DEPLOYED_DIGEST_CMP_DIFF="0"
+DEPLOYED_DIGEST_CMP_TOTAL="0"
+
+# 比較元の WAR を決める。明示指定 (--deployed-class-war) が最優先で、指定が無ければ
+# --copy-file の SRC から .war を拾う (差し替えた WAR がそのままデプロイされるかを
+# 見る、という典型的な使い方に合わせる)。
+deployed_digest_resolve_war() {
+  local spec src candidate="" found=0
+  if [ "$DEPLOYED_DIGEST_WAR_SET" = "true" ]; then
+    printf '%s\n' "$DEPLOYED_DIGEST_WAR"
+    return 0
+  fi
+  for spec in ${COPY_SPECS[@]+"${COPY_SPECS[@]}"}; do
+    src="${spec%%:*}"
+    # ':' が無い指定は --copy-file 側で書式エラーになるため、ここでは飛ばす。
+    [ "$src" = "$spec" ] && continue
+    case "$src" in
+      *.war|*.WAR)
+        found=$((found + 1))
+        [ -n "$candidate" ] || candidate="$src"
+        ;;
+    esac
+  done
+  if [ "$found" -eq 0 ]; then
+    warn "比較元の WAR を特定できませんでした (--copy-file に .war の指定がありません)。"
+    warn "  --deployed-class-war で WAR のパスを指定してください。"
+    return 1
+  fi
+  if [ "$found" -gt 1 ]; then
+    warn "--copy-file に .war が複数あるため、最初の 1 件を比較元にします: ${candidate}"
+    warn "  別の WAR を使う場合は --deployed-class-war で指定してください。"
+  fi
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+# リスト1: デプロイ実行前の WAR に含まれるファイルの MD5 一覧を作る。
+# ビルドより前 (--copy-file のコピー直後) に実行する。ここで作った一覧が
+# 突き合わせの基準になるため、ビルドやデプロイの結果に左右されない時点で採る。
+generate_deployed_digest_list1() {
+  deployed_digest_enabled || return 0
+
+  local script war out sim err_file rc
+  local -a args=()
+
+  if [ "$DRY_RUN" = "true" ]; then
+    DEPLOYED_DIGEST_LIST1_STATUS="DRY-RUN (未実行)"
+    log "[DRY-RUN] デプロイ前の WAR から MD5 一覧 (リスト1) を作成します (対象拡張子: ${DEPLOYED_DIGEST_EXT})。"
+    return 0
+  fi
+
+  if ! war="$(deployed_digest_resolve_war)"; then
+    DEPLOYED_DIGEST_LIST1_STATUS="未作成 (比較元の WAR を特定できません)"
+    return 0
+  fi
+  if [ ! -f "$war" ]; then
+    DEPLOYED_DIGEST_LIST1_STATUS="未作成 (WAR が見つかりません: ${war})"
+    warn "比較元の WAR が見つかりません: ${war}"
+    return 0
+  fi
+  if ! prepare_deployed_digest_host_script; then
+    DEPLOYED_DIGEST_LIST1_STATUS="未作成 (一覧作成スクリプトを用意できません)"
+    warn "ダイジェストリスト作成スクリプトを一時ファイルへ書き出せませんでした。"
+    return 0
+  fi
+  script="$DEPLOYED_DIGEST_HOST_SCRIPT"
+  if ! out="$(deployed_digest_output_path "_deployed_class_list1_war")"; then
+    DEPLOYED_DIGEST_LIST1_STATUS="未作成 (出力先を決められません)"
+    warn "リスト1 の出力先を決められませんでした (--report-dir または --deployed-class-dir を指定してください)。"
+    return 0
+  fi
+  if ! mkdir -p -- "$(dirname -- "$out")" 2>/dev/null; then
+    DEPLOYED_DIGEST_LIST1_STATUS="未作成 (出力先を作成できません)"
+    warn "リスト1 の出力先を作成できませんでした: $(dirname -- "$out")"
+    return 0
+  fi
+
+  sim="$(deployed_digest_simulate_for list1)"
+  err_file="$(mktemp 2>/dev/null)" || err_file=""
+  args=(
+    --war "$war"
+    --ext "$DEPLOYED_DIGEST_EXT"
+    --label "リスト1 (デプロイ前の WAR: $(basename -- "$war"))"
+    --output "$out"
+    --simulate "$sim"
+    --simulate-count "$DEPLOYED_DIGEST_SIMULATE_COUNT"
+    --simulate-tag "$(deployed_digest_simulate_tag_for list1)"
+  )
+  log "デプロイ前の WAR から MD5 一覧 (リスト1) を作成します: ${war}"
+  if [ -n "$err_file" ]; then
+    sh "$script" "${args[@]}" 2> "$err_file"
+    rc=$?
+  else
+    sh "$script" "${args[@]}"
+    rc=$?
+  fi
+  read_deployed_digest_stderr "$err_file" "リスト1: "
+  [ -n "$err_file" ] && rm -f -- "$err_file"
+
+  if [ "$rc" -ne 0 ]; then
+    DEPLOYED_DIGEST_LIST1_STATUS="失敗 (一覧作成が exit=${rc})"
+    warn "デプロイ前の WAR から MD5 一覧 (リスト1) を作成できませんでした (exit=${rc})。"
+    rm -f -- "$out" 2>/dev/null || true
+    return 0
+  fi
+
+  DEPLOYED_DIGEST_LIST1_FILE="$out"
+  DEPLOYED_DIGEST_WAR_USED="$war"
+  DEPLOYED_DIGEST_LIST1_STATUS="作成済み ($(deployed_digest_entry_count "$out") 件)"
+  log "リスト1 を出力しました: ${out}"
+  log "  比較元 WAR: ${war} / 対象拡張子: ${DEPLOYED_DIGEST_EXT} / 件数: $(deployed_digest_entry_count "$out")"
+  if [ "$sim" != "none" ]; then
+    warn "  ※ リスト1 は差分の偽装を有効にして作成しました (--deployed-class-simulate ${DEPLOYED_DIGEST_SIMULATE})。"
+  fi
+  return 0
+}
+
+# リスト2: デプロイ成功後、コンテナ内の vfs/temp 配下へ展開された中身の MD5 一覧。
+# 一覧作成スクリプトを docker exec の標準入力経由でコンテナへ配り、その場で実行して
+# 使い終えたら同じ exec の中で削除する (コンテナへ余計なものを残さない)。
+generate_deployed_digest_list2() {
+  local out sim err_file rc cid service_name container_name work_dir rc_line
+  local last_rc=0 last_label="" succeeded="false"
+  local -a target_container_ids=() run_args=()
+
+  if ! out="$(deployed_digest_output_path "_deployed_class_list2_vfs")"; then
+    DEPLOYED_DIGEST_LIST2_STATUS="未作成 (出力先を決められません)"
+    warn "リスト2 の出力先を決められませんでした (--report-dir または --deployed-class-dir を指定してください)。"
+    return 1
+  fi
+  if ! mkdir -p -- "$(dirname -- "$out")" 2>/dev/null; then
+    DEPLOYED_DIGEST_LIST2_STATUS="未作成 (出力先を作成できません)"
+    warn "リスト2 の出力先を作成できませんでした: $(dirname -- "$out")"
+    return 1
+  fi
+
+  if [ -n "$DEPLOYED_DIGEST_SERVICE" ]; then
+    mapfile -t target_container_ids < <(compose_container_ids "$DEPLOYED_DIGEST_SERVICE")
+  else
+    mapfile -t target_container_ids < <(verification_target_container_ids)
+  fi
+  if [ ${#target_container_ids[@]} -eq 0 ]; then
+    DEPLOYED_DIGEST_LIST2_STATUS="未作成 (対象コンテナが見つかりません)"
+    warn "リスト2 を取得する対象コンテナが見つかりません。"
+    return 1
+  fi
+
+  sim="$(deployed_digest_simulate_for list2)"
+  run_args=(
+    --vfs-dir "$DEPLOYED_DIGEST_VFS_DIR"
+    --ext "$DEPLOYED_DIGEST_EXT"
+    --label "リスト2 (デプロイ後の vfs/temp)"
+    --simulate "$sim"
+    --simulate-count "$DEPLOYED_DIGEST_SIMULATE_COUNT"
+    --simulate-tag "$(deployed_digest_simulate_tag_for list2)"
+  )
+  [ "$DEPLOYED_DIGEST_NESTED_JAR" = "true" ] && run_args+=(--no-default-exclude)
+  [ -n "$DEPLOYED_DIGEST_DEPLOYMENT" ] && run_args+=(--deployment "$DEPLOYED_DIGEST_DEPLOYMENT")
+
+  err_file="$(mktemp 2>/dev/null)" || err_file=""
+  work_dir="/tmp/${DEPLOYED_DIGEST_CONTAINER_DIR_PREFIX}.$$"
+
+  for cid in "${target_container_ids[@]}"; do
+    [ -n "$cid" ] || continue
+    service_name="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$cid" 2>/dev/null || true)"
+    [ -n "$service_name" ] || service_name="(unknown)"
+    container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null || printf '%s' "$cid")")"
+    [ -n "$err_file" ] && : > "$err_file"
+
+    # 標準入力からスクリプト本体を渡し、標準出力へ一覧を受け取る。
+    # 対話セッションではないため -i で標準入力を奪う心配はない (明示的に閉じた
+    # パイプだけを渡している)。
+    printf '%s\n' "$WAR_CLASS_DIGEST_SCRIPT" \
+      | docker exec -i "$cid" /bin/sh -c '
+      # deployed-class-digest: 一覧作成スクリプトを置いて vfs/temp の MD5 一覧を作る
+      umask 077
+      wcd_dir="$1"
+      shift
+      rm -rf -- "$wcd_dir" 2>/dev/null || true
+      mkdir -p "$wcd_dir" || exit 4
+      cat > "$wcd_dir/war_class_digest.sh" || exit 4
+      chmod 700 "$wcd_dir/war_class_digest.sh" 2>/dev/null || true
+      sh "$wcd_dir/war_class_digest.sh" "$@"
+      wcd_status=$?
+      rm -rf -- "$wcd_dir" 2>/dev/null || true
+      exit $wcd_status
+    ' _ "$work_dir" "${run_args[@]}" > "$out" 2>"${err_file:-/dev/null}"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      read_deployed_digest_stderr "$err_file" "リスト2: "
+      DEPLOYED_DIGEST_TARGET_LABEL="${service_name} (${container_name})"
+      DEPLOYED_DIGEST_ROOT_LABEL="$DEPLOYED_DIGEST_STDERR_ROOT"
+      succeeded="true"
+      break
+    fi
+    last_rc="$rc"
+    last_label="${service_name} (${container_name})"
+    # 対象が複数ある構成では、JBoss EAP のコンテナだけが成功する。失敗したものは
+    # 診断として残しつつ、次のコンテナを試す。
+    diag "リスト2 を取得できませんでした: ${last_label} (exit=${rc})"
+    if [ -n "$err_file" ] && [ -s "$err_file" ]; then
+      while IFS= read -r rc_line || [ -n "$rc_line" ]; do
+        case "$rc_line" in
+          WCD_*) ;;
+          '') ;;
+          *) diag "  ${rc_line}" ;;
+        esac
+      done < "$err_file"
+    fi
+  done
+
+  [ -n "$err_file" ] && rm -f -- "$err_file"
+
+  if [ "$succeeded" != "true" ]; then
+    DEPLOYED_DIGEST_LIST2_STATUS="失敗 (一覧作成が exit=${last_rc}${last_label:+ / 最後の対象: ${last_label}})"
+    warn "デプロイ後の vfs/temp から MD5 一覧 (リスト2) を作成できませんでした。"
+    warn "  JBoss EAP のコンテナを --deployed-class-service で指定するか、"
+    warn "  vfs temp のパスを --deployed-class-vfs-dir で明示してください。"
+    rm -f -- "$out" 2>/dev/null || true
+    return 1
+  fi
+
+  DEPLOYED_DIGEST_LIST2_FILE="$out"
+  DEPLOYED_DIGEST_LIST2_STATUS="作成済み ($(deployed_digest_entry_count "$out") 件)"
+  log "リスト2 を出力しました: ${out}"
+  log "  対象: ${DEPLOYED_DIGEST_TARGET_LABEL} / 展開済みデプロイルート: ${DEPLOYED_DIGEST_ROOT_LABEL:-(不明)}"
+  if [ "$sim" != "none" ]; then
+    warn "  ※ リスト2 は差分の偽装を有効にして作成しました (--deployed-class-simulate ${DEPLOYED_DIGEST_SIMULATE})。"
+  fi
+  return 0
+}
+
+# リスト1 とリスト2 を突き合わせ、差分レポートを出力する。
+# 差分が無ければ 0、差分があれば 1、突き合わせ自体に失敗したら 2 を返す。
+compare_deployed_digests() {
+  local script out err_file rc
+  if ! prepare_deployed_digest_host_script; then
+    warn "ダイジェストリスト作成スクリプトを一時ファイルへ書き出せませんでした。"
+    return 2
+  fi
+  script="$DEPLOYED_DIGEST_HOST_SCRIPT"
+  if ! out="$(deployed_digest_output_path "_deployed_class_diff")"; then
+    warn "差分レポートの出力先を決められませんでした。"
+    return 2
+  fi
+  if ! mkdir -p -- "$(dirname -- "$out")" 2>/dev/null; then
+    warn "差分レポートの出力先を作成できませんでした: $(dirname -- "$out")"
+    return 2
+  fi
+
+  err_file="$(mktemp 2>/dev/null)" || err_file=""
+  if [ -n "$err_file" ]; then
+    sh "$script" --compare "$DEPLOYED_DIGEST_LIST1_FILE" "$DEPLOYED_DIGEST_LIST2_FILE" \
+        --list1-label "リスト1" --list2-label "リスト2" --output "$out" 2> "$err_file"
+    rc=$?
+  else
+    sh "$script" --compare "$DEPLOYED_DIGEST_LIST1_FILE" "$DEPLOYED_DIGEST_LIST2_FILE" \
+        --list1-label "リスト1" --list2-label "リスト2" --output "$out"
+    rc=$?
+  fi
+  read_deployed_digest_stderr "$err_file" "突き合わせ: "
+  [ -n "$err_file" ] && rm -f -- "$err_file"
+
+  if [ "$rc" -gt 1 ]; then
+    warn "リスト1 とリスト2 の突き合わせに失敗しました (exit=${rc})。"
+    rm -f -- "$out" 2>/dev/null || true
+    return 2
+  fi
+  DEPLOYED_DIGEST_DIFF_FILE="$out"
+  return "$rc"
+}
+
+# 差分レポートを画面へ出す。差分が多い実行で画面が流れきらないよう、
+# 先頭から一定行だけを出し、残りは出力先のファイルを案内する。
+show_deployed_digest_report() {
+  local file="$1" limit="${DEPLOYED_DIGEST_DISPLAY_LINES:-80}" line count=0 total
+  [ -f "$file" ] || return 0
+  total="$(awk 'END { print NR + 0 }' "$file")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    count=$((count + 1))
+    [ "$count" -le "$limit" ] && diag "$line"
+  done < "$file"
+  if [ "$total" -gt "$limit" ]; then
+    diag "  ... (以降 $((total - limit)) 行は省略しました)"
+  fi
+  return 0
+}
+
+# --deployed-class-required 指定時だけ、検証を完了できなかったことを失敗として扱う。
+deployed_digest_required_failed() {
+  [ "$DEPLOYED_DIGEST_REQUIRED" = "true" ] || return 1
+  err "デプロイ済みファイルの MD5 差分検証を完了できませんでした (--deployed-class-required)。"
+  return 0
+}
+
+# デプロイ成功後に呼ばれる本体。リスト2 を作り、リスト1 と突き合わせて結果を出す。
+# 差分を検出した場合、既定では警告に留める (デプロイ先の構成によっては、入れ子 jar の
+# 展開などで正当な差が出ることがあるため)。--deployed-class-required 指定時のみ
+# エラー終了させる。
+verify_deployed_class_digests() {
+  deployed_digest_enabled || return 0
+
+  local cmp_rc
+
+  if [ "$DRY_RUN" = "true" ]; then
+    DEPLOYED_DIGEST_LIST2_STATUS="DRY-RUN (未実行)"
+    DEPLOYED_DIGEST_SUMMARY="DRY-RUN (未実行)"
+    log "[DRY-RUN] デプロイ後の vfs/temp から MD5 一覧 (リスト2) を作成し、リスト1 と突き合わせます。"
+    return 0
+  fi
+
+  diag ""
+  diag "==================================================================="
+  diag "デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2)"
+  diag "==================================================================="
+  diag "対象拡張子   : ${DEPLOYED_DIGEST_EXT}"
+  if [ "$DEPLOYED_DIGEST_SIMULATE" != "none" ]; then
+    diag "偽装モード   : ${DEPLOYED_DIGEST_SIMULATE} (${DEPLOYED_DIGEST_SIMULATE_COUNT} 件) ※ 動作確認用に差分を作っています"
+  fi
+
+  if [ -z "$DEPLOYED_DIGEST_LIST1_FILE" ]; then
+    DEPLOYED_DIGEST_SUMMARY="未実施 (リスト1 を作成できていません: ${DEPLOYED_DIGEST_LIST1_STATUS})"
+    warn "リスト1 (デプロイ前の WAR) を作成できていないため、突き合わせを行えません。"
+    warn "  リスト1: ${DEPLOYED_DIGEST_LIST1_STATUS}"
+    diag "==================================================================="
+    deployed_digest_required_failed && return 1
+    return 0
+  fi
+
+  if ! generate_deployed_digest_list2; then
+    DEPLOYED_DIGEST_SUMMARY="未実施 (リスト2 を作成できません: ${DEPLOYED_DIGEST_LIST2_STATUS})"
+    diag "==================================================================="
+    deployed_digest_required_failed && return 1
+    return 0
+  fi
+
+  compare_deployed_digests
+  cmp_rc=$?
+  if [ "$cmp_rc" -gt 1 ]; then
+    DEPLOYED_DIGEST_SUMMARY="未実施 (突き合わせに失敗しました)"
+    diag "==================================================================="
+    deployed_digest_required_failed && return 1
+    return 0
+  fi
+
+  diag ""
+  show_deployed_digest_report "$DEPLOYED_DIGEST_DIFF_FILE"
+  diag ""
+  diag "リスト1 (デプロイ前の WAR)      : ${DEPLOYED_DIGEST_LIST1_FILE}"
+  diag "リスト2 (デプロイ後の vfs/temp) : ${DEPLOYED_DIGEST_LIST2_FILE}"
+  diag "差分レポート                    : ${DEPLOYED_DIGEST_DIFF_FILE}"
+  diag "==================================================================="
+
+  if [ "$cmp_rc" -eq 0 ]; then
+    DEPLOYED_DIGEST_MISMATCH="false"
+    DEPLOYED_DIGEST_SUMMARY="差分なし (リスト1 ${DEPLOYED_DIGEST_CMP_LIST1} 件 / リスト2 ${DEPLOYED_DIGEST_CMP_LIST2} 件、対象拡張子: ${DEPLOYED_DIGEST_EXT})"
+    log "デプロイ済みファイルの MD5 差分はありませんでした (問題ありません)。"
+    log "  ${DEPLOYED_DIGEST_SUMMARY}"
+    return 0
+  fi
+
+  DEPLOYED_DIGEST_MISMATCH="true"
+  DEPLOYED_DIGEST_SUMMARY="差分あり ${DEPLOYED_DIGEST_CMP_TOTAL} 件 (リスト1のみ ${DEPLOYED_DIGEST_CMP_ONLY1} 件 / リスト2のみ ${DEPLOYED_DIGEST_CMP_ONLY2} 件 / MD5 不一致 ${DEPLOYED_DIGEST_CMP_DIFF} 件、対象拡張子: ${DEPLOYED_DIGEST_EXT})"
+  if [ "$DEPLOYED_DIGEST_SIMULATE" != "none" ]; then
+    warn "デプロイ済みファイルに差分を検出しました (${DEPLOYED_DIGEST_SUMMARY})。"
+    warn "  ※ この実行は --deployed-class-simulate ${DEPLOYED_DIGEST_SIMULATE} で差分を偽装しています。実際の不一致ではありません。"
+  else
+    warn "デプロイ済みファイルに差分を検出しました (${DEPLOYED_DIGEST_SUMMARY})。"
+    warn "  リスト1 のみ = ビルドした成果物がデプロイ先へ届いていない"
+    warn "  リスト2 のみ = デプロイ先にしか無いファイルがある (前回の成果物の残りなど)"
+    warn "  MD5 不一致   = 同じパスで中身が違う (古い成果物のまま動いている可能性)"
+    warn "  詳細: ${DEPLOYED_DIGEST_DIFF_FILE}"
+  fi
+  if [ "$DEPLOYED_DIGEST_REQUIRED" = "true" ]; then
+    err "デプロイ済みファイルの MD5 差分を検出しました (--deployed-class-required)。"
+    return 1
+  fi
+  return 0
+}
+
+# 全量レポート [15] の本文を書き出す。
+append_deployed_digest_report() {
+  local report_file="$1"
+
+  if ! deployed_digest_enabled; then
+    printf '差分検証を行っていません (--verify-deployed-classes を指定すると実行します)。\n' >> "$report_file"
+    return 0
+  fi
+
+  printf '結果          : %s\n' "${DEPLOYED_DIGEST_SUMMARY:-(未実施)}" >> "$report_file"
+  printf '対象拡張子    : %s\n' "$DEPLOYED_DIGEST_EXT" >> "$report_file"
+  if [ "$DEPLOYED_DIGEST_SIMULATE" = "none" ]; then
+    printf '偽装モード    : none (偽装なし)\n' >> "$report_file"
+  else
+    printf '偽装モード    : %s (%s 件) ※ 動作確認のため意図的に差分を作っています\n' \
+      "$DEPLOYED_DIGEST_SIMULATE" "$DEPLOYED_DIGEST_SIMULATE_COUNT" >> "$report_file"
+  fi
+  printf '比較元 WAR    : %s\n' "${DEPLOYED_DIGEST_WAR_USED:-(未特定)}" >> "$report_file"
+  printf 'リスト2 の対象: %s\n' "${DEPLOYED_DIGEST_TARGET_LABEL:-(未取得)}" >> "$report_file"
+  printf 'デプロイルート: %s\n' "${DEPLOYED_DIGEST_ROOT_LABEL:-(未取得)}" >> "$report_file"
+  printf 'リスト1       : %s\n' "$DEPLOYED_DIGEST_LIST1_STATUS" >> "$report_file"
+  printf '                %s\n' "${DEPLOYED_DIGEST_LIST1_FILE:-(出力なし)}" >> "$report_file"
+  printf 'リスト2       : %s\n' "$DEPLOYED_DIGEST_LIST2_STATUS" >> "$report_file"
+  printf '                %s\n' "${DEPLOYED_DIGEST_LIST2_FILE:-(出力なし)}" >> "$report_file"
+  printf '差分レポート  : %s\n' "${DEPLOYED_DIGEST_DIFF_FILE:-(出力なし)}" >> "$report_file"
+
+  if [ -n "$DEPLOYED_DIGEST_DIFF_FILE" ] && [ -f "$DEPLOYED_DIGEST_DIFF_FILE" ]; then
+    printf '\n' >> "$report_file"
+    cat -- "$DEPLOYED_DIGEST_DIFF_FILE" >> "$report_file"
+  fi
+  return 0
 }
 
 # ---- build コンテキスト / Dockerfile の上書き --------------------------------
@@ -36829,6 +38550,7 @@ write_build_report() {
     printf '                Undertow バーチャルホスト (default-host) の分析は [12] に記載\n'
     printf '                コピーしたファイルの取り込み検証は [13] に記載\n'
     printf '                ECS サーキットブレーカによるタスク停止の再現は [14] に記載\n'
+    printf '                デプロイ済みファイルの MD5 差分検証は [15] に記載\n'
     printf '                (テキストも併せて出力。Host ヘッダーごとの振り分けと実測結果を含む)\n'
   } > "$report_tmp"; then
     rm -f -- "$report_tmp"
@@ -36962,6 +38684,11 @@ write_build_report() {
   printf '\n[14] ECS サーキットブレーカによるタスク停止の再現 (server.log の切断)\n' >> "$report_tmp"
   append_ecs_circuit_breaker_report "$report_tmp"
 
+  # デプロイ済みファイルの MD5 差分検証。リストの作成と突き合わせはコンテナを
+  # 停止する前に済ませてあり、ここではその結果と差分レポートの全文を写すだけとする。
+  printf '\n[15] デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2)\n' >> "$report_tmp"
+  append_deployed_digest_report "$report_tmp"
+
   if ! mv -- "$report_tmp" "$candidate"; then
     rm -f -- "$report_tmp"
     warn "全量ビルドレポートを確定できませんでした: $candidate"
@@ -37061,6 +38788,9 @@ cleanup_all() {
   esac
   # CA 証明書をまとめた tar (と作業ディレクトリ) も、ここで確実に消す。
   cleanup_cacert_work_dir
+  # ホストへ書き出したダイジェストリスト作成スクリプトも、ここで消す
+  # (出力したリストと差分レポートはそのまま残る)。
+  cleanup_deployed_digest_script
   # build コンテキスト / Dockerfile の上書きで生成した実効 compose ファイルは、
   # teardown_container (compose down) を終えたここで消す。元の compose ファイルは
   # 生成時から一切触っていないため、ここで消えるのは生成物だけになる。
@@ -37143,6 +38873,11 @@ prepare_cwagent_log_groups
 # ここでコピーしたファイルは EXIT トラップ (cleanup_all) により
 # 処理終了後 / 途中終了時のいずれでも自動削除される。
 prepare_copy_files
+
+# ---- リスト1 (デプロイ前の WAR の MD5 一覧) の作成 --------------------------
+# デプロイ実行前の WAR の中身を、ビルドより先に控えておく。ここで採った一覧が
+# デプロイ後 (リスト2) との突き合わせの基準になる。
+generate_deployed_digest_list1
 
 # ---- CA 証明書アーカイブの生成 (BuildKit シークレット) ----------------------
 # --cacert-dir で指定したディレクトリ群の証明書を 1 つの tar へまとめ、
@@ -37352,6 +39087,15 @@ if [ "$NEED_CONTAINER" != "true" ]; then
     warn "コピーしたファイルの取り込み検証は、コンテナ起動を伴う実行でのみ行えます。--verify-startup または --verify-url を併用してください。"
     warn "  デプロイ先がボリューム / バインドマウントで覆われている場合、ビルドが成功していても古い成果物が使われ続けます。"
   fi
+  # リスト2 は起動中のコンテナからしか採れないため、突き合わせは行えない。
+  if deployed_digest_enabled; then
+    DEPLOYED_DIGEST_SUMMARY="未実施 (コンテナを起動していません)"
+    DEPLOYED_DIGEST_LIST2_STATUS="未作成 (コンテナを起動していません)"
+    warn "デプロイ済みファイルの MD5 差分検証は、コンテナ起動を伴う実行でのみ行えます。--verify-startup または --verify-url を併用してください。"
+    if [ -n "$DEPLOYED_DIGEST_LIST1_FILE" ]; then
+      warn "  リスト1 (デプロイ前の WAR) だけは出力しました: ${DEPLOYED_DIGEST_LIST1_FILE}"
+    fi
+  fi
   if [ "$DEPLOY_EXCEPTION_EXCEL_SET" = "true" ] || [ "$DEPLOY_EXCEPTION_TEXT_SET" = "true" ] \
       || [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] || [ "$DEPLOY_EXCEPTION_REPORT" = "true" ]; then
     warn "WAR デプロイ時 Java 例外解析は、コンテナを起動していないため解析対象のログがありません (結果は「未評価」として出力します)。--verify-startup または --verify-url を併用してください。"
@@ -37413,6 +39157,16 @@ fi
 # start_period を長く取った構成では、判定が出るのは起動完了ログよりずっと後になる。
 if ! verify_essential_container_health; then
   err "必須コンテナの healthcheck が unhealthy になったため、デプロイ失敗として終了します。"
+  exit 1
+fi
+
+# ---- デプロイ済みファイルの MD5 差分検証 (リスト1 / リスト2) ----------------
+# 起動完了と healthcheck を通過した = デプロイが成功した時点で、コンテナ内の
+# vfs/temp 配下へ展開された中身の一覧 (リスト2) を採り、デプロイ前の WAR から
+# 採ったリスト1 と突き合わせる。差分が無いことをもって「今回ビルドした成果物が
+# そのまま動いている」と判定する。
+if ! verify_deployed_class_digests; then
+  err "デプロイ済みファイルの MD5 差分検証に失敗しました。"
   exit 1
 fi
 

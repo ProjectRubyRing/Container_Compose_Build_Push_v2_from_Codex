@@ -1117,6 +1117,57 @@ fake_valkey_exec_cid() {
   return 1
 }
 
+# ---- デプロイ済みファイルの MD5 差分検証 (リスト2 の取得) -------------------
+# build_and_verify.sh は一覧作成スクリプト (war_class_digest.sh) を標準入力から
+# コンテナへ渡し、コンテナ内の vfs/temp を対象に実行する。偽装では、渡された
+# スクリプトをそのままホスト側で実行し、--vfs-dir の値だけを
+# FAKE_DEPLOYED_DIGEST_VFS_DIR (ホスト上の代替ディレクトリ) へ差し替える。
+# こうすることで、スクリプト本体の受け渡しから一覧の書式・件数まで、実物と同じ
+# 経路・同じ実装を通したうえで検証できる。
+#   FAKE_DEPLOYED_DIGEST_VFS_DIR   : vfs/temp の代わりに使うホスト側ディレクトリ
+#   FAKE_DEPLOYED_DIGEST_FAIL_CIDS : 一覧取得を失敗させるコンテナ ID (空白区切り)
+# 判定は他の exec ハンドラより前に置く。後ろに置くと、より緩い条件のハンドラへ
+# 先に吸い込まれ、静かに別の応答が返る。
+if [ "${1:-}" = "exec" ] && [[ "$*" == *"deployed-class-digest"* ]]; then
+  fake_digest_cid="${3:-}"
+  case " ${FAKE_DEPLOYED_DIGEST_FAIL_CIDS:-} " in
+    *" $fake_digest_cid "*)
+      printf 'war_class_digest.sh: vfs temp ディレクトリが見つかりません: auto\n' >&2
+      exit 3
+      ;;
+  esac
+  if [ -z "${FAKE_DEPLOYED_DIGEST_VFS_DIR:-}" ]; then
+    printf 'war_class_digest.sh: JBoss EAP の vfs temp ディレクトリを特定できませんでした\n' >&2
+    exit 3
+  fi
+  if [ $# -lt 8 ]; then
+    printf 'fake docker: deployed-class-digest の引数が足りません\n' >&2
+    exit 2
+  fi
+  fake_digest_script="$(mktemp "${TMPDIR:-/tmp}/fake-docker-digest.XXXXXX")"
+  cat > "$fake_digest_script"
+  # exec -i <cid> /bin/sh -c <スクリプト本体> _ <作業ディレクトリ> [ツールの引数...]
+  shift 8
+  fake_digest_args=()
+  fake_digest_skip="false"
+  for fake_digest_arg in "$@"; do
+    if [ "$fake_digest_skip" = "true" ]; then
+      fake_digest_skip="false"
+      continue
+    fi
+    if [ "$fake_digest_arg" = "--vfs-dir" ]; then
+      fake_digest_args+=(--vfs-dir "$FAKE_DEPLOYED_DIGEST_VFS_DIR")
+      fake_digest_skip="true"
+      continue
+    fi
+    fake_digest_args+=("$fake_digest_arg")
+  done
+  sh "$fake_digest_script" ${fake_digest_args[@]+"${fake_digest_args[@]}"}
+  fake_digest_status=$?
+  rm -f -- "$fake_digest_script"
+  exit "$fake_digest_status"
+fi
+
 if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
     && [[ "$*" == *"valkey-server-probe"* ]]; then
   fake_vk_cid="$(fake_valkey_exec_cid "$@")"

@@ -6,7 +6,7 @@
 - 対象ファイル: `build_and_verify.sh`
 - 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash 5.x / GNU coreutils / Docker CE)
 - 呼び出し経路: 直接実行、または `build_and_push.sh --build-only` からの委譲
-- 関連ドキュメント: [compose 版ガイド](build_and_push_guide.md) / [buildx 版ガイド](buildx_build_and_push_guide.md)
+- 関連ドキュメント: [compose 版ガイド](build_and_push_guide.md) / [buildx 版ガイド](buildx_build_and_push_guide.md) / [ダイジェストリスト作成ガイド](war_class_digest_guide.md)
 - Excel 版: [build_and_verify_guide.xlsx](build_and_verify_guide.xlsx) — 仕様 / パラメータ / 既定で有効な動作 / 設定例 の 5 シート構成 (Meiryo UI)。
   本ファイルを更新したら `python3 docs/generate_guide_xlsx.py` で再生成してください
 - 補足資料: [build_and_verify_disk_usage.xlsx](build_and_verify_disk_usage.xlsx) — 繰り返し実行 (特に `--no-cache`) で
