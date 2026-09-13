@@ -903,6 +903,38 @@ BATCH_MOCK_CLI_DEFAULT="/opt/batch-mock/efs-propagation.sh"
 # (一致していないと、書けたつもりで他コンテナから更新できないファイルになる)。
 BATCH_MOCK_EFS_UID_GID="6301:6302"
 
+# ---- Valkey (Redis 互換) のキャッシュ操作・登録内容の確認 ----------------------
+# ElastiCache (Valkey) を使う構成では、セッションやキャッシュが「AP サーバから見て
+# 本当に書けている / 読めているか」を、AP サーバと同じネットワーク位置から確かめたい。
+# ところが frontend / backend の UBI9 ベースイメージに valkey-cli は同梱されておらず、
+# dnf で入れるとテスト対象のコンテナそのものを書き換えてしまう (検証の前提が崩れる)。
+# そこで次の 2 通りを用意し、どちらもコンテナへパッケージを追加せずに実行する。
+#   (A) valkey-cli : コンテナに入っていればそれを使い、入っていなければ valkey
+#                    コンテナのイメージから使い捨てコンテナを起動し、確認対象
+#                    コンテナのネットワーク名前空間 (--network container:<id>) を
+#                    共有して実行する。確認対象コンテナには一切書き込まない。
+#   (B) 代替シェル : openssl (TLS) と bash の /dev/tcp (平文) だけで RESP を喋る
+#                    valkey_shell_cli.sh を一時ディレクトリへ置いて実行する。
+#                    valkey-cli が使えない環境で「どのコマンドで代替できるか」を
+#                    確かめるためのもので、終了時に必ず取り除く。
+VALKEY_SERVICE=""                 # --valkey-service で明示する Compose サービス名 (未指定は自動検出)
+VALKEY_SERVICE_SET="false"
+VALKEY_PORT=""                    # --valkey-port で明示するコンテナ側ポート (未指定は自動検出)
+VALKEY_PORT_DEFAULT="6379"
+VALKEY_TLS="auto"                 # auto / true / false (--valkey-tls / --no-valkey-tls)
+VALKEY_SCAN_PATTERN="*"           # 登録内容の一覧で使う既定パターン (--valkey-scan-pattern)
+# セッション用の一時ディレクトリ名。コンテナ内 /tmp 配下へ作り、必ず消す。
+VALKEY_SESSION_DIR_PREFIX=".build_and_verify_valkey"
+VALKEY_DETECTED_SERVICE=""        # 自動検出した valkey サービス名 ("-" = 見つからなかった)
+declare -A VALKEY_SERVICE_PROBE_CACHE=()   # container_id → true/false
+VALKEY_CONNECT_HOST=""            # 解決した接続先ホスト名
+VALKEY_CONNECT_PORT=""            # 解決した接続先ポート
+VALKEY_CONNECT_TLS=""             # 解決した TLS 設定 (auto/true/false)
+VALKEY_CONNECT_PASSWORD=""        # 解決したパスワード (画面・レポートへは出さない)
+VALKEY_CONNECT_PASSWORD_SET="false"
+VALKEY_CONNECT_USER=""            # ACL ユーザー名 (設定されていれば)
+VALKEY_CONNECT_SOURCE=""          # パスワードをどこから取れたかの説明
+
 # ---- CloudWatch Agent (cwagent) のログ送信検証 --------------------------------
 # ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml で起動する構成では、
 # 「設定ファイルがコンテナへ届いていない」「logs.endpoint_override の送信先を名前解決
@@ -1615,6 +1647,1145 @@ rewrite_health_history_time() {
   done
 }
 
+# ---- valkey-cli の代替シェル (コンテナへ配布して実行する) -------------------
+# 中身は tools/valkey_shell_cli.sh と同一 (--print-valkey-shell-cli で取り出せる)。
+# コンテナへは docker exec の標準入力経由で渡すため、コマンドライン長の上限に
+# 掛からない。CR が混ざったまま渡すと 1 行目から構文エラーになるので落としておく。
+VALKEY_SHELL_CLI_SCRIPT="$(cat <<'VALKEY_SHELL_CLI_SCRIPT_END'
+#!/usr/bin/env bash
+# valkey_shell_cli.sh
+#   valkey-cli が使えない環境で、valkey (Redis 互換) サーバーへ接続して操作・確認を
+#   行うための代替シェル。openssl (TLS) と bash の /dev/tcp (平文) だけで RESP
+#   プロトコルを喋るため、コンテナへパッケージを追加インストールする必要がない。
+#
+#   UBI9 系のアプリコンテナ (frontend / backend) には valkey-cli が同梱されておらず、
+#   dnf で入れるとテスト対象のコンテナそのものを書き換えてしまう。このスクリプトは
+#   「コンテナに元から入っている bash と openssl だけ」で同じ確認を行えるようにして、
+#   valkey-cli が無い状態でもキーの登録内容や TTL、型を確認できるようにする。
+#
+#   使い方の例:
+#     ./valkey_shell_cli.sh -h valkey -p 6379                 # 対話モード
+#     ./valkey_shell_cli.sh -h valkey -p 6379 GET mykey       # 1 コマンド実行
+#     ./valkey_shell_cli.sh -h valkey --scan-dump 'session:*' # 登録内容の一覧
+#     ./valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
+#     ./valkey_shell_cli.sh --show-commands                   # 手動での代替手順
+#
+#   終了コード:
+#     0   正常終了 (対話モードの終了、コマンドが成功)
+#     1   サーバーがエラー応答を返した (-ERR ... など)
+#     2   使い方の誤り (不正なオプションなど)
+#     3   接続できない / 応答が無い / TLS ハンドシェイクに失敗した
+#     4   実行環境が足りない (bash 4 未満、TLS 指定時に openssl が無い など)
+
+set -u
+
+VSC_VERSION="1.0.0"
+VSC_PROGRAM="${0##*/}"
+
+# ---- 実行環境の確認 ---------------------------------------------------------
+# /dev/tcp、read -N、連想配列を使うため bash 4 以上が必要。sh や dash で起動された
+# 場合はここで気付けるよう、はっきりしたメッセージで止める。
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s: bash で実行してください (sh や dash では動作しません)。\n' "$VSC_PROGRAM" >&2
+  exit 4
+fi
+case "${BASH_VERSINFO[0]:-0}" in
+  ''|*[!0-9]*) vsc_bash_major=0 ;;
+  *) vsc_bash_major="${BASH_VERSINFO[0]}" ;;
+esac
+if [ "$vsc_bash_major" -lt 4 ]; then
+  printf '%s: bash 4 以上が必要です (現在: %s)。\n' "$VSC_PROGRAM" "${BASH_VERSION}" >&2
+  exit 4
+fi
+unset vsc_bash_major
+
+# バイト単位で読み書きするため、ロケールに依存しないようにする。
+# (read -N は文字数で数えるため、UTF-8 ロケールのままだとマルチバイト値の
+#  バルク長 (バイト数) と食い違い、応答の読み取り位置がずれる)
+export LC_ALL=C
+
+# ---- 既定値 -----------------------------------------------------------------
+VSC_HOST="${VALKEY_HOST:-127.0.0.1}"
+VSC_PORT="${VALKEY_PORT:-6379}"
+VSC_PASSWORD="${VALKEY_PASSWORD:-}"
+VSC_PASSWORD_SET="false"
+[ -n "$VSC_PASSWORD" ] && VSC_PASSWORD_SET="true"
+VSC_USER="${VALKEY_USER:-}"
+VSC_DB="0"
+VSC_TLS="auto"                 # auto / true / false
+VSC_TLS_INSECURE="false"
+VSC_TLS_CACERT=""
+VSC_TLS_CAPATH=""
+VSC_TLS_CERT=""
+VSC_TLS_KEY=""
+VSC_TLS_SNI=""
+VSC_TIMEOUT="5"
+VSC_RAW="false"                # true なら値を引用符なしで出す (valkey-cli --raw 相当)
+VSC_SHOW_COMMANDS="false"
+VSC_SCAN_DUMP="false"
+VSC_SCAN_PATTERN="*"
+VSC_SCAN_COUNT="100"
+VSC_SCAN_VALUE_LIMIT="20"      # 1 キーあたりに表示する要素数の上限
+VSC_CONFIG_FILE="${VALKEY_SHELL_CLI_CONFIG:-}"
+
+# ---- 実行中の状態 -----------------------------------------------------------
+VSC_FD_IN=""                   # 応答を読む fd
+VSC_FD_OUT=""                  # 要求を書く fd
+VSC_TRANSPORT=""               # plain / tls
+VSC_TLS_ACTIVE="false"
+VSC_TMPDIR=""
+VSC_OPENSSL_PID=""
+VSC_CONNECTED="false"
+VSC_LINE=""
+VSC_PAYLOAD=""
+VSC_SCALAR=""
+VSC_SCALAR_KIND=""
+VSC_EXIT_STATUS=0
+declare -a VSC_ARR=()
+declare -a VSC_ARGS=()
+
+vsc_err() { printf '%s\n' "$*" >&2; }
+
+vsc_usage() {
+  cat <<'VSC_USAGE_END'
+使い方: valkey_shell_cli.sh [オプション] [--] [コマンド [引数...]]
+
+valkey-cli が無い環境で、bash と openssl だけで valkey (Redis 互換) を操作する。
+コマンドを与えると 1 回だけ実行し、与えなければ対話モードに入る。
+
+接続オプション:
+  -h, --host HOST        接続先ホスト名 / IP (既定: 127.0.0.1、環境変数 VALKEY_HOST)
+  -p, --port PORT        接続先ポート (既定: 6379、環境変数 VALKEY_PORT)
+  -a, --auth PASSWORD    AUTH に使うパスワード (環境変数 VALKEY_PASSWORD)
+      --auth-file FILE   パスワードをファイルから読む (ps へ出したくない場合)
+      --user USER        ACL のユーザー名 (指定時は AUTH <user> <password>)
+  -n, --db INDEX         接続後に SELECT するデータベース番号 (既定: 0)
+  -t, --timeout SEC      接続と応答の待ち時間 (既定: 5)
+      --config FILE      既定値を書いた設定ファイル (key=value 形式)
+                         使えるキー: host port password user db tls insecure
+                                     cacert capath cert key sni timeout
+
+TLS オプション:
+      --tls              TLS で接続する (openssl s_client を使う)
+      --no-tls           平文で接続する (bash の /dev/tcp を使う)
+                         いずれも未指定なら、平文で試してから TLS を試す
+      --cacert FILE      サーバー証明書の検証に使う CA 証明書
+      --capath DIR       同上 (ディレクトリ形式)
+      --cert FILE        クライアント証明書 (相互 TLS)
+      --key FILE         クライアント秘密鍵 (相互 TLS)
+      --sni NAME         SNI として送るサーバー名 (既定: --host の値)
+      --insecure         サーバー証明書を検証しない
+
+動作オプション:
+      --scan-dump [PATTERN]  SCAN でキーを列挙し、型・TTL・値まで表示する
+                             (PATTERN 省略時は * / valkey-cli の --scan 相当)
+      --scan                 --scan-dump と同じ (valkey-cli 互換の綴り)
+      --pattern PATTERN      --scan と組み合わせて対象パターンを指定する
+      --count N              SCAN の COUNT (既定: 100)
+      --value-limit N        1 キーあたりに表示する要素数の上限 (既定: 20、0 で無制限)
+      --raw                  値を引用符なしでそのまま出す
+      --show-commands        openssl / bash だけで同じことを行う手順を表示して終了
+      --version              バージョンを表示して終了
+      --help                 この使い方を表示して終了
+
+対話モードの組み込みコマンド:
+  help                   使えるコマンドの説明を表示する
+  quit / exit            対話モードを終了する
+  :scan [PATTERN]        --scan-dump と同じ一覧をその場で表示する
+  :raw on|off            値の引用符表示を切り替える
+  :info                  接続情報 (ホスト・ポート・TLS・DB) を表示する
+  :commands              openssl / bash による代替手順を表示する
+VSC_USAGE_END
+}
+
+# valkey-cli も、このスクリプトすら無い状況で「素の道具だけ」で確認する手順。
+# valkey は RESP の inline command (コマンド文字列 + CRLF) を受け付けるため、
+# openssl s_client や bash の /dev/tcp へ文字列を流し込むだけで応答を読める。
+vsc_show_commands() {
+  local host="$VSC_HOST" port="$VSC_PORT" cacert_opt=""
+  [ -n "$VSC_TLS_CACERT" ] && cacert_opt=" -CAfile ${VSC_TLS_CACERT}"
+  cat <<VSC_COMMANDS_END
+=== valkey-cli が無いときの代替手順 (接続先: ${host}:${port}) ===
+
+valkey / Redis は「inline command」(コマンド行 + CRLF) を受け付けるため、
+TCP へ文字列を流し込めるものなら何でもクライアントの代わりになる。
+応答は RESP 形式 (+OK / -ERR / :数値 / \$長さ+本文 / *要素数) のテキストで返る。
+
+[1] openssl s_client を使う (TLS 有効な valkey / ElastiCache Serverless など)
+    # PING して疎通を見る (-quiet で証明書情報の表示を抑える)
+    printf 'PING\r\n' | openssl s_client -quiet -connect ${host}:${port}${cacert_opt}
+
+    # 認証・DB 選択・値の取得をまとめて送る (パイプラインで順に応答が返る)
+    printf 'AUTH <password>\r\nSELECT 0\r\nKEYS *\r\n' \\
+      | openssl s_client -quiet -connect ${host}:${port}${cacert_opt}
+
+    # 証明書を検証したい場合 (検証に失敗したら接続を切る)
+    printf 'PING\r\n' | openssl s_client -quiet -verify_return_error -verify 8 \\
+      -CAfile /path/to/ca.crt -servername ${host} -connect ${host}:${port}
+
+[2] openssl s_client を平文の TCP クライアントとして使えない点に注意
+    openssl s_client は必ず TLS ハンドシェイクを行うため、TLS 無効の valkey には
+    使えない (「wrong version number」になる)。平文の場合は [3] を使う。
+
+[3] bash の /dev/tcp を使う (平文。追加コマンドが一切要らない)
+    exec 3<>/dev/tcp/${host}/${port}
+    printf 'PING\r\n' >&3
+    head -c 7 <&3            # +PONG\r\n が返る
+    printf 'KEYS *\r\n' >&3
+    timeout 2 cat <&3        # 応答を読み切る (RESP の配列が返る)
+    exec 3<&-; exec 3>&-
+
+[4] 値にスペースや改行が含まれる場合は RESP の multibulk で送る
+    # SET greeting "hello world" を multibulk で表した例
+    printf '*3\r\n\$3\r\nSET\r\n\$8\r\ngreeting\r\n\$11\r\nhello world\r\n' >&3
+
+[5] 登録内容をまとめて確認したいとき
+    # キーの一覧 (本番規模では KEYS ではなく SCAN を使う)
+    printf 'SCAN 0 MATCH * COUNT 100\r\n' >&3
+    # 型・TTL・値
+    printf 'TYPE mykey\r\nTTL mykey\r\nGET mykey\r\n' >&3
+    # 全体像
+    printf 'INFO keyspace\r\nDBSIZE\r\n' >&3
+
+[6] nc / socat があれば、そのまま使える
+    printf 'PING\r\n' | nc ${host} ${port}
+    printf 'PING\r\n' | socat - TCP:${host}:${port}
+    # TLS の場合
+    printf 'PING\r\n' | socat - OPENSSL:${host}:${port},verify=0
+
+このスクリプト (valkey_shell_cli.sh) は [1] と [3] を自動で使い分け、
+RESP の応答を valkey-cli と同じ形に整形して表示している。
+VSC_COMMANDS_END
+}
+
+# 設定ファイル (key=value) を読み込む。パスワードを argv へ出さずに渡すために使う。
+# 値はそのまま (引用符の解釈はしない)。未知のキーは無視せず警告する。
+vsc_load_config() {
+  local path="$1" line key value
+  if [ ! -r "$path" ]; then
+    vsc_err "${VSC_PROGRAM}: 設定ファイルを読み取れません: ${path}"
+    exit 2
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) vsc_err "${VSC_PROGRAM}: 設定ファイルの書式が key=value ではありません: ${line}"; continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    # 前後の空白を落とす
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    case "$key" in
+      host) VSC_HOST="$value" ;;
+      port) VSC_PORT="$value" ;;
+      password) VSC_PASSWORD="$value"; VSC_PASSWORD_SET="true" ;;
+      user) VSC_USER="$value" ;;
+      db) VSC_DB="$value" ;;
+      timeout) VSC_TIMEOUT="$value" ;;
+      tls)
+        case "$value" in
+          true|yes|1|on) VSC_TLS="true" ;;
+          false|no|0|off) VSC_TLS="false" ;;
+          auto|'') VSC_TLS="auto" ;;
+          *) vsc_err "${VSC_PROGRAM}: 設定 tls には true / false / auto を指定してください: ${value}" ;;
+        esac
+        ;;
+      insecure)
+        case "$value" in
+          true|yes|1|on) VSC_TLS_INSECURE="true" ;;
+          *) VSC_TLS_INSECURE="false" ;;
+        esac
+        ;;
+      cacert) VSC_TLS_CACERT="$value" ;;
+      capath) VSC_TLS_CAPATH="$value" ;;
+      cert) VSC_TLS_CERT="$value" ;;
+      key) VSC_TLS_KEY="$value" ;;
+      sni) VSC_TLS_SNI="$value" ;;
+      *) vsc_err "${VSC_PROGRAM}: 設定ファイルの未知のキーを無視します: ${key}" ;;
+    esac
+  done < "$path"
+}
+
+vsc_need_value() {
+  if [ "$2" -lt 2 ]; then
+    vsc_err "${VSC_PROGRAM}: ${1} には値を指定してください。"
+    exit 2
+  fi
+}
+
+vsc_check_number() {
+  local name="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      vsc_err "${VSC_PROGRAM}: ${name} には 0 以上の数値を指定してください: ${value}"
+      exit 2
+      ;;
+  esac
+}
+
+# 設定ファイルは argv より先に読み、argv の指定で上書きできるようにする。
+# (build_and_verify.sh はパスワードをファイル経由で渡し、利用者が -h などで
+#  その場の指定を上書きできる、という関係にする)
+if [ -n "$VSC_CONFIG_FILE" ]; then
+  vsc_load_config "$VSC_CONFIG_FILE"
+fi
+
+declare -a VSC_COMMAND=()
+while [ $# -gt 0 ]; do
+  # 最初の非オプション引数から先は、valkey へ渡すコマンドとして扱う。
+  # LRANGE key 0 -1 の -1 のように、負数をオプションと取り違えないため。
+  if [ ${#VSC_COMMAND[@]} -gt 0 ]; then
+    VSC_COMMAND+=("$1")
+    shift
+    continue
+  fi
+  case "$1" in
+    -h|--host) vsc_need_value "$1" $#; VSC_HOST="$2"; shift 2 ;;
+    -p|--port) vsc_need_value "$1" $#; VSC_PORT="$2"; shift 2 ;;
+    -a|--auth|--pass|--password)
+      vsc_need_value "$1" $#; VSC_PASSWORD="$2"; VSC_PASSWORD_SET="true"; shift 2 ;;
+    --auth-file|--password-file)
+      vsc_need_value "$1" $#
+      if [ ! -r "$2" ]; then
+        vsc_err "${VSC_PROGRAM}: パスワードファイルを読み取れません: ${2}"
+        exit 2
+      fi
+      # 末尾の改行だけを落とす (パスワードそのものに前後の空白がある場合を壊さない)
+      VSC_PASSWORD="$(cat -- "$2")"
+      VSC_PASSWORD_SET="true"
+      shift 2
+      ;;
+    --user) vsc_need_value "$1" $#; VSC_USER="$2"; shift 2 ;;
+    -n|--db) vsc_need_value "$1" $#; vsc_check_number "$1" "$2"; VSC_DB="$2"; shift 2 ;;
+    -t|--timeout) vsc_need_value "$1" $#; vsc_check_number "$1" "$2"; VSC_TIMEOUT="$2"; shift 2 ;;
+    --config) vsc_need_value "$1" $#; vsc_load_config "$2"; shift 2 ;;
+    --tls) VSC_TLS="true"; shift ;;
+    --no-tls) VSC_TLS="false"; shift ;;
+    --insecure|--no-verify) VSC_TLS_INSECURE="true"; shift ;;
+    --cacert|--cafile) vsc_need_value "$1" $#; VSC_TLS_CACERT="$2"; shift 2 ;;
+    --capath) vsc_need_value "$1" $#; VSC_TLS_CAPATH="$2"; shift 2 ;;
+    --cert) vsc_need_value "$1" $#; VSC_TLS_CERT="$2"; shift 2 ;;
+    --key) vsc_need_value "$1" $#; VSC_TLS_KEY="$2"; shift 2 ;;
+    --sni|--servername) vsc_need_value "$1" $#; VSC_TLS_SNI="$2"; shift 2 ;;
+    --scan-dump)
+      VSC_SCAN_DUMP="true"
+      # 直後の引数がオプションでなければパターンとして受け取る
+      if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        VSC_SCAN_PATTERN="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --scan) VSC_SCAN_DUMP="true"; shift ;;
+    --pattern) vsc_need_value "$1" $#; VSC_SCAN_PATTERN="$2"; VSC_SCAN_DUMP="true"; shift 2 ;;
+    --count) vsc_need_value "$1" $#; vsc_check_number "$1" "$2"; VSC_SCAN_COUNT="$2"; shift 2 ;;
+    --value-limit) vsc_need_value "$1" $#; vsc_check_number "$1" "$2"; VSC_SCAN_VALUE_LIMIT="$2"; shift 2 ;;
+    --raw) VSC_RAW="true"; shift ;;
+    --no-raw) VSC_RAW="false"; shift ;;
+    --show-commands) VSC_SHOW_COMMANDS="true"; shift ;;
+    --version) printf 'valkey_shell_cli.sh %s\n' "$VSC_VERSION"; exit 0 ;;
+    --help) vsc_usage; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do VSC_COMMAND+=("$1"); shift; done ;;
+    -*)
+      vsc_err "${VSC_PROGRAM}: 未対応のオプションです: ${1} (--help で使い方を表示します)"
+      exit 2
+      ;;
+    *) VSC_COMMAND+=("$1"); shift ;;
+  esac
+done
+
+case "$VSC_PORT" in
+  ''|*[!0-9]*) vsc_err "${VSC_PROGRAM}: --port には 1 から 65535 の数値を指定してください: ${VSC_PORT}"; exit 2 ;;
+esac
+if [ "$VSC_PORT" -lt 1 ] || [ "$VSC_PORT" -gt 65535 ]; then
+  vsc_err "${VSC_PROGRAM}: --port には 1 から 65535 の数値を指定してください: ${VSC_PORT}"
+  exit 2
+fi
+[ "$VSC_TIMEOUT" -ge 1 ] 2>/dev/null || VSC_TIMEOUT=5
+[ -n "$VSC_HOST" ] || { vsc_err "${VSC_PROGRAM}: --host が空です。"; exit 2; }
+
+if [ "$VSC_SHOW_COMMANDS" = "true" ]; then
+  vsc_show_commands
+  exit 0
+fi
+
+# ---- 通信路 (平文 = bash の /dev/tcp、TLS = openssl s_client) ----------------
+VSC_CRLF=$'\r\n'
+VSC_TLS_LAST_ERROR=""
+
+vsc_cleanup() {
+  { exec 3<&-; } 2>/dev/null
+  { exec 3>&-; } 2>/dev/null
+  { exec 4<&-; } 2>/dev/null
+  { exec 4>&-; } 2>/dev/null
+  if [ -n "$VSC_OPENSSL_PID" ]; then
+    kill "$VSC_OPENSSL_PID" 2>/dev/null
+    wait "$VSC_OPENSSL_PID" 2>/dev/null
+    VSC_OPENSSL_PID=""
+  fi
+  if [ -n "$VSC_TMPDIR" ] && [ -d "$VSC_TMPDIR" ]; then
+    rm -rf -- "$VSC_TMPDIR" 2>/dev/null
+    VSC_TMPDIR=""
+  fi
+  VSC_CONNECTED="false"
+  VSC_FD_IN=""
+  VSC_FD_OUT=""
+}
+trap vsc_cleanup EXIT HUP INT TERM
+
+# TCP へ到達できるかを先に確かめる。/dev/tcp 自体には時間上限が無く、パケットが
+# 捨てられる経路 (セキュリティグループ違い等) では数分固まるため、timeout があれば
+# それを使って短い時間で見切る。
+vsc_probe_tcp() {
+  command -v timeout >/dev/null 2>&1 || return 0
+  timeout "$VSC_TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$VSC_HOST" "$VSC_PORT" 2>/dev/null
+}
+
+vsc_connect_plain() {
+  vsc_probe_tcp || return 1
+  { exec 3<>"/dev/tcp/${VSC_HOST}/${VSC_PORT}"; } 2>/dev/null || return 1
+  VSC_FD_IN=3
+  VSC_FD_OUT=3
+  VSC_TRANSPORT="plain"
+  VSC_TLS_ACTIVE="false"
+  VSC_CONNECTED="true"
+  return 0
+}
+
+vsc_connect_tls() {
+  local sni
+  local -a openssl_args=()
+  VSC_TLS_LAST_ERROR=""
+  if ! command -v openssl >/dev/null 2>&1; then
+    VSC_TLS_LAST_ERROR="openssl コマンドが見つかりません。"
+    return 1
+  fi
+  if ! command -v mkfifo >/dev/null 2>&1; then
+    VSC_TLS_LAST_ERROR="mkfifo コマンドが見つかりません (TLS 接続には名前付きパイプが必要です)。"
+    return 1
+  fi
+  VSC_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/valkey-shell-cli.XXXXXX" 2>/dev/null)" || {
+    VSC_TMPDIR=""
+    VSC_TLS_LAST_ERROR="一時ディレクトリを作成できません。"
+    return 1
+  }
+  if ! mkfifo -m 600 "${VSC_TMPDIR}/req" "${VSC_TMPDIR}/resp" 2>/dev/null; then
+    VSC_TLS_LAST_ERROR="名前付きパイプを作成できません: ${VSC_TMPDIR}"
+    return 1
+  fi
+
+  openssl_args=(s_client -quiet -connect "${VSC_HOST}:${VSC_PORT}")
+  if [ "$VSC_TLS_INSECURE" != "true" ]; then
+    # 既定では検証する。openssl s_client は既定だと検証結果を無視して接続を続けるため、
+    # -verify_return_error を付けて「検証に失敗したら切る」挙動にそろえる。
+    openssl_args+=(-verify_return_error -verify 8)
+  fi
+  [ -n "$VSC_TLS_CACERT" ] && openssl_args+=(-CAfile "$VSC_TLS_CACERT")
+  [ -n "$VSC_TLS_CAPATH" ] && openssl_args+=(-CApath "$VSC_TLS_CAPATH")
+  [ -n "$VSC_TLS_CERT" ] && openssl_args+=(-cert "$VSC_TLS_CERT")
+  [ -n "$VSC_TLS_KEY" ] && openssl_args+=(-key "$VSC_TLS_KEY")
+  # SNI はホスト名のときだけ送る (IP アドレスを SNI に入れると RFC 違反で弾かれる)
+  sni="$VSC_TLS_SNI"
+  if [ -z "$sni" ]; then
+    case "$VSC_HOST" in
+      *[!0-9.]*) sni="$VSC_HOST" ;;
+      *) sni="" ;;
+    esac
+  fi
+  [ -n "$sni" ] && openssl_args+=(-servername "$sni")
+
+  openssl "${openssl_args[@]}" \
+    < "${VSC_TMPDIR}/req" > "${VSC_TMPDIR}/resp" 2> "${VSC_TMPDIR}/err" &
+  VSC_OPENSSL_PID=$!
+  # 先に書き込み側 (openssl の stdin) を開き、次に読み取り側を開く。
+  # 名前付きパイプは読み書き両用で開けばブロックしないため、この順で固まらない。
+  if ! { exec 4<>"${VSC_TMPDIR}/req"; } 2>/dev/null; then
+    VSC_TLS_LAST_ERROR="openssl への書き込み口を開けません。"
+    return 1
+  fi
+  if ! { exec 3<>"${VSC_TMPDIR}/resp"; } 2>/dev/null; then
+    VSC_TLS_LAST_ERROR="openssl からの読み取り口を開けません。"
+    return 1
+  fi
+  VSC_FD_IN=3
+  VSC_FD_OUT=4
+  VSC_TRANSPORT="tls"
+  VSC_TLS_ACTIVE="true"
+  VSC_CONNECTED="true"
+  return 0
+}
+
+vsc_tls_error_detail() {
+  local err_file="${VSC_TMPDIR}/err"
+  [ -n "$VSC_TMPDIR" ] && [ -r "$err_file" ] || return 0
+  # openssl のエラーは複数行になるため、内容のある行だけを数行に絞って出す。
+  awk 'NF { print "  openssl: " $0 }' "$err_file" 2>/dev/null | head -n 5
+}
+
+# ---- RESP の送信 ------------------------------------------------------------
+# コマンドは multibulk ($ の長さ付き) で送る。空白や改行を含む値でもそのまま
+# 渡せるため、inline command (コマンド行 + CRLF) より確実。
+vsc_send() {
+  local out arg
+  [ "$VSC_CONNECTED" = "true" ] || return 1
+  out="*$#${VSC_CRLF}"
+  for arg in "$@"; do
+    out+="\$${#arg}${VSC_CRLF}${arg}${VSC_CRLF}"
+  done
+  printf '%s' "$out" >&"$VSC_FD_OUT" 2>/dev/null || return 1
+  return 0
+}
+
+# ---- RESP の受信 ------------------------------------------------------------
+vsc_read_line() {
+  # 接続が切れているときの read のエラー文言は握りつぶし、呼び出し元の判断に任せる。
+  IFS= read -r -t "$VSC_TIMEOUT" -u "$VSC_FD_IN" VSC_LINE 2>/dev/null || return 1
+  VSC_LINE="${VSC_LINE%$'\r'}"
+  return 0
+}
+
+# バルク本文を「長さ分きっちり」読む。read -N は要求数に満たないまま返ることが
+# あるため、足りない分を繰り返し読む。進まなくなったら諦める (NUL を含む値など)。
+vsc_read_bulk() {
+  local want="$1" chunk stalled=0
+  VSC_PAYLOAD=""
+  while [ "${#VSC_PAYLOAD}" -lt "$want" ]; do
+    chunk=""
+    if ! IFS= read -r -N $(( want - ${#VSC_PAYLOAD} )) -t "$VSC_TIMEOUT" -u "$VSC_FD_IN" chunk 2>/dev/null; then
+      [ -n "$chunk" ] || return 1
+    fi
+    if [ -z "$chunk" ]; then
+      stalled=$(( stalled + 1 ))
+      [ "$stalled" -ge 3 ] && return 1
+      continue
+    fi
+    stalled=0
+    VSC_PAYLOAD+="$chunk"
+  done
+  # 本文の後ろの CRLF を捨てる
+  IFS= read -r -N 2 -t "$VSC_TIMEOUT" -u "$VSC_FD_IN" chunk 2>/dev/null || return 1
+  return 0
+}
+
+# 表示用の引用。valkey-cli と同じく制御文字はエスケープして 1 行に収める。
+vsc_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
+}
+
+vsc_spaces() {
+  local n="$1" out=""
+  while [ "$n" -gt 0 ]; do
+    out+=" "
+    n=$(( n - 1 ))
+  done
+  printf '%s' "$out"
+}
+
+# 応答を 1 つ読み、valkey-cli 風に整形して表示する。
+#   $1: 2 行目以降に付ける字下げ
+#   $2: 1 行目の行頭 (配列要素では "1) " などの見出しが入る)
+# 戻り値: 0 = 正常、1 = サーバーのエラー応答、3 = 受信できない / 解釈できない
+vsc_print_reply() {
+  local indent="$1" head="$2"
+  local type body count index child_head child_indent label status=0 element_status
+
+  if ! vsc_read_line; then
+    printf '%s(応答を受信できませんでした: %s 秒待機)\n' "$head" "$VSC_TIMEOUT"
+    return 3
+  fi
+  type="${VSC_LINE:0:1}"
+  body="${VSC_LINE:1}"
+  case "$type" in
+    '+')
+      printf '%s%s\n' "$head" "$body"
+      ;;
+    '-'|'!')
+      if [ "$type" = "!" ]; then
+        if ! vsc_read_bulk "$body"; then
+          printf '%s(エラー本文を受信できませんでした)\n' "$head"
+          return 3
+        fi
+        body="$VSC_PAYLOAD"
+      fi
+      printf '%s(error) %s\n' "$head" "$body"
+      status=1
+      ;;
+    ':'|'(')
+      printf '%s(integer) %s\n' "$head" "$body"
+      ;;
+    ',')
+      printf '%s(double) %s\n' "$head" "$body"
+      ;;
+    '#')
+      if [ "$body" = "t" ]; then
+        printf '%s(true)\n' "$head"
+      else
+        printf '%s(false)\n' "$head"
+      fi
+      ;;
+    '_')
+      printf '%s(nil)\n' "$head"
+      ;;
+    '$'|'=')
+      case "$body" in
+        -*)
+          printf '%s(nil)\n' "$head"
+          ;;
+        ''|*[!0-9]*)
+          printf '%s(解釈できない応答: %s)\n' "$head" "$VSC_LINE"
+          return 3
+          ;;
+        *)
+          if ! vsc_read_bulk "$body"; then
+            printf '%s(本文を受信できませんでした: %s バイト)\n' "$head" "$body"
+            return 3
+          fi
+          if [ "$VSC_RAW" = "true" ]; then
+            printf '%s%s\n' "$head" "$VSC_PAYLOAD"
+          else
+            printf '%s%s\n' "$head" "$(vsc_quote "$VSC_PAYLOAD")"
+          fi
+          ;;
+      esac
+      ;;
+    '*'|'~'|'>'|'%')
+      case "$body" in
+        -*)
+          printf '%s(nil)\n' "$head"
+          return 0
+          ;;
+        ''|*[!0-9]*)
+          printf '%s(解釈できない応答: %s)\n' "$head" "$VSC_LINE"
+          return 3
+          ;;
+      esac
+      count="$body"
+      # マップ (%) は「キーと値」で 2 要素ずつ返るため、要素数を 2 倍にして読む。
+      [ "$type" = "%" ] && count=$(( count * 2 ))
+      if [ "$count" -eq 0 ]; then
+        printf '%s(empty array)\n' "$head"
+        return 0
+      fi
+      index=1
+      while [ "$index" -le "$count" ]; do
+        label="${index})"
+        child_indent="${indent}$(vsc_spaces $(( ${#label} + 1 )))"
+        if [ "$index" -eq 1 ]; then
+          child_head="${head}${label} "
+        else
+          child_head="${indent}${label} "
+        fi
+        element_status=0
+        vsc_print_reply "$child_indent" "$child_head" || element_status=$?
+        if [ "$element_status" -eq 3 ]; then
+          return 3
+        fi
+        [ "$element_status" -eq 1 ] && status=1
+        index=$(( index + 1 ))
+      done
+      ;;
+    *)
+      printf '%s(解釈できない応答: %s)\n' "$head" "$VSC_LINE"
+      return 3
+      ;;
+  esac
+  return "$status"
+}
+
+# 応答を 1 つ読み、値を VSC_SCALAR / VSC_SCALAR_KIND (配列なら VSC_ARR) へ入れる。
+# kind: status / error / int / double / bool / bulk / nil / array / timeout / unknown
+vsc_read_scalar() {
+  local type body count index
+  VSC_SCALAR=""
+  VSC_SCALAR_KIND=""
+  VSC_ARR=()
+  if ! vsc_read_line; then
+    VSC_SCALAR_KIND="timeout"
+    return 3
+  fi
+  type="${VSC_LINE:0:1}"
+  body="${VSC_LINE:1}"
+  case "$type" in
+    '+') VSC_SCALAR_KIND="status"; VSC_SCALAR="$body" ;;
+    '-') VSC_SCALAR_KIND="error"; VSC_SCALAR="$body"; return 1 ;;
+    ':'|'(') VSC_SCALAR_KIND="int"; VSC_SCALAR="$body" ;;
+    ',') VSC_SCALAR_KIND="double"; VSC_SCALAR="$body" ;;
+    '#') VSC_SCALAR_KIND="bool"; VSC_SCALAR="$body" ;;
+    '_') VSC_SCALAR_KIND="nil" ;;
+    '!')
+      if ! vsc_read_bulk "$body"; then
+        VSC_SCALAR_KIND="timeout"
+        return 3
+      fi
+      VSC_SCALAR_KIND="error"
+      VSC_SCALAR="$VSC_PAYLOAD"
+      return 1
+      ;;
+    '$'|'=')
+      case "$body" in
+        -*) VSC_SCALAR_KIND="nil" ;;
+        ''|*[!0-9]*) VSC_SCALAR_KIND="unknown"; VSC_SCALAR="$VSC_LINE"; return 3 ;;
+        *)
+          if ! vsc_read_bulk "$body"; then
+            VSC_SCALAR_KIND="timeout"
+            return 3
+          fi
+          VSC_SCALAR_KIND="bulk"
+          VSC_SCALAR="$VSC_PAYLOAD"
+          ;;
+      esac
+      ;;
+    '*'|'~'|'>'|'%')
+      case "$body" in
+        -*) VSC_SCALAR_KIND="nil"; return 0 ;;
+        ''|*[!0-9]*) VSC_SCALAR_KIND="unknown"; VSC_SCALAR="$VSC_LINE"; return 3 ;;
+      esac
+      count="$body"
+      [ "$type" = "%" ] && count=$(( count * 2 ))
+      index=1
+      local -a collected=()
+      while [ "$index" -le "$count" ]; do
+        # SCAN / LRANGE / HGETALL などの「入れ子でない配列」を想定して読む。
+        # 入れ子 (SCAN の第 2 要素など) は呼び出し側が個別に読むこと。
+        if ! vsc_read_scalar; then
+          case "$VSC_SCALAR_KIND" in
+            error) ;;
+            *) return 3 ;;
+          esac
+        fi
+        collected+=("$VSC_SCALAR")
+        index=$(( index + 1 ))
+      done
+      VSC_ARR=(${collected[@]+"${collected[@]}"})
+      VSC_SCALAR_KIND="array"
+      VSC_SCALAR=""
+      ;;
+    *) VSC_SCALAR_KIND="unknown"; VSC_SCALAR="$VSC_LINE"; return 3 ;;
+  esac
+  return 0
+}
+
+# コマンドを送り、スカラー応答を読む (画面へは出さない)。
+vsc_exec_scalar() {
+  vsc_send "$@" || return 3
+  vsc_read_scalar
+}
+
+# SCAN の応答は「[カーソル, [キー...]]」という入れ子の配列になる。
+# vsc_read_scalar は入れ子を畳んでしまうため、SCAN 専用に読み分ける。
+VSC_SCAN_CURSOR=""
+declare -a VSC_SCAN_KEYS=()
+vsc_read_scan_reply() {
+  VSC_SCAN_CURSOR=""
+  VSC_SCAN_KEYS=()
+  vsc_read_line || return 3
+  case "${VSC_LINE:0:1}" in
+    '-') VSC_SCALAR="${VSC_LINE:1}"; VSC_SCALAR_KIND="error"; return 1 ;;
+    '*'|'~') ;;
+    *) VSC_SCALAR="$VSC_LINE"; VSC_SCALAR_KIND="unknown"; return 3 ;;
+  esac
+  [ "${VSC_LINE:1}" = "2" ] || { VSC_SCALAR="$VSC_LINE"; VSC_SCALAR_KIND="unknown"; return 3; }
+  vsc_read_scalar || return 3
+  VSC_SCAN_CURSOR="$VSC_SCALAR"
+  vsc_read_scalar || return 3
+  VSC_SCAN_KEYS=(${VSC_ARR[@]+"${VSC_ARR[@]}"})
+  return 0
+}
+
+# ---- 接続 -------------------------------------------------------------------
+# 接続直後に PING を投げ、RESP として解釈できる応答が返るかどうかで
+# 「その通信路で喋れているか」を判定する。TLS 必須のサーバーへ平文でつなぐと
+# ここで応答が壊れる (または切断される) ため、auto では TLS へ切り替える。
+vsc_verify_protocol() {
+  vsc_send PING || return 1
+  vsc_read_scalar
+  case "$VSC_SCALAR_KIND" in
+    status|bulk) return 0 ;;
+    error)
+      # NOAUTH / ACL のエラーは「RESP は喋れている」ので接続としては成功。
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+vsc_connect() {
+  local tried_plain="false"
+  case "$VSC_TLS" in
+    false)
+      if vsc_connect_plain && vsc_verify_protocol; then
+        return 0
+      fi
+      vsc_cleanup
+      vsc_err "valkey へ平文で接続できませんでした: ${VSC_HOST}:${VSC_PORT}"
+      vsc_err "  → ポート番号と、サーバーが TLS を必須にしていないかを確認してください (--tls)。"
+      return 3
+      ;;
+    true)
+      if vsc_connect_tls && vsc_verify_protocol; then
+        return 0
+      fi
+      [ -n "$VSC_TLS_LAST_ERROR" ] && vsc_err "  ${VSC_TLS_LAST_ERROR}"
+      vsc_tls_error_detail >&2
+      vsc_cleanup
+      vsc_err "valkey へ TLS で接続できませんでした: ${VSC_HOST}:${VSC_PORT}"
+      vsc_err "  → 証明書の検証を外して試す場合は --insecure、CA を渡す場合は --cacert を指定してください。"
+      return 3
+      ;;
+    *)
+      # auto: まず平文、駄目なら TLS。TLS 用のオプションが指定されていれば TLS を先に試す。
+      if [ -n "$VSC_TLS_CACERT" ] || [ -n "$VSC_TLS_CAPATH" ] || [ -n "$VSC_TLS_CERT" ]; then
+        if vsc_connect_tls && vsc_verify_protocol; then
+          return 0
+        fi
+        vsc_cleanup
+      else
+        tried_plain="true"
+        if vsc_connect_plain && vsc_verify_protocol; then
+          return 0
+        fi
+        vsc_cleanup
+      fi
+      if [ "$tried_plain" = "true" ]; then
+        if vsc_connect_tls && vsc_verify_protocol; then
+          vsc_err "平文では応答が得られなかったため、TLS で接続しました (--tls 相当)。"
+          return 0
+        fi
+        vsc_cleanup
+      else
+        if vsc_connect_plain && vsc_verify_protocol; then
+          vsc_err "TLS では接続できなかったため、平文で接続しました (--no-tls 相当)。"
+          return 0
+        fi
+        vsc_cleanup
+      fi
+      vsc_err "valkey へ接続できませんでした: ${VSC_HOST}:${VSC_PORT} (平文・TLS のどちらも失敗)"
+      vsc_err "  → ホスト名の解決、ポート、ネットワーク到達性を確認してください。"
+      vsc_err "  → 手動で確かめる手順は --show-commands で表示できます。"
+      return 3
+      ;;
+  esac
+}
+
+# AUTH と SELECT を済ませる。パスワード未指定で NOAUTH が返る場合は、その旨を伝える。
+vsc_handshake() {
+  local status=0
+  if [ "$VSC_PASSWORD_SET" = "true" ]; then
+    if [ -n "$VSC_USER" ]; then
+      vsc_exec_scalar AUTH "$VSC_USER" "$VSC_PASSWORD" || status=$?
+    else
+      vsc_exec_scalar AUTH "$VSC_PASSWORD" || status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+      vsc_err "AUTH に失敗しました: ${VSC_SCALAR}"
+      return 1
+    fi
+  fi
+  if [ "$VSC_DB" != "0" ]; then
+    status=0
+    vsc_exec_scalar SELECT "$VSC_DB" || status=$?
+    if [ "$status" -ne 0 ]; then
+      vsc_err "SELECT ${VSC_DB} に失敗しました: ${VSC_SCALAR}"
+      return 1
+    fi
+  fi
+  # 認証が必要かどうかをここで確かめる (PING は認証前でも通る実装があるため ECHO を使う)
+  status=0
+  vsc_exec_scalar ECHO "valkey_shell_cli" || status=$?
+  if [ "$status" -eq 1 ]; then
+    case "$VSC_SCALAR" in
+      NOAUTH*|*"Authentication required"*)
+        vsc_err "このサーバーは認証が必要です。-a / --auth-file / --user を指定してください。"
+        return 1
+        ;;
+    esac
+  fi
+  return 0
+}
+
+vsc_connection_summary() {
+  local tls_label="平文 (bash /dev/tcp)"
+  if [ "$VSC_TLS_ACTIVE" = "true" ]; then
+    if [ "$VSC_TLS_INSECURE" = "true" ]; then
+      tls_label="TLS (openssl s_client、サーバー証明書の検証なし)"
+    else
+      tls_label="TLS (openssl s_client、サーバー証明書を検証)"
+    fi
+  fi
+  printf '接続先 : %s:%s (DB %s)\n' "$VSC_HOST" "$VSC_PORT" "$VSC_DB"
+  printf '通信   : %s\n' "$tls_label"
+  if [ "$VSC_PASSWORD_SET" = "true" ]; then
+    if [ -n "$VSC_USER" ]; then
+      printf '認証   : AUTH %s <password> 済み\n' "$VSC_USER"
+    else
+      printf '認証   : AUTH <password> 済み\n'
+    fi
+  else
+    printf '認証   : なし\n'
+  fi
+}
+
+# ---- 登録内容の一覧 (SCAN) --------------------------------------------------
+# KEYS * は要素数に比例して本体をブロックするため、valkey-cli の --scan と同じく
+# SCAN でカーソルを回して列挙する。各キーの型・TTL・値まで出して「何がどう入って
+# いるか」をその場で確認できるようにする。
+vsc_scan_dump() {
+  local pattern="${1:-$VSC_SCAN_PATTERN}"
+  local cursor="0" key key_type ttl total=0 value_status
+  local -a keys=()
+
+  printf '\n=== 登録内容の一覧 (SCAN MATCH %s COUNT %s) ===\n' "$pattern" "$VSC_SCAN_COUNT"
+  if vsc_exec_scalar DBSIZE && [ "$VSC_SCALAR_KIND" = "int" ]; then
+    printf 'DB %s のキー総数 : %s\n' "$VSC_DB" "$VSC_SCALAR"
+  fi
+  while :; do
+    if ! vsc_send SCAN "$cursor" MATCH "$pattern" COUNT "$VSC_SCAN_COUNT"; then
+      vsc_err "SCAN を送信できませんでした。"
+      return 3
+    fi
+    if ! vsc_read_scan_reply; then
+      if [ "$VSC_SCALAR_KIND" = "error" ]; then
+        vsc_err "SCAN がエラーを返しました: ${VSC_SCALAR}"
+        return 1
+      fi
+      vsc_err "SCAN の応答を解釈できませんでした。"
+      return 3
+    fi
+    cursor="$VSC_SCAN_CURSOR"
+    keys=(${VSC_SCAN_KEYS[@]+"${VSC_SCAN_KEYS[@]}"})
+    for key in ${keys[@]+"${keys[@]}"}; do
+      total=$(( total + 1 ))
+      key_type="?"
+      vsc_exec_scalar TYPE "$key" >/dev/null 2>&1
+      [ -n "$VSC_SCALAR" ] && key_type="$VSC_SCALAR"
+      ttl="?"
+      vsc_exec_scalar TTL "$key" >/dev/null 2>&1
+      if [ "$VSC_SCALAR_KIND" = "int" ]; then
+        case "$VSC_SCALAR" in
+          -1) ttl="無期限" ;;
+          -2) ttl="キーなし" ;;
+          *) ttl="${VSC_SCALAR} 秒" ;;
+        esac
+      fi
+      # キー名に改行やタブが含まれていても 1 行に収まるよう、表示だけ引用する。
+      printf '\n[%s] type=%s ttl=%s\n' "$(vsc_quote "$key")" "$key_type" "$ttl"
+      value_status=0
+      case "$key_type" in
+        string)
+          vsc_send GET "$key" && vsc_print_reply "    " "    " || value_status=$?
+          ;;
+        list)
+          if [ "$VSC_SCAN_VALUE_LIMIT" -gt 0 ]; then
+            vsc_send LRANGE "$key" 0 $(( VSC_SCAN_VALUE_LIMIT - 1 )) && vsc_print_reply "    " "    " || value_status=$?
+          else
+            vsc_send LRANGE "$key" 0 -1 && vsc_print_reply "    " "    " || value_status=$?
+          fi
+          ;;
+        hash)
+          vsc_send HGETALL "$key" && vsc_print_reply "    " "    " || value_status=$?
+          ;;
+        set)
+          vsc_send SMEMBERS "$key" && vsc_print_reply "    " "    " || value_status=$?
+          ;;
+        zset)
+          if [ "$VSC_SCAN_VALUE_LIMIT" -gt 0 ]; then
+            vsc_send ZRANGE "$key" 0 $(( VSC_SCAN_VALUE_LIMIT - 1 )) WITHSCORES && vsc_print_reply "    " "    " || value_status=$?
+          else
+            vsc_send ZRANGE "$key" 0 -1 WITHSCORES && vsc_print_reply "    " "    " || value_status=$?
+          fi
+          ;;
+        stream)
+          vsc_send XLEN "$key" && vsc_print_reply "    " "    (長さ) " || value_status=$?
+          ;;
+        *)
+          printf '    (この型の値の表示には対応していません。TYPE=%s)\n' "$key_type"
+          ;;
+      esac
+      [ "$value_status" -eq 3 ] && return 3
+    done
+    [ "$cursor" = "0" ] && break
+  done
+  printf '\n列挙したキー : %s 件 (パターン: %s)\n' "$total" "$pattern"
+  if [ "$VSC_SCAN_VALUE_LIMIT" -gt 0 ]; then
+    printf '※ list / zset は先頭 %s 件までを表示しています (--value-limit で変更、0 で無制限)。\n' \
+      "$VSC_SCAN_VALUE_LIMIT"
+  fi
+  return 0
+}
+
+# ---- 対話モード -------------------------------------------------------------
+# 入力行をコマンドと引数へ分解する。valkey-cli と同じく、シングル / ダブル
+# クォートで囲んだ範囲は 1 つの引数として扱う。
+vsc_split_line() {
+  local line="$1" index=0 length="${#line}" ch quote="" current="" started="false"
+  VSC_ARGS=()
+  while [ "$index" -lt "$length" ]; do
+    ch="${line:$index:1}"
+    index=$(( index + 1 ))
+    if [ -n "$quote" ]; then
+      if [ "$ch" = "$quote" ]; then
+        quote=""
+        continue
+      fi
+      if [ "$ch" = "\\" ] && [ "$quote" = '"' ] && [ "$index" -lt "$length" ]; then
+        current+="${line:$index:1}"
+        index=$(( index + 1 ))
+        continue
+      fi
+      current+="$ch"
+      continue
+    fi
+    case "$ch" in
+      ' '|$'\t')
+        if [ "$started" = "true" ]; then
+          VSC_ARGS+=("$current")
+          current=""
+          started="false"
+        fi
+        ;;
+      "'"|'"')
+        quote="$ch"
+        started="true"
+        ;;
+      *)
+        current+="$ch"
+        started="true"
+        ;;
+    esac
+  done
+  if [ -n "$quote" ]; then
+    vsc_err "引用符が閉じていません。"
+    VSC_ARGS=()
+    return 1
+  fi
+  [ "$started" = "true" ] && VSC_ARGS+=("$current")
+  [ ${#VSC_ARGS[@]} -gt 0 ]
+}
+
+vsc_repl_help() {
+  cat <<'VSC_REPL_HELP_END'
+valkey のコマンドをそのまま入力すると実行して応答を表示する。
+  例: PING / SET key value / GET key / TYPE key / TTL key
+      KEYS '*' / SCAN 0 MATCH 'session:*' COUNT 100
+      HGETALL hash / LRANGE list 0 -1 / SMEMBERS set / ZRANGE z 0 -1 WITHSCORES
+      INFO keyspace / DBSIZE / CONFIG GET maxmemory / CLIENT LIST
+
+組み込みコマンド:
+  help            この説明を表示する
+  quit / exit     対話モードを終了する
+  :scan [PATTERN] キーを SCAN で列挙し、型・TTL・値まで表示する (既定: *)
+  :raw on|off     値を引用符なしで出すかどうかを切り替える
+  :info           現在の接続情報を表示する
+  :commands       valkey-cli も本スクリプトも無い場合の代替手順を表示する
+VSC_REPL_HELP_END
+}
+
+vsc_repl() {
+  local line first lowered status
+  printf '\n'
+  vsc_connection_summary
+  printf "コマンドを入力してください (help で説明、quit で終了)。\n"
+  while :; do
+    printf '%s:%s> ' "$VSC_HOST" "$VSC_PORT" >&2
+    if ! IFS= read -r line; then
+      printf '\n'
+      break
+    fi
+    line="${line%$'\r'}"
+    # 空行 (空白だけの行) は読み飛ばす
+    if [ -z "${line//[[:space:]]/}" ]; then
+      continue
+    fi
+    if ! vsc_split_line "$line"; then
+      continue
+    fi
+    first="${VSC_ARGS[0]}"
+    lowered="$(printf '%s' "$first" | tr 'A-Z' 'a-z')"
+    case "$lowered" in
+      quit|exit)
+        break
+        ;;
+      help|'?')
+        vsc_repl_help
+        continue
+        ;;
+      :info)
+        vsc_connection_summary
+        continue
+        ;;
+      :commands)
+        vsc_show_commands
+        continue
+        ;;
+      :raw)
+        case "${VSC_ARGS[1]:-}" in
+          on|true|1) VSC_RAW="true"; printf '値を引用符なしで表示します。\n' ;;
+          off|false|0) VSC_RAW="false"; printf '値を引用符付きで表示します。\n' ;;
+          *) printf '使い方: :raw on|off (現在: %s)\n' "$VSC_RAW" ;;
+        esac
+        continue
+        ;;
+      :scan)
+        status=0
+        vsc_scan_dump "${VSC_ARGS[1]:-*}" || status=$?
+        [ "$status" -eq 3 ] && break
+        continue
+        ;;
+    esac
+    status=0
+    if ! vsc_send "${VSC_ARGS[@]}"; then
+      vsc_err "コマンドを送信できませんでした (接続が切れている可能性があります)。"
+      break
+    fi
+    vsc_print_reply "" "" || status=$?
+    if [ "$status" -eq 3 ]; then
+      vsc_err "応答を受信できませんでした。接続が切れている可能性があります。"
+      break
+    fi
+  done
+  return 0
+}
+
+# ---- 実行 -------------------------------------------------------------------
+vsc_connect || exit $?
+vsc_handshake || { vsc_cleanup; exit 1; }
+
+if [ "$VSC_SCAN_DUMP" = "true" ]; then
+  vsc_scan_dump "$VSC_SCAN_PATTERN" || VSC_EXIT_STATUS=$?
+  vsc_cleanup
+  exit "$VSC_EXIT_STATUS"
+fi
+
+if [ ${#VSC_COMMAND[@]} -gt 0 ]; then
+  if ! vsc_send "${VSC_COMMAND[@]}"; then
+    vsc_err "コマンドを送信できませんでした: ${VSC_COMMAND[*]}"
+    vsc_cleanup
+    exit 3
+  fi
+  vsc_print_reply "" "" || VSC_EXIT_STATUS=$?
+  vsc_cleanup
+  exit "$VSC_EXIT_STATUS"
+fi
+
+vsc_repl
+vsc_cleanup
+exit 0
+VALKEY_SHELL_CLI_SCRIPT_END
+)"
+VALKEY_SHELL_CLI_SCRIPT="${VALKEY_SHELL_CLI_SCRIPT//$'\r'/}"
+
 usage() {
   cat <<'EOF'
 Usage: build_and_verify.sh [OPTIONS]
@@ -2081,6 +3252,35 @@ JBoss マスターパスワードの伝搬検証:
                                     削除して、その内容がシンボリックリンク経由で
                                     全コンテナへ反映されるかを確認する
                                     (パラメータ入力なし)
+                                    valkey / redis サーバーのサービスが起動して
+                                    いれば、どのサービスからでも「Valkey 操作」を
+                                    選択でき、そのサービスのコンテナから valkey へ
+                                    接続してキーの一覧・型・TTL・値を確認できる。
+                                    使うクライアントは次の 2 通りから選ぶ。
+                                      (A) valkey-cli : コンテナに同梱されていれば
+                                          それを使い、無ければ valkey サービスの
+                                          イメージから使い捨てコンテナを起動し、
+                                          --network container:<確認対象> で
+                                          ネットワーク名前空間だけを共有して
+                                          実行する (確認対象コンテナへは何も
+                                          インストールしない)
+                                      (B) 代替シェル : openssl (TLS) と bash の
+                                          /dev/tcp (平文) だけで RESP を喋る
+                                          valkey_shell_cli.sh を /tmp の一時
+                                          ディレクトリへ置いて実行し、終了時に
+                                          削除する。valkey-cli が使えない環境で
+                                          どのコマンドで代替できるかを確かめる
+                                          ためのもの
+                                    どちらでも「対話接続」と「登録内容の一覧」を
+                                    選べるほか、疎通確認 (名前解決・PING) と、
+                                    手で叩く場合のコマンドの表示も選べる。
+                                    2 の bash 接続でも同じコマンド
+                                    (valkey-cli / valkey-connect /
+                                     valkey_shell_cli.sh) を PATH へ用意した
+                                    状態でセッションを始めるため、シェルの中から
+                                    そのまま valkey を操作できる
+                                    (接続先・認証は設定済み。用意したものは
+                                     セッション終了時に必ず削除する)
                                     (bash 接続先に /bin/bash が無い場合は
                                      /bin/sh を使う)
                            bash/http で対象が複数ある場合と、logs のサービス選択では
@@ -2271,6 +3471,36 @@ JBoss マスターパスワードの伝搬検証:
   --no-truststore-inventory-text
                            トラストストア一覧のテキスト出力を行わない
                            (画面表示だけにする)
+
+Valkey (Redis 互換) の操作・登録内容の確認:
+  (--keep-container-mode logs の「Valkey 操作」と、同メニューの bash 接続で使う。
+   確認は必ず「選択したサービスのコンテナ」から行うため、frontend / backend から
+   valkey へ到達できているかをそのまま確かめられる。
+   確認対象コンテナへ valkey-cli をインストールすることは一切しない)
+  --valkey-service NAME    valkey サーバーの Compose サービス名を明示する。
+                           未指定時は起動中サービスを順に調べ、valkey-server か
+                           redis-server を持つコンテナのサービスを自動検出する
+                           (サービス名やイメージタグには依存しない)
+  --valkey-port PORT       接続先のコンテナ側ポートを明示する。未指定時は valkey
+                           コンテナの環境変数 (VALKEY_PORT / REDIS_PORT)、
+                           valkey.conf / redis.conf の port・tls-port、起動コマンドの
+                           --port から検出し、いずれも無ければ 6379 を使う
+  --valkey-tls             TLS で接続する (openssl s_client を使う)
+  --no-valkey-tls          平文で接続する (bash の /dev/tcp を使う)
+                           いずれも未指定なら、valkey 側の tls-port 検出結果に従い、
+                           分からない場合は平文で試してから TLS を試す
+  --valkey-scan-pattern P  登録内容の一覧で使う SCAN のパターン (既定: *)
+                           例: --valkey-scan-pattern 'session:*'
+  --print-valkey-shell-cli valkey-cli の代替シェル (valkey_shell_cli.sh) を標準出力へ
+                           書き出して終了する。コンテナへ配るものと同じ内容なので、
+                           別の環境へ持ち出して単体で使ったり、中身を読んで
+                           「valkey-cli が無いときにどのコマンドで代替できるか」を
+                           確かめたりできる。リポジトリでは
+                           tools/valkey_shell_cli.sh として同じものを置いている。
+                           代替シェル単体の使い方は
+                           tools/valkey_shell_cli.sh --help、
+                           openssl / bash による手動の代替手順は
+                           tools/valkey_shell_cli.sh --show-commands で表示できる
 
 WAR デプロイ時の Java 例外解析:
   (デプロイ処理のログに Java 例外があれば自動で解析する。ただし画面表示と
@@ -2892,6 +4122,18 @@ while [ $# -gt 0 ]; do
                            need_value "$1" $#; TRUSTSTORE_INVENTORY_TEXT="$2"; TRUSTSTORE_INVENTORY_TEXT_SET="true"; shift 2 ;;
     --no-truststore-inventory-text)
                            TRUSTSTORE_INVENTORY_TEXT_ENABLED="false"; shift ;;
+    --valkey-service)      need_value "$1" $#; VALKEY_SERVICE="$2"; VALKEY_SERVICE_SET="true"; shift 2 ;;
+    --valkey-port)         need_value "$1" $#; VALKEY_PORT="$2"; shift 2 ;;
+    --valkey-tls)          VALKEY_TLS="true"; shift ;;
+    --no-valkey-tls)       VALKEY_TLS="false"; shift ;;
+    --valkey-scan-pattern) need_value "$1" $#; VALKEY_SCAN_PATTERN="$2"; shift 2 ;;
+    --print-valkey-shell-cli)
+                           # valkey-cli の代替シェルを標準出力へ書き出して終了する。
+                           # コンテナへ配るのと同じ内容なので、別環境へ持ち出して
+                           # 単体で使ったり、中身を読んで手順を確かめたりできる。
+                           printf '%s\n' "$VALKEY_SHELL_CLI_SCRIPT"
+                           exit 0
+                           ;;
     --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
     --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
     --deploy-exception-report) DEPLOY_EXCEPTION_REPORT="true"; shift ;;
@@ -3410,6 +4652,29 @@ case "$KEEP_CONTAINER_MODE" in
     exit 2
     ;;
 esac
+
+# Valkey 操作の指定値。接続してから気付くと調査の流れが止まるため、ここで弾く。
+if [ -n "$VALKEY_PORT" ]; then
+  case "$VALKEY_PORT" in
+    ''|*[!0-9]*)
+      err "--valkey-port には 1 から 65535 の範囲を指定してください: ${VALKEY_PORT}"
+      exit 2
+      ;;
+  esac
+  if [ "${#VALKEY_PORT}" -gt 5 ] \
+      || (( 10#$VALKEY_PORT < 1 || 10#$VALKEY_PORT > 65535 )); then
+    err "--valkey-port には 1 から 65535 の範囲を指定してください: ${VALKEY_PORT}"
+    exit 2
+  fi
+fi
+if [ "$VALKEY_SERVICE_SET" = "true" ] && [ -z "$VALKEY_SERVICE" ]; then
+  err "--valkey-service にはサービス名を指定してください"
+  exit 2
+fi
+if [ -z "$VALKEY_SCAN_PATTERN" ]; then
+  err "--valkey-scan-pattern にはパターンを指定してください (全件は * を指定します)"
+  exit 2
+fi
 
 # 完全クリアに使うスクリプトは、終了時になって「無い」と分かっても手遅れなので、
 # 明示指定された場合だけここで実在を確認する (自動解決は終了時に行う)。
@@ -12473,6 +13738,15 @@ fi
 printf '%s\n' "$_bv_tree_hint" >&2
 [ -n "$_bv_tree_note" ] && printf '%s\n' "$_bv_tree_note" >&2
 
+# valkey 操作用のコマンドを build_and_verify.sh が用意していれば PATH の先頭へ足す。
+# 中身は openssl / bash だけで RESP を喋る代替シェルと、接続先を埋め込んだ
+# ラッパーで、いずれも一時ディレクトリに置かれ、セッション終了時に消される。
+if [ -n "${BV_VALKEY_DIR:-}" ] && [ -d "${BV_VALKEY_DIR}" ]; then
+  PATH="${BV_VALKEY_DIR}:${PATH}"
+  export PATH
+  [ -n "${BV_VALKEY_HINT:-}" ] && printf '%s\n' "$BV_VALKEY_HINT" >&2
+fi
+
 # 対話 bash はここで起動する。終了したら、用意した簡易実装を片付けてから抜ける。
 /bin/bash
 _bv_tree_status=$?
@@ -12729,6 +14003,13 @@ fi
 printf '%s\n' "$_bv_tree_hint" >&2
 [ -n "$_bv_tree_note" ] && printf '%s\n' "$_bv_tree_note" >&2
 
+# valkey 操作用のコマンド (代替シェルと接続ラッパー) を用意してあれば PATH へ足す。
+if [ -n "${BV_VALKEY_DIR:-}" ] && [ -d "${BV_VALKEY_DIR}" ]; then
+  PATH="${BV_VALKEY_DIR}:${PATH}"
+  export PATH
+  [ -n "${BV_VALKEY_HINT:-}" ] && printf '%s\n' "$BV_VALKEY_HINT" >&2
+fi
+
 # 対話シェルはここで起動する。終了したら、用意した簡易実装を片付けてから抜ける。
 "$_bv_shell_bin"
 _bv_shell_status=$?
@@ -12737,6 +14018,7 @@ exit "$_bv_shell_status"
 CONTAINER_INTERACTIVE_SH_SCRIPT_END
 )"
 CONTAINER_INTERACTIVE_SH_SCRIPT="${CONTAINER_INTERACTIVE_SH_SCRIPT//$'\r'/}"
+
 
 # ---- 接続に使うシェルの解決 --------------------------------------------------
 # 対話接続の入口は 1 つだが、コンテナに /bin/bash があるとは限らない。
@@ -12803,7 +14085,7 @@ resolve_container_interactive_shell() {
 # bash があれば bash 用、無ければ POSIX sh 用のスクリプトを使う。
 # $2 を指定すると docker exec -u へそのまま渡す (root ユーザでの接続で使う)。
 exec_container_interactive_bash() {
-  local container_id="$1" exec_user="${2:-}"
+  local container_id="$1" exec_user="${2:-}" status=0 valkey_dir=""
   local -a exec_args=(exec -it)
   [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
 
@@ -12813,19 +14095,35 @@ exec_container_interactive_bash() {
     return 127
   fi
 
-  if [ "$INTERACTIVE_SHELL_KIND" = "bash" ]; then
-    docker "${exec_args[@]}" "$container_id" \
-      "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT"
-    return $?
+  # valkey サービスが起動していれば、このセッションで valkey を操作できるように
+  # コマンドを用意する。用意するのは /tmp 配下の一時ディレクトリだけで、
+  # パッケージの導入は行わない (セッション終了時に必ず削除する)。
+  if prepare_valkey_session_tools "$container_id" "$exec_user"; then
+    valkey_dir="$VALKEY_SESSION_DIR"
+    # VALKEY_SHELL_CLI_CONFIG も渡し、ラッパーを介さず valkey_shell_cli.sh を
+    # 直に叩いたときも接続先・認証が効くようにする (設定ファイルは 600)。
+    exec_args+=(-e "BV_VALKEY_DIR=${valkey_dir}" -e "BV_VALKEY_HINT=${VALKEY_SESSION_HINT}" \
+      -e "VALKEY_SHELL_CLI_CONFIG=${valkey_dir}/valkey.conf")
   fi
 
-  # bash が無いコンテナ。POSIX sh 用のセッションスクリプトへ切り替える。
-  # 使うシェルのパスは引数で渡す ($0 相当の第 1 引数はラベル)。
-  diag "このコンテナには bash がないため、${INTERACTIVE_SHELL_PATH} (POSIX シェル) で接続します。"
-  diag "bash 固有の書き方 (配列、[[ ]]、シェル関数の export など) は使えません。"
-  docker "${exec_args[@]}" "$container_id" \
-    "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_SH_SCRIPT" \
-    build-and-verify-session "$INTERACTIVE_SHELL_PATH"
+  if [ "$INTERACTIVE_SHELL_KIND" = "bash" ]; then
+    docker "${exec_args[@]}" "$container_id" \
+      "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_BASH_SCRIPT" || status=$?
+  else
+    # bash が無いコンテナ。POSIX sh 用のセッションスクリプトへ切り替える。
+    # 使うシェルのパスは引数で渡す ($0 相当の第 1 引数はラベル)。
+    diag "このコンテナには bash がないため、${INTERACTIVE_SHELL_PATH} (POSIX シェル) で接続します。"
+    diag "bash 固有の書き方 (配列、[[ ]]、シェル関数の export など) は使えません。"
+    docker "${exec_args[@]}" "$container_id" \
+      "$INTERACTIVE_SHELL_PATH" -c "$CONTAINER_INTERACTIVE_SH_SCRIPT" \
+      build-and-verify-session "$INTERACTIVE_SHELL_PATH" || status=$?
+  fi
+
+  if [ -n "$valkey_dir" ]; then
+    remove_container_valkey_tools "$container_id" "$valkey_dir" "$exec_user"
+    VALKEY_SESSION_DIR=""
+  fi
+  return "$status"
 }
 
 # 選択された Compose サービスの実行中コンテナへ対話式 bash で接続する。
@@ -13035,6 +14333,883 @@ MYSQL_CLIENT_SCRIPT
     return 1
   fi
   log "MySQL セッションを終了しました。サービス操作の選択へ戻ります。"
+}
+
+# ---- Valkey (Redis 互換) の操作・登録内容の確認 --------------------------------
+# 「frontend / backend から valkey へ」という経路をそのまま確かめたいので、確認は
+# 必ず選択したサービスのコンテナ (またはそのネットワーク名前空間) から実行する。
+# 確認対象のコンテナへパッケージを入れる操作は一切行わない。
+
+# 選択されたコンテナが valkey / redis サーバーかどうかを実行ファイルで判定する。
+# サービス名やイメージタグには依存しない (valkey / redis / cache など命名は様々)。
+container_is_valkey_server() {
+  local container_id="$1" cached
+  cached="${VALKEY_SERVICE_PROBE_CACHE[$container_id]:-}"
+  if [ -n "$cached" ]; then
+    [ "$cached" = "true" ]
+    return $?
+  fi
+  if docker exec "$container_id" /bin/sh -c '
+    # valkey-server-probe: valkey / redis のサーバープロセスを持つコンテナか
+    command -v valkey-server >/dev/null 2>&1 && exit 0
+    command -v redis-server >/dev/null 2>&1 && exit 0
+    exit 1
+  ' >/dev/null 2>&1; then
+    VALKEY_SERVICE_PROBE_CACHE["$container_id"]="true"
+    return 0
+  fi
+  VALKEY_SERVICE_PROBE_CACHE["$container_id"]="false"
+  return 1
+}
+
+# 起動中の Compose サービスから valkey サーバーのサービスを 1 つ決める。
+# --valkey-service の明示があればそれを使い、無ければ起動中サービスを順に調べる。
+# 見つかれば VALKEY_DETECTED_SERVICE へサービス名を入れて 0 を返す。
+# 結果は実行中ずっと使い回す ("-" は「探したが無かった」の印)。
+# 呼び出し元がコマンド置換で受けるとサブシェルになってキャッシュも警告の抑止も
+# 効かなくなるため、値は戻り値とグローバル変数で渡す。
+valkey_server_service() {
+  local service container_id
+  local -a services=() container_ids=()
+
+  if [ -n "$VALKEY_DETECTED_SERVICE" ]; then
+    [ "$VALKEY_DETECTED_SERVICE" = "-" ] && return 1
+    return 0
+  fi
+
+  if [ "$VALKEY_SERVICE_SET" = "true" ]; then
+    mapfile -t container_ids < <(compose_container_ids "$VALKEY_SERVICE")
+    if [ ${#container_ids[@]} -eq 0 ]; then
+      # 明示指定したのに使えない理由は伝える (黙って操作が消えると原因が分からない)。
+      warn "--valkey-service で指定した '${VALKEY_SERVICE}' の実行中コンテナが無いため、Valkey 操作は選べません。"
+      VALKEY_DETECTED_SERVICE="-"
+      return 1
+    fi
+    # 明示指定は「そこが valkey である」という利用者の宣言として尊重し、
+    # 実行ファイルの有無では弾かない (代替シェルだけで確認する構成もあるため)。
+    VALKEY_DETECTED_SERVICE="$VALKEY_SERVICE"
+    return 0
+  fi
+
+  mapfile -t services < <(compose_started_services)
+  for service in ${services[@]+"${services[@]}"}; do
+    [ -n "$service" ] || continue
+    mapfile -t container_ids < <(compose_container_ids "$service")
+    [ ${#container_ids[@]} -gt 0 ] || continue
+    container_id="${container_ids[0]}"
+    if container_is_valkey_server "$container_id"; then
+      VALKEY_DETECTED_SERVICE="$service"
+      return 0
+    fi
+  done
+  VALKEY_DETECTED_SERVICE="-"
+  return 1
+}
+
+# valkey サーバーのコンテナから、接続に必要な設定 (ポート・TLS・パスワード) を読む。
+# 公式イメージの環境変数 (VALKEY_PASSWORD 等) と valkey.conf / redis.conf の
+# requirepass / port / tls-port の双方を見る。パスワードは画面にもレポートにも
+# 出さず、コンテナ内の設定ファイル (600) 経由でのみ渡す。
+resolve_valkey_connection() {
+  local valkey_service="$1" container_id line key value
+  local -a container_ids=()
+
+  VALKEY_CONNECT_HOST="$valkey_service"
+  VALKEY_CONNECT_PORT="${VALKEY_PORT:-}"
+  VALKEY_CONNECT_TLS="$VALKEY_TLS"
+  VALKEY_CONNECT_PASSWORD=""
+  VALKEY_CONNECT_PASSWORD_SET="false"
+  VALKEY_CONNECT_USER=""
+  VALKEY_CONNECT_SOURCE="未検出"
+
+  mapfile -t container_ids < <(compose_container_ids "$valkey_service")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  container_id="${container_ids[0]}"
+
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      port)
+        # valkey / redis は port 0 を「平文の待ち受けを無効にする」意味で使う
+        # (TLS 専用構成)。接続先として採用してはいけない。
+        if [ -n "$value" ] && [ "$value" != "0" ] && [ -z "$VALKEY_PORT" ]; then
+          VALKEY_CONNECT_PORT="$value"
+        fi
+        ;;
+      tls_port)
+        # tls-port があれば TLS 構成とみなし、接続先もそちらへ寄せる。
+        # --no-valkey-tls で平文を明示している場合は平文の port を優先する。
+        if [ -n "$value" ] && [ "$value" != "0" ] && [ "$VALKEY_TLS" != "false" ]; then
+          [ "$VALKEY_TLS" = "auto" ] && VALKEY_CONNECT_TLS="true"
+          [ -z "$VALKEY_PORT" ] && VALKEY_CONNECT_PORT="$value"
+        fi
+        ;;
+      password)
+        if [ -n "$value" ]; then
+          VALKEY_CONNECT_PASSWORD="$value"
+          VALKEY_CONNECT_PASSWORD_SET="true"
+        fi
+        ;;
+      password_source) [ -n "$value" ] && VALKEY_CONNECT_SOURCE="$value" ;;
+      user) [ -n "$value" ] && VALKEY_CONNECT_USER="$value" ;;
+    esac
+  done < <(docker exec "$container_id" /bin/sh -c '
+    # valkey-settings-probe: 接続に必要な設定をコンテナ内から集める
+    vk_port=""
+    vk_tls_port=""
+    vk_password=""
+    vk_source=""
+    vk_user=""
+    for vk_env_name in VALKEY_PASSWORD REDIS_PASSWORD VALKEY_REQUIREPASS REQUIREPASS; do
+      vk_env_value="$(eval "printf %s \"\${${vk_env_name}:-}\"")"
+      if [ -n "$vk_env_value" ]; then
+        vk_password="$vk_env_value"
+        vk_source="環境変数 ${vk_env_name}"
+        break
+      fi
+    done
+    for vk_env_name in VALKEY_PASSWORD_FILE REDIS_PASSWORD_FILE; do
+      [ -n "$vk_password" ] && break
+      vk_env_value="$(eval "printf %s \"\${${vk_env_name}:-}\"")"
+      if [ -n "$vk_env_value" ] && [ -r "$vk_env_value" ]; then
+        vk_password="$(cat -- "$vk_env_value")"
+        vk_source="${vk_env_name} (${vk_env_value})"
+      fi
+    done
+    for vk_env_name in VALKEY_USER REDIS_USER VALKEY_ACL_USER; do
+      vk_env_value="$(eval "printf %s \"\${${vk_env_name}:-}\"")"
+      if [ -n "$vk_env_value" ]; then
+        vk_user="$vk_env_value"
+        break
+      fi
+    done
+    for vk_env_name in VALKEY_PORT REDIS_PORT; do
+      vk_env_value="$(eval "printf %s \"\${${vk_env_name}:-}\"")"
+      case "$vk_env_value" in
+        ""|*[!0-9]*) ;;
+        *) vk_port="$vk_env_value"; break ;;
+      esac
+    done
+    for vk_conf in /etc/valkey/valkey.conf /usr/local/etc/valkey/valkey.conf \
+        /valkey.conf /etc/redis/redis.conf /usr/local/etc/redis/redis.conf /redis.conf; do
+      [ -r "$vk_conf" ] || continue
+      [ -n "$vk_port" ] || vk_port="$(sed -n "s/^[[:space:]]*port[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p" "$vk_conf" 2>/dev/null | tail -n 1)"
+      [ -n "$vk_tls_port" ] || vk_tls_port="$(sed -n "s/^[[:space:]]*tls-port[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p" "$vk_conf" 2>/dev/null | tail -n 1)"
+      if [ -z "$vk_password" ]; then
+        vk_password="$(sed -n "s/^[[:space:]]*requirepass[[:space:]][[:space:]]*\(.*\)$/\1/p" "$vk_conf" 2>/dev/null | tail -n 1)"
+        [ -n "$vk_password" ] && vk_source="${vk_conf} の requirepass"
+      fi
+    done
+    # 起動コマンドの --requirepass / --port / --tls-port も見る (compose の command 指定)
+    vk_cmdline="$(tr "\0" "\n" < /proc/1/cmdline 2>/dev/null || true)"
+    if [ -n "$vk_cmdline" ]; then
+      vk_prev=""
+      for vk_arg in $vk_cmdline; do
+        case "$vk_prev" in
+          --requirepass) [ -n "$vk_password" ] || { vk_password="$vk_arg"; vk_source="起動コマンドの --requirepass"; } ;;
+          --port) case "$vk_arg" in ""|*[!0-9]*) ;; *) [ -n "$vk_port" ] || vk_port="$vk_arg" ;; esac ;;
+          --tls-port) case "$vk_arg" in ""|*[!0-9]*) ;; *) [ -n "$vk_tls_port" ] || vk_tls_port="$vk_arg" ;; esac ;;
+        esac
+        vk_prev="$vk_arg"
+      done
+    fi
+    printf "port=%s\n" "$vk_port"
+    printf "tls_port=%s\n" "$vk_tls_port"
+    printf "user=%s\n" "$vk_user"
+    printf "password_source=%s\n" "$vk_source"
+    printf "password=%s\n" "$vk_password"
+  ' 2>/dev/null)
+
+  case "$VALKEY_CONNECT_PORT" in
+    ''|*[!0-9]*) VALKEY_CONNECT_PORT="$VALKEY_PORT_DEFAULT" ;;
+  esac
+  [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ] || VALKEY_CONNECT_SOURCE="未検出 (認証なし、または自動検出できず)"
+  return 0
+}
+
+# 確認対象コンテナで使える valkey クライアントを調べる。
+# 出力は "<種別> <パス>" (種別: valkey-cli / redis-cli)、無ければ何も出さない。
+container_valkey_cli_path() {
+  local container_id="$1" exec_user="${2:-}"
+  local -a exec_args=(exec)
+  [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
+  docker "${exec_args[@]}" "$container_id" /bin/sh -c '
+    # valkey-client-probe: コンテナに同梱されているクライアントを探す
+    for vk_name in valkey-cli redis-cli; do
+      vk_path="$(command -v "$vk_name" 2>/dev/null)" || vk_path=""
+      if [ -n "$vk_path" ]; then
+        printf "%s %s\n" "$vk_name" "$vk_path"
+        exit 0
+      fi
+    done
+    exit 1
+  ' 2>/dev/null
+}
+
+# 代替シェルを動かせるかどうか (bash と、TLS を使うなら openssl) を調べる。
+container_valkey_shell_ready() {
+  local container_id="$1" exec_user="${2:-}"
+  local -a exec_args=(exec)
+  [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
+  docker "${exec_args[@]}" "$container_id" /bin/sh -c '
+    # valkey-shell-probe: 代替シェルの動作条件 (bash 4 以上) を確認する
+    for vk_bash in /bin/bash /usr/bin/bash /usr/local/bin/bash; do
+      [ -x "$vk_bash" ] || continue
+      "$vk_bash" -c "[ \"\${BASH_VERSINFO[0]:-0}\" -ge 4 ]" >/dev/null 2>&1 && exit 0
+    done
+    exit 1
+  ' >/dev/null 2>&1
+}
+
+# valkey コンテナのイメージ名。valkey-cli を持たないコンテナから確認するときに、
+# そのイメージで使い捨てコンテナを起動して valkey-cli を借りるために使う。
+valkey_service_image() {
+  local valkey_service="$1"
+  local -a container_ids=()
+  mapfile -t container_ids < <(compose_container_ids "$valkey_service")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  docker inspect -f '{{.Config.Image}}' "${container_ids[0]}" 2>/dev/null
+}
+
+# 確認対象コンテナから見た valkey のアドレスを IP で求める。
+# 使い捨てコンテナは --network container:<id> でネットワーク名前空間だけを共有する
+# 都合上、compose の埋め込み DNS を引けないため、名前解決は確認対象コンテナ側で行う。
+# 結果は VALKEY_CONNECT_ADDRESS へ、どこで解決できたかは VALKEY_ADDRESS_SOURCE へ
+# 入れる (container / docker / 空)。呼び出し元がコマンド置換で受けるとサブシェルに
+# なって解決元が失われるため、戻り値とグローバル変数で渡す。
+# 「確認対象コンテナから名前を引けるか」自体が確認したいことなので、Docker 側の
+# 情報で代用したときはそれと分かるようにする。
+VALKEY_ADDRESS_SOURCE=""
+VALKEY_CONNECT_ADDRESS=""
+resolve_valkey_host_address() {
+  local target_id="$1" host="$2" valkey_service="$3" address=""
+  local -a valkey_ids=()
+
+  VALKEY_ADDRESS_SOURCE=""
+  VALKEY_CONNECT_ADDRESS=""
+  address="$(docker exec "$target_id" /bin/sh -c '
+    # valkey-resolve-probe: 確認対象コンテナ側で valkey のホスト名を解決する
+    vk_host="$1"
+    if command -v getent >/dev/null 2>&1; then
+      getent hosts "$vk_host" 2>/dev/null | awk "NF { print \$1; exit }" && exit 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$vk_host" 2>/dev/null && exit 0
+    fi
+    awk -v h="$vk_host" "\$2 == h || \$3 == h { print \$1; exit }" /etc/hosts 2>/dev/null
+  ' _ "$host" 2>/dev/null | awk 'NF { print $1; exit }')"
+
+  if [ -n "$address" ]; then
+    VALKEY_ADDRESS_SOURCE="container"
+  else
+    # 確認対象コンテナ側で解決できない場合は、Docker が持つ情報から補う。
+    # 補えたとしても「コンテナからは名前を引けない」状態なので、そのまま伝える。
+    mapfile -t valkey_ids < <(compose_container_ids "$valkey_service")
+    if [ ${#valkey_ids[@]} -gt 0 ]; then
+      address="$(docker inspect \
+        -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "${valkey_ids[0]}" 2>/dev/null \
+        | awk 'NF { print $1; exit }')"
+    fi
+    [ -n "$address" ] && VALKEY_ADDRESS_SOURCE="docker"
+  fi
+  [ -n "$address" ] || return 1
+  VALKEY_CONNECT_ADDRESS="$address"
+  return 0
+}
+
+# 代替シェルと接続用ラッパーを、確認対象コンテナの一時ディレクトリへ置く。
+# 置くのは /tmp 配下の専用ディレクトリだけで、パッケージの導入も既存ファイルの
+# 書き換えも行わない。セッション終了時に remove_container_valkey_tools で必ず消す。
+# 成功すると VALKEY_SESSION_DIR へディレクトリのパスを入れる。
+VALKEY_SESSION_DIR=""
+install_container_valkey_tools() {
+  local container_id="$1" exec_user="${2:-}" dir cli_line cli_path
+  local -a exec_args=(exec -i)
+  local -a plain_args=(exec)
+  [ -n "$exec_user" ] && exec_args+=(-u "$exec_user") && plain_args+=(-u "$exec_user")
+
+  VALKEY_SESSION_DIR=""
+  dir="/tmp/${VALKEY_SESSION_DIR_PREFIX}.$$"
+
+  # 同梱クライアントがあればラッパーからそれを呼ぶ (無ければ代替シェルを呼ぶ)。
+  cli_line="$(container_valkey_cli_path "$container_id" "$exec_user" || true)"
+  cli_path="${cli_line#* }"
+  [ -n "$cli_line" ] || cli_path=""
+
+  # 代替シェル本体を標準入力から書き込む (コマンドライン長の上限に掛からない)。
+  if ! printf '%s\n' "$VALKEY_SHELL_CLI_SCRIPT" \
+      | docker "${exec_args[@]}" "$container_id" /bin/sh -c '
+    # valkey-tools-install: 代替シェルを一時ディレクトリへ置く
+    set -e
+    umask 077
+    vk_dir="$1"
+    rm -rf -- "$vk_dir" 2>/dev/null || true
+    mkdir -p "$vk_dir"
+    cat > "$vk_dir/valkey_shell_cli.sh"
+    chmod 755 "$vk_dir/valkey_shell_cli.sh"
+  ' _ "$dir" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # 接続設定 (パスワードを含む) は 600 のファイルとしてだけ渡す。
+  # docker exec の引数やコンテナの環境変数には載せない (ps から見えないようにする)。
+  if ! {
+        printf 'host=%s\n' "$VALKEY_CONNECT_HOST"
+        printf 'port=%s\n' "$VALKEY_CONNECT_PORT"
+        printf 'tls=%s\n' "$VALKEY_CONNECT_TLS"
+        [ -n "$VALKEY_CONNECT_USER" ] && printf 'user=%s\n' "$VALKEY_CONNECT_USER"
+        [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ] \
+          && printf 'password=%s\n' "$VALKEY_CONNECT_PASSWORD"
+        printf 'insecure=true\n'
+      } | docker "${exec_args[@]}" "$container_id" /bin/sh -c '
+    # valkey-tools-config: 接続設定を 600 で書き出し、接続用ラッパーを用意する
+    set -e
+    umask 077
+    vk_dir="$1"
+    vk_cli_path="$2"
+    cat > "$vk_dir/valkey.conf"
+    chmod 600 "$vk_dir/valkey.conf"
+    vk_host="$(sed -n "s/^host=//p" "$vk_dir/valkey.conf" | tail -n 1)"
+    vk_port="$(sed -n "s/^port=//p" "$vk_dir/valkey.conf" | tail -n 1)"
+    vk_tls="$(sed -n "s/^tls=//p" "$vk_dir/valkey.conf" | tail -n 1)"
+    {
+      printf "#!/bin/sh\n"
+      printf "# build_and_verify.sh がこのセッション用に用意した接続ラッパー。\n"
+      printf "VALKEY_SHELL_CLI_CONFIG=%s/valkey.conf\n" "$vk_dir"
+      printf "export VALKEY_SHELL_CLI_CONFIG\n"
+      if [ -n "$vk_cli_path" ]; then
+        # 同梱のクライアントがある場合はそれを使う。パスワードは引数ではなく
+        # REDISCLI_AUTH (valkey-cli / redis-cli が読む環境変数) で渡す。
+        printf "REDISCLI_AUTH=\$(sed -n \"s/^password=//p\" %s/valkey.conf | tail -n 1)\n" "$vk_dir"
+        printf "[ -n \"\$REDISCLI_AUTH\" ] && export REDISCLI_AUTH\n"
+        if [ "$vk_tls" = "true" ]; then
+          printf "exec %s -h %s -p %s --tls --insecure \"\$@\"\n" "$vk_cli_path" "$vk_host" "$vk_port"
+        else
+          printf "exec %s -h %s -p %s \"\$@\"\n" "$vk_cli_path" "$vk_host" "$vk_port"
+        fi
+      else
+        printf "exec %s/valkey_shell_cli.sh \"\$@\"\n" "$vk_dir"
+      fi
+    } > "$vk_dir/valkey-connect"
+    chmod 755 "$vk_dir/valkey-connect"
+    # 同梱のクライアントが無いときだけ、代替シェルを valkey-cli の名前でも呼べるようにする
+    # (元から入っているコマンドを隠さないため、ある場合は作らない)。
+    if [ -z "$vk_cli_path" ]; then
+      {
+        printf "#!/bin/sh\n"
+        printf "# valkey-cli の代替 (openssl / bash で RESP を喋るシェル実装)。\n"
+        printf "VALKEY_SHELL_CLI_CONFIG=%s/valkey.conf\n" "$vk_dir"
+        printf "export VALKEY_SHELL_CLI_CONFIG\n"
+        printf "exec %s/valkey_shell_cli.sh \"\$@\"\n" "$vk_dir"
+      } > "$vk_dir/valkey-cli"
+      chmod 755 "$vk_dir/valkey-cli"
+    fi
+    exit 0
+  ' _ "$dir" "$cli_path" >/dev/null 2>&1; then
+    docker "${plain_args[@]}" "$container_id" /bin/sh -c 'rm -rf -- "$1"' _ "$dir" >/dev/null 2>&1
+    return 1
+  fi
+
+  VALKEY_SESSION_DIR="$dir"
+  return 0
+}
+
+# 置いた一時ディレクトリを消す。パスワードを含む設定ファイルを残さないため、
+# セッションが異常終了した場合でも呼べるように独立した関数にしておく。
+remove_container_valkey_tools() {
+  local container_id="$1" dir="$2" exec_user="${3:-}"
+  local -a exec_args=(exec)
+  [ -n "$dir" ] || return 0
+  [ -n "$exec_user" ] && exec_args+=(-u "$exec_user")
+  if ! docker "${exec_args[@]}" "$container_id" /bin/sh -c '
+    # valkey-tools-cleanup: 用意した一時ディレクトリを取り除く
+    rm -rf -- "$1"
+  ' _ "$dir" >/dev/null 2>&1; then
+    # 接続設定にはパスワードが入っているため、消せなかったことは必ず伝える。
+    warn "valkey 操作用に置いた一時ディレクトリを削除できませんでした: ${dir}"
+    warn "  → 接続設定 (${dir}/valkey.conf) にパスワードが入っています。コンテナを残す場合は手動で削除してください。"
+    return 1
+  fi
+  return 0
+}
+
+# 対話シェルのセッション用に valkey 操作のコマンドを用意する。
+# 用意できたら 0 を返し、VALKEY_SESSION_DIR と VALKEY_SESSION_HINT を設定する。
+# valkey サービスが起動していない構成では何もせず 1 を返すので、従来どおりの
+# セッション (tree だけを用意する) になる。
+VALKEY_SESSION_HINT=""
+prepare_valkey_session_tools() {
+  local container_id="$1" exec_user="${2:-}" valkey_service cli_line cli_name
+  local has_cli="false" shell_ready="false"
+
+  VALKEY_SESSION_HINT=""
+  valkey_server_service || return 1
+  valkey_service="$VALKEY_DETECTED_SERVICE"
+  resolve_valkey_connection "$valkey_service" || return 1
+
+  cli_line="$(container_valkey_cli_path "$container_id" "$exec_user" || true)"
+  cli_name="${cli_line%% *}"
+  [ -n "$cli_line" ] && has_cli="true"
+  container_valkey_shell_ready "$container_id" "$exec_user" && shell_ready="true"
+  # 同梱クライアントも bash も無いコンテナでは、用意できるものが無いので何もしない。
+  [ "$has_cli" = "true" ] || [ "$shell_ready" = "true" ] || return 1
+
+  install_container_valkey_tools "$container_id" "$exec_user" || return 1
+
+  if [ "$has_cli" = "true" ]; then
+    VALKEY_SESSION_HINT="valkey 操作が可能です: valkey-connect (同梱の ${cli_name} に ${VALKEY_CONNECT_HOST}:${VALKEY_CONNECT_PORT} の接続設定を付けたもの)。例: valkey-connect PING / valkey-connect --scan"
+  else
+    VALKEY_SESSION_HINT="valkey 操作が可能です: valkey-cli と valkey-connect (どちらも openssl / bash による代替シェル。接続先 ${VALKEY_CONNECT_HOST}:${VALKEY_CONNECT_PORT} は設定済み)。例: valkey-cli PING / valkey-cli --scan-dump '*' / valkey_shell_cli.sh --show-commands"
+  fi
+  if [ "$shell_ready" = "true" ]; then
+    VALKEY_SESSION_HINT="${VALKEY_SESSION_HINT} (代替シェルの実体: ${VALKEY_SESSION_DIR}/valkey_shell_cli.sh。セッション終了時に削除します)"
+  fi
+  return 0
+}
+
+# サービス操作メニューへ「Valkey 操作」を出すかどうか。
+# valkey サーバーのサービスが起動していれば、どのサービスからでも選べるようにする
+# (frontend / backend から見た到達性こそ確かめたいものなので、対象は限定しない)。
+compose_service_supports_valkey_cli() {
+  local service_name="$1"
+  local -a container_ids=()
+
+  valkey_server_service || return 1
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  [ ${#container_ids[@]} -gt 0 ] || return 1
+  return 0
+}
+
+# valkey-cli / 代替シェルのどちらでも使える「手で叩くときのコマンド」を案内する。
+# valkey-cli が使えない環境で何をすればよいかを、その場の接続先で組み立てて見せる。
+print_valkey_manual_commands() {
+  local service_name="$1" container_name="$2" cli_name="$3" address="$4"
+  local host="$VALKEY_CONNECT_HOST" port="$VALKEY_CONNECT_PORT"
+  local tls_opt="" auth_note=""
+
+  [ "$VALKEY_CONNECT_TLS" = "true" ] && tls_opt=" --tls --insecure"
+  [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ] \
+    && auth_note=" (パスワードは REDISCLI_AUTH 環境変数か -a で渡す)"
+
+  diag ""
+  diag "[手で叩く場合のコマンド]"
+  diag "コンテナ ${container_name} の中で実行する想定です。"
+  if [ -n "$cli_name" ]; then
+    diag "  # コンテナに同梱されている ${cli_name} を使う${auth_note}"
+    diag "  ${cli_name} -h ${host} -p ${port}${tls_opt} PING"
+    diag "  ${cli_name} -h ${host} -p ${port}${tls_opt} --scan"
+    diag "  ${cli_name} -h ${host} -p ${port}${tls_opt} TYPE <key>"
+  else
+    diag "  # このコンテナに valkey-cli は入っていない (入れると検証対象が変わるため入れない)"
+    diag "  # 1) valkey コンテナのイメージから使い捨てコンテナを起動し、"
+    diag "  #    このコンテナのネットワーク名前空間を借りて valkey-cli を実行する"
+    diag "  docker run --rm -it --network container:${container_name} \\"
+    diag "    <valkey のイメージ> valkey-cli -h ${address:-$host} -p ${port}${tls_opt} PING"
+    diag "  # 2) openssl / bash だけで済ませる (代替シェルが行っているのと同じこと)"
+  fi
+  diag "  # TLS のとき: openssl s_client を RESP のクライアントとして使う"
+  diag "  printf 'PING\\r\\n' | openssl s_client -quiet -connect ${host}:${port}"
+  diag "  # 平文のとき: bash の /dev/tcp へ直接書く"
+  diag "  exec 3<>/dev/tcp/${host}/${port}; printf 'PING\\r\\n' >&3; head -c 7 <&3"
+  diag "  # 登録内容の確認"
+  diag "  printf 'SCAN 0 MATCH ${VALKEY_SCAN_PATTERN} COUNT 100\\r\\nDBSIZE\\r\\nINFO keyspace\\r\\n' >&3"
+  diag ""
+  diag "代替シェル (valkey_shell_cli.sh) の全手順は次で表示できます:"
+  diag "  ${VALKEY_SESSION_DIR:-<一時ディレクトリ>}/valkey_shell_cli.sh --show-commands"
+  diag "  (ホスト側では tools/valkey_shell_cli.sh --show-commands、"
+  diag "   スクリプト単体を取り出すには build_and_verify.sh --print-valkey-shell-cli)"
+}
+
+# 使い捨てコンテナで valkey-cli を実行する。確認対象コンテナのネットワーク名前空間
+# (--network container:<id>) を共有するため、名前解決・経路・送信元アドレスは
+# 確認対象コンテナと同じになる。確認対象コンテナには一切書き込まない。
+run_valkey_sidecar_cli() {
+  local target_id="$1" valkey_service="$2" address="$3" interactive="$4"
+  shift 4
+  local image
+  local -a run_args=()
+
+  image="$(valkey_service_image "$valkey_service" || true)"
+  if [ -z "$image" ]; then
+    err "valkey サービスのイメージ名を取得できませんでした: ${valkey_service}"
+    return 1
+  fi
+  run_args=(run --rm)
+  # 対話しない実行で -i を付けると、ダイアログへ渡している標準入力を
+  # コンテナ側が読み取ってしまうため、対話するときだけ付ける。
+  [ "$interactive" = "true" ] && run_args+=(-it)
+  run_args+=(--network "container:${target_id}")
+  if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+    # パスワードは引数ではなく環境変数で渡す (docker run の引数は ps から見えるため、
+    # -e NAME 形式で「ホスト側の値をそのまま渡す」書き方にする)。
+    run_args+=(-e REDISCLI_AUTH)
+  fi
+  run_args+=("$image" valkey-cli -h "$address" -p "$VALKEY_CONNECT_PORT")
+  [ "$VALKEY_CONNECT_TLS" = "true" ] && run_args+=(--tls --insecure)
+  run_args+=("$@")
+
+  if [ "$interactive" = "true" ]; then
+    if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+      REDISCLI_AUTH="$VALKEY_CONNECT_PASSWORD" docker "${run_args[@]}"
+    else
+      docker "${run_args[@]}"
+    fi
+  elif [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+    REDISCLI_AUTH="$VALKEY_CONNECT_PASSWORD" docker "${run_args[@]}" </dev/null
+  else
+    docker "${run_args[@]}" </dev/null
+  fi
+}
+
+# 「Valkey 操作」の本体。選択したサービスのコンテナから valkey を操作する。
+run_interactive_compose_valkey() {
+  local service_name="$1" container_id container_name valkey_service
+  local cli_line cli_name cli_path address choice status
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  if ! valkey_server_service; then
+    err "valkey サーバーの Compose サービスが見つかりません (--valkey-service で明示できます)。"
+    return 1
+  fi
+  valkey_service="$VALKEY_DETECTED_SERVICE"
+  if ! resolve_valkey_connection "$valkey_service"; then
+    err "valkey サービス '${valkey_service}' の接続設定を取得できませんでした。"
+    return 1
+  fi
+
+  cli_line="$(container_valkey_cli_path "$container_id" || true)"
+  cli_name="${cli_line%% *}"
+  cli_path="${cli_line#* }"
+  [ -n "$cli_line" ] || { cli_name=""; cli_path=""; }
+  resolve_valkey_host_address "$container_id" "$VALKEY_CONNECT_HOST" "$valkey_service" || true
+  address="$VALKEY_CONNECT_ADDRESS"
+
+  diag ""
+  diag "════════════════════════════════════════════════════════"
+  diag "Valkey 操作 (実行元 service=${service_name}, container=${container_name})"
+  diag "════════════════════════════════════════════════════════"
+  diag "接続先サービス   : ${valkey_service}"
+  diag "接続先           : ${VALKEY_CONNECT_HOST}:${VALKEY_CONNECT_PORT}"
+  case "$VALKEY_ADDRESS_SOURCE" in
+    container)
+      diag "名前解決         : ${VALKEY_CONNECT_HOST} -> ${address} (実行元コンテナから解決)"
+      ;;
+    docker)
+      diag "名前解決         : ${VALKEY_CONNECT_HOST} -> ${address} (実行元コンテナでは引けず、Docker が持つ IP で代用)"
+      warn "実行元コンテナから ${VALKEY_CONNECT_HOST} を名前解決できません。compose のネットワーク定義とサービス名を確認してください。"
+      ;;
+    *)
+      diag "名前解決         : 解決できませんでした (実行元コンテナから ${VALKEY_CONNECT_HOST} を引けない)"
+      ;;
+  esac
+  case "$VALKEY_CONNECT_TLS" in
+    true) diag "通信             : TLS (openssl s_client。サーバー証明書の検証は行いません)" ;;
+    false) diag "通信             : 平文 (--no-valkey-tls の指定)" ;;
+    *) diag "通信             : 自動判定 (平文で試し、駄目なら TLS)" ;;
+  esac
+  if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+    diag "認証             : あり (${VALKEY_CONNECT_SOURCE} から取得。画面・レポートへは出しません)"
+  else
+    diag "認証             : ${VALKEY_CONNECT_SOURCE}"
+  fi
+  if [ -n "$cli_name" ]; then
+    diag "同梱クライアント : ${cli_name} (${cli_path})"
+  else
+    diag "同梱クライアント : なし (UBI9 ベース等。導入すると検証対象が変わるため入れません)"
+  fi
+
+  while :; do
+    diag ""
+    diag "Valkey 操作を選択してください:"
+    diag "  1) valkey-cli で対話接続 (コマンドを打ちながら確認する)"
+    diag "  2) valkey-cli で登録内容を一覧 (SCAN + TYPE / TTL / 値)"
+    diag "  3) 代替シェルで対話接続 (openssl / bash だけで RESP を喋る)"
+    diag "  4) 代替シェルで登録内容を一覧 (valkey-cli が無くても同じ確認ができる)"
+    diag "  5) 疎通確認と、手で叩く場合のコマンドを表示"
+    diag "  0) サービス操作の選択へ戻る"
+    printf '選択番号 [0-5]: ' >&2
+    if ! IFS= read -r choice; then
+      err "Valkey 操作の選択を読み取れませんでした。対話可能な端末から実行してください。"
+      return 1
+    fi
+    case "$choice" in
+      1)
+        status=0
+        run_valkey_cli_session "$service_name" "$container_id" "$container_name" \
+          "$valkey_service" "$cli_name" "$cli_path" "$address" "interactive" || status=$?
+        [ "$status" -eq 0 ] || warn "valkey-cli での対話接続に失敗しました。Valkey 操作の選択へ戻ります。"
+        ;;
+      2)
+        status=0
+        run_valkey_cli_session "$service_name" "$container_id" "$container_name" \
+          "$valkey_service" "$cli_name" "$cli_path" "$address" "dump" || status=$?
+        [ "$status" -eq 0 ] || warn "valkey-cli での登録内容の一覧に失敗しました。Valkey 操作の選択へ戻ります。"
+        pause_compose_service_actions || return 1
+        ;;
+      3)
+        status=0
+        run_valkey_shell_session "$service_name" "$container_id" "$container_name" "interactive" || status=$?
+        [ "$status" -eq 0 ] || warn "代替シェルでの対話接続に失敗しました。Valkey 操作の選択へ戻ります。"
+        ;;
+      4)
+        status=0
+        run_valkey_shell_session "$service_name" "$container_id" "$container_name" "dump" || status=$?
+        [ "$status" -eq 0 ] || warn "代替シェルでの登録内容の一覧に失敗しました。Valkey 操作の選択へ戻ります。"
+        pause_compose_service_actions || return 1
+        ;;
+      5)
+        run_valkey_connectivity_check "$service_name" "$container_id" "$container_name" \
+          "$valkey_service" "$cli_name" "$address"
+        pause_compose_service_actions || return 1
+        ;;
+      0)
+        log "Valkey 操作を終了し、サービス操作の選択へ戻ります。"
+        return 0
+        ;;
+      *)
+        warn "0 から 5 の番号を入力してください。"
+        ;;
+    esac
+  done
+}
+
+# valkey-cli を使う操作。コンテナに同梱されていればそれを、無ければ valkey の
+# イメージから使い捨てコンテナを起動して実行する (確認対象コンテナは変更しない)。
+run_valkey_cli_session() {
+  local service_name="$1" container_id="$2" container_name="$3" valkey_service="$4"
+  local cli_name="$5" cli_path="$6" address="$7" mode="$8"
+  local status=0
+  local -a cli_args=()
+  local -a exec_args=()
+
+  diag ""
+  if [ "$mode" = "dump" ]; then
+    diag "valkey-cli で登録内容を一覧します (パターン: ${VALKEY_SCAN_PATTERN})。"
+  else
+    diag "valkey-cli で対話接続します。終了するには exit または quit を入力してください。"
+  fi
+
+  if [ -n "$cli_path" ]; then
+    diag "使用するクライアント: コンテナ同梱の ${cli_name} (${cli_path})"
+    if [ "$mode" = "dump" ]; then
+      valkey_cli_dump_via_exec "$container_id" "$cli_path" || return 1
+      return 0
+    fi
+    exec_args=(exec -it)
+    cli_args=("$cli_path" -h "$VALKEY_CONNECT_HOST" -p "$VALKEY_CONNECT_PORT")
+    [ "$VALKEY_CONNECT_TLS" = "true" ] && cli_args+=(--tls --insecure)
+    if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+      # パスワードは argv ではなく REDISCLI_AUTH で渡す (コンテナ内の ps 対策)。
+      exec_args+=(-e REDISCLI_AUTH)
+      REDISCLI_AUTH="$VALKEY_CONNECT_PASSWORD" \
+        docker "${exec_args[@]}" "$container_id" "${cli_args[@]}" || status=$?
+    else
+      docker "${exec_args[@]}" "$container_id" "${cli_args[@]}" || status=$?
+    fi
+    [ "$status" -eq 0 ] || return 1
+    log "valkey-cli のセッションを終了しました。"
+    return 0
+  fi
+
+  if [ -z "$address" ]; then
+    err "実行元コンテナから ${VALKEY_CONNECT_HOST} を名前解決できないため、使い捨てコンテナでの valkey-cli を実行できません。"
+    err "  → 代替シェル (3 / 4) を使うか、compose のネットワーク定義を確認してください。"
+    return 1
+  fi
+  diag "使用するクライアント: valkey サービスのイメージから起動する使い捨てコンテナ"
+  diag "  (--network container:${container_name} で ${container_name} のネットワーク名前空間を共有します。"
+  diag "   ${container_name} にはファイルもパッケージも追加しません)"
+  if [ "$mode" = "dump" ]; then
+    valkey_cli_dump_via_sidecar "$container_id" "$valkey_service" "$address" || return 1
+    return 0
+  fi
+  run_valkey_sidecar_cli "$container_id" "$valkey_service" "$address" "true" || return 1
+  log "valkey-cli のセッションを終了しました。"
+  return 0
+}
+
+# valkey-cli で「キーの一覧 + 型 + TTL + 値」を出すための小さなスクリプト。
+# valkey-cli 自体にはこの一括表示が無いため、--scan の結果を回して組み立てる。
+# $1 に valkey-cli の起動コマンド (シェルとして評価される文字列) を渡す。
+VALKEY_CLI_DUMP_SCRIPT='
+# valkey-cli-dump: --scan で列挙し、型・TTL・値までまとめて表示する
+# キーの列挙・型・TTL は素の出力 (1 行 1 件) で受け取り、値だけ --no-raw で
+# 引用して表示する (改行を含む値でも 1 行に収まるようにする)。
+vk_run="$1"
+vk_pattern="$2"
+vk_limit="$3"
+printf "\n=== 登録内容の一覧 (valkey-cli --scan --pattern %s) ===\n" "$vk_pattern"
+printf "DBSIZE : "
+eval "$vk_run DBSIZE" 2>/dev/null || printf "(取得できず)\n"
+eval "$vk_run --scan --pattern \"\$vk_pattern\"" 2>/dev/null | while IFS= read -r vk_key; do
+  [ -n "$vk_key" ] || continue
+  vk_type="$(eval "$vk_run TYPE \"\$vk_key\"" 2>/dev/null | tr -d "\r")"
+  vk_ttl="$(eval "$vk_run TTL \"\$vk_key\"" 2>/dev/null | tr -d "\r")"
+  case "$vk_ttl" in
+    -1) vk_ttl="無期限" ;;
+    -2) vk_ttl="キーなし" ;;
+    *) vk_ttl="${vk_ttl} 秒" ;;
+  esac
+  printf "\n[%s] type=%s ttl=%s\n" "$vk_key" "$vk_type" "$vk_ttl"
+  case "$vk_type" in
+    string) eval "$vk_run --no-raw GET \"\$vk_key\"" 2>/dev/null | sed "s/^/    /" ;;
+    list)   eval "$vk_run --no-raw LRANGE \"\$vk_key\" 0 \$(( vk_limit - 1 ))" 2>/dev/null | sed "s/^/    /" ;;
+    hash)   eval "$vk_run --no-raw HGETALL \"\$vk_key\"" 2>/dev/null | sed "s/^/    /" ;;
+    set)    eval "$vk_run --no-raw SMEMBERS \"\$vk_key\"" 2>/dev/null | sed "s/^/    /" ;;
+    zset)   eval "$vk_run --no-raw ZRANGE \"\$vk_key\" 0 \$(( vk_limit - 1 )) WITHSCORES" 2>/dev/null | sed "s/^/    /" ;;
+    stream) eval "$vk_run XLEN \"\$vk_key\"" 2>/dev/null | sed "s/^/    (長さ) /" ;;
+    *)      printf "    (この型の値の表示には対応していません)\n" ;;
+  esac
+done
+printf "\n=== 一覧ここまで ===\n"
+'
+
+valkey_cli_dump_via_exec() {
+  local container_id="$1" cli_path="$2" run_command status=0
+  local -a exec_args=(exec)
+
+  run_command="$(printf '%q' "$cli_path") -h $(printf '%q' "$VALKEY_CONNECT_HOST") -p $(printf '%q' "$VALKEY_CONNECT_PORT")"
+  [ "$VALKEY_CONNECT_TLS" = "true" ] && run_command="${run_command} --tls --insecure"
+
+  if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+    exec_args+=(-e REDISCLI_AUTH)
+    REDISCLI_AUTH="$VALKEY_CONNECT_PASSWORD" \
+      docker "${exec_args[@]}" "$container_id" /bin/sh -c "$VALKEY_CLI_DUMP_SCRIPT" \
+      valkey-cli-dump "$run_command" "$VALKEY_SCAN_PATTERN" 20 </dev/null || status=$?
+  else
+    docker "${exec_args[@]}" "$container_id" /bin/sh -c "$VALKEY_CLI_DUMP_SCRIPT" \
+      valkey-cli-dump "$run_command" "$VALKEY_SCAN_PATTERN" 20 </dev/null || status=$?
+  fi
+  [ "$status" -eq 0 ] || return 1
+  return 0
+}
+
+valkey_cli_dump_via_sidecar() {
+  local container_id="$1" valkey_service="$2" address="$3" run_command status=0
+
+  run_command="valkey-cli -h $(printf '%q' "$address") -p $(printf '%q' "$VALKEY_CONNECT_PORT")"
+  [ "$VALKEY_CONNECT_TLS" = "true" ] && run_command="${run_command} --tls --insecure"
+
+  # 使い捨てコンテナの中でスクリプトを回すため、valkey-cli ではなく sh を起動する。
+  valkey_sidecar_sh "$container_id" "$valkey_service" \
+    "$VALKEY_CLI_DUMP_SCRIPT" valkey-cli-dump "$run_command" "$VALKEY_SCAN_PATTERN" 20 || status=$?
+  [ "$status" -eq 0 ] || return 1
+  return 0
+}
+
+# 使い捨てコンテナで /bin/sh を起動し、任意のスクリプトを実行する。
+valkey_sidecar_sh() {
+  local target_id="$1" valkey_service="$2" script="$3"
+  shift 3
+  local image
+  local -a run_args=()
+
+  image="$(valkey_service_image "$valkey_service" || true)"
+  if [ -z "$image" ]; then
+    err "valkey サービスのイメージ名を取得できませんでした: ${valkey_service}"
+    return 1
+  fi
+  run_args=(run --rm --network "container:${target_id}")
+  [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ] && run_args+=(-e REDISCLI_AUTH)
+  run_args+=("$image" /bin/sh -c "$script" "$@")
+  if [ "$VALKEY_CONNECT_PASSWORD_SET" = "true" ]; then
+    REDISCLI_AUTH="$VALKEY_CONNECT_PASSWORD" docker "${run_args[@]}" </dev/null
+  else
+    docker "${run_args[@]}" </dev/null
+  fi
+}
+
+# 代替シェル (valkey_shell_cli.sh) を確認対象コンテナへ置いて実行する。
+run_valkey_shell_session() {
+  local service_name="$1" container_id="$2" container_name="$3" mode="$4"
+  local status=0
+  local -a exec_args=()
+
+  if ! container_valkey_shell_ready "$container_id"; then
+    err "代替シェルの動作条件 (bash 4 以上) を満たすコンテナではありません: ${container_name}"
+    err "  → valkey-cli を使う操作 (1 / 2) か、bash を持つ別サービスから確認してください。"
+    return 1
+  fi
+  if ! install_container_valkey_tools "$container_id"; then
+    err "代替シェルをコンテナへ配置できませんでした: ${container_name}"
+    err "  → 読み取り専用ファイルシステムや /tmp の noexec を使っている可能性があります。"
+    return 1
+  fi
+
+  diag ""
+  diag "代替シェルを ${VALKEY_SESSION_DIR}/valkey_shell_cli.sh へ配置しました (終了時に削除します)。"
+  diag "openssl (TLS) と bash の /dev/tcp (平文) だけで RESP を喋るため、"
+  diag "コンテナへ valkey-cli をインストールしていません。"
+
+  exec_args=(exec)
+  if [ "$mode" = "dump" ]; then
+    diag "登録内容を一覧します (パターン: ${VALKEY_SCAN_PATTERN})。"
+    docker "${exec_args[@]}" "$container_id" \
+      "${VALKEY_SESSION_DIR}/valkey_shell_cli.sh" \
+      --config "${VALKEY_SESSION_DIR}/valkey.conf" \
+      --scan-dump "$VALKEY_SCAN_PATTERN" </dev/null || status=$?
+  else
+    exec_args+=(-it)
+    diag "対話モードに入ります。quit で終了するとサービス操作の選択へ戻ります。"
+    docker "${exec_args[@]}" "$container_id" \
+      "${VALKEY_SESSION_DIR}/valkey_shell_cli.sh" \
+      --config "${VALKEY_SESSION_DIR}/valkey.conf" || status=$?
+  fi
+
+  if remove_container_valkey_tools "$container_id" "$VALKEY_SESSION_DIR"; then
+    diag "配置した代替シェルと接続設定を削除しました: ${VALKEY_SESSION_DIR}"
+  fi
+  VALKEY_SESSION_DIR=""
+  [ "$status" -eq 0 ] || return 1
+  [ "$mode" = "dump" ] || log "代替シェルのセッションを終了しました。"
+  return 0
+}
+
+# 疎通確認 (名前解決・TCP 到達・PING) と、手で叩くときのコマンドの案内。
+run_valkey_connectivity_check() {
+  local service_name="$1" container_id="$2" container_name="$3" valkey_service="$4"
+  local cli_name="$5" address="$6"
+  local ping_output="" ping_status=0
+
+  diag ""
+  diag "[疎通確認 (実行元: ${container_name})]"
+  case "$VALKEY_ADDRESS_SOURCE" in
+    container) diag "名前解決 : ${VALKEY_CONNECT_HOST} -> ${address}" ;;
+    docker)    diag "名前解決 : 実行元コンテナからは失敗 (Docker が持つ IP ${address} で代用)" ;;
+    *)         diag "名前解決 : 失敗 (${VALKEY_CONNECT_HOST} を実行元コンテナから引けません)" ;;
+  esac
+
+  if container_valkey_shell_ready "$container_id" && install_container_valkey_tools "$container_id"; then
+    ping_output="$(docker exec "$container_id" \
+      "${VALKEY_SESSION_DIR}/valkey_shell_cli.sh" \
+      --config "${VALKEY_SESSION_DIR}/valkey.conf" PING </dev/null 2>&1)" || ping_status=$?
+    remove_container_valkey_tools "$container_id" "$VALKEY_SESSION_DIR"
+    VALKEY_SESSION_DIR=""
+    if [ "$ping_status" -eq 0 ]; then
+      diag "PING     : OK (${ping_output})"
+    else
+      diag "PING     : NG (exit=${ping_status})"
+      printf '%s\n' "$ping_output" | while IFS= read -r line; do
+        [ -n "$line" ] && diag "           ${line}"
+      done
+    fi
+  else
+    diag "PING     : 実行できませんでした (代替シェルを配置できないコンテナ)"
+  fi
+
+  print_valkey_manual_commands "$service_name" "$container_name" "$cli_name" "$address"
 }
 
 # 選択された Compose サービスが「JVM トラストストアと HTTPS 接続先を持つ AP コンテナ」かを、
@@ -22402,6 +24577,7 @@ run_interactive_compose_service_actions() {
   local mysql_action=0 observability_action=0 cert_check_action=0
   local alb_healthcheck_action=0 otel_config_action=0 trace_html_action=0
   local jboss_module_action=0 root_bash_action=0 efs_propagation_action=0
+  local valkey_action=0
   local truststore_inventory_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
@@ -22451,6 +24627,12 @@ run_interactive_compose_service_actions() {
   # 末尾へ採番して、既存操作の番号を変えないようにする。
   max_action=$(( max_action + 1 ))
   root_bash_action="$max_action"
+  # Valkey 操作は root bash よりさらに後ろへ採番する。valkey サービスが起動して
+  # いる構成でだけ増える操作なので、既存構成の番号 (root bash まで) を動かさない。
+  if compose_service_supports_valkey_cli "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    valkey_action="$max_action"
+  fi
   while :; do
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
@@ -22490,6 +24672,9 @@ run_interactive_compose_service_actions() {
       diag "  ${truststore_inventory_action}) トラストストア一覧 (JBoss EAP の Java アプリで有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンド)"
     fi
     diag "  ${root_bash_action}) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+    if [ "$valkey_action" -gt 0 ]; then
+      diag "  ${valkey_action}) Valkey 操作 (valkey-cli / openssl 代替シェルでキー一覧・値・TTL を確認)"
+    fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
     if ! IFS= read -r action; then
@@ -22578,6 +24763,10 @@ run_interactive_compose_service_actions() {
           if ! run_interactive_compose_bash "$service_name" "root"; then
             warn "root ユーザでの bash 接続に失敗しました。サービス操作の選択へ戻ります。"
           fi
+        elif [ "$valkey_action" -gt 0 ] && [ "$action" = "$valkey_action" ]; then
+          if ! run_interactive_compose_valkey "$service_name"; then
+            warn "Valkey 操作に失敗しました。サービス操作の選択へ戻ります。"
+          fi
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -22649,13 +24838,13 @@ run_keep_container_interaction() {
   if [ "$DRY_RUN" = "true" ]; then
     case "$KEEP_CONTAINER_MODE" in
       bash)
-        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します (tree コマンドを使える状態にしてから開始します。bash が無いコンテナは /bin/sh へ切り替えます)。"
+        log "[DRY-RUN] 検証対象コンテナを選択し、docker exec -it <container> /bin/bash で直接接続します (tree コマンドを使える状態にしてから開始します。bash が無いコンテナは /bin/sh へ切り替えます。valkey サーバーが起動していれば valkey-cli / valkey-connect / valkey_shell_cli.sh も使える状態にし、セッション終了時に削除します)。"
         ;;
       http)
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

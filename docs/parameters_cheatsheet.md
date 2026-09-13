@@ -179,11 +179,39 @@
 | `--jboss-http-port PORT` | 1〜65535 | (ログから検出。既定 8080) | `http` モード専用。コンテナ側の HTTP ポート |
 | `--exit-on-deploy-error` | フラグ | `false` | デプロイエラーを検出しても調査用の対話操作へ入らず、従来どおり終了する |
 | `--keep-container-after-interaction` | フラグ | `false` | 対話操作をすべて終えても完全クリーンアップを行わず、従来どおりコンテナを残す |
+| (操作) Valkey 操作 | — | — | `logs` モードの操作。valkey / redis サーバーのサービスが起動していれば、**どのサービスからでも**選べる。選んだサービスのコンテナから valkey へ接続し、対話接続・登録内容の一覧 (SCAN → 型 / TTL / 値)・疎通確認を行う。クライアントは (A) コンテナ同梱の `valkey-cli`、無ければ valkey のイメージから起動する使い捨てコンテナ (`docker run --rm --network container:<確認対象>`)、(B) `openssl` と bash の `/dev/tcp` だけで RESP を喋る代替シェル `valkey_shell_cli.sh` の 2 通り。**確認対象コンテナへ valkey-cli をインストールすることはない** |
 | (操作) EFS マウント伝播確認 | — | — | `logs` モードの操作。偽装バッチサーバー (`batch-mock`) から EFS へファイル・相対シンボリックリンクを作成 → 書き換え → 削除し、同じ EFS をマウントする全コンテナへ反映されるかを確認する。偽装サービス名は `BATCH_MOCK_SERVICE`、期待する `uid:gid` は `BATCH_MOCK_EFS_UID_GID` (既定 `6301:6302`) |
 | `--remove-volumes` | フラグ | `false` | この実行が行うすべての `compose down` に `--volumes` を付ける |
 | `--keep-volumes` | フラグ | `false` | 対話操作の終了後の後始末でもボリュームを削除しない (従来の動作) |
 | `--usage-check-script PATH` | ファイルパス | (自動解決) | 完全クリアに使う `docker-usage-check.sh` のパス |
 | `--disk-free-path DIR` | ディレクトリ | (既定の 7 か所) | 終了時の空き容量一覧へ表示するディレクトリを追加 (繰り返し指定可) |
+
+### Valkey (Redis 互換) の操作・登録内容の確認
+
+> `--keep-container-mode logs` の「Valkey 操作」と、同じメニューの bash 接続で使います。
+> 確認は必ず「選択したサービスのコンテナ」から行うため、frontend / backend から valkey へ
+> 到達できているかをそのまま確かめられます。
+> 確認対象コンテナへ valkey-cli を入れる操作は行いません (検証対象を変えないため)。
+
+| オプション | 値 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `--valkey-service NAME` | Compose サービス名 | (自動検出) | valkey サーバーのサービス名。未指定時は起動中サービスを順に調べ、`valkey-server` か `redis-server` を持つコンテナのサービスを使う |
+| `--valkey-port PORT` | 1〜65535 | (自動検出。既定 6379) | 接続先のコンテナ側ポート。未指定時は valkey コンテナの環境変数・`valkey.conf` / `redis.conf`・起動コマンドから検出する |
+| `--valkey-tls` | フラグ | (自動判定) | TLS で接続する (`openssl s_client` を使う) |
+| `--no-valkey-tls` | フラグ | (自動判定) | 平文で接続する (bash の `/dev/tcp` を使う) |
+| `--valkey-scan-pattern P` | SCAN のパターン | `*` | 登録内容の一覧で使うパターン。例: `--valkey-scan-pattern 'session:*'` |
+| `--print-valkey-shell-cli` | フラグ | — | 代替シェル (`valkey_shell_cli.sh`) を標準出力へ書き出して終了する。コンテナへ配るものと同じ内容。リポジトリの `tools/valkey_shell_cli.sh` と同一 |
+
+代替シェル単体の使い方:
+
+```bash
+tools/valkey_shell_cli.sh --help                       # 使い方
+tools/valkey_shell_cli.sh -h valkey --show-commands    # openssl / bash による手動の代替手順
+tools/valkey_shell_cli.sh -h valkey -p 6379            # 対話モード
+tools/valkey_shell_cli.sh -h valkey GET mykey          # 1 コマンド実行
+tools/valkey_shell_cli.sh -h valkey --scan-dump '*'    # キー・型・TTL・値の一覧
+tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
+```
 
 ### 情報表示・レポート
 

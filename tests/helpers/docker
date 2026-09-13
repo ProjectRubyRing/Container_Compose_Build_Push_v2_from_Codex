@@ -392,6 +392,18 @@ if [ "${1:-}" = "compose" ]; then
               *" backend-api "*) printf 'cid-backend-api\n' ;;
             esac
             ;;
+          # valkey サーバーと、valkey-cli を同梱するアプリコンテナも、
+          # FAKE_COMPOSE_PS_SERVICES へ含めたときだけ起動しているものとして扱う。
+          valkey)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" valkey "*) printf 'cid-valkey\n' ;;
+            esac
+            ;;
+          cacheapp)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" cacheapp "*) printf 'cid-cacheapp\n' ;;
+            esac
+            ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -946,6 +958,8 @@ PATH=/usr/bin}"
       case "$*" in
         *"cid-frontend-web"*) printf 'frontend-web\n' ;;
         *"cid-backend-api"*) printf 'backend-api\n' ;;
+        *"cid-valkey"*) printf 'valkey\n' ;;
+        *"cid-cacheapp"*) printf 'cacheapp\n' ;;
         *) printf 'app\n' ;;
       esac
       ;;
@@ -982,11 +996,24 @@ PATH=/usr/bin}"
         *"cid-efs-mock"*) printf '/efs-mock\n' ;;
         *"cid-frontend-web"*) printf '/test-frontend-web-1\n' ;;
         *"cid-backend-api"*) printf '/test-backend-api-1\n' ;;
+        *"cid-valkey"*) printf '/test-valkey-1\n' ;;
+        *"cid-cacheapp"*) printf '/test-cacheapp-1\n' ;;
         *) printf '/test-app-1\n' ;;
       esac
       ;;
     *".NetworkSettings.Networks"*)
-      printf '172.20.0.2\n'
+      # valkey の確認では「コンテナから名前を引けないが Docker は IP を知っている」
+      # 場合と「どちらからも分からない」場合を区別したいので、後者も再現できるようにする。
+      if [ "${FAKE_VALKEY_INSPECT_IP_FAIL:-false}" != "true" ]; then
+        printf '172.20.0.2\n'
+      fi
+      ;;
+    *"{{.Config.Image}}"*)
+      # 使い捨てコンテナで valkey-cli を借りるときに参照するイメージ名。
+      case "$*" in
+        *"cid-valkey"*) printf '%s\n' "${FAKE_VALKEY_IMAGE:-valkey/valkey:8.1-alpine}" ;;
+        *) printf 'fake-image\n' ;;
+      esac
       ;;
     *"{{.Image}}"*)
       printf 'fake-image\n'
@@ -1037,6 +1064,208 @@ if [ "${1:-}" = "diff" ]; then
   if [ -n "${FAKE_DOCKER_DIFF:-}" ]; then
     printf '%s\n' "$FAKE_DOCKER_DIFF"
   fi
+  exit 0
+fi
+
+
+# ---- Valkey 操作の再現 -------------------------------------------------------
+# build_and_verify.sh が投げるプローブを目印 (valkey-*-probe) で拾い、
+# 「valkey サーバーのコンテナ」「valkey-cli を同梱するコンテナ」「どちらでもない
+# コンテナ」を区別して返す。ここで拾わないと、後段の汎用 exec ハンドラが
+# 成功を返してしまい、すべてのサービスが valkey 扱いになってしまう。
+#   FAKE_VALKEY_SERVER_CONTAINERS : valkey サーバーとして扱うコンテナ ID
+#   FAKE_VALKEY_CLI_CONTAINERS    : valkey-cli を同梱するコンテナ ID
+#   FAKE_VALKEY_NO_BASH_CONTAINERS: 代替シェルを動かせないコンテナ ID
+#   FAKE_VALKEY_PASSWORD          : valkey 側で検出されるパスワード
+#   FAKE_VALKEY_TLS_PORT          : valkey 側で検出される tls-port
+#   FAKE_VALKEY_RESOLVE_FAIL      : true なら確認対象コンテナから名前解決できない
+#   FAKE_VALKEY_INSTALL_FAIL      : true なら代替シェルの配置に失敗する
+#   FAKE_VALKEY_CLI_FAIL          : true なら valkey-cli の実行に失敗する
+#   FAKE_VALKEY_CALLS             : 配置・削除・実行の記録先ファイル
+fake_valkey_record() {
+  [ -n "${FAKE_VALKEY_CALLS:-}" ] || return 0
+  printf '%s\n' "$*" >> "$FAKE_VALKEY_CALLS"
+}
+
+# 引数のいずれかが指定した値そのもの (部分一致ではない) かどうか。
+fake_valkey_has_arg() {
+  fake_vk_want="$1"; shift
+  for fake_vk_arg in "$@"; do
+    [ "$fake_vk_arg" = "$fake_vk_want" ] && return 0
+  done
+  return 1
+}
+
+# 引数のいずれかが指定した文字列で終わるかどうか (実行ファイルのパス判定用)。
+fake_valkey_arg_ends_with() {
+  fake_vk_want="$1"; shift
+  for fake_vk_arg in "$@"; do
+    case "$fake_vk_arg" in
+      *"$fake_vk_want") return 0 ;;
+    esac
+  done
+  return 1
+}
+
+fake_valkey_exec_cid() {
+  # docker exec の引数から対象コンテナ ID を拾う (-i / -it / -u / -e の後ろ)
+  for fake_vk_arg in "$@"; do
+    case "$fake_vk_arg" in
+      cid-*) printf '%s' "$fake_vk_arg"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-server-probe"* ]]; then
+  fake_vk_cid="$(fake_valkey_exec_cid "$@")"
+  case " ${FAKE_VALKEY_SERVER_CONTAINERS:-} " in
+    *" $fake_vk_cid "*) exit 0 ;;
+  esac
+  exit 1
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-client-probe"* ]]; then
+  fake_vk_cid="$(fake_valkey_exec_cid "$@")"
+  case " ${FAKE_VALKEY_CLI_CONTAINERS:-} " in
+    *" $fake_vk_cid "*)
+      printf 'valkey-cli /usr/local/bin/valkey-cli\n'
+      exit 0
+      ;;
+  esac
+  exit 1
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-shell-probe"* ]]; then
+  fake_vk_cid="$(fake_valkey_exec_cid "$@")"
+  case " ${FAKE_VALKEY_NO_BASH_CONTAINERS:-} " in
+    *" $fake_vk_cid "*) exit 1 ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-settings-probe"* ]]; then
+  printf 'port=%s\n' "${FAKE_VALKEY_PORT:-6379}"
+  printf 'tls_port=%s\n' "${FAKE_VALKEY_TLS_PORT:-}"
+  printf 'user=%s\n' "${FAKE_VALKEY_USER:-}"
+  if [ -n "${FAKE_VALKEY_PASSWORD:-}" ]; then
+    printf 'password_source=環境変数 VALKEY_PASSWORD\n'
+    printf 'password=%s\n' "$FAKE_VALKEY_PASSWORD"
+  else
+    printf 'password_source=\n'
+    printf 'password=\n'
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-resolve-probe"* ]]; then
+  if [ "${FAKE_VALKEY_RESOLVE_FAIL:-false}" = "true" ]; then
+    exit 1
+  fi
+  printf '%s\n' "${FAKE_VALKEY_ADDRESS:-172.20.0.9}"
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-tools-install"* ]]; then
+  # 代替シェル本体は標準入力で渡ってくる。書き込み側が SIGPIPE で落ちないよう
+  # 必ず読み切ってから結果を返す。
+  if [ -n "${FAKE_VALKEY_SCRIPT_CAPTURE:-}" ]; then
+    cat > "$FAKE_VALKEY_SCRIPT_CAPTURE"
+  else
+    cat > /dev/null
+  fi
+  fake_valkey_record "install $(fake_valkey_exec_cid "$@")"
+  [ "${FAKE_VALKEY_INSTALL_FAIL:-false}" = "true" ] && exit 1
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-tools-config"* ]]; then
+  if [ -n "${FAKE_VALKEY_CONFIG_CAPTURE:-}" ]; then
+    cat > "$FAKE_VALKEY_CONFIG_CAPTURE"
+  else
+    cat > /dev/null
+  fi
+  fake_valkey_record "config $(fake_valkey_exec_cid "$@")"
+  exit 0
+fi
+
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /bin/sh "$@" \
+    && [[ "$*" == *"valkey-tools-cleanup"* ]]; then
+  fake_valkey_record "cleanup $(fake_valkey_exec_cid "$@")"
+  exit 0
+fi
+
+# valkey-cli の一括ダンプ (docker exec / 使い捨てコンテナのどちらからも来る)。
+# sh -c の $0 として valkey-cli-dump が渡ってくるので、引数まるごとで判定する。
+if fake_valkey_has_arg valkey-cli-dump "$@"; then
+  fake_valkey_record "cli-dump ${1:-}"
+  if [ "${FAKE_VALKEY_CLI_FAIL:-false}" = "true" ]; then
+    printf 'fake valkey-cli dump failed\n' >&2
+    exit 70
+  fi
+  printf '\n=== 登録内容の一覧 (valkey-cli --scan --pattern %s) ===\n' "${FAKE_VALKEY_SCAN_PATTERN:-*}"
+  printf 'DBSIZE : (integer) 3\n'
+  printf '\n[session:abc] type=string ttl=1800 秒\n'
+  printf '    "user-1"\n'
+  printf '\n[cart:1] type=hash ttl=無期限\n'
+  printf '    1) "item"\n'
+  printf '    2) "book"\n'
+  printf '\n=== 一覧ここまで ===\n'
+  exit 0
+fi
+
+# 代替シェル (valkey_shell_cli.sh) の実行。配置先のパスで判定する。
+if [ "${1:-}" = "exec" ] && fake_valkey_arg_ends_with /valkey_shell_cli.sh "$@"; then
+  fake_valkey_record "shell-cli $*"
+  if [ "${FAKE_VALKEY_SHELL_FAIL:-false}" = "true" ]; then
+    printf 'valkey へ接続できませんでした: valkey:6379\n' >&2
+    exit 3
+  fi
+  if [[ "$*" == *"--scan-dump"* ]]; then
+    printf '\n=== 登録内容の一覧 (SCAN MATCH %s COUNT 100) ===\n' "${FAKE_VALKEY_SCAN_PATTERN:-*}"
+    printf 'DB 0 のキー総数 : 3\n'
+    printf '\n["session:abc"] type=string ttl=1800 秒\n'
+    printf '    "user-1"\n'
+    printf '\n["cart:1"] type=hash ttl=無期限\n'
+    printf '    1) "item"\n'
+    printf '    2) "book"\n'
+    printf '\n列挙したキー : 2 件 (パターン: %s)\n' "${FAKE_VALKEY_SCAN_PATTERN:-*}"
+    exit 0
+  fi
+  if [[ " $* " == *" PING "* ]]; then
+    printf 'PONG\n'
+    exit 0
+  fi
+  printf 'fake valkey shell cli session\n'
+  exit 0
+fi
+
+# コンテナ同梱の valkey-cli を直接起動する経路
+if [ "${1:-}" = "exec" ] && fake_valkey_has_arg /usr/local/bin/valkey-cli "$@"; then
+  fake_valkey_record "cli-exec $*"
+  if [ "${FAKE_VALKEY_CLI_FAIL:-false}" = "true" ]; then
+    printf 'Could not connect to Valkey at valkey:6379: Connection refused\n' >&2
+    exit 1
+  fi
+  printf 'fake valkey-cli session (container)\n'
+  exit 0
+fi
+
+# 使い捨てコンテナ (docker run --network container:<id>) 経由の valkey-cli
+if [ "${1:-}" = "run" ] && fake_valkey_has_arg --network "$@"; then
+  fake_valkey_record "sidecar $*"
+  if [ "${FAKE_VALKEY_CLI_FAIL:-false}" = "true" ]; then
+    printf 'Could not connect to Valkey at 172.20.0.9:6379: Connection refused\n' >&2
+    exit 1
+  fi
+  printf 'fake valkey-cli session (sidecar)\n'
   exit 0
 fi
 

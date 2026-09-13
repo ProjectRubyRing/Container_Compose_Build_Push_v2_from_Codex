@@ -1667,6 +1667,8 @@ assert_occurrences "$logs_mode_output" "  3) healthcheck 設定・実行履歴�
 # root ユーザでの bash 接続は、追加操作の有無にかかわらず末尾の番号で選べる。
 assert_occurrences "$logs_mode_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)" 7
 assert_not_contains "$logs_mode_output" "MySQL クライアントへ接続 (SQL クエリを対話実行)"
+# valkey サーバーが起動していない構成では Valkey 操作も増えない。
+assert_not_contains "$logs_mode_output" "Valkey 操作"
 assert_occurrences "$logs_mode_output" "Compose サービスログ (サービス:" 1
 assert_contains "$logs_mode_output" "Compose サービスログ (サービス: db, 末尾 50/52 行 (指定上限: 50)):"
 assert_contains "$logs_mode_output" "DB003: companion service log"
@@ -1721,7 +1723,9 @@ assert_contains "$FAKE_USAGE_CHECK_CALLS" "--clean all --force"
 assert_not_contains "$logs_mode_output" "コンテナを残します (--keep-container)"
 assert_before "$logs_mode_output" "Compose サービスの対話操作を終了しました。" \
     "各ディレクトリのディスク空き容量"
-assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml ps --services" 3
+# サービス選択へ戻るたびに一覧を取り直す (3 回) のに加えて、valkey サーバーの
+# 自動検出が 1 度だけ起動中サービスを列挙する (結果は実行中ずっと使い回す)。
+assert_occurrences "$FAKE_DOCKER_CALLS" "compose -f compose.yml ps --services" 4
 assert_matches "$FAKE_DOCKER_CALLS" 'compose -f compose\.yml logs --no-color --since [^ ]+ db'
 assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash"
 assert_contains "$FAKE_DOCKER_CALLS" ".Config.Healthcheck.Test"
@@ -1984,6 +1988,487 @@ assert_contains "$mysql_failure_output" "MySQL 接続に失敗しました。サ
 assert_occurrences "$mysql_failure_output" "Compose サービス 'mysql80' で実行する操作を選択してください:" 2
 assert_contains "$mysql_failure_output" "Compose サービスの対話操作を終了しました。"
 assert_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+
+
+# ---- Valkey 操作 (valkey-cli と openssl 代替シェル) --------------------------
+# 指定値の誤りは接続前に弾く (調査の流れが止まらないようにする)。
+for valkey_bad_option in "--valkey-port 0" "--valkey-port 65536" "--valkey-port abc"; do
+  valkey_bad_output="$TEST_TMP/valkey-bad-option.out"
+  if (
+    cd "$REPO_ROOT"
+    # shellcheck disable=SC2086
+    bash ./build_and_verify.sh --dry-run $valkey_bad_option
+  ) >"$valkey_bad_output" 2>&1; then
+    cat "$valkey_bad_output" >&2
+    fail "invalid valkey option '$valkey_bad_option' unexpectedly returned zero"
+  fi
+  assert_matches "$valkey_bad_output" "--valkey-port には 1 から 65535 の範囲を指定してください"
+done
+
+valkey_empty_pattern_output="$TEST_TMP/valkey-empty-pattern.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --valkey-scan-pattern ""
+) >"$valkey_empty_pattern_output" 2>&1; then
+  cat "$valkey_empty_pattern_output" >&2
+  fail "empty --valkey-scan-pattern unexpectedly returned zero"
+fi
+assert_contains "$valkey_empty_pattern_output" \
+  "--valkey-scan-pattern にはパターンを指定してください (全件は * を指定します)"
+
+# DRY-RUN の案内にも Valkey 操作を含める (実行予定を読めるようにする)。
+valkey_dryrun_output="$TEST_TMP/valkey-dry-run.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --keep-container-mode logs
+) >"$valkey_dryrun_output" 2>&1; then
+  cat "$valkey_dryrun_output" >&2
+  fail "dry-run logs mode returned a non-zero status"
+fi
+assert_contains "$valkey_dryrun_output" \
+  "Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)"
+
+valkey_dryrun_bash_output="$TEST_TMP/valkey-dry-run-bash.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --keep-container-mode bash
+) >"$valkey_dryrun_bash_output" 2>&1; then
+  cat "$valkey_dryrun_bash_output" >&2
+  fail "dry-run bash mode returned a non-zero status"
+fi
+assert_contains "$valkey_dryrun_bash_output" \
+  "valkey サーバーが起動していれば valkey-cli / valkey-connect / valkey_shell_cli.sh も使える状態にし、セッション終了時に削除します"
+
+valkey_usage_output="$TEST_TMP/valkey-usage.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --help
+) >"$valkey_usage_output" 2>&1; then
+  cat "$valkey_usage_output" >&2
+  fail "--help returned a non-zero status"
+fi
+assert_contains "$valkey_usage_output" "Valkey (Redis 互換) の操作・登録内容の確認:"
+assert_contains "$valkey_usage_output" "  --valkey-service NAME    valkey サーバーの Compose サービス名を明示する。"
+assert_contains "$valkey_usage_output" "  --print-valkey-shell-cli valkey-cli の代替シェル (valkey_shell_cli.sh) を標準出力へ"
+
+# 代替シェル単体が壊れていないこと。コンテナへ配るのと同じファイルなので、
+# ここが通らなければ以降の確認はすべて意味を持たない。
+bash -n "$REPO_ROOT/tools/valkey_shell_cli.sh" \
+  || fail "tools/valkey_shell_cli.sh has a syntax error"
+
+valkey_shell_help="$TEST_TMP/valkey-shell-help.out"
+if ! bash "$REPO_ROOT/tools/valkey_shell_cli.sh" --help >"$valkey_shell_help" 2>&1; then
+  cat "$valkey_shell_help" >&2
+  fail "valkey_shell_cli.sh --help returned a non-zero status"
+fi
+assert_contains "$valkey_shell_help" "使い方: valkey_shell_cli.sh"
+assert_contains "$valkey_shell_help" "--scan-dump [PATTERN]"
+assert_contains "$valkey_shell_help" "--show-commands"
+
+valkey_shell_commands="$TEST_TMP/valkey-shell-commands.out"
+if ! bash "$REPO_ROOT/tools/valkey_shell_cli.sh" -h valkey -p 6379 --show-commands \
+    >"$valkey_shell_commands" 2>&1; then
+  cat "$valkey_shell_commands" >&2
+  fail "valkey_shell_cli.sh --show-commands returned a non-zero status"
+fi
+assert_contains "$valkey_shell_commands" "=== valkey-cli が無いときの代替手順 (接続先: valkey:6379) ==="
+assert_contains "$valkey_shell_commands" "printf 'PING\r\n' | openssl s_client -quiet -connect valkey:6379"
+assert_contains "$valkey_shell_commands" "exec 3<>/dev/tcp/valkey/6379"
+assert_contains "$valkey_shell_commands" "printf 'SCAN 0 MATCH * COUNT 100\r\n' >&3"
+
+# 使い方の誤りと接続できない場合の終了コードを分ける (呼び出し側の判定に使う)。
+if bash "$REPO_ROOT/tools/valkey_shell_cli.sh" --nonexistent-option >/dev/null 2>&1; then
+  fail "valkey_shell_cli.sh accepted an unknown option"
+else
+  [ "$?" -eq 2 ] || fail "valkey_shell_cli.sh should exit 2 for an unknown option"
+fi
+
+# build_and_verify.sh に埋め込んだ代替シェルと、リポジトリのファイルが同一であること。
+# (埋め込みだけ直して tools/ を直し忘れる、あるいはその逆を防ぐ)
+valkey_shell_printed="$TEST_TMP/valkey-shell-printed.sh"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --print-valkey-shell-cli
+) >"$valkey_shell_printed" 2>&1; then
+  cat "$valkey_shell_printed" >&2
+  fail "--print-valkey-shell-cli returned a non-zero status"
+fi
+sed 's/\r$//' "$REPO_ROOT/tools/valkey_shell_cli.sh" > "$TEST_TMP/valkey-shell-source.sh"
+sed 's/\r$//' "$valkey_shell_printed" > "$TEST_TMP/valkey-shell-printed-normalized.sh"
+diff -q "$TEST_TMP/valkey-shell-source.sh" "$TEST_TMP/valkey-shell-printed-normalized.sh" >/dev/null \
+  || fail "--print-valkey-shell-cli differs from tools/valkey_shell_cli.sh"
+bash -n "$valkey_shell_printed" || fail "--print-valkey-shell-cli output has a syntax error"
+
+# valkey-cli を持たないコンテナ (UBI9 ベースの想定) から操作する経路。
+# 同梱クライアントが無いので、使い捨てコンテナと代替シェルの双方を確かめる。
+valkey_menu_output="$TEST_TMP/keep-mode-valkey-menu.out"
+valkey_calls="$TEST_TMP/valkey.calls"
+valkey_script_capture="$TEST_TMP/valkey-delivered-script.sh"
+valkey_config_capture="$TEST_TMP/valkey-delivered-config.txt"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_COMPOSE_PS_SERVICES="app valkey cacheapp"
+export FAKE_VALKEY_SERVER_CONTAINERS="cid-valkey"
+export FAKE_VALKEY_CLI_CONTAINERS="cid-valkey cid-cacheapp"
+export FAKE_VALKEY_CALLS="$valkey_calls"
+export FAKE_VALKEY_SCRIPT_CAPTURE="$valkey_script_capture"
+export FAKE_VALKEY_CONFIG_CAPTURE="$valkey_config_capture"
+export FAKE_VALKEY_PASSWORD="do-not-log-this-valkey-password"
+if ! printf '1\n5\n1\n2\n\n3\n4\n\n5\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_menu_output" 2>&1; then
+  cat "$valkey_menu_output" >&2
+  fail "Valkey interactive helper returned a non-zero status"
+fi
+
+# メニューは root bash の後ろ (5 番) に増え、既存操作の番号を動かさない。
+assert_contains "$valkey_menu_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+assert_contains "$valkey_menu_output" \
+  "  5) Valkey 操作 (valkey-cli / openssl 代替シェルでキー一覧・値・TTL を確認)"
+assert_contains "$valkey_menu_output" "Valkey 操作 (実行元 service=app, container=test-app-1)"
+assert_contains "$valkey_menu_output" "接続先サービス   : valkey"
+assert_contains "$valkey_menu_output" "接続先           : valkey:6379"
+assert_contains "$valkey_menu_output" "名前解決         : valkey -> 172.20.0.9 (実行元コンテナから解決)"
+assert_contains "$valkey_menu_output" "同梱クライアント : なし (UBI9 ベース等。導入すると検証対象が変わるため入れません)"
+assert_contains "$valkey_menu_output" \
+  "認証             : あり (環境変数 VALKEY_PASSWORD から取得。画面・レポートへは出しません)"
+# パスワードそのものは画面にもレポートにも出さない。
+assert_not_contains "$valkey_menu_output" "do-not-log-this-valkey-password"
+
+# (1) valkey-cli の対話接続は、確認対象コンテナのネットワーク名前空間を借りる
+#     使い捨てコンテナで行う (確認対象コンテナには何も入れない)。
+assert_contains "$valkey_menu_output" "使用するクライアント: valkey サービスのイメージから起動する使い捨てコンテナ"
+assert_contains "$valkey_menu_output" \
+  "  (--network container:test-app-1 で test-app-1 のネットワーク名前空間を共有します。"
+assert_contains "$valkey_menu_output" "fake valkey-cli session (sidecar)"
+assert_contains "$valkey_calls" \
+  "sidecar run --rm -it --network container:cid-app -e REDISCLI_AUTH valkey/valkey:8.1-alpine valkey-cli -h 172.20.0.9 -p 6379"
+# (2) valkey-cli による登録内容の一覧
+assert_contains "$valkey_menu_output" "=== 登録内容の一覧 (valkey-cli --scan --pattern *) ==="
+assert_contains "$valkey_menu_output" "[session:abc] type=string ttl=1800 秒"
+# (3)(4) 代替シェルは一時ディレクトリへ置いて実行し、必ず消す
+assert_matches "$valkey_menu_output" \
+  "代替シェルを /tmp/\.build_and_verify_valkey\.[0-9]+/valkey_shell_cli\.sh へ配置しました \(終了時に削除します\)。"
+assert_contains "$valkey_menu_output" \
+  "コンテナへ valkey-cli をインストールしていません。"
+assert_contains "$valkey_menu_output" "=== 登録内容の一覧 (SCAN MATCH * COUNT 100) ==="
+assert_contains "$valkey_menu_output" '["session:abc"] type=string ttl=1800 秒'
+assert_matches "$valkey_menu_output" "配置した代替シェルと接続設定を削除しました: /tmp/\.build_and_verify_valkey\.[0-9]+"
+# (5) 疎通確認と手順の案内
+assert_contains "$valkey_menu_output" "[疎通確認 (実行元: test-app-1)]"
+assert_contains "$valkey_menu_output" "PING     : OK (PONG)"
+assert_contains "$valkey_menu_output" "[手で叩く場合のコマンド]"
+assert_contains "$valkey_menu_output" \
+  "  # このコンテナに valkey-cli は入っていない (入れると検証対象が変わるため入れない)"
+assert_contains "$valkey_menu_output" "    <valkey のイメージ> valkey-cli -h 172.20.0.9 -p 6379 PING"
+assert_contains "$valkey_menu_output" "  printf 'PING\r\n' | openssl s_client -quiet -connect valkey:6379"
+assert_contains "$valkey_menu_output" \
+  "  exec 3<>/dev/tcp/valkey/6379; printf 'PING\r\n' >&3; head -c 7 <&3"
+assert_contains "$valkey_menu_output" \
+  "   スクリプト単体を取り出すには build_and_verify.sh --print-valkey-shell-cli)"
+
+# 配置と削除は必ず対になる (パスワードを含む設定ファイルを残さない)。
+valkey_install_count="$({ grep -c '^install ' "$valkey_calls" || true; } | tr -d '[:space:]')"
+valkey_cleanup_count="$({ grep -c '^cleanup ' "$valkey_calls" || true; } | tr -d '[:space:]')"
+[ "$valkey_install_count" -ge 3 ] \
+  || fail "expected the valkey shell helper to be installed at least 3 times, got $valkey_install_count"
+[ "$valkey_install_count" = "$valkey_cleanup_count" ] \
+  || fail "valkey helper install ($valkey_install_count) and cleanup ($valkey_cleanup_count) counts differ"
+
+# コンテナへ渡した代替シェルは tools/valkey_shell_cli.sh と同一で、構文も通ること。
+sed 's/\r$//' "$valkey_script_capture" > "$TEST_TMP/valkey-delivered-normalized.sh"
+diff -q "$TEST_TMP/valkey-shell-source.sh" "$TEST_TMP/valkey-delivered-normalized.sh" >/dev/null \
+  || fail "the script delivered into the container differs from tools/valkey_shell_cli.sh"
+bash -n "$valkey_script_capture" || fail "the delivered valkey shell helper has a syntax error"
+# 接続設定はファイル経由でのみ渡す (docker の引数には出さない)。
+assert_contains "$valkey_config_capture" "host=valkey"
+assert_contains "$valkey_config_capture" "port=6379"
+assert_contains "$valkey_config_capture" "password=do-not-log-this-valkey-password"
+assert_not_contains "$FAKE_DOCKER_CALLS" "do-not-log-this-valkey-password"
+
+# 同梱の valkey-cli を持つコンテナからは、そのまま docker exec で使う。
+valkey_bundled_output="$TEST_TMP/keep-mode-valkey-bundled.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+if ! printf '3\n5\n1\n2\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_bundled_output" 2>&1; then
+  cat "$valkey_bundled_output" >&2
+  fail "bundled valkey-cli scenario returned a non-zero status"
+fi
+assert_contains "$valkey_bundled_output" "Valkey 操作 (実行元 service=cacheapp, container=test-cacheapp-1)"
+assert_contains "$valkey_bundled_output" "同梱クライアント : valkey-cli (/usr/local/bin/valkey-cli)"
+assert_contains "$valkey_bundled_output" "使用するクライアント: コンテナ同梱の valkey-cli (/usr/local/bin/valkey-cli)"
+assert_contains "$valkey_bundled_output" "fake valkey-cli session (container)"
+# パスワードは引数ではなく REDISCLI_AUTH 環境変数で渡す。
+assert_contains "$valkey_calls" \
+  "cli-exec exec -it -e REDISCLI_AUTH cid-cacheapp /usr/local/bin/valkey-cli -h valkey -p 6379"
+assert_not_contains "$FAKE_DOCKER_CALLS" "do-not-log-this-valkey-password"
+
+# bash 接続でも同じコマンドを使える状態でセッションを始め、終了時に片付ける。
+valkey_bash_output="$TEST_TMP/keep-mode-valkey-bash.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+if ! printf '1\n2\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_bash_output" 2>&1; then
+  cat "$valkey_bash_output" >&2
+  fail "valkey-enabled bash session returned a non-zero status"
+fi
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it -e BV_VALKEY_DIR=/tmp/.build_and_verify_valkey."
+assert_contains "$FAKE_DOCKER_CALLS" "-e BV_VALKEY_HINT=valkey 操作が可能です: valkey-cli と valkey-connect"
+# ラッパーを介さず valkey_shell_cli.sh を直に叩いたときも接続先が効くようにする。
+assert_contains "$FAKE_DOCKER_CALLS" "-e VALKEY_SHELL_CLI_CONFIG=/tmp/.build_and_verify_valkey."
+assert_contains "$valkey_calls" "install cid-app"
+assert_contains "$valkey_calls" "cleanup cid-app"
+
+# --valkey-service / --valkey-port / --valkey-scan-pattern / --valkey-tls の反映
+valkey_options_output="$TEST_TMP/keep-mode-valkey-options.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+if ! printf '1\n5\n4\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --valkey-service valkey \
+    --valkey-port 6380 \
+    --valkey-tls \
+    --valkey-scan-pattern 'session:*' \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_options_output" 2>&1; then
+  cat "$valkey_options_output" >&2
+  fail "valkey option scenario returned a non-zero status"
+fi
+assert_contains "$valkey_options_output" "接続先           : valkey:6380"
+assert_contains "$valkey_options_output" "通信             : TLS"
+assert_contains "$valkey_options_output" "登録内容を一覧します (パターン: session:*)。"
+assert_contains "$valkey_config_capture" "port=6380"
+assert_contains "$valkey_config_capture" "tls=true"
+
+# TLS 専用の valkey (平文は port 0 で無効、tls-port だけ開ける) を自動検出する。
+# port 0 を接続先として採用してしまうと、どのクライアントでもつながらなくなる。
+valkey_tlsonly_output="$TEST_TMP/keep-mode-valkey-tls-only.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_PORT="0"
+export FAKE_VALKEY_TLS_PORT="6380"
+if ! printf '1\n5\n4\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_tlsonly_output" 2>&1; then
+  unset FAKE_VALKEY_PORT FAKE_VALKEY_TLS_PORT
+  cat "$valkey_tlsonly_output" >&2
+  fail "TLS-only valkey scenario returned a non-zero status"
+fi
+unset FAKE_VALKEY_PORT FAKE_VALKEY_TLS_PORT
+assert_contains "$valkey_tlsonly_output" "接続先           : valkey:6380"
+assert_contains "$valkey_tlsonly_output" \
+  "通信             : TLS (openssl s_client。サーバー証明書の検証は行いません)"
+assert_not_contains "$valkey_tlsonly_output" "接続先           : valkey:0"
+assert_contains "$valkey_config_capture" "port=6380"
+assert_contains "$valkey_config_capture" "tls=true"
+
+# --no-valkey-tls を明示したときは、tls-port があっても平文の port を使う。
+valkey_forceplain_output="$TEST_TMP/keep-mode-valkey-force-plain.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_PORT="6379"
+export FAKE_VALKEY_TLS_PORT="6380"
+if ! printf '1\n5\n4\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --no-valkey-tls \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_forceplain_output" 2>&1; then
+  unset FAKE_VALKEY_PORT FAKE_VALKEY_TLS_PORT
+  cat "$valkey_forceplain_output" >&2
+  fail "forced plaintext valkey scenario returned a non-zero status"
+fi
+unset FAKE_VALKEY_PORT FAKE_VALKEY_TLS_PORT
+assert_contains "$valkey_forceplain_output" "接続先           : valkey:6379"
+assert_contains "$valkey_forceplain_output" "通信             : 平文 (--no-valkey-tls の指定)"
+assert_contains "$valkey_config_capture" "tls=false"
+
+# 失敗しても操作メニューへ戻り、後始末 (配置した代替シェルの削除) は行う。
+valkey_failure_output="$TEST_TMP/keep-mode-valkey-failure.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_CLI_FAIL="true"
+export FAKE_VALKEY_SHELL_FAIL="true"
+if ! printf '1\n5\n1\n4\n\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_failure_output" 2>&1; then
+  unset FAKE_VALKEY_CLI_FAIL FAKE_VALKEY_SHELL_FAIL
+  cat "$valkey_failure_output" >&2
+  fail "failed valkey scenario did not return to the action menu"
+fi
+unset FAKE_VALKEY_CLI_FAIL FAKE_VALKEY_SHELL_FAIL
+assert_contains "$valkey_failure_output" "valkey-cli での対話接続に失敗しました。Valkey 操作の選択へ戻ります。"
+assert_contains "$valkey_failure_output" "代替シェルでの登録内容の一覧に失敗しました。Valkey 操作の選択へ戻ります。"
+assert_matches "$valkey_failure_output" "配置した代替シェルと接続設定を削除しました: /tmp/\.build_and_verify_valkey\.[0-9]+"
+assert_contains "$valkey_calls" "cleanup cid-app"
+
+# 名前解決できないコンテナからは、使い捨てコンテナを使えないことを理由付きで伝える。
+valkey_resolve_output="$TEST_TMP/keep-mode-valkey-resolve.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_RESOLVE_FAIL="true"
+if ! printf '1\n5\n1\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_resolve_output" 2>&1; then
+  unset FAKE_VALKEY_RESOLVE_FAIL
+  cat "$valkey_resolve_output" >&2
+  fail "valkey name resolution failure scenario returned a non-zero status"
+fi
+unset FAKE_VALKEY_RESOLVE_FAIL
+# コンテナからは引けないが Docker は IP を知っている場合は、代用したことを明示する。
+assert_contains "$valkey_resolve_output" \
+  "名前解決         : valkey -> 172.20.0.2 (実行元コンテナでは引けず、Docker が持つ IP で代用)"
+assert_contains "$valkey_resolve_output" \
+  "実行元コンテナから valkey を名前解決できません。compose のネットワーク定義とサービス名を確認してください。"
+assert_contains "$valkey_resolve_output" "fake valkey-cli session (sidecar)"
+
+# どちらからも分からない場合は、使い捨てコンテナを使えない理由を伝えて代替シェルへ誘導する。
+valkey_noaddr_output="$TEST_TMP/keep-mode-valkey-noaddr.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_RESOLVE_FAIL="true"
+export FAKE_VALKEY_INSPECT_IP_FAIL="true"
+if ! printf '1\n5\n1\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_noaddr_output" 2>&1; then
+  unset FAKE_VALKEY_RESOLVE_FAIL FAKE_VALKEY_INSPECT_IP_FAIL
+  cat "$valkey_noaddr_output" >&2
+  fail "valkey address-unavailable scenario returned a non-zero status"
+fi
+unset FAKE_VALKEY_RESOLVE_FAIL FAKE_VALKEY_INSPECT_IP_FAIL
+assert_contains "$valkey_noaddr_output" \
+  "名前解決         : 解決できませんでした (実行元コンテナから valkey を引けない)"
+assert_contains "$valkey_noaddr_output" \
+  "実行元コンテナから valkey を名前解決できないため、使い捨てコンテナでの valkey-cli を実行できません。"
+assert_contains "$valkey_noaddr_output" "  → 代替シェル (3 / 4) を使うか、compose のネットワーク定義を確認してください。"
+
+# 代替シェルを置けないコンテナでは、その旨を伝えて valkey-cli 側へ誘導する。
+valkey_noshell_output="$TEST_TMP/keep-mode-valkey-noshell.out"
+: > "$FAKE_DOCKER_CALLS"
+: > "$valkey_calls"
+export FAKE_VALKEY_NO_BASH_CONTAINERS="cid-app"
+if ! printf '1\n5\n3\n0\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,valkey,cacheapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_noshell_output" 2>&1; then
+  unset FAKE_VALKEY_NO_BASH_CONTAINERS
+  cat "$valkey_noshell_output" >&2
+  fail "valkey shell-unavailable scenario returned a non-zero status"
+fi
+unset FAKE_VALKEY_NO_BASH_CONTAINERS
+assert_contains "$valkey_noshell_output" \
+  "代替シェルの動作条件 (bash 4 以上) を満たすコンテナではありません: test-app-1"
+assert_contains "$valkey_noshell_output" \
+  "  → valkey-cli を使う操作 (1 / 2) か、bash を持つ別サービスから確認してください。"
+
+unset FAKE_COMPOSE_PS_SERVICES FAKE_VALKEY_SERVER_CONTAINERS FAKE_VALKEY_CLI_CONTAINERS \
+  FAKE_VALKEY_CALLS FAKE_VALKEY_SCRIPT_CAPTURE FAKE_VALKEY_CONFIG_CAPTURE FAKE_VALKEY_PASSWORD
+
+# valkey サービスが起動していない構成では、メニューも配置も一切増えない。
+valkey_absent_output="$TEST_TMP/keep-mode-valkey-absent.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app db"
+if ! printf '1\n2\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,db \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$valkey_absent_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$valkey_absent_output" >&2
+  fail "valkey-less scenario returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_not_contains "$valkey_absent_output" "Valkey 操作"
+assert_contains "$valkey_absent_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+assert_contains "$valkey_absent_output" "選択番号 [0-4]: "
+assert_contains "$FAKE_DOCKER_CALLS" "exec -it cid-app /bin/bash -c"
+assert_not_contains "$FAKE_DOCKER_CALLS" "-e BV_VALKEY_DIR="
+assert_not_contains "$FAKE_DOCKER_CALLS" "valkey-tools-install"
 
 cert_check_output="$TEST_TMP/keep-mode-cert-check.out"
 cert_check_reports="$TEST_TMP/cert-check-reports"

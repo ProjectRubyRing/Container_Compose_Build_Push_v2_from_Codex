@@ -19,6 +19,15 @@
 > - [scripts_reference.xlsx](docs/scripts_reference.xlsx) — 3 スクリプトを横断して一覧化した
 >   Excel 資料 (全 9 シート。`08_JVM_OTel設定` に JVM パラメータの分類と
 >   OpenTelemetry 環境変数の特定条件をまとめています)。こちらも同じ md から生成します
+>
+> **付属ツール**
+>
+> - [tools/valkey_shell_cli.sh](tools/valkey_shell_cli.sh) — `valkey-cli` が使えない環境で
+>   valkey (Redis 互換) を操作・確認するための代替シェルです。`openssl` (TLS) と bash の
+>   `/dev/tcp` (平文) だけで RESP を喋るため、コンテナへパッケージを追加せずに使えます。
+>   `build_and_verify.sh` が `--keep-container-mode logs` の「Valkey 操作」と bash 接続で
+>   使うものと同一で、`build_and_verify.sh --print-valkey-shell-cli` でも取り出せます
+>   (→ [Valkey の操作と登録内容の確認](#valkey-の操作と登録内容の確認valkey-cli--openssl-代替シェル))。
 
 ### Excel 版ガイド (`docs/*_guide.xlsx`)
 
@@ -200,7 +209,12 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド)、valkey / redis サーバーのサービスがあれば Valkey 操作 (選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは使い捨てコンテナか `openssl` / bash の代替シェルを使い、確認対象コンテナへはインストールしない) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--valkey-service NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作 (`--keep-container-mode logs` の操作) の接続先となる valkey サーバーの Compose サービス名。未指定時は起動中サービスを順に調べ、`valkey-server` / `redis-server` を持つコンテナのサービスを自動検出する | (自動検出) |
+| `--valkey-port PORT` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の接続先ポート (コンテナ側)。未指定時は valkey コンテナの環境変数・`valkey.conf` / `redis.conf`・起動コマンドから検出する | (自動検出。既定 `6379`) |
+| `--valkey-tls` / `--no-valkey-tls` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の通信を TLS (`openssl s_client`) か平文 (bash の `/dev/tcp`) に固定する | (自動判定) |
+| `--valkey-scan-pattern P` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の「登録内容の一覧」で使う SCAN のパターン | `*` |
+| `--print-valkey-shell-cli` | **`build_and_verify.sh` のみ**。`valkey-cli` の代替シェル (`tools/valkey_shell_cli.sh` と同一) を標準出力へ書き出して終了する。`valkey-cli` が使えない環境でどのコマンドで代替できるかを確かめるために使う | — |
 | `--keep-container-after-interaction` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。`--keep-container-mode logs` の対話操作をすべて終えても、既定の完全クリーンアップ (compose down → `docker-usage-check.sh --clean all --force` → 空き容量の一覧) を行わず、従来どおりコンテナを残す。`--keep-container` を明示した場合も同じ扱い | `false` |
 | `--remove-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。この実行が行うすべての `compose down` に `--volumes` を付け、Compose プロジェクトの名前付きボリュームも毎回削除する | `false` |
 | `--keep-volumes` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。対話操作の終了後の後始末でもボリュームを削除しない (従来の動作)。DB のデータを実行間で引き継ぎたい場合に指定する | `false` |
@@ -2415,6 +2429,8 @@ CloudWatch Logs には届きません。
   確認（ステータスコード / 成功失敗判定）・JBoss モジュール一覧（`module-info` が `success`
   となったモジュール名と jar ファイル名）・トラストストア一覧（JBoss EAP 上の Java アプリから
   有効になっているトラストストアと、そこに登録された証明書の棚卸し）が追加されます。
+  valkey / redis サーバーの Compose サービスが起動していれば、**どのサービスからでも**
+  `Valkey 操作` を選べます（→ [Valkey の操作と登録内容の確認](#valkey-の操作と登録内容の確認valkey-cli--openssl-代替シェル)）。
   **最後の操作番号**には、どのサービスでも選べる `root ユーザで bash へ接続` が並びます。
   `2` と同じ対話 bash を `docker exec -u 0:0` で開くため、コンテナの既定ユーザーが
   非 root（JBoss EAP の `jboss` ユーザー等）で権限不足になるファイル参照やパッケージ導入も
@@ -3091,6 +3107,161 @@ compose 側で増やせば表示対象も自動で増えます。
 Compose サービス名や、EFS を初期化する `uid:gid` を変えている場合は、スクリプト冒頭の
 `BATCH_MOCK_SERVICE`（既定 `batch-mock`）と `BATCH_MOCK_EFS_UID_GID`（既定 `6301:6302`）を
 合わせてください。
+
+### Valkey の操作と登録内容の確認（valkey-cli / openssl 代替シェル）
+
+ElastiCache (Valkey) を使う構成では、セッションやキャッシュが
+**「`frontend` / `backend` から見て」本当に書けている / 読めているか**を確かめたくなります。
+ところが `frontend` / `backend` の **UBI9.8 ベースイメージに `valkey-cli` は同梱されておらず**、
+`dnf` で入れてしまうと**テスト対象のコンテナそのものが変わり、検証の前提が崩れます**。
+
+そこで `logs` モードでは、**確認対象コンテナへパッケージを一切追加せずに** valkey を操作できる
+2 通りを用意しています。valkey / redis サーバーのサービスが起動していれば、
+どのサービスを選んでもサービス操作メニューの**末尾**（`root ユーザで bash へ接続` の次）に
+`Valkey 操作` が並びます。
+
+| | 使うもの | 確認対象コンテナへの影響 |
+|---|---|---|
+| **(A) `valkey-cli`** | コンテナに同梱されていればそれを `docker exec` で使う。無ければ **valkey サービスのイメージから使い捨てコンテナ**を起動し、`--network container:<確認対象>` で**ネットワーク名前空間だけ**を共有して実行する | **なし**（使い捨てコンテナは `--rm`。確認対象コンテナには 1 バイトも書き込まない） |
+| **(B) 代替シェル** | `openssl`（TLS）と bash の `/dev/tcp`（平文）だけで RESP を喋る `valkey_shell_cli.sh` を `/tmp` の専用ディレクトリへ置いて実行する | 一時ディレクトリのみ。**セッション終了時に必ず削除** |
+
+(A) の使い捨てコンテナは確認対象コンテナのネットワーク名前空間を共有するため、
+**名前解決・経路・送信元アドレスが確認対象コンテナと同じ**になります。
+「`frontend` から `valkey` へ届くか」をそのまま確かめられます。
+
+```
+Valkey 操作を選択してください:
+  1) valkey-cli で対話接続 (コマンドを打ちながら確認する)
+  2) valkey-cli で登録内容を一覧 (SCAN + TYPE / TTL / 値)
+  3) 代替シェルで対話接続 (openssl / bash だけで RESP を喋る)
+  4) 代替シェルで登録内容を一覧 (valkey-cli が無くても同じ確認ができる)
+  5) 疎通確認と、手で叩く場合のコマンドを表示
+  0) サービス操作の選択へ戻る
+```
+
+選択前に、接続先・名前解決の結果・TLS の判定・認証の有無・同梱クライアントの有無を表示します。
+
+```
+════════════════════════════════════════════════════════
+Valkey 操作 (実行元 service=backend, container=test-backend-1)
+════════════════════════════════════════════════════════
+接続先サービス   : valkey
+接続先           : valkey:6379
+名前解決         : valkey -> 172.20.0.9 (実行元コンテナから解決)
+通信             : 自動判定 (平文で試し、駄目なら TLS)
+認証             : あり (環境変数 VALKEY_PASSWORD から取得。画面・レポートへは出しません)
+同梱クライアント : なし (UBI9 ベース等。導入すると検証対象が変わるため入れません)
+```
+
+`2` / `4` の一覧は、SCAN でキーを列挙して型・TTL・値まで表示します
+（パターンは `--valkey-scan-pattern`、既定は `*`）。
+
+```
+=== 登録内容の一覧 (SCAN MATCH * COUNT 100) ===
+DB 0 のキー総数 : 5
+
+["greeting"] type=string ttl=無期限
+    "hello world"
+
+["session:abc"] type=string ttl=1792 秒
+    "user-1"
+
+["cart:1"] type=hash ttl=無期限
+    1) "item"
+    2) "book"
+```
+
+#### 接続先の自動検出
+
+| 項目 | 検出元（上から順に見る） |
+|------|--------------------------|
+| サービス | `--valkey-service` → 起動中サービスのうち `valkey-server` / `redis-server` を持つコンテナ |
+| ホスト | Compose サービス名（compose のネットワークで名前解決できる） |
+| ポート | `--valkey-port` → 環境変数 `VALKEY_PORT` / `REDIS_PORT` → `valkey.conf` / `redis.conf` の `port` / `tls-port` → 起動コマンドの `--port` → `6379` |
+| TLS | `--valkey-tls` / `--no-valkey-tls` → `tls-port` の検出結果 → 自動判定（平文で試し、駄目なら TLS） |
+| パスワード | 環境変数 `VALKEY_PASSWORD` / `REDIS_PASSWORD` / `VALKEY_REQUIREPASS` / `REQUIREPASS` → `*_PASSWORD_FILE` → 設定ファイルの `requirepass` → 起動コマンドの `--requirepass` |
+
+**パスワードは画面にも全量レポートにも出しません。** コンテナ内の 600 の設定ファイル経由か、
+`REDISCLI_AUTH` 環境変数でだけ渡します（`docker` の引数にも載せないため、`ps` からも見えません）。
+
+> TLS で接続する場合、**サーバー証明書の検証は行いません**（`openssl s_client` を
+> 検証なしで使い、`valkey_shell_cli.sh` へは `insecure=true` を渡します）。
+> ここで確かめたいのは「登録内容を読めるか」であり、証明書そのものの妥当性は
+> 別機能の**証明書チェック**が担当します。代替シェルを直接使う場合は
+> `--cacert` を付ければ検証します（`--insecure` を外すと検証が有効になります）。
+
+#### bash 接続の中からもそのまま使える
+
+`2` の `bash へ接続`（`root ユーザで bash へ接続` も同じ）でも、valkey サービスが起動していれば
+接続の直前に次のコマンドを `PATH` の先頭へ用意してからセッションを始めます。
+`tree` と同じ仕組みで、**セッション終了時に必ず削除**します。
+
+| コマンド | 中身 |
+|----------|------|
+| `valkey-connect` | 接続先・認証を埋め込んだラッパー。同梱の `valkey-cli` があればそれを、無ければ代替シェルを呼ぶ |
+| `valkey-cli` | **コンテナに同梱されていない場合だけ**用意する代替シェルの別名（元から入っているコマンドは隠さない） |
+| `valkey_shell_cli.sh` | 代替シェルの実体（`--help` / `--show-commands` / `--scan-dump` が使える） |
+
+```
+valkey 操作が可能です: valkey-cli と valkey-connect (どちらも openssl / bash による代替シェル。
+接続先 valkey:6379 は設定済み)。例: valkey-cli PING / valkey-cli --scan-dump '*' /
+valkey_shell_cli.sh --show-commands
+```
+
+#### 代替シェル `tools/valkey_shell_cli.sh`
+
+「**valkey-cli が使えないとき、どのコマンドで代替できるか**」を確かめるためのものです。
+`build_and_verify.sh --print-valkey-shell-cli` で同じ内容を取り出せます
+（リポジトリの `tools/valkey_shell_cli.sh` と同一で、テストで一致を検査しています）。
+ホスト側でも単体で実行できます。
+
+```bash
+tools/valkey_shell_cli.sh --help                       # 使い方
+tools/valkey_shell_cli.sh -h valkey --show-commands    # openssl / bash による手動の代替手順
+tools/valkey_shell_cli.sh -h valkey -p 6379            # 対話モード
+tools/valkey_shell_cli.sh -h valkey GET mykey          # 1 コマンド実行
+tools/valkey_shell_cli.sh -h valkey --scan-dump '*'    # キー・型・TTL・値の一覧
+tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
+```
+
+| できること | 備考 |
+|------------|------|
+| 1 コマンド実行 / 対話モード | 引数にコマンドを渡せば 1 回実行、渡さなければ REPL |
+| 登録内容の一覧 | `--scan-dump 'session:*'` で SCAN → 型 → TTL → 値まで表示 |
+| TLS | `--tls` で `openssl s_client`、`--cacert` / `--insecure` / `--cert` / `--key` / `--sni` |
+| 平文 | `--no-tls` で bash の `/dev/tcp`（追加コマンド不要） |
+| 認証 | `-a` / `--auth-file` / `--user` / 環境変数 `VALKEY_PASSWORD` / `--config` |
+| 手動の代替手順の表示 | `--show-commands` |
+
+終了コードは `0` 正常、`1` サーバーがエラー応答、`2` 使い方の誤り、`3` 接続できない、
+`4` 実行環境が足りない（bash 4 未満など）です。
+
+#### スクリプトすら使えないときの手順（`--show-commands`）
+
+valkey は RESP の **inline command**（コマンド行 + CRLF）を受け付けるため、
+TCP へ文字列を流し込めるものなら何でもクライアントの代わりになります。
+
+```bash
+# TLS のとき（openssl s_client を RESP のクライアントとして使う）
+printf 'PING\r\n' | openssl s_client -quiet -connect valkey:6379
+
+# 認証・DB 選択・キー一覧をまとめて送る（パイプラインで順に応答が返る）
+printf 'AUTH <password>\r\nSELECT 0\r\nKEYS *\r\n' \
+  | openssl s_client -quiet -connect valkey:6379
+
+# 平文のとき（bash の /dev/tcp。追加コマンドが一切要らない）
+exec 3<>/dev/tcp/valkey/6379
+printf 'PING\r\n' >&3
+head -c 7 <&3                 # +PONG\r\n が返る
+printf 'SCAN 0 MATCH * COUNT 100\r\nDBSIZE\r\nINFO keyspace\r\n' >&3
+timeout 2 cat <&3
+
+# 値にスペースや改行が含まれる場合は RESP の multibulk で送る
+printf '*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n' >&3
+```
+
+> `openssl s_client` は必ず TLS ハンドシェイクを行うため、**平文の valkey には使えません**
+> （`wrong version number` になります）。平文は `/dev/tcp` か `nc` / `socat` を使ってください。
 
 ### bash を持たないコンテナへの接続（`/bin/sh` への自動切り替え）
 
