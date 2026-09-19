@@ -425,6 +425,9 @@ arg_takes_value() {
     --ecs-server-log|--ecs-circuit-breaker-text) return 0 ;;
     --ecs-circuit-breaker-watch-timeout) return 0 ;;
     --cert-check-text) return 0 ;;
+    --jmeter-service|--jmeter-profile|--jmeter-report-dir|--jmeter-plan) return 0 ;;
+    --jmeter-threads|--jmeter-rampup|--jmeter-loops) return 0 ;;
+    --jmeter-target|--jmeter-duration) return 0 ;;
     --trace-report-dir|--trace-report-format) return 0 ;;
     --trace-report-limit|--trace-report-lookback) return 0 ;;
     --cwagent-service|--cwagent-config-dir|--cwagent-delivery-target) return 0 ;;

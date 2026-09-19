@@ -181,6 +181,7 @@
 | `--keep-container-after-interaction` | フラグ | `false` | 対話操作をすべて終えても完全クリーンアップを行わず、従来どおりコンテナを残す |
 | (操作) Valkey 操作 | — | — | `logs` モードの操作。valkey / redis サーバーのサービスが起動していれば、**どのサービスからでも**選べる。選んだサービスのコンテナから valkey へ接続し、対話接続・登録内容の一覧 (SCAN → 型 / TTL / 値)・疎通確認を行う。クライアントは (A) コンテナ同梱の `valkey-cli`、無ければ valkey のイメージから起動する使い捨てコンテナ (`docker run --rm --network container:<確認対象>`)、(B) `openssl` と bash の `/dev/tcp` だけで RESP を喋る代替シェル `valkey_shell_cli.sh` の 2 通り。**確認対象コンテナへ valkey-cli をインストールすることはない** |
 | (操作) EFS マウント伝播確認 | — | — | `logs` モードの操作。偽装バッチサーバー (`batch-mock`) から EFS へファイル・相対シンボリックリンクを作成 → 書き換え → 削除し、同じ EFS をマウントする全コンテナへ反映されるかを確認する。偽装サービス名は `BATCH_MOCK_SERVICE`、期待する `uid:gid` は `BATCH_MOCK_EFS_UID_GID` (既定 `6301:6302`) |
+| (操作) JMeter 性能試験を実行 / 実行状況を確認 | — | — | `logs` モードの操作。jmeter サービスが compose に定義されていれば、**起動していなくても**サービス選択の一覧に現れる (`profiles: ["loadtest"]` の「実行するたびに起動して終わるジョブ」のため)。テスト計画 (`.jmx`) を選び、設定されているスレッド数 / Ramp-Up 期間 / ループ回数を上書きして `docker compose --profile loadtest run --rm jmeter run <計画>` を実行する。結果 (`result.jtl`) と HTML レポートは**レポートファイルと同じディレクトリ**へ出力する |
 | `--remove-volumes` | フラグ | `false` | この実行が行うすべての `compose down` に `--volumes` を付ける |
 | `--keep-volumes` | フラグ | `false` | 対話操作の終了後の後始末でもボリュームを削除しない (従来の動作) |
 | `--usage-check-script PATH` | ファイルパス | (自動解決) | 完全クリアに使う `docker-usage-check.sh` のパス |
@@ -211,6 +212,44 @@ tools/valkey_shell_cli.sh -h valkey -p 6379            # 対話モード
 tools/valkey_shell_cli.sh -h valkey GET mykey          # 1 コマンド実行
 tools/valkey_shell_cli.sh -h valkey --scan-dump '*'    # キー・型・TTL・値の一覧
 tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
+```
+
+### JMeter 性能試験 (jmeter コンテナの呼び出し)
+
+> `--keep-container-mode logs` の「JMeter 性能試験を実行」「JMeter 実行状況を確認」で使います。
+> jmeter サービスは `profiles` 配下の「実行するたびに起動して終わるジョブ」のため、
+> `compose up` では起動しません。`docker compose --profile loadtest run --rm jmeter run <計画>`
+> として呼び出します。
+> スレッド数 / Ramp-Up 期間 / ループ回数の上書きは、環境変数
+> (`JMETER_THREADS` / `JMETER_RAMPUP` / `JMETER_LOOPS`) を渡すのに加えて、
+> **数値が直接書かれている `.jmx` でも効くよう、該当箇所だけを書き換えた複製**を作って実行します
+> (元の `.jmx` は変更しません)。
+
+| オプション | 値 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `--jmeter-service NAME` | Compose サービス名 | `jmeter` | JMeter 実行コンテナのサービス名 |
+| `--jmeter-profile NAME` | profiles 名 | `loadtest` | compose へ `--profile` として渡す値 |
+| `--no-jmeter-profile` | フラグ | — | compose へ `--profile` を渡さない (profiles を使っていない構成) |
+| `--jmeter-report-dir DIR` | ディレクトリ | (`--report-dir` 配下 → 一時ディレクトリ) | 結果 (`result.jtl` / `report/index.html` / `jmeter.log`) の出力先 |
+| `--jmeter-plan FILE` | `.jmx` のファイル名 | (対話で選択) | 実行するテスト計画 |
+| `--jmeter-threads N` | 1 以上の整数 | (対話で入力) | スレッド数 (同時実行ユーザ数) の上書き値 |
+| `--jmeter-rampup SEC` | 0 以上の整数 | (対話で入力) | Ramp-Up 期間 (秒) の上書き値 |
+| `--jmeter-loops N` | 1 以上の整数または `-1` | (対話で入力) | ループ回数の上書き値 (`-1` = 試験時間まで無限に回す) |
+| `--jmeter-target NAME` | `targets.json` のキー | (コンテナの既定) | 負荷をかける相手 (frontend / backend / alb など) |
+| `--jmeter-duration SEC` | 0 以上の整数 | (コンテナの既定) | 試験時間 (秒) |
+| `--no-jmeter-build` | フラグ | `false` | 実行前の `compose build <jmeter サービス>` を行わない |
+| `--jmeter-status` | フラグ | — | 実行状況を表示して終了する (ビルド・起動・後始末を行わない) |
+
+```bash
+# 対話で計画と負荷条件を決めて実行する (結果は ./reports 配下へ出る)
+./build_and_verify.sh --verify-startup --keep-container-mode logs --report-dir ./reports
+
+# 負荷条件をあらかじめ決めて、対話での入力を省く
+./build_and_verify.sh --verify-startup --keep-container-mode logs --report-dir ./reports \
+  --jmeter-plan sample-frontend.jmx --jmeter-threads 200 --jmeter-rampup 200 --jmeter-loops -1
+
+# 背面で走らせた試験の進捗を、別の端末から確認する
+./build_and_verify.sh --jmeter-status --report-dir ./reports
 ```
 
 ### 情報表示・レポート

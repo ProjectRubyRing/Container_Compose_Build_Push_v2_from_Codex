@@ -64,6 +64,7 @@
 | 20 | サービス別ビルドログ (`base` / `frontend` / `backend` などサービスごとに切り分けたビルドログのファイル出力と、ビルドエラー時の画面への全量表示) | (既定で自動。出力先は `--report-dir` 配下、指定が無ければ一時ディレクトリ) |
 | 21 | ECS サーキットブレーカによるタスク停止の再現 (必須コンテナの healthcheck 失敗 → SIGTERM → `stopTimeout` → SIGKILL を `jboss-cli` の `:reload` と重ね、`server.log` が途中で切れる事象を再現・判定する) | (起動確認時に既定で自動。必須コンテナが `unhealthy` になったときだけ動く。`--ecs-essential-service` 指定時は起動完了ログの後も判定を待つ。無効化は `--no-ecs-circuit-breaker`、正常時に意図的に再現するには `--ecs-circuit-breaker-drill`) |
 | 22 | Valkey (Redis 互換) の操作・登録内容の確認 (frontend / backend など選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは、valkey のイメージから起動する使い捨てコンテナでネットワーク名前空間だけを共有するか、`openssl` / bash の `/dev/tcp` だけで RESP を喋る代替シェルを使う。**確認対象コンテナへのインストールは行わない**) | (`--keep-container-mode logs` の「Valkey 操作」。同じメニューの bash 接続でも`valkey-cli` / `valkey-connect` / `valkey_shell_cli.sh` を使える状態にする。接続先の指定は `--valkey-service` / `--valkey-port` / `--valkey-tls` / `--valkey-scan-pattern`、代替シェルの取り出しは `--print-valkey-shell-cli`) |
+| 23 | JMeter 性能試験の実行と実行状況の確認 (compose へ追加された jmeter コンテナを `docker compose --profile loadtest run --rm jmeter run <テスト計画>` として呼び出し、テスト計画 (`.jmx`) に設定されているスレッド数・Ramp-Up 期間・ループ回数を上書きして実行する。結果 (`result.jtl`) と HTML ダッシュボードは**レポートファイルと同じディレクトリ**へ出力する) | (`--keep-container-mode logs` の「JMeter 性能試験を実行」「JMeter 実行状況を確認」。サービス名・profiles は `--jmeter-service` / `--jmeter-profile`、負荷条件は `--jmeter-threads` / `--jmeter-rampup` / `--jmeter-loops`、出力先は `--jmeter-report-dir`、別端末からの確認は `--jmeter-status`) |
 
 `--verify-startup` も `--verify-url` も指定しなければ、**純粋にビルドのみ**を行って終了します
 (従来の `build_and_push.sh --build-only` 相当)。
@@ -570,6 +571,23 @@ compose down (削除)
 | `--no-valkey-tls` | フラグ | (自動判定) | 平文で接続する (bash の `/dev/tcp` を使う) |
 | `--valkey-scan-pattern P` | SCAN のパターン | `*` | 登録内容の一覧で使うパターン |
 | `--print-valkey-shell-cli` | フラグ | — | 代替シェル (`valkey_shell_cli.sh`) を標準出力へ書き出して終了 |
+
+### 4.6-3 JMeter 性能試験 (jmeter コンテナの呼び出し)
+
+| オプション | 値の形式 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `--jmeter-service NAME` | Compose サービス名 | `jmeter` | JMeter 実行コンテナのサービス名 (→ 5.4-5) |
+| `--jmeter-profile NAME` | profiles 名 | `loadtest` | compose へ `--profile` として渡す値 |
+| `--no-jmeter-profile` | フラグ | — | compose へ `--profile` を渡さない (profiles を使っていない構成) |
+| `--jmeter-report-dir DIR` | ディレクトリパス | (`--report-dir` → 一時ディレクトリ) | 結果 (`result.jtl` / `report/index.html` / `jmeter.log`) の出力先 |
+| `--jmeter-plan FILE` | `.jmx` のファイル名 | (対話で選択) | 実行するテスト計画 |
+| `--jmeter-threads N` | 1 以上の整数 | (対話で入力) | スレッド数 (同時実行ユーザ数) の上書き値 |
+| `--jmeter-rampup SEC` | 0 以上の整数 | (対話で入力) | Ramp-Up 期間 (秒) の上書き値 |
+| `--jmeter-loops N` | 1 以上の整数または `-1` | (対話で入力) | ループ回数の上書き値 (`-1` = 試験時間まで無限に回す) |
+| `--jmeter-target NAME` | `targets.json` のキー | (コンテナの既定) | 負荷をかける相手 (frontend / backend / alb など) |
+| `--jmeter-duration SEC` | 0 以上の整数 | (コンテナの既定) | 試験時間 (秒) |
+| `--no-jmeter-build` | フラグ | `false` | 実行前の `compose build <jmeter サービス>` を行わない |
+| `--jmeter-status` | フラグ | — | 実行状況を表示して終了する (ビルド・起動・後始末をしない) |
 
 ### 4.7 情報表示・レポート
 
@@ -1125,7 +1143,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・Valkey 操作 (→ 5.4-4) を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -1759,6 +1777,123 @@ printf '*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n' >&3
 
 > `openssl s_client` は必ず TLS ハンドシェイクを行うため、**平文の valkey には使えません**
 > (`wrong version number` になります)。平文は `/dev/tcp` か `nc` / `socat` を使ってください。
+
+### 5.4-5 JMeter 性能試験 (jmeter コンテナの呼び出し)
+
+compose へ追加された **jmeter サービス**は、常駐サービスではなく
+**「実行するたびに起動して終わるジョブ」**として定義されています
+(`profiles: ["loadtest"]`)。そのため `docker compose up` では起動せず、
+起動確認の対象にもならず、`docker compose ps` にも現れません。
+
+このスクリプトは `--keep-container-mode logs` の対話操作から、その jmeter
+コンテナを `docker compose --profile loadtest run --rm jmeter run <テスト計画>`
+として呼び出します。
+
+#### サービス選択の一覧に出る
+
+jmeter サービスが compose に定義されていれば、**起動していなくても**
+サービス選択の一覧へ出ます (起動中のサービスの後ろに置き、既存の番号は動かしません)。
+
+```
+操作する起動中の Compose サービスを選択してください:
+  1) frontend
+  2) backend
+  3) jmeter (未起動: 実行するたびに起動する性能試験コンテナ)
+  0) 対話操作を終了
+```
+
+jmeter を選ぶと、サービス操作メニューの末尾へ 2 つの操作が増えます
+(他のサービスでは増えないため、既存構成の操作番号は変わりません)。
+
+```
+  5) JMeter 性能試験を実行 (テスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きして実行)
+  6) JMeter 実行状況を確認 (実行中のコンテナ / 進捗 / 結果と HTML レポートの出力先)
+```
+
+#### テスト計画の選択と、負荷条件の上書き
+
+テスト計画の一覧と、コンテナ側の既定値は**コンテナ自身に答えさせます**
+(`JMETER_PLANS_DIR` などのパスは compose 側で決まるため、ホストで推測しません)。
+選んだ `.jmx` はホストへ取り出し、設定されている負荷条件を読んで表示します。
+
+```
+[テスト計画に設定されている負荷条件]
+  #1 TG01 一般ユーザ
+     スレッド数   : 10 (数値が直接書かれている)
+     Ramp-Up 期間 : 5 (数値が直接書かれている)
+     ループ回数   : 2 (数値が直接書かれている)
+  #2 TG02 参照専用
+     スレッド数   : ${__P(threads,10)} (環境変数で差し替えられる書き方)
+  (参考) SetupThreadGroup 'SU01 前処理' は setUp/tearDown などのスレッドグループのため、上書きの対象外です。
+```
+
+上書きは 2 段構えで行います。**どちらの書き方の `.jmx` でも同じ結果になる**ようにするためです。
+
+| | 何をするか | どの書き方に効くか |
+| --- | --- | --- |
+| (A) 環境変数 | `-e JMETER_THREADS` / `-e JMETER_RAMPUP` / `-e JMETER_LOOPS` を `docker compose run` へ渡す。jmeter コンテナ側でこれが `-Jthreads` / `-Jrampup` / `-Jloops` になる | `${__P(threads,10)}` のように書かれたテスト計画 |
+| (B) 複製の書き換え | 該当箇所だけを書き換えた**複製**を一時ディレクトリへ作り、読み取り専用でマウントして実行する (`JMETER_PLANS_DIR` を差し替える) | GUI で作った `.jmx` のように**数値が直接書かれている**テスト計画 |
+
+**元の `.jmx` は一切変更しません。** 書き換えるのは通常のスレッドグループの
+`ThreadGroup.num_threads` / `ThreadGroup.ramp_time` と、**その中の**
+`LoopController.loops` だけです。配下のループコントローラや
+setUp / tearDown スレッドグループは、同じプロパティ名を持っていても対象にしません
+(取り違えると試験の中身が変わってしまうため)。
+
+上書き後の値は実行前に表示し、実際に使ったテスト計画の複製は結果ディレクトリへ
+`plan.jmx` として残ります (後から同じ条件で再現できます)。
+
+#### 結果はレポートファイルと同じディレクトリへ出る
+
+コンテナ側の結果出力先 (`/results`) ではなく、**レポートファイルと同じディレクトリ**を
+コンテナへマウントして書かせます。`--report-dir` を指定していればその配下、
+指定が無ければ一時ディレクトリで、`--jmeter-report-dir` で変更できます。
+
+```
+<レポートディレクトリ>/
+  build_and_verify_<日時>_jmeter_<計画名>/
+      result.jtl          JMeter GUI のリスナーから開く
+      report/index.html   HTML ダッシュボード (ブラウザで開く)
+      jmeter.log          JMeter 自身のログ
+      run-info.txt        この実行の条件 (再現用)
+      plan.jmx            実行したテスト計画 (上書き後の複製)
+      summary-stats.txt   一次集計
+  build_and_verify_<日時>_jmeter_<計画名>.log      実行ログ (進捗の summary 行)
+  build_and_verify_<日時>_jmeter_<計画名>.status   実行状態 (別端末からの確認用)
+```
+
+> 結果ファイルは**コンテナ内のユーザー**で作られます (root になることがあります)。
+> 別端末へ渡すときやディレクトリを消すときは、所有者にご注意ください。
+
+#### 実行方法 (背面 / 前面) と実行状況の確認
+
+性能試験は数分〜数十分かかるため、**背面 (バックグラウンド) 実行が既定**です。
+開始するとすぐ操作の選択へ戻れます。前面実行を選べば、終わるまで出力を画面へ流します。
+
+```
+実行方法を選択してください:
+  1) 背面で実行し、すぐ操作の選択へ戻る (既定。進捗は「JMeter 実行状況を確認」で見る)
+  2) 前面で実行し、終わるまで待つ (出力をそのまま画面へ出す)
+  0) 実行を中止
+```
+
+進捗と結果は、同じメニューの「JMeter 実行状況を確認」か、**別の端末から**
+`--jmeter-status` で確認できます。`--jmeter-status` はビルドも起動も後始末も行わず、
+状況を表示して終了します (状況を見ただけでコンテナが消えることはありません)。
+
+```bash
+# 別端末から、走っている性能試験の進捗を見る
+./build_and_verify.sh --jmeter-status --report-dir /var/tmp/reports
+```
+
+表示するのは、結果ディレクトリの実行一覧 (新しい順)、実行中の JMeter コンテナ
+(`docker ps`)、最新実行の進捗 (JMeter の `summary` 行)、`result.jtl` と
+HTML レポートの出力先、一次集計です。実行中のまま残っている記録は、
+コンテナが生きているかどうかで裏を取ります。
+
+> 対話操作をすべて終える (「0) 対話操作を終了」) と、既定では
+> `compose down` → 未使用リソースの完全クリアまで進みます。背面実行が残っていると
+> 試験は途中で終わり結果も残らないため、**終了する前に完了を待つかどうかを確認します**。
 
 ### 5.5 `--verify-url` 関連オプションの組み合わせ
 
@@ -3286,6 +3421,18 @@ Excel はフォント Meiryo UI、行高を内容と列幅から計算して明�
 
 # 10-3) 従来どおり、デプロイエラーならそのまま終了する (CI 向け)
 ./build_and_verify.sh --verify-startup --exit-on-deploy-error
+
+# 10-4) 起動後に JMeter で性能試験を行う (対話で計画とスレッド数 / Ramp-Up / ループを指定)
+#       結果 (result.jtl) と HTML レポートは --report-dir と同じディレクトリへ出る
+./build_and_verify.sh --verify-startup --keep-container-mode logs --report-dir ./reports
+
+# 10-5) 負荷条件をあらかじめ決めておき、対話での入力を省く
+./build_and_verify.sh --verify-startup --keep-container-mode logs --report-dir ./reports \
+  --jmeter-plan sample-frontend.jmx --jmeter-threads 200 --jmeter-rampup 200 --jmeter-loops -1 \
+  --jmeter-target frontend --jmeter-duration 600
+
+# 10-6) 背面で走らせた性能試験の進捗を、別の端末から確認する
+./build_and_verify.sh --jmeter-status --report-dir ./reports
 
 # 11) 全量レポートを保存 (ツリーは画面・レポートとも既定では出さない)
 #     (JVM パラメータと OpenTelemetry 設定は指定不要で同じレポートへ保存される)

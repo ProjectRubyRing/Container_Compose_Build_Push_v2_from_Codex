@@ -995,6 +995,68 @@ VALKEY_CONNECT_PASSWORD_SET="false"
 VALKEY_CONNECT_USER=""            # ACL ユーザー名 (設定されていれば)
 VALKEY_CONNECT_SOURCE=""          # パスワードをどこから取れたかの説明
 
+# ---- JMeter 性能試験 (別プロジェクトの compose に追加された jmeter コンテナ) --
+# compose.yaml へ追加された jmeter サービスは、常駐サービスではなく
+# 「実行するたびに起動して終わるジョブ」として作られている (profiles: loadtest)。
+# そのため docker compose up では起動せず、起動確認の対象にもならない。
+# ここでは --keep-container-mode logs の対話操作から、その jmeter コンテナを
+#   docker compose --profile loadtest run --rm jmeter run <テスト計画>
+# として呼び出せるようにする。
+#
+# 対話で上書きできるのは、GUI で作った .jmx に設定されている次の 3 つ。
+#   - スレッド数     (ThreadGroup.num_threads)   = 同時実行ユーザ数
+#   - Ramp-Up 期間   (ThreadGroup.ramp_time)     = 全スレッドを起動しきる秒数
+#   - ループ回数     (LoopController.loops)      = -1 で試験時間まで無限に回す
+# 上書きは 2 段構えで行う。
+#   (A) jmeter コンテナが解釈する環境変数 (JMETER_THREADS / JMETER_RAMPUP /
+#       JMETER_LOOPS) を docker compose run へ渡す。テスト計画が
+#       ${__P(threads,10)} のように書かれている場合はこれだけで効く。
+#   (B) テスト計画に数値がそのまま書かれている (GUI で作るとこちらになる) 場合、
+#       (A) は何の効果も持たない。そこでテスト計画をホスト側へ取り出し、
+#       該当する 3 つの値だけを書き換えた複製を作って、それを読み取り専用で
+#       マウントして実行する。元の .jmx は一切変更しない。
+# どちらの書き方でも同じ結果になるよう、上書きを指定したときは常に (A)(B) の
+# 両方を行う。
+#
+# 結果 (jtl / HTML ダッシュボード / jmeter.log) は、レポートファイルと同じ
+# ディレクトリ (--report-dir) へ既定で出力する。コンテナ内の出力先は
+# JMETER_RESULTS_DIR で差し替えられるため、そこへホスト側のレポート
+# ディレクトリをマウントして書かせる (--jmeter-report-dir で変更可)。
+#
+# 試験は既定で背面 (バックグラウンド) 実行し、すぐ対話操作へ戻る。走っている
+# 間の進捗と、終わったあとの結果は「JMeter 実行状況を確認」と、
+# 別端末からも使える --jmeter-status で確認する。
+JMETER_SERVICE="jmeter"           # --jmeter-service。jmeter コンテナの Compose サービス名
+JMETER_SERVICE_SET="false"
+JMETER_PROFILE="loadtest"         # --jmeter-profile。空文字なら --profile を付けない
+JMETER_PROFILE_SET="false"
+JMETER_REPORT_DIR=""              # --jmeter-report-dir。空なら --report-dir 配下 → 一時ディレクトリ
+JMETER_REPORT_DIR_SET="false"
+# 対話で毎回入力しなくて済むよう、コマンドラインからも既定値を渡せるようにする。
+# 変数名を JMETER_THREADS などにしないのは、同名の環境変数が compose.yaml 側の
+# ${JMETER_THREADS:-10} の解決に使われるため (export 済みの値を壊さない)。
+JMETER_ARG_PLAN=""                # --jmeter-plan     テスト計画 (.jmx) のファイル名
+JMETER_ARG_THREADS=""             # --jmeter-threads  スレッド数 (同時実行ユーザ数)
+JMETER_ARG_RAMPUP=""              # --jmeter-rampup   Ramp-Up 期間 (秒)
+JMETER_ARG_LOOPS=""               # --jmeter-loops    ループ回数 (-1 = 試験時間まで無限)
+JMETER_ARG_TARGET=""              # --jmeter-target   投げ先 (targets.json のキー)
+JMETER_ARG_DURATION=""            # --jmeter-duration 試験時間 (秒)
+JMETER_STATUS_ONLY="false"        # --jmeter-status。状況を表示して終了する
+JMETER_BUILD_IMAGE="true"         # --no-jmeter-build で false。実行前のイメージビルド
+JMETER_SERVICE_DETECTED=""        # 自動検出の結果 ("-" = compose 定義に無い)
+# 上書きしたテスト計画と結果を受け渡すコンテナ内のパス。compose.yaml 側の
+# /test-plans・/results とは別の場所にして、元のマウントを隠さないようにする。
+JMETER_PLANS_MOUNT="/bv-jmeter-plans"
+JMETER_RESULTS_MOUNT="/bv-jmeter-results"
+JMETER_RUN_NAME_SUPPORTED=""      # docker compose run が --name を持つか (空=未確認)
+JMETER_BACKGROUND_RUNS=()         # 背面実行の "PID<TAB>run_id<TAB>状態ファイル"
+JMETER_STATUS_REPORT_LIMIT="10"   # 実行状況の一覧に出す件数 (新しい順)
+JMETER_STATUS_LOG_LINES="12"      # 進捗として出す実行ログの行数
+JMETER_WAIT_INTERVAL="15"         # 背面実行の完了待ちで進捗を出す間隔 (秒)
+JMETER_COMPOSE_CMD=()             # --profile 付きの compose コマンド (組み立て結果)
+JMETER_RUN_COMMAND=()             # 実行する docker compose run の引数一式
+JMETER_PROMPT_VALUE=""            # 上書き値の対話入力の受け取り
+
 # ---- CloudWatch Agent (cwagent) のログ送信検証 --------------------------------
 # ECS の taskdef と同じ CloudWatch Agent サイドカーを compose.yml で起動する構成では、
 # 「設定ファイルがコンテナへ届いていない」「logs.endpoint_override の送信先を名前解決
@@ -4346,6 +4408,17 @@ JBoss マスターパスワードの伝搬検証:
                                      セッション終了時に必ず削除する)
                                     (bash 接続先に /bin/bash が無い場合は
                                      /bin/sh を使う)
+                                    jmeter サービス (性能試験の実行コンテナ) が
+                                    compose に定義されていれば、起動していなくても
+                                    サービス選択の一覧へ現れ、「JMeter 性能試験を
+                                    実行」と「JMeter 実行状況を確認」を選べる。
+                                    実行では test-plans の .jmx を番号で選び、
+                                    テスト計画に設定されているスレッド数・
+                                    Ramp-Up 期間・ループ回数を対話で上書きして
+                                    docker compose run で実行する。結果 (jtl) と
+                                    HTML レポートはレポートファイルと同じ
+                                    ディレクトリへ出力する
+                                    (JMeter 性能試験の項を参照)。
                            bash/http で対象が複数ある場合と、logs のサービス選択では
                            番号選択ダイアログを表示する。
                            送達診断の JSON 整形には curl と Python 3 が必要。
@@ -4564,6 +4637,59 @@ Valkey (Redis 互換) の操作・登録内容の確認:
                            tools/valkey_shell_cli.sh --help、
                            openssl / bash による手動の代替手順は
                            tools/valkey_shell_cli.sh --show-commands で表示できる
+
+JMeter 性能試験 (jmeter コンテナの呼び出し):
+  (--keep-container-mode logs の「JMeter 性能試験を実行」/「JMeter 実行状況を確認」
+   で使う。jmeter サービスは profiles 配下の「実行するたびに起動して終わるジョブ」
+   のため compose up では起動せず、docker compose run で呼び出す。
+   GUI で作った .jmx を非 GUI モードで実行し、GUI で開ける結果 (result.jtl) と
+   HTML ダッシュボード (report/index.html) を出力する)
+  --jmeter-service NAME    JMeter 実行コンテナの Compose サービス名 (既定: jmeter)
+  --jmeter-profile NAME    jmeter サービスに付いている profiles 名 (既定: loadtest)。
+                           compose へ --profile として渡す。profiles を使っていない
+                           構成では --no-jmeter-profile を指定する
+  --no-jmeter-profile      compose へ --profile を渡さない
+  --jmeter-report-dir DIR  結果 (result.jtl / jmeter.log / HTML レポート) の出力先。
+                           未指定時は --report-dir 配下、--report-dir も無い場合は
+                           一時ディレクトリへ出力する。指定したディレクトリを
+                           コンテナへマウントし、その配下へ
+                           build_and_verify_<日時>_jmeter_<計画名>/ を作って
+                           result.jtl・report/index.html・jmeter.log・run-info.txt を
+                           書き出す (レポートファイルと同じディレクトリで揃う)
+  --jmeter-plan FILE       実行するテスト計画 (.jmx) のファイル名。指定すると
+                           対話での選択を省略する
+  --jmeter-threads N       スレッド数 (同時実行ユーザ数) の上書き値。指定すると
+                           対話での入力を省略する
+  --jmeter-rampup SEC      Ramp-Up 期間 (秒) の上書き値。全スレッドを起動しきる
+                           までの秒数で、最低でもスレッド数と同じ秒数を推奨
+  --jmeter-loops N         ループ回数の上書き値 (-1 = 試験時間まで無限に回す)
+  --jmeter-target NAME     投げ先 (jmeter コンテナの targets.json のキー)。
+                           未指定時はコンテナ側の既定を使う
+  --jmeter-duration SEC    試験時間 (秒)。未指定時はコンテナ側の既定を使う
+                           ※ 上の 3 つ (スレッド数 / Ramp-Up 期間 / ループ回数) は、
+                             テスト計画が ${__P(threads,10)} のように書かれていれば
+                             環境変数 (JMETER_THREADS / JMETER_RAMPUP / JMETER_LOOPS)
+                             として渡すだけで効く。GUI で作った .jmx のように数値が
+                             直接書かれている場合はそれだけでは効かないため、
+                             該当箇所だけを書き換えた複製を一時ディレクトリへ作り、
+                             それを読み取り専用でマウントして実行する
+                             (元の .jmx は変更しない)。
+                             書き換えるのは通常のスレッドグループの
+                             ThreadGroup.num_threads / ThreadGroup.ramp_time と、
+                             その中の LoopController.loops だけで、配下のループ
+                             コントローラや setUp/tearDown スレッドグループは
+                             対象にしない。
+  --no-jmeter-build        実行前の compose build <jmeter サービス> を行わない
+                           (イメージが用意済みの場合に時間を節約する)
+  --jmeter-status          JMeter の実行状況を表示して終了する。ビルドも起動も
+                           後始末も行わないため、性能試験を背面で走らせたまま
+                           別の端末から進捗を確認できる。
+                           表示内容: 結果ディレクトリの実行一覧 (新しい順) /
+                           実行中の JMeter コンテナ (docker ps) / 最新実行の進捗
+                           (JMeter の summary 行) / result.jtl・HTML レポートの
+                           出力先と一次集計。
+                           結果の出力先を変えている場合は、実行時と同じ
+                           --report-dir / --jmeter-report-dir を併せて指定する
 
 WAR デプロイ時の Java 例外解析:
   (デプロイ処理のログに Java 例外があれば自動で解析する。ただし画面表示と
@@ -5224,6 +5350,18 @@ while [ $# -gt 0 ]; do
                            printf '%s\n' "$VALKEY_SHELL_CLI_SCRIPT"
                            exit 0
                            ;;
+    --jmeter-service)      need_value "$1" $#; JMETER_SERVICE="$2"; JMETER_SERVICE_SET="true"; shift 2 ;;
+    --jmeter-profile)      need_value "$1" $#; JMETER_PROFILE="$2"; JMETER_PROFILE_SET="true"; shift 2 ;;
+    --no-jmeter-profile)   JMETER_PROFILE=""; JMETER_PROFILE_SET="true"; shift ;;
+    --jmeter-report-dir)   need_value "$1" $#; JMETER_REPORT_DIR="$2"; JMETER_REPORT_DIR_SET="true"; shift 2 ;;
+    --jmeter-plan)         need_value "$1" $#; JMETER_ARG_PLAN="$2"; shift 2 ;;
+    --jmeter-threads)      need_value "$1" $#; JMETER_ARG_THREADS="$2"; shift 2 ;;
+    --jmeter-rampup)       need_value "$1" $#; JMETER_ARG_RAMPUP="$2"; shift 2 ;;
+    --jmeter-loops)        need_value "$1" $#; JMETER_ARG_LOOPS="$2"; shift 2 ;;
+    --jmeter-target)       need_value "$1" $#; JMETER_ARG_TARGET="$2"; shift 2 ;;
+    --jmeter-duration)     need_value "$1" $#; JMETER_ARG_DURATION="$2"; shift 2 ;;
+    --no-jmeter-build)     JMETER_BUILD_IMAGE="false"; shift ;;
+    --jmeter-status)       JMETER_STATUS_ONLY="true"; shift ;;
     --deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="true"; shift ;;
     --no-deploy-exception-display) DEPLOY_EXCEPTION_DISPLAY="false"; shift ;;
     --deploy-exception-report) DEPLOY_EXCEPTION_REPORT="true"; shift ;;
@@ -5324,6 +5462,39 @@ validate_non_negative_integer() {
       err "${opt_name} には 0 以上の整数を指定してください: ${value}"
       return 1
     ;;
+  esac
+  return 0
+}
+
+# 数値の妥当性を確認する。$1: 値, $2: 種別, $3: 指定元の名前 (メッセージ用)
+jmeter_validate_number() {
+  local value="$1" kind="$2" origin="$3"
+  case "$kind" in
+    threads)
+      case "$value" in
+        ''|*[!0-9]*|0*)
+          err "${origin} には 1 以上の整数 (同時実行ユーザ数) を指定してください: ${value}"
+          return 1
+          ;;
+      esac
+      ;;
+    rampup|duration)
+      case "$value" in
+        ''|*[!0-9]*)
+          err "${origin} には 0 以上の整数 (秒) を指定してください: ${value}"
+          return 1
+          ;;
+      esac
+      ;;
+    loops)
+      case "$value" in
+        -1) ;;
+        ''|*[!0-9]*|0*)
+          err "${origin} には 1 以上の整数か、試験時間まで無限に回す -1 を指定してください: ${value}"
+          return 1
+          ;;
+      esac
+      ;;
   esac
   return 0
 }
@@ -5500,6 +5671,25 @@ if [ "$TRACE_REPORT_DIR_SET" = "true" ] \
   err "--trace-report-dir にはディレクトリのパスを指定してください: $TRACE_REPORT_DIR"
   exit 2
 fi
+# JMeter の負荷条件は、対話でも同じ判定で弾く (jmeter_validate_number)。
+# 指定した値がそのままテスト計画の書き換えに入るため、ここで形を確かめておく。
+if [ "$JMETER_REPORT_DIR_SET" = "true" ] \
+    && { [ -z "$JMETER_REPORT_DIR" ] || [ "$JMETER_REPORT_DIR" = "-" ]; }; then
+  err "--jmeter-report-dir にはディレクトリのパスを指定してください: $JMETER_REPORT_DIR"
+  exit 2
+fi
+if [ "$JMETER_SERVICE_SET" = "true" ] && [ -z "$JMETER_SERVICE" ]; then
+  err "--jmeter-service には Compose サービス名を指定してください。"
+  exit 2
+fi
+[ -z "$JMETER_ARG_THREADS" ] \
+  || jmeter_validate_number "$JMETER_ARG_THREADS" threads "--jmeter-threads" || exit 2
+[ -z "$JMETER_ARG_RAMPUP" ] \
+  || jmeter_validate_number "$JMETER_ARG_RAMPUP" rampup "--jmeter-rampup" || exit 2
+[ -z "$JMETER_ARG_LOOPS" ] \
+  || jmeter_validate_number "$JMETER_ARG_LOOPS" loops "--jmeter-loops" || exit 2
+[ -z "$JMETER_ARG_DURATION" ] \
+  || jmeter_validate_number "$JMETER_ARG_DURATION" duration "--jmeter-duration" || exit 2
 validate_positive_integer "$DEPLOY_EXCEPTION_MAX" "--deploy-exception-limit" || exit 2
 if [ "$DEPLOY_EXCEPTION_DISPLAY" = "true" ] && [ "$DEPLOY_EXCEPTION_ANALYSIS" != "true" ]; then
   err "--deploy-exception-display と --no-deploy-exception-analysis は同時に指定できません。"
@@ -26274,6 +26464,1032 @@ run_otel_jaeger_trace_helper() {
   diag "トレース属性・イベントには機微情報が含まれ得るため、共有・ログ保存時の取り扱いに注意してください。"
 }
 
+# =============================================================================
+# JMeter 性能試験 (jmeter コンテナの呼び出し)
+# -----------------------------------------------------------------------------
+# jmeter サービスは profiles (既定: loadtest) 配下にあり、docker compose up では
+# 起動しない「実行するたびに起動して終わるジョブ」として定義されている。
+# ここでは --keep-container-mode logs の対話操作から
+#   docker compose --profile loadtest run --rm jmeter run <テスト計画>
+# を組み立てて呼び出し、テスト計画に設定されているスレッド数・Ramp-Up 期間・
+# ループ回数を上書きして実行できるようにする。
+# =============================================================================
+
+# compose へ渡す共通の引数 (profiles 付き) を組み立てる。
+# COMPOSE_FILE_ARGS はログドライバの差し替えで増えることがあるため、
+# 使うたびに組み立て直す。
+jmeter_build_compose_cmd() {
+  JMETER_COMPOSE_CMD=("${COMPOSE_CMD[@]}")
+  # profiles 配下のサービスは --profile を付けないと compose から見えない。
+  [ -n "$JMETER_PROFILE" ] && JMETER_COMPOSE_CMD+=(--profile "$JMETER_PROFILE")
+  JMETER_COMPOSE_CMD+=("${COMPOSE_FILE_ARGS[@]}")
+  return 0
+}
+
+# jmeter サービスが compose 定義にあるか。結果は実行中ずっと使い回す。
+#   1. --profile 付きの config --services (profiles 配下のサービスもここで出る)
+#   2. profiles を解釈できない版のための config --services
+#   3. 既にコンテナを作ったことがある場合の ps -a --services
+jmeter_service_defined() {
+  local services=""
+
+  if [ -n "$JMETER_SERVICE_DETECTED" ]; then
+    [ "$JMETER_SERVICE_DETECTED" = "-" ] && return 1
+    return 0
+  fi
+
+  jmeter_build_compose_cmd
+  services="$("${JMETER_COMPOSE_CMD[@]}" config --services 2>/dev/null || true)"
+  if ! printf '%s\n' "$services" | grep -Fxq -- "$JMETER_SERVICE"; then
+    if [ -n "$JMETER_PROFILE" ]; then
+      services="$("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" config --services 2>/dev/null || true)"
+    fi
+  fi
+  if ! printf '%s\n' "$services" | grep -Fxq -- "$JMETER_SERVICE"; then
+    services="$("${COMPOSE_CMD[@]}" "${COMPOSE_FILE_ARGS[@]}" ps -a --services 2>/dev/null || true)"
+  fi
+  if printf '%s\n' "$services" | grep -Fxq -- "$JMETER_SERVICE"; then
+    JMETER_SERVICE_DETECTED="$JMETER_SERVICE"
+    return 0
+  fi
+  if [ "$JMETER_SERVICE_SET" = "true" ]; then
+    # 明示指定したのに使えない理由は伝える (黙って操作が消えると原因が分からない)。
+    warn "--jmeter-service で指定した '${JMETER_SERVICE}' が compose 定義に見つからないため、JMeter の操作は選べません。"
+    [ -n "$JMETER_PROFILE" ] \
+      && warn "  profiles 配下にある場合は --jmeter-profile でプロファイル名を合わせてください (現在: ${JMETER_PROFILE})。"
+  fi
+  JMETER_SERVICE_DETECTED="-"
+  return 1
+}
+
+# 選択された Compose サービスで JMeter の操作を出すか。
+compose_service_supports_jmeter() {
+  local service_name="$1"
+  [ "$service_name" = "$JMETER_SERVICE" ] || return 1
+  jmeter_service_defined
+}
+
+# 値が一覧に含まれるか (起動中サービス一覧との突き合わせに使う)。
+jmeter_in_list() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# docker compose run が --name を持つか (版差を吸収する)。
+jmeter_compose_run_supports_name() {
+  local help_text
+  if [ -z "$JMETER_RUN_NAME_SUPPORTED" ]; then
+    help_text="$("${COMPOSE_CMD[@]}" run --help 2>&1)" || true
+    case "$help_text" in
+      *"--name"*) JMETER_RUN_NAME_SUPPORTED="true" ;;
+      *)          JMETER_RUN_NAME_SUPPORTED="false" ;;
+    esac
+  fi
+  [ "$JMETER_RUN_NAME_SUPPORTED" = "true" ]
+}
+
+# 結果 (jtl / HTML レポート / jmeter.log) の出力先を決める。
+#   --jmeter-report-dir > --report-dir 配下 > 一時ディレクトリ
+# コンテナへマウントするため、必ず絶対パスへ解決する。
+# $1 に false を渡すと、存在しないディレクトリを作らない (状況表示で使う)。
+jmeter_resolve_report_dir() {
+  local create="${1:-true}" base resolved
+
+  if [ "$JMETER_REPORT_DIR_SET" = "true" ]; then
+    base="$JMETER_REPORT_DIR"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base="$BUILD_REPORT_DIR"
+  else
+    # 出力先の指定が無くても、結果は後から必ず見たくなるため一時ディレクトリへ残す。
+    base="${TMPDIR:-/tmp}"
+  fi
+  base="${base%/}"
+  if [ ! -d "$base" ]; then
+    if [ "$create" != "true" ]; then
+      printf '%s\n' "$base"
+      return 0
+    fi
+    if ! mkdir -p -- "$base" 2>/dev/null; then
+      err "JMeter の結果出力先を作成できませんでした: ${base}"
+      return 1
+    fi
+  fi
+  resolved="$(cd -- "$base" 2>/dev/null && pwd -P)" || resolved=""
+  [ -n "$resolved" ] || resolved="$base"
+  printf '%s\n' "$resolved"
+  return 0
+}
+
+# 上書きしたテスト計画を置くホスト側の一時ディレクトリ。
+jmeter_make_work_dir() {
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/build_and_verify_jmeter.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$dir"
+}
+
+jmeter_remove_work_dir() {
+  local dir="${1:-}"
+  [ -n "$dir" ] || return 0
+  case "$dir" in
+    */build_and_verify_jmeter.*) rm -rf -- "$dir" ;;
+  esac
+  return 0
+}
+
+# コンテナ名・ディレクトリ名に使えない文字を落とす。
+jmeter_safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+# -----------------------------------------------------------------------------
+# テスト計画 (.jmx) の読み取りと書き換え
+# -----------------------------------------------------------------------------
+# GUI で作った .jmx は 1 行 1 プロパティで保存される。スレッド数・Ramp-Up 期間は
+# <ThreadGroup> の直下、ループ回数は <ThreadGroup> の中の
+# elementProp name="ThreadGroup.main_controller" の中にある。
+# ループ回数は配下の「ループコントローラ」でも同じ名前 (LoopController.loops) を
+# 使うため、スレッドグループ本体のものだけを対象にする (取り違えると試験の中身が
+# 変わってしまう)。setUp/tearDown スレッドグループは負荷そのものではないため
+# 対象にせず、存在することだけを知らせる。
+JMETER_PLAN_SCAN_AWK="$(cat <<'JMETER_PLAN_SCAN_AWK_END'
+function attr_value(line, name,   marker, pos, rest, quote) {
+  marker = name "=\""
+  pos = index(line, marker)
+  if (pos == 0) return ""
+  rest = substr(line, pos + length(marker))
+  quote = index(rest, "\"")
+  if (quote == 0) return ""
+  return substr(rest, 1, quote - 1)
+}
+function tag_value(line,   open_pos, rest, close_pos) {
+  open_pos = index(line, ">")
+  if (open_pos == 0) return ""
+  rest = substr(line, open_pos + 1)
+  close_pos = index(rest, "<")
+  if (close_pos == 0) return ""
+  return substr(rest, 1, close_pos - 1)
+}
+BEGIN { count = 0; others = 0; in_tg = 0; in_main = 0 }
+{
+  line = $0
+  if (line ~ /<ThreadGroup[ >]/) {
+    in_tg = 1
+    in_main = 0
+    count++
+    tg_name[count] = attr_value(line, "testname")
+    tg_enabled[count] = attr_value(line, "enabled")
+    tg_threads[count] = ""
+    tg_rampup[count] = ""
+    tg_loops[count] = ""
+  } else if (match(line, /<[A-Za-z0-9]+ThreadGroup[ >]/)) {
+    others++
+    other_type[others] = substr(line, RSTART + 1, RLENGTH - 2)
+    other_name[others] = attr_value(line, "testname")
+  }
+  if (in_tg) {
+    if (line ~ /name="ThreadGroup\.main_controller"/) {
+      if (line ~ /\/>[[:space:]]*$/) in_main = 0; else in_main = 1
+    }
+    if (line ~ /name="ThreadGroup\.num_threads"/) tg_threads[count] = tag_value(line)
+    if (line ~ /name="ThreadGroup\.ramp_time"/) tg_rampup[count] = tag_value(line)
+    if (in_main && line ~ /name="LoopController\.loops"/) tg_loops[count] = tag_value(line)
+    if (in_main && line ~ /<\/elementProp>/) in_main = 0
+    if (line ~ /<\/ThreadGroup>/) { in_tg = 0; in_main = 0 }
+  }
+}
+END {
+  for (i = 1; i <= count; i++)
+    printf "tg\t%d\t%s\t%s\t%s\t%s\t%s\n", i, tg_name[i], tg_enabled[i], \
+      tg_threads[i], tg_rampup[i], tg_loops[i]
+  for (i = 1; i <= others; i++)
+    printf "other\t%s\t%s\n", other_type[i], other_name[i]
+}
+JMETER_PLAN_SCAN_AWK_END
+)"
+
+# 上と同じ場所だけを書き換えて、テスト計画の複製を作る。
+# 空文字を渡した項目は書き換えない (テスト計画側の設定をそのまま使う)。
+JMETER_PLAN_OVERRIDE_AWK="$(cat <<'JMETER_PLAN_OVERRIDE_AWK_END'
+BEGIN { in_tg = 0; in_main = 0 }
+{
+  line = $0
+  if (line ~ /<ThreadGroup[ >]/) { in_tg = 1; in_main = 0 }
+  if (in_tg) {
+    if (line ~ /name="ThreadGroup\.main_controller"/) {
+      if (line ~ /\/>[[:space:]]*$/) in_main = 0; else in_main = 1
+    }
+    if (threads != "" && line ~ /name="ThreadGroup\.num_threads"/)
+      sub(/>[^<]*</, ">" threads "<", line)
+    if (rampup != "" && line ~ /name="ThreadGroup\.ramp_time"/)
+      sub(/>[^<]*</, ">" rampup "<", line)
+    if (in_main && loops != "" && line ~ /name="LoopController\.loops"/)
+      sub(/>[^<]*</, ">" loops "<", line)
+  }
+  print line
+  if (in_tg) {
+    if (in_main && line ~ /<\/elementProp>/) in_main = 0
+    if (line ~ /<\/ThreadGroup>/) { in_tg = 0; in_main = 0 }
+  }
+}
+JMETER_PLAN_OVERRIDE_AWK_END
+)"
+
+# jmeter コンテナへ 1 度だけ入り、テスト計画の一覧とコンテナ側の既定値を取る。
+# コンテナ内のパス (JMETER_PLANS_DIR など) は compose.yaml で決まるため、
+# ホスト側で推測せずコンテナ自身に答えさせる。
+JMETER_PROBE_SCRIPT='
+plans_dir="${JMETER_PLANS_DIR:-/test-plans}"
+printf "env\tplans_dir\t%s\n" "$plans_dir"
+printf "env\tresults_dir\t%s\n" "${JMETER_RESULTS_DIR:-/results}"
+printf "env\ttarget\t%s\n" "${JMETER_TARGET:-}"
+printf "env\tthreads\t%s\n" "${JMETER_THREADS:-}"
+printf "env\trampup\t%s\n" "${JMETER_RAMPUP:-}"
+printf "env\tloops\t%s\n" "${JMETER_LOOPS:-}"
+printf "env\tduration\t%s\n" "${JMETER_DURATION:-}"
+for plan_file in "$plans_dir"/*.jmx; do
+  [ -f "$plan_file" ] || continue
+  printf "plan\t%s\n" "${plan_file##*/}"
+done
+'
+
+jmeter_probe_container() {
+  jmeter_build_compose_cmd
+  "${JMETER_COMPOSE_CMD[@]}" run --rm --no-deps -T \
+    --entrypoint /bin/sh "$JMETER_SERVICE" -c "$JMETER_PROBE_SCRIPT" </dev/null 2>/dev/null
+}
+
+# 選択されたテスト計画をホスト側へ取り出す (元のファイルには一切触れない)。
+jmeter_cat_plan() {
+  local plan="$1"
+  jmeter_build_compose_cmd
+  "${JMETER_COMPOSE_CMD[@]}" run --rm --no-deps -T \
+    --entrypoint /bin/sh "$JMETER_SERVICE" \
+    -c 'cat -- "${JMETER_PLANS_DIR:-/test-plans}/$1"' jmeter-plan "$plan" \
+    </dev/null 2>/dev/null
+}
+
+# 値が ${__P(...)} 形式かどうかの注釈。
+jmeter_value_note() {
+  case "$1" in
+    *'${__P('*) printf ' (環境変数で差し替えられる書き方)' ;;
+    '') ;;
+    *) printf ' (数値が直接書かれている)' ;;
+  esac
+  return 0
+}
+
+# テスト計画の負荷条件を画面へ出す。$1: 走査結果, $2: 見出し
+jmeter_print_plan_settings() {
+  local scan="$1" heading="$2"
+  local kind index name enabled threads rampup loops found="false" suffix
+
+  diag ""
+  diag "[${heading}]"
+  while IFS=$'\t' read -r kind index name enabled threads rampup loops; do
+    case "$kind" in
+      tg)
+        found="true"
+        suffix=""
+        [ "$enabled" = "false" ] && suffix=" (無効)"
+        diag "  #${index} ${name:-(名前なし)}${suffix}"
+        diag "     スレッド数   : ${threads:-(未設定)}$(jmeter_value_note "$threads")"
+        diag "     Ramp-Up 期間 : ${rampup:-(未設定)}$(jmeter_value_note "$rampup")"
+        diag "     ループ回数   : ${loops:-(未設定)}$(jmeter_value_note "$loops")"
+        ;;
+      other)
+        diag "  (参考) ${index} '${name:-(名前なし)}' は setUp/tearDown などのスレッドグループのため、上書きの対象外です。"
+        ;;
+    esac
+  done <<< "$scan"
+  if [ "$found" != "true" ]; then
+    warn "このテスト計画からスレッドグループを読み取れませんでした。値の上書きは行えません。"
+    return 1
+  fi
+  return 0
+}
+
+# 走査結果から 1 つ目のスレッドグループの値を取り出す (対話の既定値の表示に使う)。
+# $2: threads / rampup / loops
+jmeter_first_plan_value() {
+  local scan="$1" field="$2"
+  printf '%s\n' "$scan" | awk -F'\t' -v field="$field" '
+    $1 == "tg" {
+      if (field == "threads") { print $5; exit }
+      if (field == "rampup")  { print $6; exit }
+      if (field == "loops")   { print $7; exit }
+    }'
+}
+
+# 上書き値を 1 つ対話で読む。空入力は「テスト計画のまま」を意味する。
+# 結果は JMETER_PROMPT_VALUE へ入れる。
+jmeter_prompt_override() {
+  local label="$1" current="$2" kind="$3" input=""
+
+  JMETER_PROMPT_VALUE=""
+  while :; do
+    printf '%s [テスト計画の設定: %s] (空欄=変更しない): ' "$label" "${current:-未設定}" >&2
+    if ! IFS= read -r input; then
+      err "${label}の入力を読み取れませんでした。対話可能な端末から実行してください。"
+      return 1
+    fi
+    [ -z "$input" ] && return 0
+    case "$kind" in
+      threads)
+        case "$input" in
+          ''|*[!0-9]*|0*) warn "1 以上の整数を入力してください。"; continue ;;
+        esac
+        ;;
+      rampup)
+        case "$input" in
+          ''|*[!0-9]*) warn "0 以上の整数 (秒) を入力してください。"; continue ;;
+        esac
+        ;;
+      loops)
+        case "$input" in
+          -1) ;;
+          ''|*[!0-9]*|0*) warn "1 以上の整数か、試験時間まで無限に回す -1 を入力してください。"; continue ;;
+        esac
+        ;;
+    esac
+    JMETER_PROMPT_VALUE="$input"
+    return 0
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 実行状態ファイル (別端末の --jmeter-status からも読めるようにする)
+# -----------------------------------------------------------------------------
+# 1 行 1 項目の key=value。後から書いた行が勝つ形にしておき、完了時は追記だけで
+# 状態を更新する (途中で落ちても読めなくならないようにする)。
+jmeter_status_file_path() {
+  printf '%s/%s.status\n' "$1" "$2"
+}
+
+jmeter_log_file_path() {
+  printf '%s/%s.log\n' "$1" "$2"
+}
+
+jmeter_status_value() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  awk -v key="$key" '
+    index($0, key "=") == 1 { value = substr($0, length(key) + 2) }
+    END { if (value != "") print value }' "$file" 2>/dev/null
+}
+
+jmeter_finish_status_file() {
+  local file="$1" exit_code="$2" state
+  [ -n "$file" ] || return 0
+  case "$exit_code" in
+    0) state="完了" ;;
+    # jmeter-run.sh はエラー率が上限を超えた場合に 2 を返す。
+    2) state="完了 (エラー率が上限超過)" ;;
+    *) state="失敗 (終了コード ${exit_code})" ;;
+  esac
+  {
+    printf 'finished_at=%s\n' "$(now_display_time)"
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'state=%s\n' "$state"
+  } >> "$file" 2>/dev/null || true
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 実行
+# -----------------------------------------------------------------------------
+# docker compose run の引数一式を JMETER_RUN_COMMAND へ組み立てる。
+jmeter_build_run_command() {
+  local run_id="$1" report_dir="$2" plan="$3" plan_dir="$4"
+  local threads="$5" rampup="$6" loops="$7" target="$8" duration="$9"
+
+  jmeter_build_compose_cmd
+  JMETER_RUN_COMMAND=("${JMETER_COMPOSE_CMD[@]}" run --rm -T)
+  # 実行中のコンテナを名前で追えるようにする (状況確認で使う)。
+  if jmeter_compose_run_supports_name; then
+    JMETER_RUN_COMMAND+=(--name "$(jmeter_safe_name "$run_id")")
+  fi
+  # 結果 (jtl / HTML レポート) はレポートファイルと同じディレクトリへ書かせる。
+  JMETER_RUN_COMMAND+=(-v "${report_dir}:${JMETER_RESULTS_MOUNT}")
+  JMETER_RUN_COMMAND+=(-e "JMETER_RESULTS_DIR=${JMETER_RESULTS_MOUNT}")
+  JMETER_RUN_COMMAND+=(-e "JMETER_RUN_NAME=${run_id}")
+  # 値を書き換えた複製を使う場合は、そのディレクトリを読み取り専用で渡す。
+  if [ -n "$plan_dir" ]; then
+    JMETER_RUN_COMMAND+=(-v "${plan_dir}:${JMETER_PLANS_MOUNT}:ro")
+    JMETER_RUN_COMMAND+=(-e "JMETER_PLANS_DIR=${JMETER_PLANS_MOUNT}")
+  fi
+  # ${__P(threads,10)} のように書かれたテスト計画は、この環境変数で決まる。
+  [ -n "$threads" ]  && JMETER_RUN_COMMAND+=(-e "JMETER_THREADS=${threads}")
+  [ -n "$rampup" ]   && JMETER_RUN_COMMAND+=(-e "JMETER_RAMPUP=${rampup}")
+  [ -n "$loops" ]    && JMETER_RUN_COMMAND+=(-e "JMETER_LOOPS=${loops}")
+  [ -n "$target" ]   && JMETER_RUN_COMMAND+=(-e "JMETER_TARGET=${target}")
+  [ -n "$duration" ] && JMETER_RUN_COMMAND+=(-e "JMETER_DURATION=${duration}")
+  JMETER_RUN_COMMAND+=("$JMETER_SERVICE" run "$plan")
+  return 0
+}
+
+# 実行前にイメージを用意する。build を持たない定義や、まだ一度もビルドして
+# いない構成でも実行できるよう、失敗しても実行自体は続ける。
+jmeter_prepare_image() {
+  [ "$JMETER_BUILD_IMAGE" = "true" ] || return 0
+  jmeter_build_compose_cmd
+  log "JMeter コンテナのイメージを用意します (compose build ${JMETER_SERVICE}) ..."
+  if ! "${JMETER_COMPOSE_CMD[@]}" build "$JMETER_SERVICE" </dev/null; then
+    warn "JMeter コンテナのイメージをビルドできませんでした。実行時の自動ビルド・取得に任せます。"
+    warn "  ビルドを行わない場合は --no-jmeter-build を指定してください。"
+  fi
+  return 0
+}
+
+# 状態ファイルの初期内容を書く。
+jmeter_write_status_file() {
+  local status_file="$1" run_id="$2" report_dir="$3" plan="$4" mode="$5"
+  local threads="$6" rampup="$7" loops="$8" target="$9"
+  local container_name="${10}" overridden="${11}" log_file="${12}"
+
+  {
+    printf 'run_id=%s\n' "$run_id"
+    printf 'state=実行中\n'
+    printf 'started_at=%s\n' "$(now_display_time)"
+    printf 'mode=%s\n' "$mode"
+    printf 'service=%s\n' "$JMETER_SERVICE"
+    printf 'compose_file=%s\n' "$COMPOSE_FILE"
+    printf 'plan=%s\n' "$plan"
+    printf 'plan_overridden=%s\n' "$overridden"
+    printf 'threads=%s\n' "${threads:-(テスト計画のまま)}"
+    printf 'rampup=%s\n' "${rampup:-(テスト計画のまま)}"
+    printf 'loops=%s\n' "${loops:-(テスト計画のまま)}"
+    printf 'target=%s\n' "${target:-(コンテナの既定)}"
+    printf 'container=%s\n' "$container_name"
+    printf 'results_dir=%s/%s\n' "$report_dir" "$run_id"
+    printf 'html_report=%s/%s/report/index.html\n' "$report_dir" "$run_id"
+    printf 'log=%s\n' "$log_file"
+  } > "$status_file" 2>/dev/null || {
+    warn "JMeter 実行状態のファイルを作成できませんでした: ${status_file}"
+    return 1
+  }
+  return 0
+}
+
+# 背面 (バックグラウンド) 実行。すぐ対話操作へ戻れるようにする。
+jmeter_launch_background() {
+  local status_file="$1" log_file="$2" work_dir="$3" run_id="$4"
+  local pid
+
+  (
+    "${JMETER_RUN_COMMAND[@]}" </dev/null >>"$log_file" 2>&1
+    jmeter_finish_status_file "$status_file" "$?"
+    jmeter_remove_work_dir "$work_dir"
+  ) &
+  pid=$!
+  JMETER_BACKGROUND_RUNS+=("${pid}"$'\t'"${run_id}"$'\t'"${status_file}")
+  return 0
+}
+
+# 前面実行。終わるまで待ち、出力をそのまま画面とログファイルへ流す。
+jmeter_launch_foreground() {
+  local status_file="$1" log_file="$2" work_dir="$3"
+  local status=0
+
+  "${JMETER_RUN_COMMAND[@]}" </dev/null 2>&1 | tee -a "$log_file" >&2
+  status="${PIPESTATUS[0]}"
+  jmeter_finish_status_file "$status_file" "$status"
+  jmeter_remove_work_dir "$work_dir"
+  return "$status"
+}
+
+# -----------------------------------------------------------------------------
+# 「JMeter 性能試験を実行」の本体
+# -----------------------------------------------------------------------------
+run_interactive_compose_jmeter() {
+  local service_name="$1"
+  local probe="" kind key value
+  local plans_dir="/test-plans" results_dir="/results"
+  local env_threads="" env_rampup="" env_loops=""
+  local choice index plan="" plan_path="" scan="" after_scan=""
+  local threads="" rampup="" loops="" target="" duration=""
+  local report_dir="" run_id="" run_dir="" work_dir="" plan_dir="" mode="background"
+  local status_file="" log_file="" container_name="" overridden="false" counter=1
+  local suffix=""
+  local -a plans=()
+
+  if ! jmeter_service_defined; then
+    err "compose 定義に JMeter の Compose サービス '${JMETER_SERVICE}' が見つかりません。"
+    return 1
+  fi
+
+  suffix=""
+  [ -n "$JMETER_PROFILE" ] && suffix=" (profile: ${JMETER_PROFILE})"
+  diag ""
+  diag "════════════ JMeter 性能試験の実行 ════════════"
+  diag "Compose サービス : ${JMETER_SERVICE}${suffix}"
+  diag "位置づけ         : 常駐サービスではなく、実行するたびに起動して終わるジョブです。"
+  diag "                   GUI で作った .jmx を非 GUI モードで実行し、GUI で開ける結果 (jtl) と"
+  diag "                   HTML ダッシュボードを出します。"
+
+  jmeter_prepare_image
+
+  log "テスト計画の一覧を取得します (compose run --rm ${JMETER_SERVICE}) ..."
+  if ! probe="$(jmeter_probe_container)" || [ -z "$probe" ]; then
+    err "JMeter コンテナを起動できませんでした。"
+    diag "  確認: ${JMETER_COMPOSE_CMD[*]} run --rm ${JMETER_SERVICE} doctor"
+    diag "  イメージが未作成の場合は先にビルドが必要です (初回は数分かかります)。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r kind key value; do
+    case "$kind" in
+      env)
+        case "$key" in
+          plans_dir)   [ -n "$value" ] && plans_dir="$value" ;;
+          results_dir) [ -n "$value" ] && results_dir="$value" ;;
+          threads)     env_threads="$value" ;;
+          rampup)      env_rampup="$value" ;;
+          loops)       env_loops="$value" ;;
+        esac
+        ;;
+      plan)
+        [ -n "$key" ] && plans+=("$key")
+        ;;
+    esac
+  done <<< "$probe"
+
+  if [ ${#plans[@]} -eq 0 ]; then
+    err "テスト計画 (.jmx) が 1 つも見つかりません: コンテナ内 ${plans_dir}"
+    diag "  GUI で作った .jmx を、compose.yaml が ${plans_dir} へマウントしているディレクトリへ置いてください。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+
+  # --jmeter-plan の指定があればそれを使い、無ければ番号で選ばせる。
+  if [ -n "$JMETER_ARG_PLAN" ]; then
+    if jmeter_in_list "$JMETER_ARG_PLAN" "${plans[@]}"; then
+      plan="$JMETER_ARG_PLAN"
+      log "--jmeter-plan で指定されたテスト計画を使用します: ${plan}"
+    else
+      warn "--jmeter-plan で指定した '${JMETER_ARG_PLAN}' が見つからないため、一覧から選択します。"
+    fi
+  fi
+  if [ -z "$plan" ]; then
+    diag ""
+    diag "実行するテスト計画を選択してください (コンテナ内 ${plans_dir}):"
+    for index in "${!plans[@]}"; do
+      diag "  $(( index + 1 ))) ${plans[$index]}"
+    done
+    diag "  0) 実行を中止"
+    while :; do
+      printf '選択番号 [0-%s]: ' "${#plans[@]}" >&2
+      if ! IFS= read -r choice; then
+        err "テスト計画の選択を読み取れませんでした。対話可能な端末から実行してください。"
+        return 1
+      fi
+      case "$choice" in
+        0)
+          log "JMeter 性能試験の実行を中止しました。"
+          diag "════════════════════════════════════════════════════════"
+          return 0
+          ;;
+        ''|*[!0-9]*|0*)
+          warn "0 から ${#plans[@]} の番号を入力してください。"
+          ;;
+        *)
+          if [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#plans[@]} ] 2>/dev/null; then
+            plan="${plans[$(( choice - 1 ))]}"
+            break
+          fi
+          warn "0 から ${#plans[@]} の番号を入力してください。"
+          ;;
+      esac
+    done
+  fi
+
+  # テスト計画をホスト側へ取り出し、設定されている負荷条件を読む。
+  if ! work_dir="$(jmeter_make_work_dir)"; then
+    err "テスト計画を取り出す一時ディレクトリを作成できませんでした。"
+    return 1
+  fi
+  plan_path="${work_dir}/${plan}"
+  jmeter_cat_plan "$plan" > "$plan_path" 2>/dev/null
+  if [ ! -s "$plan_path" ]; then
+    err "テスト計画を読み取れませんでした: ${plans_dir}/${plan}"
+    jmeter_remove_work_dir "$work_dir"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  scan="$(awk "$JMETER_PLAN_SCAN_AWK" "$plan_path" 2>/dev/null || true)"
+
+  diag ""
+  diag "テスト計画 : ${plan}"
+  if ! jmeter_print_plan_settings "$scan" "テスト計画に設定されている負荷条件"; then
+    jmeter_remove_work_dir "$work_dir"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  diag ""
+  diag "  ※ \${__P(...)} 形式の値はコンテナの環境変数で決まります"
+  diag "     (コンテナの既定: スレッド数 ${env_threads:-未設定} / Ramp-Up ${env_rampup:-未設定} / ループ ${env_loops:-未設定})。"
+  diag "  ※ 数値が直接書かれている場合は、入力した値へ書き換えた複製を作って実行します"
+  diag "     (元の .jmx は変更しません)。"
+
+  # 上書き値の入力 (コマンドラインで指定済みならそれを使う)。
+  threads="$JMETER_ARG_THREADS"
+  rampup="$JMETER_ARG_RAMPUP"
+  loops="$JMETER_ARG_LOOPS"
+  diag ""
+  # 3 つともコマンドラインで指定済みなら、入力を促す案内は出さない。
+  if [ -z "$threads" ] || [ -z "$rampup" ] || [ -z "$loops" ]; then
+    diag "上書きする値を入力してください (空欄ならテスト計画の設定のまま実行します)。"
+  fi
+  if [ -z "$threads" ]; then
+    if ! jmeter_prompt_override "スレッド数 (同時実行ユーザ数)" \
+        "$(jmeter_first_plan_value "$scan" threads)" threads; then
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    threads="$JMETER_PROMPT_VALUE"
+  else
+    log "--jmeter-threads の指定を使用します: ${threads}"
+  fi
+  if [ -z "$rampup" ]; then
+    if ! jmeter_prompt_override "Ramp-Up 期間 (秒)" \
+        "$(jmeter_first_plan_value "$scan" rampup)" rampup; then
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    rampup="$JMETER_PROMPT_VALUE"
+  else
+    log "--jmeter-rampup の指定を使用します: ${rampup}"
+  fi
+  if [ -z "$loops" ]; then
+    if ! jmeter_prompt_override "ループ回数 (-1 = 試験時間まで無限に回す)" \
+        "$(jmeter_first_plan_value "$scan" loops)" loops; then
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    loops="$JMETER_PROMPT_VALUE"
+  else
+    log "--jmeter-loops の指定を使用します: ${loops}"
+  fi
+  target="$JMETER_ARG_TARGET"
+  duration="$JMETER_ARG_DURATION"
+
+  # 数値が直接書かれていても効くよう、上書きを指定したときは複製も作る。
+  if [ -n "$threads" ] || [ -n "$rampup" ] || [ -n "$loops" ]; then
+    plan_dir="${work_dir}/override"
+    if ! mkdir -p -- "$plan_dir" 2>/dev/null; then
+      err "書き換えたテスト計画の置き場を作成できませんでした: ${plan_dir}"
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    awk -v threads="$threads" -v rampup="$rampup" -v loops="$loops" \
+      "$JMETER_PLAN_OVERRIDE_AWK" "$plan_path" > "${plan_dir}/${plan}" 2>/dev/null
+    if [ ! -s "${plan_dir}/${plan}" ]; then
+      err "テスト計画の値を書き換えられませんでした: ${plan}"
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    overridden="true"
+    after_scan="$(awk "$JMETER_PLAN_SCAN_AWK" "${plan_dir}/${plan}" 2>/dev/null || true)"
+    jmeter_print_plan_settings "$after_scan" "上書き後の負荷条件 (この内容で実行します)" || true
+  else
+    diag ""
+    diag "上書きの指定が無いため、テスト計画の設定のまま実行します。"
+  fi
+
+  # 出力先 (レポートファイルと同じディレクトリ) を決める。
+  if ! report_dir="$(jmeter_resolve_report_dir true)"; then
+    jmeter_remove_work_dir "$work_dir"
+    return 1
+  fi
+  run_id="build_and_verify_${RUN_TIMESTAMP}_jmeter_$(jmeter_safe_name "${plan%.jmx}")"
+  while [ -e "${report_dir}/${run_id}" ]; do
+    run_id="build_and_verify_${RUN_TIMESTAMP}_jmeter_$(jmeter_safe_name "${plan%.jmx}")_${counter}"
+    counter=$(( counter + 1 ))
+  done
+  run_dir="${report_dir}/${run_id}"
+  status_file="$(jmeter_status_file_path "$report_dir" "$run_id")"
+  log_file="$(jmeter_log_file_path "$report_dir" "$run_id")"
+  container_name="$(jmeter_safe_name "$run_id")"
+  jmeter_compose_run_supports_name || container_name=""
+
+  # 実行方法の選択 (背面実行を既定にする。長時間の試験でも対話操作へ戻れる)。
+  diag ""
+  diag "実行方法を選択してください:"
+  diag "  1) 背面で実行し、すぐ操作の選択へ戻る (既定。進捗は「JMeter 実行状況を確認」で見る)"
+  diag "  2) 前面で実行し、終わるまで待つ (出力をそのまま画面へ出す)"
+  diag "  0) 実行を中止"
+  while :; do
+    printf '選択番号 [0-2] (空欄=1): ' >&2
+    if ! IFS= read -r choice; then
+      err "実行方法の選択を読み取れませんでした。対話可能な端末から実行してください。"
+      jmeter_remove_work_dir "$work_dir"
+      return 1
+    fi
+    case "$choice" in
+      ''|1) mode="background"; break ;;
+      2)    mode="foreground"; break ;;
+      0)
+        log "JMeter 性能試験の実行を中止しました。"
+        jmeter_remove_work_dir "$work_dir"
+        diag "════════════════════════════════════════════════════════"
+        return 0
+        ;;
+      *) warn "0 から 2 の番号を入力してください。" ;;
+    esac
+  done
+
+  jmeter_build_run_command "$run_id" "$report_dir" "$plan" "$plan_dir" \
+    "$threads" "$rampup" "$loops" "$target" "$duration"
+  : > "$log_file" 2>/dev/null || true
+  jmeter_write_status_file "$status_file" "$run_id" "$report_dir" "$plan" "$mode" \
+    "$threads" "$rampup" "$loops" "$target" "$container_name" "$overridden" "$log_file"
+
+  suffix=""
+  [ "$overridden" = "true" ] && suffix=" (値を書き換えた複製で実行)"
+  diag ""
+  diag "[実行内容]"
+  diag "  テスト計画   : ${plan}${suffix}"
+  diag "  スレッド数   : ${threads:-テスト計画のまま}"
+  diag "  Ramp-Up 期間 : ${rampup:-テスト計画のまま}"
+  diag "  ループ回数   : ${loops:-テスト計画のまま}"
+  [ -n "$target" ]   && diag "  投げ先       : ${target}"
+  [ -n "$duration" ] && diag "  試験時間     : ${duration} 秒"
+  diag "  結果の出力先 : ${run_dir}/"
+  diag "  HTML レポート: ${run_dir}/report/index.html"
+  diag "  実行ログ     : ${log_file}"
+  diag "  実行コマンド : ${JMETER_RUN_COMMAND[*]}"
+  diag "  ※ コンテナ側の既定の出力先 (${results_dir}) ではなく、レポートファイルと"
+  diag "     同じディレクトリへ出力します (--jmeter-report-dir で変更できます)。"
+  diag "  ※ 結果ファイルはコンテナ内のユーザーで作られます (root になることがあります)。"
+
+  if [ "$mode" = "foreground" ]; then
+    diag ""
+    diag "前面で実行します。終わるまでこの画面へ出力を流します (中断は Ctrl-C)。"
+    diag "────────────────────────────────────────────────────────"
+    jmeter_launch_foreground "$status_file" "$log_file" "$work_dir"
+    diag "────────────────────────────────────────────────────────"
+    jmeter_print_run_result "$status_file"
+    diag "════════════════════════════════════════════════════════"
+    return 0
+  fi
+
+  jmeter_launch_background "$status_file" "$log_file" "$work_dir" "$run_id"
+  log "JMeter 性能試験を背面で開始しました: ${run_id}"
+  diag "  進捗は同じメニューの「JMeter 実行状況を確認」で見られます。"
+  diag "  別の端末からは次で確認できます:"
+  diag "    $0 --jmeter-status"
+  diag "  対話操作を終了するときに、実行中であれば完了を待つかどうかを確認します。"
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
+# 1 回の実行の結果 (判定・出力物) を表示する。
+jmeter_print_run_result() {
+  local status_file="$1" state results_dir html log_file line
+
+  state="$(jmeter_status_value "$status_file" state || true)"
+  results_dir="$(jmeter_status_value "$status_file" results_dir || true)"
+  html="$(jmeter_status_value "$status_file" html_report || true)"
+  log_file="$(jmeter_status_value "$status_file" log || true)"
+
+  diag ""
+  diag "[実行結果]"
+  diag "  状態          : ${state:-不明}"
+  if [ -n "$results_dir" ] && [ -d "$results_dir" ]; then
+    diag "  結果          : ${results_dir}/result.jtl (JMeter GUI のリスナーから開く)"
+    if [ -f "${results_dir}/summary-stats.txt" ]; then
+      while IFS= read -r line; do
+        [ -n "$line" ] && diag "    ${line}"
+      done < "${results_dir}/summary-stats.txt"
+    fi
+  else
+    diag "  結果          : ${results_dir:-(不明)} (まだ作成されていません)"
+  fi
+  if [ -n "$html" ] && [ -f "$html" ]; then
+    diag "  HTML レポート : ${html}"
+    diag "                  レポートファイルと同じディレクトリへ出力しています。"
+    diag "                  ディレクトリごと別端末へコピーし、index.html を開いてください。"
+  else
+    diag "  HTML レポート : ${html:-(不明)} (まだ作成されていません)"
+  fi
+  [ -n "$log_file" ] && diag "  実行ログ      : ${log_file}"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 実行状況の確認
+# -----------------------------------------------------------------------------
+# 実行中の jmeter コンテナを列挙する。
+jmeter_running_containers() {
+  docker ps --filter "label=com.docker.compose.service=${JMETER_SERVICE}" \
+    --format '{{.Names}}|{{.Status}}|{{.Image}}' 2>/dev/null || true
+}
+
+jmeter_container_alive() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$name"
+}
+
+# 実行ログから進捗 (JMeter の summary 行) を取り出す。
+jmeter_progress_lines() {
+  local log_file="${1:-}" lines="$2" progress
+  [ -n "$log_file" ] && [ -f "$log_file" ] || return 1
+  progress="$(grep -E '^summary' "$log_file" 2>/dev/null | tail -n "$lines" || true)"
+  if [ -z "$progress" ]; then
+    progress="$(tail -n "$lines" "$log_file" 2>/dev/null || true)"
+  fi
+  [ -n "$progress" ] || return 1
+  printf '%s\n' "$progress"
+}
+
+# 実行状況をまとめて表示する。対話操作からも --jmeter-status からも使う。
+jmeter_print_status_report() {
+  local report_dir="" status_file run_id state started plan threads rampup loops
+  local container results_dir html log_file value shown=0 latest_status=""
+  local containers="" progress="" c_name c_status c_image suffix=""
+  local -a status_files=()
+
+  report_dir="$(jmeter_resolve_report_dir false)" || return 1
+  [ -n "$JMETER_PROFILE" ] && suffix=" (profile: ${JMETER_PROFILE})"
+
+  diag ""
+  diag "════════════ JMeter 実行状況 ════════════"
+  diag "Compose サービス : ${JMETER_SERVICE}${suffix}"
+  diag "結果の出力先     : ${report_dir}"
+
+  if [ -d "$report_dir" ]; then
+    # run_id の先頭へ実行日時を入れてあるため、名前の降順が新しい順になる。
+    mapfile -t status_files < <(
+      for status_file in "$report_dir"/build_and_verify_*_jmeter_*.status; do
+        [ -f "$status_file" ] && printf '%s\n' "$status_file"
+      done | sort -r
+    )
+  fi
+
+  diag ""
+  diag "[この結果ディレクトリの実行一覧 (新しい順, 最大 ${JMETER_STATUS_REPORT_LIMIT} 件)]"
+  if [ ${#status_files[@]} -eq 0 ]; then
+    diag "  (まだ 1 件もありません)"
+  fi
+  for status_file in ${status_files[@]+"${status_files[@]}"}; do
+    [ "$shown" -lt "$JMETER_STATUS_REPORT_LIMIT" ] || break
+    shown=$(( shown + 1 ))
+    run_id="$(jmeter_status_value "$status_file" run_id || true)"
+    state="$(jmeter_status_value "$status_file" state || true)"
+    started="$(jmeter_status_value "$status_file" started_at || true)"
+    plan="$(jmeter_status_value "$status_file" plan || true)"
+    threads="$(jmeter_status_value "$status_file" threads || true)"
+    rampup="$(jmeter_status_value "$status_file" rampup || true)"
+    loops="$(jmeter_status_value "$status_file" loops || true)"
+    container="$(jmeter_status_value "$status_file" container || true)"
+    # 実行中のまま残っている記録は、コンテナが生きているかで裏を取る。
+    if [ "$state" = "実行中" ] && [ -n "$container" ] && ! jmeter_container_alive "$container"; then
+      state="実行中の記録あり (コンテナが見つかりません: 中断された可能性)"
+    fi
+    diag "  ${started:-日時不明}  [${state:-不明}]  ${run_id}"
+    diag "      テスト計画: ${plan:-不明} / スレッド数: ${threads:-不明} / Ramp-Up: ${rampup:-不明} / ループ: ${loops:-不明}"
+    [ -z "$latest_status" ] && latest_status="$status_file"
+  done
+
+  diag ""
+  diag "[実行中の JMeter コンテナ (docker ps)]"
+  containers="$(jmeter_running_containers)"
+  if [ -n "$containers" ]; then
+    while IFS='|' read -r c_name c_status c_image; do
+      [ -n "$c_name" ] && diag "  ${c_name} : ${c_status} (${c_image})"
+    done <<< "$containers"
+  else
+    diag "  (実行中のコンテナはありません)"
+  fi
+
+  if [ -n "$latest_status" ]; then
+    run_id="$(jmeter_status_value "$latest_status" run_id || true)"
+    log_file="$(jmeter_status_value "$latest_status" log || true)"
+    results_dir="$(jmeter_status_value "$latest_status" results_dir || true)"
+    html="$(jmeter_status_value "$latest_status" html_report || true)"
+    diag ""
+    diag "[最新の実行の進捗 (${run_id})]"
+    if progress="$(jmeter_progress_lines "$log_file" "$JMETER_STATUS_LOG_LINES")"; then
+      while IFS= read -r value; do
+        [ -n "$value" ] && diag "  ${value}"
+      done <<< "$progress"
+    else
+      diag "  (まだ出力がありません)"
+    fi
+    diag ""
+    diag "[最新の実行の出力物]"
+    if [ -n "$results_dir" ] && [ -f "${results_dir}/result.jtl" ]; then
+      diag "  result.jtl        : ${results_dir}/result.jtl"
+    else
+      diag "  result.jtl        : ${results_dir:-不明}/result.jtl (未作成)"
+    fi
+    if [ -n "$html" ] && [ -f "$html" ]; then
+      diag "  HTML レポート     : ${html}"
+    else
+      diag "  HTML レポート     : ${html:-不明} (未作成。試験の終了時に作られます)"
+    fi
+    if [ -n "$results_dir" ] && [ -f "${results_dir}/summary-stats.txt" ]; then
+      diag "  一次集計          :"
+      while IFS= read -r value; do
+        [ -n "$value" ] && diag "    ${value}"
+      done < "${results_dir}/summary-stats.txt"
+    fi
+    [ -n "$log_file" ] && diag "  実行ログ          : ${log_file}"
+  fi
+
+  diag ""
+  diag "別の端末からも次のコマンドで同じ内容を確認できます:"
+  diag "  $0 --jmeter-status (結果の出力先を変えている場合は --report-dir / --jmeter-report-dir も同じ指定で)"
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
+# 対話操作から呼ぶ「JMeter 実行状況を確認」。
+run_interactive_compose_jmeter_status() {
+  jmeter_print_status_report
+}
+
+# この実行で起動し、まだ動いている背面実行を列挙する。
+jmeter_active_background_runs() {
+  local entry pid found=1
+  [ ${#JMETER_BACKGROUND_RUNS[@]} -gt 0 ] || return 1
+  for entry in ${JMETER_BACKGROUND_RUNS[@]+"${JMETER_BACKGROUND_RUNS[@]}"}; do
+    pid="${entry%%$'\t'*}"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$entry"
+      found=0
+    fi
+  done
+  return "$found"
+}
+
+# 対話操作を終える前に、背面実行の扱いを確認する。
+# 対話操作の終了後は既定でコンテナを削除する (compose down → 完全クリア) ため、
+# 実行中の試験があればここで確認しないと、結果を残せないまま消えてしまう。
+jmeter_wait_background_runs() {
+  local entry pid run_id status_file choice progress waited=0 log_file
+  local -a active=()
+
+  mapfile -t active < <(jmeter_active_background_runs)
+  [ ${#active[@]} -gt 0 ] || return 0
+
+  diag ""
+  diag "════════════ 実行中の JMeter 性能試験 ════════════"
+  for entry in "${active[@]}"; do
+    IFS=$'\t' read -r pid run_id status_file <<< "$entry"
+    diag "  ${run_id} (実行中)"
+  done
+  diag "対話操作を終了すると、既定ではコンテナを削除する後始末へ進みます。"
+  diag "そのまま終了すると試験は途中で終わり、結果と HTML レポートは作られません。"
+  diag "  1) 完了を待つ (推奨)"
+  diag "  2) 待たずに終了する"
+  while :; do
+    printf '選択番号 [1-2] (空欄=1): ' >&2
+    if ! IFS= read -r choice; then
+      warn "入力を読み取れないため、完了を待たずに終了します。"
+      choice=2
+    fi
+    case "$choice" in
+      ''|1) choice=1; break ;;
+      2)    break ;;
+      *)    warn "1 か 2 を入力してください。" ;;
+    esac
+  done
+
+  if [ "$choice" = "2" ]; then
+    warn "実行中の JMeter 性能試験を待たずに終了します。結果が残らない可能性があります。"
+    diag "════════════════════════════════════════════════════════"
+    return 0
+  fi
+
+  log "JMeter 性能試験の完了を待ちます (中断は Ctrl-C) ..."
+  while :; do
+    active=()
+    mapfile -t active < <(jmeter_active_background_runs)
+    [ ${#active[@]} -gt 0 ] || break
+    sleep "$JMETER_WAIT_INTERVAL"
+    waited=$(( waited + JMETER_WAIT_INTERVAL ))
+    for entry in "${active[@]}"; do
+      IFS=$'\t' read -r pid run_id status_file <<< "$entry"
+      log_file="$(jmeter_status_value "$status_file" log || true)"
+      progress="$(jmeter_progress_lines "$log_file" 1 || true)"
+      log "  ${run_id}: 実行中 (${waited} 秒経過)${progress:+ / ${progress}}"
+    done
+  done
+  log "JMeter 性能試験が完了しました。"
+  for entry in ${JMETER_BACKGROUND_RUNS[@]+"${JMETER_BACKGROUND_RUNS[@]}"}; do
+    IFS=$'\t' read -r pid run_id status_file <<< "$entry"
+    jmeter_print_run_result "$status_file"
+  done
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
 # 選択済み Compose サービスについて、ログ表示、対話式 bash / root bash / MySQL 接続、
 # healthcheck 診断、対応サービスのローカル可観測性診断、ALB ヘルスチェック確認を
 # 繰り返す。0 を選択すると、起動中 Compose サービスの選択へ戻る。
@@ -26300,6 +27516,7 @@ run_interactive_compose_service_actions() {
   local jboss_module_action=0 root_bash_action=0 efs_propagation_action=0
   local valkey_action=0
   local truststore_inventory_action=0
+  local jmeter_run_action=0 jmeter_status_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -26354,6 +27571,14 @@ run_interactive_compose_service_actions() {
     max_action=$(( max_action + 1 ))
     valkey_action="$max_action"
   fi
+  # JMeter の操作は jmeter サービスを選んだときだけ、さらに後ろへ採番する。
+  # 他のサービスの番号は一切動かないため、既存の構成の操作番号は変わらない。
+  if compose_service_supports_jmeter "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    jmeter_run_action="$max_action"
+    max_action=$(( max_action + 1 ))
+    jmeter_status_action="$max_action"
+  fi
   while :; do
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
@@ -26395,6 +27620,12 @@ run_interactive_compose_service_actions() {
     diag "  ${root_bash_action}) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
     if [ "$valkey_action" -gt 0 ]; then
       diag "  ${valkey_action}) Valkey 操作 (valkey-cli / openssl 代替シェルでキー一覧・値・TTL を確認)"
+    fi
+    if [ "$jmeter_run_action" -gt 0 ]; then
+      diag "  ${jmeter_run_action}) JMeter 性能試験を実行 (テスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きして実行)"
+    fi
+    if [ "$jmeter_status_action" -gt 0 ]; then
+      diag "  ${jmeter_status_action}) JMeter 実行状況を確認 (実行中のコンテナ / 進捗 / 結果と HTML レポートの出力先)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -26488,6 +27719,16 @@ run_interactive_compose_service_actions() {
           if ! run_interactive_compose_valkey "$service_name"; then
             warn "Valkey 操作に失敗しました。サービス操作の選択へ戻ります。"
           fi
+        elif [ "$jmeter_run_action" -gt 0 ] && [ "$action" = "$jmeter_run_action" ]; then
+          if ! run_interactive_compose_jmeter "$service_name"; then
+            warn "JMeter 性能試験の実行に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$jmeter_status_action" -gt 0 ] && [ "$action" = "$jmeter_status_action" ]; then
+          if ! run_interactive_compose_jmeter_status; then
+            warn "JMeter 実行状況の確認に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -26501,19 +27742,31 @@ run_interactive_compose_service_actions() {
 run_interactive_compose_service_menu() {
   local choice index service_name _service_index
   local -a started_services=()
+  local -a service_labels=()
 
   while :; do
     started_services=()
+    service_labels=()
     mapfile -t started_services < <(compose_started_services)
     if [ ${#started_services[@]} -eq 0 ]; then
       err "対話操作できる起動中の Compose サービスが見つかりません。"
       return 1
     fi
+    for _service_index in "${!started_services[@]}"; do
+      service_labels+=("${started_services[$_service_index]}")
+    done
+    # jmeter は「実行するたびに起動して終わるジョブ」なので、起動中の一覧には
+    # 現れない。compose 定義にあれば選択肢へ足し、性能試験を始められるようにする。
+    if jmeter_service_defined \
+        && ! jmeter_in_list "$JMETER_SERVICE" ${started_services[@]+"${started_services[@]}"}; then
+      started_services+=("$JMETER_SERVICE")
+      service_labels+=("${JMETER_SERVICE} (未起動: 実行するたびに起動する性能試験コンテナ)")
+    fi
 
     diag ""
     diag "操作する起動中の Compose サービスを選択してください:"
     for _service_index in "${!started_services[@]}"; do
-      diag "  $(( _service_index + 1 ))) ${started_services[$_service_index]}"
+      diag "  $(( _service_index + 1 ))) ${service_labels[$_service_index]}"
     done
     diag "  0) 対話操作を終了"
 
@@ -26526,6 +27779,9 @@ run_interactive_compose_service_menu() {
       INTERACTION_MENU_ENTERED="true"
       case "$choice" in
         0)
+          # 背面で走らせた JMeter 性能試験があれば、コンテナを消す後始末へ進む前に
+          # 完了を待つかどうかを確認する (待たずに終えると結果が残らない)。
+          jmeter_wait_background_runs
           # 対話操作をすべて終えた合図。終了処理で完全クリアと空き容量の一覧を行う。
           INTERACTION_FINISHED="true"
           log "Compose サービスの対話操作を終了しました。"
@@ -26565,7 +27821,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;
@@ -38811,6 +40067,15 @@ cleanup_all() {
   fi
   exit "$cleanup_status"
 }
+# ---- JMeter 実行状況の表示だけを行う (--jmeter-status) ----------------------
+# 背面で走らせた性能試験を別の端末から確認するための入口。ビルドも起動も
+# 行わないため、後始末 (EXIT トラップ) を張る前に表示して終了する
+# (状況を見ただけでコンテナが消える、という事故を起こさないため)。
+if [ "$JMETER_STATUS_ONLY" = "true" ]; then
+  jmeter_print_status_report
+  exit 0
+fi
+
 # ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に後始末する
 trap cleanup_all EXIT
 

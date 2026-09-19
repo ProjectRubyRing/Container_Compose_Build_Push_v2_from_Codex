@@ -9014,4 +9014,231 @@ if (
 fi
 assert_contains "$ecs_cb_conflict_output" "--ecs-circuit-breaker-watch-timeout には 0 以上の整数を指定してください: abc"
 
-printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, deployed class MD5 digest comparison (pre-deploy WAR vs. deployed vfs/temp, with difference simulation), and ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log)\n'
+# ---- JMeter 性能試験 (jmeter コンテナの呼び出し) ----------------------------
+# 別プロジェクトの compose へ追加された jmeter サービス (profiles: loadtest) は
+# compose up では起動しないため、起動中サービスの一覧には現れない。
+# それでも対話操作から選べること、テスト計画に「数値が直接書かれている」値を
+# 上書きして実行できること、結果と HTML レポートがレポートファイルと同じ
+# ディレクトリへ出ること、実行状況を確認できることを確かめる。
+jmeter_output="$TEST_TMP/jmeter-dialog.out"
+jmeter_reports="$TEST_TMP/jmeter-reports"
+mkdir -p "$jmeter_reports"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_USAGE_CHECK_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+# compose 定義には jmeter がある (profiles 配下でも --profile 付きで見える) 状態。
+export FAKE_COMPOSE_CONFIG_SERVICES="app jmeter"
+export FAKE_JMETER_PLANS="sample-frontend.jmx sample-async-post.jmx"
+export FAKE_JMETER_PLAN_FILE="$TEST_DIR/fixtures/jmeter-plan-sample.jmx"
+export FAKE_DOCKER_PS="jmeter-running-container|Up 10 seconds|proj-jmeter"
+# jmeter サービス選択 → 性能試験の実行 → 計画選択 → 不正値 → 上書き値 →
+# 前面実行 → Enter → 実行状況の確認 → Enter → サービス選択へ戻る → 終了
+if ! printf '2\n5\n1\nabc\n50\n60\n3\n2\n\n6\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --report-dir "$jmeter_reports" \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$jmeter_output" 2>&1; then
+  cat "$jmeter_output" >&2
+  fail "JMeter interaction returned a non-zero status"
+fi
+
+# 起動していなくてもサービス選択の一覧へ現れる (実行するたびに起動するジョブのため)。
+assert_contains "$jmeter_output" "  2) jmeter (未起動: 実行するたびに起動する性能試験コンテナ)"
+# 追加操作は末尾へ採番し、既存の操作番号 (1〜4) は動かさない。
+assert_contains "$jmeter_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+assert_contains "$jmeter_output" \
+  "  5) JMeter 性能試験を実行 (テスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きして実行)"
+assert_contains "$jmeter_output" \
+  "  6) JMeter 実行状況を確認 (実行中のコンテナ / 進捗 / 結果と HTML レポートの出力先)"
+# テスト計画の一覧はコンテナ内の test-plans から取る。
+assert_contains "$jmeter_output" "実行するテスト計画を選択してください (コンテナ内 /test-plans):"
+assert_contains "$jmeter_output" "  1) sample-frontend.jmx"
+assert_contains "$jmeter_output" "  2) sample-async-post.jmx"
+# テスト計画に設定されている値を読み、書き方 (数値 / ${__P(...)}) まで示す。
+assert_contains "$jmeter_output" "  #1 TG01 一般ユーザ"
+assert_contains "$jmeter_output" "     スレッド数   : 10 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "     Ramp-Up 期間 : 5 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "     ループ回数   : 2 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "     スレッド数   : \${__P(threads,10)} (環境変数で差し替えられる書き方)"
+# setUp/tearDown スレッドグループは上書きの対象外であることを伝える。
+assert_contains "$jmeter_output" \
+  "  (参考) SetupThreadGroup 'SU01 前処理' は setUp/tearDown などのスレッドグループのため、上書きの対象外です。"
+# 不正な入力はその場で弾き、同じ入力を繰り返し求める。
+assert_contains "$jmeter_output" "1 以上の整数を入力してください。"
+# 上書き後の値を、実行前に確認できる形で示す。
+assert_contains "$jmeter_output" "[上書き後の負荷条件 (この内容で実行します)]"
+assert_contains "$jmeter_output" "     スレッド数   : 50 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "     Ramp-Up 期間 : 60 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "     ループ回数   : 3 (数値が直接書かれている)"
+assert_contains "$jmeter_output" "  テスト計画   : sample-frontend.jmx (値を書き換えた複製で実行)"
+
+# profiles 配下のサービスなので --profile を付けて呼び出す。
+assert_contains "$FAKE_DOCKER_CALLS" "compose --profile loadtest -f compose.yml config --services"
+assert_contains "$FAKE_DOCKER_CALLS" "compose --profile loadtest -f compose.yml build jmeter"
+# テスト計画の一覧取得と読み出しは、使い捨てコンテナで行う (--rm --no-deps -T)。
+assert_matches "$FAKE_DOCKER_CALLS" \
+  'compose --profile loadtest -f compose\.yml run --rm --no-deps -T --entrypoint /bin/sh jmeter -c'
+# 実行本体: 結果の出力先をレポートディレクトリへ向け、上書き値を環境変数でも渡す。
+assert_matches "$FAKE_DOCKER_CALLS" 'run --rm -T --name build_and_verify_[0-9]+_jmeter_sample-frontend'
+assert_contains "$FAKE_DOCKER_CALLS" ":/bv-jmeter-results -e JMETER_RESULTS_DIR=/bv-jmeter-results"
+assert_contains "$FAKE_DOCKER_CALLS" ":/bv-jmeter-plans:ro -e JMETER_PLANS_DIR=/bv-jmeter-plans"
+assert_contains "$FAKE_DOCKER_CALLS" "-e JMETER_THREADS=50 -e JMETER_RAMPUP=60 -e JMETER_LOOPS=3"
+assert_contains "$FAKE_DOCKER_CALLS" "jmeter run sample-frontend.jmx"
+
+# 結果一式はレポートファイルと同じディレクトリへ出力する。
+jmeter_run_dir="$(
+  find "$jmeter_reports" -maxdepth 1 -type d -name 'build_and_verify_*_jmeter_sample-frontend' | head -1
+)"
+[ -n "$jmeter_run_dir" ] || fail "JMeter result directory was not created under the report directory"
+[ -f "$jmeter_run_dir/report/index.html" ] \
+  || fail "JMeter HTML report was not created in $jmeter_run_dir/report"
+[ -f "$jmeter_run_dir/result.jtl" ] || fail "JMeter result.jtl was not created in $jmeter_run_dir"
+assert_contains "$jmeter_output" "  HTML レポート : ${jmeter_run_dir}/report/index.html"
+assert_contains "$jmeter_output" "                  レポートファイルと同じディレクトリへ出力しています。"
+
+# 実行に使われたテスト計画 (複製) は、スレッドグループ本体だけが書き換わっている。
+assert_contains "$jmeter_run_dir/plan.jmx" '<stringProp name="ThreadGroup.num_threads">50</stringProp>'
+assert_contains "$jmeter_run_dir/plan.jmx" '<stringProp name="ThreadGroup.ramp_time">60</stringProp>'
+assert_contains "$jmeter_run_dir/plan.jmx" '<stringProp name="LoopController.loops">3</stringProp>'
+# 配下のループコントローラ (7) と setUp スレッドグループ (1) は書き換えない。
+assert_contains "$jmeter_run_dir/plan.jmx" '<stringProp name="LoopController.loops">7</stringProp>'
+assert_contains "$jmeter_run_dir/plan.jmx" '<stringProp name="ThreadGroup.num_threads">1</stringProp>'
+# 元のテスト計画 (fixture) は一切変更しない。
+assert_contains "$TEST_DIR/fixtures/jmeter-plan-sample.jmx" \
+  '<stringProp name="ThreadGroup.num_threads">10</stringProp>'
+assert_not_contains "$TEST_DIR/fixtures/jmeter-plan-sample.jmx" \
+  '<stringProp name="ThreadGroup.num_threads">50</stringProp>'
+
+# 実行状況の確認 (同じメニューの操作)。
+assert_contains "$jmeter_output" "════════════ JMeter 実行状況 ════════════"
+assert_contains "$jmeter_output" "[この結果ディレクトリの実行一覧 (新しい順, 最大 10 件)]"
+assert_contains "$jmeter_output" "[実行中の JMeter コンテナ (docker ps)]"
+assert_contains "$jmeter_output" "  jmeter-running-container : Up 10 seconds (proj-jmeter)"
+assert_contains "$jmeter_output" "summary +      1 in 00:00:01"
+assert_contains "$jmeter_output" "  一次集計          :"
+
+# 状態ファイルは別端末からも読めるよう、結果ディレクトリの隣へ残す。
+jmeter_status_file="$(
+  find "$jmeter_reports" -maxdepth 1 -type f -name 'build_and_verify_*_jmeter_sample-frontend.status' | head -1
+)"
+[ -n "$jmeter_status_file" ] || fail "JMeter status file was not created"
+assert_contains "$jmeter_status_file" "plan=sample-frontend.jmx"
+assert_contains "$jmeter_status_file" "threads=50"
+assert_contains "$jmeter_status_file" "rampup=60"
+assert_contains "$jmeter_status_file" "loops=3"
+assert_contains "$jmeter_status_file" "plan_overridden=true"
+assert_contains "$jmeter_status_file" "state=完了"
+
+# --- 別端末からの実行状況の確認 (--jmeter-status) ---
+# ビルドも起動も後始末も行わず、状況だけを表示して終了する。
+jmeter_status_output="$TEST_TMP/jmeter-status.out"
+: > "$FAKE_DOCKER_CALLS"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-status --report-dir "$jmeter_reports"
+) >"$jmeter_status_output" 2>&1; then
+  cat "$jmeter_status_output" >&2
+  fail "--jmeter-status returned a non-zero status"
+fi
+assert_contains "$jmeter_status_output" "════════════ JMeter 実行状況 ════════════"
+assert_contains "$jmeter_status_output" "結果の出力先     : ${jmeter_reports}"
+assert_contains "$jmeter_status_output" "  jmeter-running-container : Up 10 seconds (proj-jmeter)"
+assert_contains "$jmeter_status_output" "  HTML レポート     : ${jmeter_run_dir}/report/index.html"
+# 状況を見ただけでコンテナが消えないよう、compose down も完全クリアも行わない。
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml down"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml up"
+assert_not_contains "$FAKE_DOCKER_CALLS" "compose -f compose.yml build"
+
+unset FAKE_COMPOSE_PS_SERVICES FAKE_COMPOSE_CONFIG_SERVICES
+unset FAKE_JMETER_PLANS FAKE_JMETER_PLAN_FILE FAKE_DOCKER_PS
+
+# --- jmeter が定義されていない構成では、操作も選択肢も増えない ---
+jmeter_absent_output="$TEST_TMP/jmeter-absent.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="app"
+if ! printf '1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$jmeter_absent_output" 2>&1; then
+  cat "$jmeter_absent_output" >&2
+  fail "logs mode without a jmeter service returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+assert_not_contains "$jmeter_absent_output" "JMeter 性能試験を実行"
+assert_not_contains "$jmeter_absent_output" "JMeter 実行状況を確認"
+assert_not_contains "$jmeter_absent_output" "未起動: 実行するたびに起動する性能試験コンテナ"
+assert_contains "$jmeter_absent_output" "  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+
+# --- 指定の誤りは exit 2 で止める ---
+jmeter_invalid_output="$TEST_TMP/jmeter-invalid.out"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-threads 0
+) >"$jmeter_invalid_output" 2>&1; then
+  fail "--jmeter-threads 0 must fail"
+fi
+assert_contains "$jmeter_invalid_output" \
+  "--jmeter-threads には 1 以上の整数 (同時実行ユーザ数) を指定してください: 0"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-rampup abc
+) >"$jmeter_invalid_output" 2>&1; then
+  fail "--jmeter-rampup abc must fail"
+fi
+assert_contains "$jmeter_invalid_output" "--jmeter-rampup には 0 以上の整数 (秒) を指定してください: abc"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-loops 0
+) >"$jmeter_invalid_output" 2>&1; then
+  fail "--jmeter-loops 0 must fail"
+fi
+assert_contains "$jmeter_invalid_output" \
+  "--jmeter-loops には 1 以上の整数か、試験時間まで無限に回す -1 を指定してください: 0"
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-report-dir -
+) >"$jmeter_invalid_output" 2>&1; then
+  fail "--jmeter-report-dir - must fail"
+fi
+assert_contains "$jmeter_invalid_output" "--jmeter-report-dir にはディレクトリのパスを指定してください: -"
+# ループ回数の -1 (試験時間まで無限に回す) と Ramp-Up 0 は受け付ける。
+# 後から検証する --jmeter-duration のエラーで止まることで、手前の 3 つを
+# 通過したことが分かる。
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --jmeter-loops -1 --jmeter-threads 200 --jmeter-rampup 0 \
+    --jmeter-duration abc
+) >"$jmeter_invalid_output" 2>&1; then
+  fail "--jmeter-duration abc must fail"
+fi
+assert_contains "$jmeter_invalid_output" "--jmeter-duration には 0 以上の整数 (秒) を指定してください: abc"
+assert_not_contains "$jmeter_invalid_output" "--jmeter-loops には"
+assert_not_contains "$jmeter_invalid_output" "--jmeter-threads には"
+assert_not_contains "$jmeter_invalid_output" "--jmeter-rampup には"
+# 使い方にも JMeter の項を載せる。
+jmeter_help_output="$TEST_TMP/jmeter-help.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --help
+) >"$jmeter_help_output" 2>&1; then
+  cat "$jmeter_help_output" >&2
+  fail "--help returned a non-zero status"
+fi
+assert_contains "$jmeter_help_output" "JMeter 性能試験 (jmeter コンテナの呼び出し):"
+assert_contains "$jmeter_help_output" "  --jmeter-status          JMeter の実行状況を表示して終了する。ビルドも起動も"
+
+printf 'PASS: build_and_verify.sh startup/companion log display, tree rendering/pruning, interaction, full report, JBoss master password propagation, Undertow virtual host (default-host) analysis, cwagent CloudWatch Logs delivery verification, WAR deploy Java exception analysis, --copy-file overwrite/restore, disk usage reclaim/prune/report, build stall detection/progress/timeout, cert check received-certificate detail (root CA / v1 / leaf classification) and result text output, cert check chain diagnosis, truststore inventory (effective stores / custom certificate highlighting / assembled curl commands) and its text output, Docker cleanup scenarios, build context/Dockerfile override, and --keep-service no-cache exclusion / image / volume protection, host syslog (/var/log/messages) output suppression, deployed class MD5 digest comparison (pre-deploy WAR vs. deployed vfs/temp, with difference simulation), ECS deployment circuit breaker reproduction (essential container unhealthy -> stop during jboss-cli reload -> truncated server.log), and JMeter load test invocation (profile-gated jmeter service in the dialog, thread/ramp-up/loop override of the .jmx, HTML report next to the report file, and run status via the dialog and --jmeter-status)\n'

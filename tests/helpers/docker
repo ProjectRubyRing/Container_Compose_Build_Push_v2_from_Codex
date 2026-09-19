@@ -142,7 +142,7 @@ if [ "${1:-}" = "compose" ]; then
   subcommand=""
   for arg in "$@"; do
     case "$arg" in
-      version|build|up|logs|ps|down|stop|config|pull)
+      version|build|up|logs|ps|down|stop|config|pull|run)
         subcommand="$arg"
         break
         ;;
@@ -404,6 +404,13 @@ if [ "${1:-}" = "compose" ]; then
               *" cacheapp "*) printf 'cid-cacheapp\n' ;;
             esac
             ;;
+          # JMeter 実行コンテナは compose 定義にあっても常駐しない。
+          # FAKE_COMPOSE_PS_SERVICES へ含めたときだけ起動しているものとして扱う。
+          jmeter)
+            case " ${FAKE_COMPOSE_PS_SERVICES:-app} " in
+              *" jmeter "*) printf 'cid-jmeter\n' ;;
+            esac
+            ;;
           *) printf 'cid-app\n' ;;
         esac
       fi
@@ -417,10 +424,140 @@ if [ "${1:-}" = "compose" ]; then
     down)
       printf 'fake app container removed\n'
       ;;
+    run)
+      # docker compose run (JMeter 実行コンテナの呼び出し) の再現。
+      # --help は --name オプションの有無を判定するために使われる。
+      if [[ " $* " == *" --help "* ]]; then
+        printf 'Usage:  docker compose run [OPTIONS] SERVICE [COMMAND] [ARGS...]\n\nOptions:\n'
+        if [ "${FAKE_COMPOSE_RUN_NO_NAME:-false}" != "true" ]; then
+          printf '      --name string            Assign a name to the container\n'
+        fi
+        printf '      --rm                     Automatically remove the container when it exits\n'
+        printf '  -T, --no-TTY                 Disable pseudo-TTY allocation\n'
+        exit 0
+      fi
+      fake_run_script=""
+      fake_run_results=""
+      fake_run_plans=""
+      fake_run_name=""
+      fake_run_threads=""
+      fake_run_rampup=""
+      fake_run_loops=""
+      fake_run_plan=""
+      fake_run_prev=""
+      fake_run_service_seen="false"
+      for fake_run_arg in "$@"; do
+        case "$fake_run_prev" in
+          -c) fake_run_script="$fake_run_arg" ;;
+          -v|--volume)
+            case "$fake_run_arg" in
+              *:/bv-jmeter-results)  fake_run_results="${fake_run_arg%:/bv-jmeter-results}" ;;
+              *:/bv-jmeter-plans:ro) fake_run_plans="${fake_run_arg%:/bv-jmeter-plans:ro}" ;;
+            esac
+            ;;
+          -e)
+            case "$fake_run_arg" in
+              JMETER_RUN_NAME=*) fake_run_name="${fake_run_arg#JMETER_RUN_NAME=}" ;;
+              JMETER_THREADS=*)  fake_run_threads="${fake_run_arg#JMETER_THREADS=}" ;;
+              JMETER_RAMPUP=*)   fake_run_rampup="${fake_run_arg#JMETER_RAMPUP=}" ;;
+              JMETER_LOOPS=*)    fake_run_loops="${fake_run_arg#JMETER_LOOPS=}" ;;
+            esac
+            ;;
+        esac
+        # "<サービス名> run <テスト計画>" の並びから、実行するテスト計画を拾う。
+        if [ "$fake_run_service_seen" = "true" ] && [ "$fake_run_prev" = "run" ]; then
+          fake_run_plan="$fake_run_arg"
+        fi
+        [ "$fake_run_arg" = "${FAKE_JMETER_SERVICE:-jmeter}" ] && fake_run_service_seen="true"
+        fake_run_prev="$fake_run_arg"
+      done
+
+      # --entrypoint /bin/sh で渡されたスクリプト (一覧取得 / 計画の取り出し)。
+      case "$fake_run_script" in
+        '') ;;
+        *plans_dir*)
+          printf 'env\tplans_dir\t%s\n' "${FAKE_JMETER_PLANS_DIR:-/test-plans}"
+          printf 'env\tresults_dir\t%s\n' "${FAKE_JMETER_RESULTS_DIR:-/results}"
+          printf 'env\ttarget\t%s\n' "${FAKE_JMETER_TARGET:-frontend}"
+          printf 'env\tthreads\t%s\n' "${FAKE_JMETER_ENV_THREADS:-10}"
+          printf 'env\trampup\t%s\n' "${FAKE_JMETER_ENV_RAMPUP:-10}"
+          printf 'env\tloops\t%s\n' "${FAKE_JMETER_ENV_LOOPS:--1}"
+          printf 'env\tduration\t%s\n' "${FAKE_JMETER_ENV_DURATION:-300}"
+          for fake_run_entry in ${FAKE_JMETER_PLANS:-sample-frontend.jmx sample-async-post.jmx}; do
+            printf 'plan\t%s\n' "$fake_run_entry"
+          done
+          exit 0
+          ;;
+        *"cat --"*)
+          if [ -n "${FAKE_JMETER_PLAN_FILE:-}" ] && [ -f "${FAKE_JMETER_PLAN_FILE}" ]; then
+            cat "$FAKE_JMETER_PLAN_FILE"
+            exit 0
+          fi
+          printf 'fake docker: FAKE_JMETER_PLAN_FILE is not set\n' >&2
+          exit 66
+          ;;
+      esac
+
+      # 性能試験そのものの実行。結果一式をマウント先 (ホスト側の出力先) へ作る。
+      if [ "${FAKE_JMETER_RUN_FAIL:-false}" = "true" ]; then
+        printf '[jmeter-run] ERROR: 対象へ到達できないため試験を開始しない\n' >&2
+        exit 1
+      fi
+      printf '[jmeter-run] テスト計画 : %s\n' "$fake_run_plan"
+      printf 'summary +      1 in 00:00:01 =    1.0/s Avg: 12 Min: 12 Max: 12 Err: 0 (0.00%%) Active: %s Started: %s Finished: 0\n' \
+        "${fake_run_threads:-1}" "${fake_run_threads:-1}"
+      printf 'summary =      2 in 00:00:02 =    1.0/s Avg: 12 Min: 12 Max: 12 Err: 0 (0.00%%)\n'
+      # 背面実行の完了待ちを再現するため、指定があれば実行に時間をかける。
+      [ -n "${FAKE_JMETER_RUN_SLEEP:-}" ] && sleep "$FAKE_JMETER_RUN_SLEEP"
+      if [ -n "$fake_run_results" ] && [ -n "$fake_run_name" ]; then
+        mkdir -p "${fake_run_results}/${fake_run_name}/report" 2>/dev/null
+        {
+          printf 'timeStamp,elapsed,label,responseCode,success\n'
+          printf '1758240000000,12,S01,200,true\n'
+        } > "${fake_run_results}/${fake_run_name}/result.jtl"
+        printf '<html><body>JMeter Dashboard</body></html>\n' \
+          > "${fake_run_results}/${fake_run_name}/report/index.html"
+        {
+          printf 'サンプル数   : 2\n'
+          printf 'エラー       : 0 (0.00%%)\n'
+        } > "${fake_run_results}/${fake_run_name}/summary-stats.txt"
+        {
+          printf '# JMeter 実行条件 (自動生成)\n'
+          printf 'run_id            : %s\n' "$fake_run_name"
+          printf 'test_plan         : %s\n' "$fake_run_plan"
+          printf 'properties        :\n'
+          [ -n "$fake_run_threads" ] && printf '  -Jthreads=%s\n' "$fake_run_threads"
+          [ -n "$fake_run_rampup" ] && printf '  -Jrampup=%s\n' "$fake_run_rampup"
+          [ -n "$fake_run_loops" ] && printf '  -Jloops=%s\n' "$fake_run_loops"
+        } > "${fake_run_results}/${fake_run_name}/run-info.txt"
+        # 実行したテスト計画の複製は、本物と同じく結果ディレクトリへ残す。
+        if [ -n "$fake_run_plans" ] && [ -f "${fake_run_plans}/${fake_run_plan}" ]; then
+          cp "${fake_run_plans}/${fake_run_plan}" \
+            "${fake_run_results}/${fake_run_name}/plan.jmx" 2>/dev/null
+        fi
+      fi
+      printf '[jmeter-run] 結果 (ホスト側): %s\n' "$fake_run_name"
+      ;;
     *)
       fail "compose $*"
       ;;
   esac
+  exit 0
+fi
+
+# 実行中コンテナの一覧 (JMeter の実行状況確認で使う)。
+# FAKE_DOCKER_PS に "名前|状態|イメージ" を 1 行ずつ入れたときだけ中身を返す。
+if [ "${1:-}" = "ps" ]; then
+  if [ -n "${FAKE_DOCKER_PS:-}" ]; then
+    while IFS='|' read -r ps_name ps_status ps_image; do
+      [ -n "$ps_name" ] || continue
+      if [[ " $* " == *"{{.Names}}|{{.Status}}|{{.Image}}"* ]]; then
+        printf '%s|%s|%s\n' "$ps_name" "$ps_status" "$ps_image"
+      else
+        printf '%s\n' "$ps_name"
+      fi
+    done <<< "$FAKE_DOCKER_PS"
+  fi
   exit 0
 fi
 
