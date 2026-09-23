@@ -51,6 +51,7 @@ compose.yml ──> docker compose build ──> j1/base.local (ローカル)
 | compose でビルドして ECR へプッシュしたい | **build_and_push.sh** (このスクリプト) |
 | Dockerfile を buildx で直接ビルドして ECR へプッシュしたい | `buildx_build_and_push.sh` |
 | ビルドだけ / 起動確認や URL 確認までしたい (ECR 不要) | `build_and_verify.sh` (= `build_and_push.sh --build-only`) |
+| ベース → フロント → バックを続けてプッシュし、ベースのタグを受け渡したい | `build_and_push_all.sh` (各イメージ用ラッパー経由で本スクリプトを呼ぶ。5.9 参照) |
 
 ### 前提条件
 
@@ -177,12 +178,12 @@ flowchart TD
 | 13 | ECR 権限チェック | `aws ecr get-login-password` の成否で判定。成功時のトークンは後段の `docker login` に再利用 | 下記 3.3 参照 |
 | 14 | シークレット準備 | パラメータストア / 直接指定 / 既存環境変数のいずれかからマスターパスワードを取得し export | `exit 1` |
 | 15 | 事前コピー | `--copy-file SRC:DEST_DIR` を検証してコピー。終了時に自動削除 | `exit 1` / `exit 2` |
-| 16 | ビルド | `docker compose -f <file> build [--no-cache] [service]` を監視プロセス付きで実行 (進捗表示・停滞検知・上限時間での中断。5.7 参照)。開始前に data root の空き容量を確認 | `exit 1` |
+| 16 | ビルド | `docker compose -f <file> build [--no-cache] [--build-arg BASE_IMAGE_TAG=<tag>] [service]` を監視プロセス付きで実行 (`--build-arg` は `--base-image-tag` 指定時のみ) (進捗表示・停滞検知・上限時間での中断。5.7 参照)。開始前に data root の空き容量を確認 | `exit 1` |
 | 17 | イメージ確認 | `docker image inspect <local-image>` (`--dry-run` 時はスキップ) | `exit 1` |
 | 18 | タグ生成 | `<TAG_PREFIX>-<YYYYMMDDHHMMSS>` (JST) | — |
 | 19 | ECR ログイン | `docker login --username AWS --password-stdin` (パスワードは標準入力経由) | `exit 1` |
 | 20 | タグ付け・プッシュ | `docker image tag` → `docker push`。出力は `tee` で保存し、失敗時に解析 | `exit 1` + 診断 |
-| 21 | 出力 | `imagedefinition.json` を書き込み (書き込み失敗も検出) | `exit 1` |
+| 21 | 出力 | `imagedefinition.json` を書き込み (書き込み失敗も検出)。`--image-uri-file` 指定時は、最後にプッシュしたイメージの参照を書き出す | `exit 1` |
 
 ### 3.3 ECR 権限チェックの分岐
 
@@ -241,12 +242,14 @@ flowchart TD
 | `--compose-file FILE` | ファイルパス | `compose.yml` | 不可 | compose 定義ファイル |
 | `--compose-service NAME` | サービス名 | (全サービス) | 不可 | 指定時はそのサービスのみビルド |
 | `--no-cache` | フラグ | `false` | — | キャッシュを破棄してビルド |
+| `--base-image-tag TAG` | 英数字と `. _ -` (先頭は英数字か `_`、128 文字以内) | (なし = 渡さない) | 不可 | 指定した場合のみ、ビルド引数 `BASE_IMAGE_TAG=TAG` として compose build へ渡す (`--build-arg`)。フロント / バックのように、プッシュ済みのベースイメージを `FROM` で参照するイメージのビルドで使う。ベースイメージ自体のビルドでは指定しない (5.9 参照) |
 | `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | 不可 | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔。`0` で表示しない (5.7 参照) |
 | `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | 不可 | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する。`0` で検知しない。検知しても処理は中断しない |
 | `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | 不可 | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM で中断し (20 秒後に SIGKILL)、`exit 1` |
 | `--no-build-watchdog` | フラグ | `false` | — | 上記の監視をすべて行わない。監視が有効な間は `BUILDKIT_PROGRESS=tty` を `plain` へ切り替えるため、tty 形式を使いたい場合に指定する |
 | `--container-name NAME` | 任意の文字列 | `--repository` の値 | 不可 | `imagedefinition.json` の `name` |
 | `--output FILE` | ファイルパス | `imagedefinition.json` | 不可 | imagedefinition の出力先 |
+| `--image-uri-file FILE` | ファイルパス | (なし) | 不可 | プッシュしたイメージの参照 (`<registry>/<repository>:<tag>`) を 1 行で書き出す。呼び出し元のスクリプト (`build_and_push_all.sh` など) がタグを受け取るためのもの。プッシュと imagedefinition の出力が済んだ最後に書き出す。`--dry-run` 時もプレビュー上の参照を書き出す (5.9 参照) |
 
 ### 4.3 実行制御・ログ
 
@@ -319,6 +322,7 @@ flowchart TD
 | --- | --- |
 | ビルド / タグ付け / プッシュ / ログイン | 実行せず、実行予定のコマンドを `[DRY-RUN]` 付きで表示 |
 | `imagedefinition.json` | 書き込まず、内容をプレビュー表示 |
+| `--image-uri-file` | **書き出す** (中身はプッシュしていないプレビュー上の参照)。呼び出し元が後続のプレビューまで進めるようにするため |
 | `--copy-file` | コピーも削除も行わず、予定を表示 |
 | Docker デーモン未接続 | 中止せず警告のみ |
 | AWS 未認証 | 中止せず警告のみ |
@@ -349,8 +353,10 @@ flowchart TD
 - 委譲**されない**もの:
   - `--log-dir` — 委譲元で処理済み (委譲先の出力もログファイルに記録されます)
   - ECR 専用オプション — `--account-id` / `--registry` / `--repository` /
-    `--tag-prefix` / `--container-name` / `--output` / `--switchback-shell` /
-    `--auto-switchback` / `--warn-only`。指定された場合は**警告のうえ無視**されます
+    `--tag-prefix` / `--container-name` / `--output` / `--image-uri-file` /
+    `--base-image-tag` / `--switchback-shell` / `--auto-switchback` / `--warn-only`。
+    指定された場合は**警告のうえ無視**されます (`--base-image-tag` も委譲先が
+    ビルド引数の指定に対応していないため無視されます)
 
 ```
 [WARN] --build-only では ECR 関連処理を行わないため、次のオプションは無視します: --account-id --repository
@@ -533,6 +539,137 @@ RUN --mount=type=secret,id=cacerts \
 > 出力先を明示した場合のみ残ります)。`--cacert-dir` を指定しない実行では、
 > 従来どおり証明書なしでビルドされます。
 
+### 5.9 ベース → フロント → バックの一括実行 (`build_and_push_all.sh`)
+
+フロント / バックのイメージは、プッシュ済みのベースイメージを `FROM` で参照します。
+`build_and_push_all.sh` は、各イメージ用のラッパー (`build_and_push.sh` へリポジトリ名など
+イメージごとの引数を渡して起動するシェル) を順に呼び出し、ベースイメージのタグを
+フロント / バックへ受け渡します。最後にフロント / バックのイメージタグを表示します。
+
+```
+build_and_push_all.sh
+  │ 1. bash <ベース用ラッパー> --image-uri-file <受け取りファイル>
+  │      └─ build_and_push.sh ... → <registry>/baseimage:BaseImage-20260923120000 をプッシュ
+  │    受け取りファイルの参照からタグの部分だけを取り出す → BaseImage-20260923120000
+  │ 2. bash <フロント用ラッパー> --image-uri-file <受け取りファイル> \
+  │         --base-image-tag BaseImage-20260923120000
+  │      └─ build_and_push.sh ... → compose build --build-arg BASE_IMAGE_TAG=BaseImage-20260923120000
+  │ 3. bash <バック用ラッパー> (フロントと同じ引数)
+  ▼ 4. フロント / バックのイメージタグを表示
+```
+
+| 段 | ラッパーへ追加で渡す引数 | 取り出す値 |
+| --- | --- | --- |
+| 1. ベース | `--image-uri-file <受け取りファイル>` (ベースイメージ自体のビルドには不要なため `--base-image-tag` は**渡さない**) | ベースイメージのタグ |
+| 2. フロント | `--image-uri-file <受け取りファイル> --base-image-tag <ベースのタグ>` | フロントイメージのタグ |
+| 3. バック | 同上 | バックイメージのタグ |
+
+#### ラッパー側の要件
+
+ラッパーは、受け取った引数 (`"$@"`) を `build_and_push.sh` へ**そのまま渡して**ください。
+追加の引数が届かないと、ラッパーが正常終了してもタグを受け取れないため、
+`build_and_push_all.sh` はその時点でエラー終了し、ラッパーの直し方を表示します。
+
+```bash
+#!/usr/bin/env bash
+# build_and_push_front.sh (フロントイメージ用ラッパーの例)
+./build_and_push.sh --account-id 123456789012 \
+    --repository frontimage --tag-prefix FrontImage \
+    --compose-service frontend --local-image j1/front.local \
+    --output imagedefinition_front.json \
+    "$@"
+```
+
+フロント / バックの Dockerfile では、ビルド引数 `BASE_IMAGE_TAG` でベースイメージを参照します。
+`FROM` で使う `ARG` は、最初の `FROM` より前に宣言します。既定値を付けずにおくと、
+タグを渡し忘れたビルドは `FROM` の参照が不正になってその場で失敗するため、
+古いベースイメージで黙ってビルドされることを防げます。
+
+```dockerfile
+# フロント / バックの Dockerfile (抜粋)
+ARG BASE_IMAGE_TAG
+FROM 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/baseimage:${BASE_IMAGE_TAG}
+```
+
+#### タグの取り出し方
+
+- `build_and_push.sh` は、プッシュと `imagedefinition.json` の出力が済んだ**最後**に
+  `--image-uri-file` へ参照を 1 行で書き出します。受け取りファイルが空のままなら、
+  そこまで到達していません。
+- タグは参照の**最後の `:` より後ろ**です。レジストリにポート (`host:5000`) が付いていても
+  リポジトリ名には `:` が入らないため、正しく取り出せます。
+- ラッパー側の `--output` などはそのまま効きます (受け取りファイルは `imagedefinition.json`
+  とは別のファイルです)。
+
+#### 実行例と表示
+
+```bash
+# 既定のラッパー (build_and_push_all.sh と同じ場所の build_and_push_{base,front,back}.sh) を使う
+./build_and_push_all.sh
+
+# ラッパーの場所を指定する
+./build_and_push_all.sh --base-script ./wrappers/base.sh \
+    --front-script ./wrappers/front.sh --back-script ./wrappers/back.sh
+
+# 実行内容のプレビューだけ (各ラッパーへ --dry-run を渡す)
+./build_and_push_all.sh --dry-run
+
+# -- 以降は 3 つのラッパーすべてへそのまま渡す
+./build_and_push_all.sh -- --no-cache --log-dir ./logs
+```
+
+完了すると、フロント / バックのイメージタグをログの接頭辞なしで表示します。
+1 行に値が 1 つだけなので、行ごと選択してそのままコピーできます。
+
+```
+==================================================================
+ プッシュしたフロント / バックのイメージタグ
+==================================================================
+
+フロントイメージタグ:
+FrontImage-20260923120500
+
+バックイメージタグ:
+BackImage-20260923121000
+
+シェルへ貼り付ける場合:
+FRONT_IMAGE_TAG=FrontImage-20260923120500
+BACK_IMAGE_TAG=BackImage-20260923121000
+==================================================================
+```
+
+#### 途中で失敗した場合
+
+失敗した時点で中止し、失敗したラッパーの終了コードで終了します。
+ベースをプッシュした後の失敗では、ベースを作り直さずに残りだけやり直すコマンドを表示します。
+
+| 失敗した段 | 表示される内容 |
+| --- | --- |
+| ベース | 失敗した旨のみ (何もプッシュされていない) |
+| フロント | ベースのプッシュ済み参照と、フロント / バックのラッパーを `--base-image-tag <ベースのタグ>` 付きで実行するコマンド |
+| バック | ベース / フロントのプッシュ済み参照と、バックのラッパーを `--base-image-tag <ベースのタグ>` 付きで実行するコマンド |
+
+#### `build_and_push_all.sh` の引数と終了コード
+
+| build_and_push_all.sh の引数 | 説明 |
+| --- | --- |
+| `--base-script PATH` | ベースイメージ用ラッパー (既定: `<スクリプトの場所>/build_and_push_base.sh`) |
+| `--front-script PATH` | フロントイメージ用ラッパー (既定: `<スクリプトの場所>/build_and_push_front.sh`) |
+| `--back-script PATH` | バックイメージ用ラッパー (既定: `<スクリプトの場所>/build_and_push_back.sh`) |
+| `--dry-run` | 各ラッパーへ `--dry-run` を渡し、プレビューだけを行う。フロント / バックへはプレビュー上のベースイメージタグを渡す |
+| `-- ARGS...` | `--` 以降を 3 つのラッパーすべてへそのまま渡す。`--image-uri-file` / `--base-image-tag` (このスクリプトが渡すもの)、`--build-only` (プッシュされずタグを受け取れない)、`--help` は指定できない (`exit 2`) |
+| `-h`, `--help` | ヘルプを表示して `exit 0` |
+
+| build_and_push_all.sh の終了コード | 発生条件 |
+| --- | --- |
+| `0` | 3 イメージのビルド・プッシュが完了した (`--dry-run` ではプレビューが完了した) |
+| `1` | ラッパーが見つからない / 読み取れない、プッシュしたイメージの参照を受け取れなかった |
+| `2` | 引数エラー (不明なオプション、`--` 以降に指定できない引数) |
+| その他 | 失敗したラッパーの終了コードをそのまま返す |
+
+> ラッパーはすべて開始前に存在を確かめます。ベースのビルドが終わってから
+> フロント / バックのラッパーが無いことに気付く、ということはありません。
+
 ---
 
 ## 6. 環境変数
@@ -569,7 +706,7 @@ RUN --mount=type=secret,id=cacerts \
 | --- | --- | --- |
 | `0` | 正常終了 | プッシュと imagedefinition 出力が完了 / `--help` / `--dry-run` 完走 |
 | `1` | 実行時エラー | AWS 未認証、Docker デーモン未接続、ECR 権限なし、スイッチバック失敗、SSM 取得失敗、コピー失敗、ビルド失敗、`--build-timeout` の上限超過によるビルド中断、ローカルイメージ未検出、ログイン失敗、タグ付け失敗、push 失敗、出力書き込み失敗、ログディレクトリ作成失敗、必須コマンド不足 |
-| `2` | 引数エラー | 不明なオプション、値の欠落、ビルド監視の各値が 0 未満か非数値、`--account-id`/`--registry` 未指定、リポジトリ名・タグ接頭辞の形式違反、JBoss オプションの排他違反、`--copy-file` の書式不正 |
+| `2` | 引数エラー | 不明なオプション、値の欠落、ビルド監視の各値が 0 未満か非数値、`--account-id`/`--registry` 未指定、リポジトリ名・タグ接頭辞・`--base-image-tag` の形式違反、`--image-uri-file` の出力先ディレクトリ不在 (またはディレクトリを指定)、JBoss オプションの排他違反、`--copy-file` の書式不正 |
 
 `--build-only` 委譲時は、委譲先 `build_and_verify.sh` の終了コードがそのまま返ります。
 
@@ -583,6 +720,7 @@ RUN --mount=type=secret,id=cacerts \
 | 入力 | `Dockerfile` | compose から参照される |
 | 入力 | `--switchback-shell` のパス | `source` で読み込む |
 | 出力 | `imagedefinition.json` (`--output`) | CodePipeline 用。`name` と `imageUri` を含む |
+| 出力 | `--image-uri-file` のパス | プッシュしたイメージの参照を 1 行で記録 (呼び出し元への受け渡し用)。`--dry-run` 時もプレビュー上の参照を書き出す |
 | 出力 | `--log-dir` 配下のログ | 画面出力の複製 |
 | 一時 | コピーしたファイル | 終了時に自動削除 |
 | 一時 | push ログ・SSM エラー出力 | 終了時に自動削除 |
@@ -640,6 +778,15 @@ RUN --mount=type=secret,id=cacerts \
 # 9) レジストリを直接指定 (アカウント ID 不要)
 ./build_and_push.sh --registry 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com
 
+# 10) フロントイメージ: プッシュ済みベースイメージのタグをビルド引数 BASE_IMAGE_TAG で渡す
+./build_and_push.sh --account-id 123456789012 \
+    --repository frontimage --tag-prefix FrontImage \
+    --compose-service frontend --local-image j1/front.local \
+    --base-image-tag BaseImage-20260923120000
+
+# 11) ベース → フロント → バックをラッパー経由で一括実行し、タグを受け渡す (5.9 参照)
+./build_and_push_all.sh
+
 # ビルドが exporting layers から進まないときの調査 (進捗 10 秒 / 停滞判定 60 秒)
 ./build_and_push.sh --account-id 123456789012 \
     --build-progress-interval 10 --build-stall-timeout 60
@@ -670,3 +817,7 @@ RUN --mount=type=secret,id=cacerts \
 | `BUILDKIT_PROGRESS=tty はビルド監視と併用できないため plain へ切り替えます。` | 行単位で読めない tty 形式が指定された | tty 形式のまま実行するには `--no-build-watchdog` を指定する |
 | `docker push に失敗しました` | 権限・ネットワーク・リポジトリ不存在など | 表示される原因診断ガイド (A〜E) の調査手順に従う |
 | `imagedefinition の書き込みに失敗しました` | 出力先の権限不足・容量不足 | `--output` のパスと権限を確認 |
+| `--base-image-tag には英数字と . _ - のみ …` | タグとして使えない文字が含まれる | ベースイメージのタグ (例: `BaseImage-20260923120000`) をそのまま指定する |
+| `--image-uri-file の出力先ディレクトリが存在しません` | 書き出し先のディレクトリが無い | 既存のディレクトリ配下のパスを指定する |
+| `(build_and_push_all.sh) … プッシュしたイメージの参照を受け取れませんでした` | ラッパーが受け取った引数を `build_and_push.sh` へ渡していない、またはラッパーが `--build-only` を指定している | ラッパー内の `build_and_push.sh` の呼び出しの末尾に `"$@"` を付ける (5.9 参照) |
+| `(build_and_push_all.sh) ラッパーシェルスクリプトが見つかりません` | 既定のパスにラッパーが無い | `--base-script` / `--front-script` / `--back-script` でラッパーのパスを指定する |

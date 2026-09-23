@@ -8,6 +8,7 @@
 | [`build_and_verify.sh`](#build_and_verifysh) | ビルド + 起動確認・URL 確認・各種診断 (ECR へは触れない) | [build_and_verify_guide.md](build_and_verify_guide.md) |
 | [`build_and_push.sh`](#build_and_pushsh) | `docker compose build` → ECR へタグ付け・プッシュ | [build_and_push_guide.md](build_and_push_guide.md) |
 | [`buildx_build_and_push.sh`](#buildx_build_and_pushsh) | `docker buildx build` → ECR へタグ付け・プッシュ | [buildx_build_and_push_guide.md](buildx_build_and_push_guide.md) |
+| [`build_and_push_all.sh`](#build_and_push_allsh) | ベース → フロント → バックのラッパーを順に呼び、ベースのタグを受け渡してプッシュ | [build_and_push_guide.md の 5.9](build_and_push_guide.md#59-ベース--フロント--バックの一括実行-build_and_push_allsh) |
 
 表の見かた
 
@@ -342,7 +343,8 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 > このとき **`build_and_verify.sh` のオプションもそのまま指定できます** (`--verify-startup` /
 > `--report-dir` / `--keep-container-mode` など)。ECR 専用オプション
 > (`--account-id` / `--registry` / `--repository` / `--tag-prefix` / `--container-name` /
-> `--output` / `--switchback-shell` / `--auto-switchback` / `--warn-only`) は警告のうえ除去されます。
+> `--output` / `--image-uri-file` / `--base-image-tag` / `--switchback-shell` / `--auto-switchback` /
+> `--warn-only`) は警告のうえ除去されます。
 
 ### ECR 接続先の指定
 
@@ -362,18 +364,20 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 | `--compose-file FILE` | ファイルパス | `compose.yml` | compose 定義ファイル |
 | `--compose-service NAME` | サービス名 | (全サービス) | 指定時はそのサービスのみビルド |
 | `--no-cache` | フラグ | `false` | キャッシュを破棄してビルド |
+| `--base-image-tag TAG` | 英数字と `. _ -` (先頭は英数字か `_`、128 文字以内) | (なし = 渡さない) | 指定時のみビルド引数 `BASE_IMAGE_TAG=TAG` として compose build へ渡す (フロント / バック用。ベースイメージ自体のビルドでは指定しない) |
 | `--build-progress-interval SEC` | 0 以上の整数 (秒) | `30` | ビルド中に経過時間・BuildKit のフェーズ・data root の空き容量の増減を表示する間隔 |
 | `--build-stall-timeout SEC` | 0 以上の整数 (秒) | `300` | ビルド出力がこの秒数途切れたら停滞と判断し、原因の切り分け診断を表示する |
 | `--build-timeout SEC` | 0 以上の整数 (秒) | `0` (無制限) | ビルド全体の上限秒数 |
 | `--no-build-watchdog` | フラグ | `false` | 上記の監視をすべて行わない |
 | `--container-name NAME` | 任意の文字列 | `--repository` の値 | `imagedefinition.json` の `name` |
 | `--output FILE` | ファイルパス | `imagedefinition.json` | imagedefinition の出力先 |
+| `--image-uri-file FILE` | ファイルパス | (なし) | プッシュしたイメージの参照 (`<registry>/<repository>:<tag>`) を 1 行で書き出す。呼び出し元 (`build_and_push_all.sh` など) への受け渡し用。`--dry-run` 時もプレビュー上の値を書き出す |
 
 ### 実行制御・ログ
 
 | オプション | 値 | 既定 | 説明 |
 | --- | --- | --- | --- |
-| `--dry-run` | フラグ | `false` | ビルド/ログイン/タグ付け/プッシュ/ファイル出力を行わず、実行内容のみ表示 |
+| `--dry-run` | フラグ | `false` | ビルド/ログイン/タグ付け/プッシュ/ファイル出力を行わず、実行内容のみ表示 (`--image-uri-file` だけは書き出す) |
 | `--build-only` | フラグ | `false` | ビルドのみ実行 (`build_and_verify.sh` へ委譲)。ECR 関連処理は行わない |
 | `--log-dir DIR` | ディレクトリパス | (なし) | 画面出力を `DIR/build_and_push_<日時>.log` にも保存 |
 | `-h`, `--help` | フラグ | — | ヘルプを表示して `exit 0` |
@@ -484,3 +488,21 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 | `--cacert-secret-id ID` | 英数字と `. _ -` | `cacerts` | シークレット id |
 | `--cacert-bundle PATH` | tar のパス | 一時ファイル | 生成する tar の出力先 |
 | `--cacert-glob PATTERN` | glob パターン<br>(繰り返し可) | `*.crt` と `*.pem` | 各ディレクトリから取り込むファイルのパターン |
+
+---
+
+## `build_and_push_all.sh`
+
+> ベース → フロント → バックの順に、各イメージ用のラッパー (`build_and_push.sh` へ
+> イメージごとの引数を渡して起動するシェル) を呼び出します。ラッパーへは
+> `--image-uri-file` (全イメージ) と `--base-image-tag <ベースのタグ>` (フロント / バック) を
+> 追加で渡すため、**ラッパーは受け取った引数 (`"$@"`) を `build_and_push.sh` へそのまま
+> 渡してください**。詳細は [build_and_push_guide.md の 5.9](build_and_push_guide.md#59-ベース--フロント--バックの一括実行-build_and_push_allsh)。
+
+| オプション | 値 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `--base-script PATH` | ファイルパス | `<スクリプトの場所>/build_and_push_base.sh` | ベースイメージ用ラッパー |
+| `--front-script PATH` | ファイルパス | `<スクリプトの場所>/build_and_push_front.sh` | フロントイメージ用ラッパー |
+| `--back-script PATH` | ファイルパス | `<スクリプトの場所>/build_and_push_back.sh` | バックイメージ用ラッパー |
+| `--dry-run` | フラグ | `false` | 各ラッパーへ `--dry-run` を渡し、プレビューだけを行う |
+| `-- ARGS...` | 任意の引数 | (なし) | `--` 以降を 3 つのラッパーすべてへそのまま渡す (例: `-- --no-cache`)。`--image-uri-file` / `--base-image-tag` / `--build-only` / `--help` は指定不可 |

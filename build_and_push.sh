@@ -40,6 +40,15 @@
 #     (moby/buildkit#970) ため、1 ファイルに詰めて 1 つのシークレットとして渡す。
 #     提供元が増えても Dockerfile / compose.yml は変更不要。
 #
+# ベースイメージタグ (ビルド引数) / プッシュ結果の受け渡し:
+#   - --base-image-tag を指定した場合のみ、ビルド引数 BASE_IMAGE_TAG として
+#     compose build へ渡す。フロント / バックの Dockerfile がプッシュ済みの
+#     ベースイメージを FROM で参照するために使い、ベースイメージ自体のビルドでは
+#     指定しない (未指定ならビルド引数を渡さない)。
+#   - --image-uri-file を指定すると、プッシュしたイメージの参照を 1 行で書き出す。
+#     build_and_push_all.sh はこれを使い、ベース → フロント → バックの順に
+#     ラッパー経由で本スクリプトを呼び出してタグを受け渡す。
+#
 # 使い方:
 #   ./build_and_push.sh --account-id 123456789012 --region ap-northeast-1 \
 #       --jboss-password-param /j1/jboss/master-password \
@@ -83,6 +92,14 @@ CONTAINER_NAME=""                 # imagedefinition.json の name。未指定な
 COMPOSE_FILE="compose.yml"
 COMPOSE_SERVICE=""                # 指定時はそのサービスのみビルド
 NO_CACHE="false"                  # true: キャッシュを破棄してビルド (--no-cache)
+# ベースイメージのタグ (--base-image-tag)。フロント / バックのように、プッシュ済みの
+# ベースイメージを FROM で参照するイメージのビルドで使う。指定時のみビルド引数
+# BASE_IMAGE_TAG_ARG としてビルドへ渡し、未指定 (ベースイメージ自体のビルド) では使わない。
+BASE_IMAGE_TAG=""
+BASE_IMAGE_TAG_ARG="BASE_IMAGE_TAG"  # 受け渡しに使うビルド引数名 (Dockerfile の ARG と一致させる)
+# プッシュしたイメージの参照 (<registry>/<repository>:<tag>) の書き出し先 (--image-uri-file)。
+# build_and_push_all.sh のような呼び出し元が、タグを受け取るために使う。
+IMAGE_URI_FILE=""
 
 # ---- ビルドの停滞検知・進捗表示 ---------------------------------------------
 # BuildKit の "exporting to image" / "exporting layers" は、ビルドしたレイヤを
@@ -260,6 +277,15 @@ Options:
   --compose-file FILE      compose ファイル (既定: compose.yml)
   --compose-service NAME   ビルド対象サービス名 (未指定なら全サービス)
   --no-cache               キャッシュを破棄して compose build する
+  --base-image-tag TAG     ベースイメージのタグ。指定した場合のみ、ビルド引数
+                           BASE_IMAGE_TAG=TAG として compose build へ渡す
+                           (--build-arg)。フロント / バックのように、プッシュ済みの
+                           ベースイメージを参照するイメージのビルドで使う。
+                           ベースイメージ自体のビルドでは指定しない (未指定なら
+                           ビルド引数を渡さない)。Dockerfile 側では次のように参照する:
+                             ARG BASE_IMAGE_TAG
+                             FROM <registry>/<ベースのリポジトリ>:${BASE_IMAGE_TAG}
+                           (使用可能文字: 英数字 . _ -、先頭は英数字か _、128 文字以内)
   --build-progress-interval SEC
                            ビルド中に進捗を表示する間隔 (既定: 30)。0 で行わない。
                            BuildKit の "exporting to image" / "exporting layers"
@@ -283,6 +309,12 @@ Options:
                            ※ 監視は行単位でビルド出力を読むため、有効な間は
                              BUILDKIT_PROGRESS=tty を plain へ切り替える。
   --output FILE            imagedefinition の出力先 (既定: imagedefinition.json)
+  --image-uri-file FILE    プッシュしたイメージの参照 (<registry>/<repository>:<tag>) を
+                           FILE へ 1 行で書き出す。呼び出し元のスクリプト
+                           (build_and_push_all.sh など) がタグを受け取るためのもの。
+                           プッシュと imagedefinition の出力が済んだ後に書き出す。
+                           --dry-run 時も、プレビュー上の参照を書き出す
+                           (呼び出し元が後続のプレビューへ進めるようにするため)
   --log-dir DIR            コンソールに出力されるログを、DIR 配下のログファイルにも
                            保存する (画面表示は従来どおり継続)。ログ末尾には処理実行
                            時間 (経過秒数) も記録される。
@@ -302,6 +334,7 @@ Options:
                            詳細は ./build_and_verify.sh --help を参照。
                            なお ECR 関連オプション (--account-id / --registry /
                            --repository / --tag-prefix / --container-name / --output /
+                           --image-uri-file / --base-image-tag /
                            --switchback-shell / --auto-switchback / --warn-only) は
                            委譲先が解釈できないため、警告のうえ無視される。
 
@@ -403,6 +436,7 @@ arg_takes_value() {
     # このスクリプト自身のオプション
     --account-id|--region|--registry|--repository|--tag-prefix|--local-image) return 0 ;;
     --container-name|--compose-file|--compose-service|--output|--log-dir|--copy-file) return 0 ;;
+    --base-image-tag|--image-uri-file) return 0 ;;
     --build-progress-interval|--build-stall-timeout|--build-timeout) return 0 ;;
     --jboss-password-param|--jboss-password|--jboss-password-env|--switchback-shell) return 0 ;;
     --cacert-dir|--cacert-secret-id|--cacert-bundle|--cacert-bundle-env|--cacert-glob) return 0 ;;
@@ -440,9 +474,12 @@ arg_takes_value() {
 }
 
 # 委譲先が解釈できない ECR 専用オプション (--build-only 時は警告して除去する)。
+# --base-image-tag は ECR 上のベースイメージを参照するビルド引数、--image-uri-file は
+# プッシュ結果の書き出しで、いずれも委譲先 (build_and_verify.sh) は受け付けない。
 ecr_only_option() {
   case "$1" in
     --account-id|--registry|--repository|--tag-prefix|--container-name|--output) return 0 ;;
+    --image-uri-file|--base-image-tag) return 0 ;;
     --switchback-shell|--auto-switchback|--warn-only) return 0 ;;
   esac
   return 1
@@ -552,11 +589,13 @@ while [ $# -gt 0 ]; do
     --compose-file)     need_value "$1" $#; COMPOSE_FILE="$2"; shift 2 ;;
     --compose-service)  need_value "$1" $#; COMPOSE_SERVICE="$2"; shift 2 ;;
     --no-cache)         NO_CACHE="true"; shift ;;
+    --base-image-tag)   need_value "$1" $#; BASE_IMAGE_TAG="$2"; shift 2 ;;
     --build-progress-interval) need_value "$1" $#; BUILD_PROGRESS_INTERVAL="$2"; shift 2 ;;
     --build-stall-timeout)     need_value "$1" $#; BUILD_STALL_TIMEOUT="$2"; shift 2 ;;
     --build-timeout)           need_value "$1" $#; BUILD_TIMEOUT="$2"; shift 2 ;;
     --no-build-watchdog)       BUILD_WATCHDOG="false"; shift ;;
     --output)           need_value "$1" $#; OUTPUT_FILE="$2"; shift 2 ;;
+    --image-uri-file)   need_value "$1" $#; IMAGE_URI_FILE="$2"; shift 2 ;;
     --log-dir)          need_value "$1" $#; LOG_DIR="$2"; shift 2 ;;  # 冒頭でログ複製を設定済み (値の再取得のみ)
     --dry-run)          DRY_RUN="true"; shift ;;
     --build-only)       shift ;;  # 冒頭で build_and_verify.sh に委譲済み (ここには到達しない)
@@ -709,6 +748,25 @@ fi
 if ! printf '%s' "$TAG_PREFIX" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,112}$'; then
   err "--tag-prefix には英数字と . _ - のみ (先頭は英数字か _、113 文字以内) を指定してください: ${TAG_PREFIX}"
   exit 2
+fi
+# ベースイメージタグはビルド引数として FROM の参照に埋め込まれるため、タグとして
+# 不正な値だとビルドの途中で invalid reference format になる。ビルド前に弾く。
+if [ -n "$BASE_IMAGE_TAG" ] \
+    && ! printf '%s' "$BASE_IMAGE_TAG" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; then
+  err "--base-image-tag には英数字と . _ - のみ (先頭は英数字か _、128 文字以内) を指定してください: ${BASE_IMAGE_TAG}"
+  exit 2
+fi
+# プッシュ後に書き出せないと、呼び出し元はタグを受け取れず後続へ進めない。
+# 長いビルドとプッシュを終えてから失敗しないよう、書き出し先をここで確かめる。
+if [ -n "$IMAGE_URI_FILE" ]; then
+  if [ -d "$IMAGE_URI_FILE" ]; then
+    err "--image-uri-file にディレクトリが指定されました: ${IMAGE_URI_FILE}"
+    exit 2
+  fi
+  if [ ! -d "$(dirname -- "$IMAGE_URI_FILE")" ]; then
+    err "--image-uri-file の出力先ディレクトリが存在しません: $(dirname -- "$IMAGE_URI_FILE")"
+    exit 2
+  fi
 fi
 
 if [ "$DRY_RUN" = "true" ]; then
@@ -1971,6 +2029,12 @@ if [ "$NO_CACHE" = "true" ]; then
   BUILD_OPTS+=(--no-cache)
   log "キャッシュを破棄して (--no-cache) ビルドします。"
 fi
+# ベースイメージタグは指定された場合だけビルド引数にする。ベースイメージ自体の
+# ビルドでは未指定のため、ビルド引数を一切渡さない (従来どおりのビルド)。
+if [ -n "$BASE_IMAGE_TAG" ]; then
+  BUILD_OPTS+=(--build-arg "${BASE_IMAGE_TAG_ARG}=${BASE_IMAGE_TAG}")
+  log "ベースイメージタグをビルド引数で渡します: ${BASE_IMAGE_TAG_ARG}=${BASE_IMAGE_TAG}"
+fi
 
 # exporting layers の書き出し先が足りているかを、ビルドを始める前に確認する。
 check_build_disk_space
@@ -2056,6 +2120,24 @@ else
     exit 1
   fi
   log "imagedefinition を出力しました: ${OUTPUT_FILE}"
+fi
+
+# ---- プッシュしたイメージ参照の書き出し (呼び出し元への受け渡し) -----------
+# 呼び出し元 (build_and_push_all.sh など) はこのファイルからタグを取り出し、後続の
+# ビルドへ --base-image-tag で渡す。プッシュと imagedefinition の出力が済んだ最後に
+# 書くことで、「ファイルがある = ここまで成功した」と扱えるようにする。
+# DRY-RUN でも書き出すのは、呼び出し元が後続のプレビューまで進めるようにするため
+# (中身はプッシュしていないプレビュー上の参照になる)。
+if [ -n "$IMAGE_URI_FILE" ]; then
+  if ! printf '%s\n' "$TARGET_IMAGE" > "$IMAGE_URI_FILE"; then
+    err "プッシュしたイメージ参照の書き出しに失敗しました: ${IMAGE_URI_FILE}"
+    exit 1
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] プレビュー上のイメージ参照を書き出しました (プッシュはしていません): ${IMAGE_URI_FILE}"
+  else
+    log "プッシュしたイメージ参照を書き出しました: ${IMAGE_URI_FILE}"
+  fi
 fi
 
 log "  name     = ${CONTAINER_NAME}"

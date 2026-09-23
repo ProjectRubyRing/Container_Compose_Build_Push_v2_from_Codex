@@ -81,6 +81,10 @@ xlsx は標準ライブラリだけで組み立てます)。
 | `build_and_push.sh` | `compose.yml` を使った `docker compose build` |
 | `buildx_build_and_push.sh` | `docker buildx build` (compose 不使用)。ECR ログイン (`aws ecr get-login-password \| docker login`)、`docker image tag`、`docker image push` を個別コマンドで実行 |
 
+ベース → フロント → バックの順に、各イメージ用ラッパー経由で `build_and_push.sh` を呼び出し、
+ベースイメージのタグをフロント / バックへ受け渡す `build_and_push_all.sh` も提供します
+(後述の「[ベース → フロント → バックの一括ビルド・プッシュ](#ベース--フロント--バックの一括ビルドプッシュ-build_and_push_allsh)」を参照)。
+
 さらに、**ビルドのみを行う** (ECR へはプッシュしない) 専用スクリプトとして
 `build_and_verify.sh` を提供します。ビルドに加えて、コンテナを起動して
 **jbosseap (WildFly/JBoss EAP) サーバーの起動確認**や、**指定 URL への HTTP 応答確認**、
@@ -134,6 +138,65 @@ CloudWatch Logs / Jaeger 診断のイベント時刻は JST で表示されま�
 ./buildx_build_and_push.sh --account-id 123456789012 --region ap-northeast-1 \
     --auto-switchback --switchback-shell /opt/team/switchback.sh
 ```
+
+## ベース → フロント → バックの一括ビルド・プッシュ (`build_and_push_all.sh`)
+
+`build_and_push_all.sh` は、ベース・フロント・バックの各イメージ用ラッパー
+(`build_and_push.sh` へイメージごとの引数を渡して起動するシェル) を順に呼び出します。
+ベースイメージのタグをフロント / バックへ受け渡し、最後にフロント / バックの
+イメージタグをコピーしやすい形式で表示します。
+
+1. ベース用ラッパーを呼び出してベースイメージをプッシュし、プッシュしたイメージの
+   参照 (`--image-uri-file`) からタグの部分だけを取り出す
+2. フロント用ラッパーへそのタグを `--base-image-tag` で渡してプッシュする
+   (`build_and_push.sh` がビルド引数 `BASE_IMAGE_TAG` としてビルドへ渡す)
+3. バック用ラッパーも同様
+4. フロント / バックのイメージタグを表示する
+
+```bash
+# 既定では build_and_push_all.sh と同じ場所の
+# build_and_push_base.sh / build_and_push_front.sh / build_and_push_back.sh を呼び出す
+./build_and_push_all.sh
+./build_and_push_all.sh --base-script ./wrappers/base.sh \
+    --front-script ./wrappers/front.sh --back-script ./wrappers/back.sh
+./build_and_push_all.sh --dry-run            # プレビューのみ
+./build_and_push_all.sh -- --no-cache        # -- 以降は 3 つのラッパーすべてへ渡す
+```
+
+ラッパーは、受け取った引数 (`"$@"`) を `build_and_push.sh` へそのまま渡してください。
+フロント / バックの Dockerfile では `ARG BASE_IMAGE_TAG` を最初の `FROM` より前に宣言し、
+`FROM <registry>/<ベースのリポジトリ>:${BASE_IMAGE_TAG}` の形で参照します。
+
+```bash
+#!/usr/bin/env bash
+# build_and_push_front.sh (フロントイメージ用ラッパーの例)
+./build_and_push.sh --account-id 123456789012 \
+    --repository frontimage --tag-prefix FrontImage \
+    --compose-service frontend --local-image j1/front.local "$@"
+```
+
+完了時の表示 (ログの接頭辞を付けず、1 行に値を 1 つだけ置いています):
+
+```
+==================================================================
+ プッシュしたフロント / バックのイメージタグ
+==================================================================
+
+フロントイメージタグ:
+FrontImage-20260923120500
+
+バックイメージタグ:
+BackImage-20260923121000
+
+シェルへ貼り付ける場合:
+FRONT_IMAGE_TAG=FrontImage-20260923120500
+BACK_IMAGE_TAG=BackImage-20260923121000
+==================================================================
+```
+
+途中で失敗した場合はその時点で中止し、プッシュ済みのイメージと、ベースを作り直さずに
+残りだけやり直すコマンドを表示します。詳細は
+[build_and_push.sh 詳細ガイドの 5.9](docs/build_and_push_guide.md#59-ベース--フロント--バックの一括実行-build_and_push_allsh) を参照してください。
 
 ## イメージタグについて
 
@@ -189,6 +252,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--build-timeout SEC` | ビルド全体の上限秒数。超えたら診断のうえ SIGTERM でビルドを中断し (20 秒後に SIGKILL)、終了コード `1` で終了する。`0` は無制限 | `0` |
 | `--no-build-watchdog` | 上記の監視をすべて行わず、ビルド出力をそのまま流す。監視が有効な間は `BUILDKIT_PROGRESS=tty` (buildx 版は `--progress tty`) を `plain` へ切り替えるため、tty 形式を使いたい場合に指定する | `false` |
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
+| `--base-image-tag TAG` | 指定した場合のみ、ビルド引数 `BASE_IMAGE_TAG=TAG` として compose build へ渡す。フロント / バックのように、プッシュ済みのベースイメージを `FROM` で参照するイメージのビルドで使う。ベースイメージ自体のビルドでは指定しない (**compose 版のみ**。buildx 版は `--build-arg BASE_IMAGE_TAG=TAG` で同じことができる) | (なし。未指定ならビルド引数を渡さない) |
+| `--image-uri-file FILE` | プッシュしたイメージの参照 (`<registry>/<repository>:<tag>`) を `FILE` へ 1 行で書き出す。`build_and_push_all.sh` などの呼び出し元がタグを受け取るためのもの。`--dry-run` 時もプレビュー上の参照を書き出す (**compose 版のみ**) | (なし) |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
 | `--cleanup-all-docker-data` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。処理終了時に確認ダイアログを表示し、承認後、現在の Docker context の全コンテナ・全イメージ・全ローカルボリューム・未使用ネットワーク・現在の daemon で削除可能な全ビルドキャッシュを削除する | `false` |
 | `--no-reclaim-old-image` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。既定で有効な「世代交代した旧イメージ (dangling) の回収」を行わない。既定ではビルド前後の image ID を突き合わせ、タグを失った旧世代だけを削除する | `false` (= 回収する) |
