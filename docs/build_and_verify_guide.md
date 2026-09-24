@@ -605,7 +605,7 @@ compose down (削除)
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。サービス別ビルドログ (`..._build_log_<サービス名>.txt`) と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリ構成のツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。サービス別ビルドログ (`..._build_log_<サービス名>.txt`) と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。`logs` モードの server.log の FD 点検 / ログ設定の静的点検の結果 (`..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt`) も同じディレクトリへ出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリ構成のツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない。`--no-deploy-exception-analysis` とは排他 |
 | `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 不可 | `--report-dir` の全量レポート `[10]` へ解析結果を出力する。既定では出力せず、見出しの下に未出力である旨だけを残す。`--no-deploy-exception-analysis` とは排他 |
@@ -1143,7 +1143,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・server.log の FD 点検とログ設定の静的点検・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -1231,8 +1231,10 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | EFS マウント伝播確認 | 偽装バッチサーバー (`batch-mock`) から EFS 上へファイル・ディレクトリ・**相対シンボリックリンク**を作成 → 書き換え → 削除し、その内容が同じ EFS をマウントする**全コンテナ**へシンボリックリンク経由で反映されるかを突き合わせる | 偽装バッチサーバーが起動しており、選択サービスが同じボリュームをマウントしていること |
 | トラストストア一覧 | JBoss EAP 上の Java アプリから**有効になっている**トラストストア (起動中 JVM の `-Djavax.net.ssl.trustStore` / JDK 同梱 `cacerts` / Elytron の `trust-manager` / `standalone.conf` / `*TRUSTSTORE*` 環境変数) をフルパスで並べ、登録証明書の**種別**と**ドメイン URL** を一覧化する。カスタムとして追加された証明書は ★ 付きで強調し、そのドメインから**接続確認用の `curl` コマンド**を組み立てて表示・出力する | 証明書チェックと同じ (コンテナ内の `curl` + `keytool`。種別とドメインの判定には `openssl`) |
 | root ユーザで bash へ接続 | bash 接続と同じ対話セッションを `docker exec -u 0:0` で開く。コンテナの既定ユーザーが非 root (JBoss EAP の `jboss` ユーザー等) で、権限不足により読めないファイルの確認やパッケージ導入を調べたいときに使う | 接続先に対話シェル (root 実行を禁止する設定では接続できない) |
+| server.log の FD 点検 | 日付をまたいでも `server.log.<前日>` へ追記され続ける原因を、`/proc/*/fd` から `server.log*` を指す FD の本数・FD 番号・inode を集めて判定する (Log4j_EFS_Rolling の `check-server-log-fd.sh` と同じ判定。原因候補 1/1b・2・3)。結果をテキストへも出力 | JBoss モジュール一覧と同じ (frontend / backend の JBoss EAP)。コンテナ内の `awk` / `ls` / `stat` ほか |
+| ログ設定の静的点検 | `server.log` を開く／rename する主体を、standalone.xml・logging.properties・WAR / EAR 内のログ設定・logrotate / cron・起動コマンド・jboss-cli.sh の実行時設定から特定する (Log4j_EFS_Rolling の `audit-logging-config.sh` と同じ点検)。結果をテキストへも出力 | 同上。WAR / EAR を読むのに `unzip` / `python3` / `jar` / `bsdtar` / `busybox unzip` のいずれか |
 
-証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろ (**最後の操作番号**) に並びます。
+証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろに並びます。後から加わった Valkey 操作・JMeter の操作・server.log の FD 点検とログ設定の静的点検は、既存の番号 (`root ユーザで bash へ接続` まで) を動かさないよう、さらに後ろ (**操作一覧の最後**) に並びます。
 
 bash 接続と root ユーザでの bash 接続は、接続先に `/bin/bash` が無ければ `/bin/sh` (POSIX シェル) へ自動で切り替えます。詳細は「[bash を持たないコンテナへの接続](#bash-を持たないコンテナへの接続)」を参照してください。
 
@@ -1591,6 +1593,32 @@ ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でもも�
 
 `4.` の TSV は表計算ソフトへそのまま貼り付けられるため、**前回ビルドのイメージとの差分比較**
 (モジュールが増えた・jar のバージョンが変わった) にも使えます。
+
+#### server.log の FD 点検 / ログ設定の静的点検 (前日付ファイルへの追記の切り分け)
+
+JBoss EAP の `server.log` が、日付をまたいだ後も `server.log.<前日>` へ追記され続け、`server.log` に
+書かれない事象を切り分ける 2 つの操作です。別プロジェクト **Log4j_EFS_Rolling** の
+`jboss/bin/check-server-log-fd.sh` (実行時の FD 点検) と `jboss/bin/audit-logging-config.sh`
+(設定の静的点検) と同じ判定を、コンテナへ何も置かずに `docker exec` で実行します。
+FILE ハンドラは回転時に**自分の FD だけ**を閉じて開き直すため、同じ `server.log` を開く別の書き手や、
+外部からの rename があると、残った FD が日付ファイルを指したまま書き続けます
+(原因と対策は Log4j_EFS_Rolling の解説 md の第 16 章)。選択後の入力は一切ありません。
+
+| 項目 | server.log の FD 点検 | ログ設定の静的点検 |
+| --- | --- | --- |
+| 表示条件 | JBoss モジュール一覧と同じ (コンテナ内に `jboss-cli.sh` と `modules` がある = frontend / backend の JBoss EAP)。操作一覧の最後に 2 つ並ぶ | 同左 |
+| 対象の特定 | 起動中の JVM (argv[0] が `java` で `jboss-modules.jar` / `-Djboss.home.dir` を持つもの) の引数から、ログディレクトリを `-Djboss.server.log.dir` → `-Djboss.server.base.dir` 配下の `log` → `-Djboss.home.dir` 配下の `standalone/log` → `JBOSS_HOME` の候補の順に決める。そこで誰も開いていなければ、実際に `server.log*` が開かれている場所へ切り替える | `JBOSS_HOME` は JVM の `-Djboss.home.dir` → 環境変数 → 既定の候補、設定ファイルは `--jboss-config-file` → JVM の `-c` → `standalone.xml`、デプロイ先は `deployment-scanner` の `path` / `relative-to` |
+| 実行ユーザー | JBoss EAP の JVM と同じ uid:gid (`docker exec -u`)。`/proc/<pid>/fd` は同じユーザーか `CAP_SYS_PTRACE` でしか読めず、Docker の既定の権限では root でも別ユーザーの FD は見えないため。読めなかったプロセスは `[情報]` で一覧にする | コンテナの既定ユーザー。権限で読めない cron のディレクトリは `[情報]` で示す |
+| 判定 | 同じ JVM に 2 本以上 → 原因候補1／1b、FD 1/2 → 原因候補2、java 以外が開いている → 要確認、1 本だけで日付ファイル / inode 不一致 → 原因候補3、削除済み・`.nfs*` → データ消失 | `1.` 同じファイルを開く複数のハンドラ、`2.` `fileName` を持つ起動時ハンドラが複数、`3.` デプロイメント内のログ設定 ((a) コンテナが読む `logging.properties` / (b) 同梱 reload4j の `log4j.xml` / (c) 同梱 log4j-core / (d) 同梱 logback / (e) 無視) が有効で `server.log` を指す、`4.` logrotate / cron、`5.` 起動コマンド・起動スクリプトのリダイレクトを `[指摘]` とする。`6.` は jboss-cli.sh の実行時設定の表示 |
+| 元のスクリプトからの読み替え | ログディレクトリの自動特定、JVM と同じ uid:gid での実行、収集結果を一時ファイルではなく変数に持つ (読み取り専用のルートでも動く) | WAR / EAR を `unzip` (Info-ZIP / BusyBox) → `python3` → `jar` → `bsdtar` → `busybox unzip` の順で読む (元は `unzip` だけ)、`find` が無ければシェルの展開で辿る、`use-deployment-logging-config` を要素の形 (`<… value="false"/>`) で判定、起動スクリプトを `ENTRYPOINT` / `CMD` から自動で点検 (起動コマンドは標準入力で渡す)、実行時設定を常に取得、`jboss.server.log.dir` 内の別ファイル (`app.log` 等) を指すだけなら `[情報]` |
+| ファイル出力 | `--report-dir` 配下の `build_and_verify_<日時>_server_log_fd_<サービス名>.txt` → 一時ディレクトリ | `--report-dir` 配下の `build_and_verify_<日時>_logging_config_audit_<サービス名>.txt` → 一時ディレクトリ |
+| 終了扱い | `判定: 異常` は診断結果として操作選択へ戻る。ログディレクトリ・`server.log*` を開いているプロセスを確認できない (`判定不能`) 場合だけヘルパー失敗 | `判定: 指摘あり` は診断結果として操作選択へ戻る。設定ファイルを読めない・作業用の一時領域が無い (`実行不能`) 場合だけヘルパー失敗 |
+
+どちらのテキストも画面と同じ内容に、Compose サービス・コンテナ・実行ユーザー・判定・点検内容の
+見出しを付けて残します。同じサービスを繰り返し点検した場合は連番を付けて上書きしないため、
+日付をまたぐ前と後の結果を見比べられます。原因候補 1・2 は日付をまたぐ前でも検出でき、
+原因候補 3 (外部からの rename) は日付をまたいだ後でないと見えません。どちらの点検も読むだけで、
+コンテナ内のファイルは変更しません。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 
@@ -2683,6 +2711,8 @@ ECS のデプロイサーキットブレーカはデプロイ中にだけ働き�
 | `--report-dir/build_and_verify_<日時>_jboss_modules_<サービス名>.txt` | `--keep-container-mode logs` で JBoss モジュール一覧を実行したとき (`--no-jboss-module-list-text` で抑制) | `module-info` が `success` となったモジュール名・スロット・jar ファイル名の一覧と TSV |
 | `--report-dir/build_and_verify_<日時>_truststore_inventory_<サービス名>.txt` | `--keep-container-mode logs` でトラストストア一覧を実行したとき (`--no-truststore-inventory-text` で抑制) | 有効なトラストストアのフルパスと有効性、登録証明書の種別・ドメイン URL、カスタム証明書の強調一覧、接続確認コマンド、TSV |
 | `--cert-check-text` / `--jboss-module-list-text` / `--truststore-inventory-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
+| `--report-dir/build_and_verify_<日時>_server_log_fd_<サービス名>.txt` | `--keep-container-mode logs` で server.log の FD 点検を実行したとき (`--report-dir` が無ければ一時ディレクトリ。繰り返すと連番) | `server.log*` を開いている FD の一覧 (PID / COMM / FD / inode / 指している名前) と原因候補の判定 |
+| `--report-dir/build_and_verify_<日時>_logging_config_audit_<サービス名>.txt` | `--keep-container-mode logs` でログ設定の静的点検を実行したとき (同上) | ファイル系ハンドラの一覧、起動時ログ設定、WAR / EAR 内のログ設定の分類と有効性、logrotate / cron、起動コマンドのリダイレクト、jboss-cli.sh の実行時設定と `[指摘]` |
 | `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker.txt` | ECS サーキットブレーカ再現を実行したとき (`--no-ecs-circuit-breaker-text` で抑制) | 再現結果 (契機・停止手順・reload の結果・切断の判定と根拠・logging subsystem の設定・対処) |
 | `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker_<サービス名>_<回数>.log` | 同上 (`--no-ecs-circuit-breaker-save-server-log` で抑制) | 停止直後に取り出した `server.log` そのもの (切れたままの状態) |
 | `--ecs-circuit-breaker-text` のパス | 指定時 | 同上 (出力先を明示した場合) |

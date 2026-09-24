@@ -1340,6 +1340,21 @@ TRUSTSTORE_INVENTORY_TEXT_SET="false"    # 出力先が明示指定されたか
 TRUSTSTORE_INVENTORY_TEXT_ENABLED="true" # false (--no-truststore-inventory-text): 出力しない
 TRUSTSTORE_INVENTORY_TEXT_OUTPUT=""      # 直近に出力したテキストのパス
 
+# ---- server.log の FD 点検 / ログ設定の静的点検 (前日付ファイルへの追記) ------
+# JBoss EAP の server.log が、日付をまたいだ後も server.log.<前日> へ追記され続け、
+# server.log に書かれない事象の切り分け。別プロジェクト Log4j_EFS_Rolling の
+# jboss/bin/check-server-log-fd.sh (実行時の FD 点検) と
+# jboss/bin/audit-logging-config.sh (設定の静的点検) と同じ判定を、logs モードの
+# 操作として JBoss EAP のコンテナ (frontend / backend) で実行する。
+# FD は「ファイル名」ではなく inode に結びつくため、server.log を開く・rename する
+# 主体が FILE ハンドラ以外にもいると、その FD は rename 後の日付ファイルを指したまま
+# 書き続ける。どちらの点検も読むだけで、コンテナ内のファイルは変更しない。
+# 判定は日付をまたぐ前後で見比べたくなるため、画面と同じ内容をテキストへも残す。
+# 出力先は --report-dir 配下 > 一時ディレクトリ の順。
+SERVER_LOG_CHECK_BASENAME="server.log"   # 点検対象のファイル名 (FILE ハンドラの path)
+SERVER_LOG_FD_CHECK_TEXT_OUTPUT=""       # 直近に出力した FD 点検テキストのパス
+LOGGING_CONFIG_AUDIT_TEXT_OUTPUT=""      # 直近に出力した静的点検テキストのパス
+
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
 # 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
@@ -4368,6 +4383,31 @@ JBoss マスターパスワードの伝搬検証:
                                     テキストファイルへも出力する
                                     (--jboss-module-list-text /
                                      --no-jboss-module-list-text)
+                                    同じ JBoss EAP のコンテナでは
+                                    「server.log の FD 点検」と
+                                    「ログ設定の静的点検」も選択でき、
+                                    日付をまたいでも server.log が
+                                    server.log.<前日> へ追記され続ける原因を
+                                    切り分ける (別プロジェクト
+                                    Log4j_EFS_Rolling の
+                                    check-server-log-fd.sh /
+                                    audit-logging-config.sh と同じ判定)。
+                                    FD 点検は /proc/*/fd から server.log* を
+                                    開いている FD の本数・番号・inode を集めて
+                                    原因候補 1/1b・2・3 を判定し、静的点検は
+                                    standalone.xml・logging.properties・
+                                    WAR/EAR 内のログ設定・logrotate/cron・
+                                    起動コマンドと jboss-cli.sh の実行時設定を
+                                    横断して、server.log を開く／rename する
+                                    主体を特定する (パラメータ入力なし)。
+                                    結果は画面へ表示し、同じ内容を --report-dir
+                                    配下の build_and_verify_<日時>_
+                                    server_log_fd_<サービス名>.txt /
+                                    logging_config_audit_<サービス名>.txt へ
+                                    出力する (--report-dir が無ければ一時
+                                    ディレクトリ。繰り返すと連番を付ける)。
+                                    この 2 つは既存の番号を変えないよう、
+                                    操作一覧の最後に並ぶ
                                     偽装バッチサーバー (batch-mock) が起動して
                                     いれば、同じ EFS をマウントするサービスと
                                     偽装バッチサーバー自身で
@@ -4565,7 +4605,13 @@ JBoss マスターパスワードの伝搬検証:
                            DIR/build_and_verify_<日時>_build_log_<サービス名>.txt へ
                            サービスごとに出力する。--report-dir が無い実行では
                            一時ディレクトリへ出力し、どちらの場合も出力先を
-                           画面へ表示する
+                           画面へ表示する。
+                           --keep-container-mode logs で「server.log の FD 点検」
+                           「ログ設定の静的点検」を実行したときは、その結果を
+                           DIR/build_and_verify_<日時>_server_log_fd_<サービス名>.txt /
+                           DIR/build_and_verify_<日時>_logging_config_audit_<サービス名>.txt
+                           へ出力する (こちらも --report-dir が無ければ一時
+                           ディレクトリ。繰り返すと連番を付けて上書きしない)
   --cert-check-text FILE   証明書チェック (--keep-container-mode logs の操作) の
                            結果を FILE へ出力する。受領した自己証明書の詳細
                            (種別・X.509 バージョン・トラストアンカー可否・全項目) と
@@ -20327,6 +20373,1293 @@ JBOSS_MODULE_LIST_SCRIPT
   return 0
 }
 
+# ---- server.log の FD 点検 / ログ設定の静的点検 ------------------------------
+# JBoss EAP の server.log が、日付をまたいだ後も server.log.<前日> へ追記され続け、
+# server.log に書かれない事象を切り分ける 2 つの操作。別プロジェクト
+# Log4j_EFS_Rolling の jboss/bin 配下の診断スクリプトと同じ判定を、コンテナへ何も
+# 置かずに docker exec で実行する。
+#   server.log の FD 点検 … check-server-log-fd.sh 相当。/proc/*/fd から
+#                           server.log* を指す FD の本数・FD 番号・inode を集め、
+#                           原因候補 1/1b・2・3 を判定する (実行時の点検)
+#   ログ設定の静的点検    … audit-logging-config.sh 相当。standalone.xml・
+#                           logging.properties・WAR/EAR 内のログ設定・logrotate/cron・
+#                           起動コマンドを横断し、server.log を開く／rename する
+#                           主体の定義箇所を特定する
+# JBoss の FILE ハンドラは回転時に自分の FD だけを閉じて開き直す。同じ server.log を
+# 別の書き手 (2 つ目のハンドラ・同梱 reload4j・シェルのリダイレクト) も開いていたり、
+# 外部 (logrotate・収集バッチ) が rename したりすると、残った FD は日付ファイルを
+# 指したまま書き続ける。原因と対策の詳細は Log4j_EFS_Rolling の解説 md の第 16 章。
+# 対象サービスの判定は JBoss モジュール一覧と同じ (jboss-cli.sh と modules を持つ
+# コンテナ = frontend / backend の JBoss EAP) で、操作メニュー側で判定を共有する。
+
+# 点検結果テキストの出力先を決める。--report-dir 配下 > 一時ディレクトリ。
+# 日付をまたぐ前後で同じサービスを繰り返し点検して見比べられるよう、既存ファイルが
+# あれば連番を足し、直前の結果を上書きしない。
+#   $1 = Compose サービス名 / $2 = 種別 (server_log_fd / logging_config_audit)
+resolve_server_log_check_path() {
+  local service_name="$1" kind="$2"
+  local safe_name base dir_part prefix candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_${kind}_${safe_name}.txt"
+  else
+    # 出力先の指定が無くても、判定は日付をまたいだ後の結果と見比べたくなるので
+    # 一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_${kind}_${safe_name}.txt"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  prefix="$(basename -- "$base" .txt)"
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}.txt"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# 画面へ出したものと同じ内容を、どの構成に対する結果かが分かる見出しを付けて残す。
+# 設定ファイルや起動コマンドの行を含むため、他ユーザーからは読めない権限で作る。
+#   $1 = 出力先 / $2 = 種別 (server_log_fd / logging_config_audit) / $3 = サービス名
+#   $4 = コンテナ名 / $5 = 取得した出力 / $6 = 判定 / $7 = 実行ユーザーの説明
+write_server_log_check_text() {
+  local path="$1" kind="$2" service_name="$3" container_name="$4" capture_file="$5"
+  local verdict="$6" exec_note="$7" dir_path title
+
+  case "$kind" in
+    server_log_fd) title="server.log の FD 点検" ;;
+    *)             title="ログ設定の静的点検" ;;
+  esac
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "${title}の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "${title}のテキストを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf '%s (build_and_verify.sh)\n' "$title"
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf 'Compose サービス : %s\n' "$service_name"
+    printf 'コンテナ         : %s\n' "$container_name"
+    printf 'compose ファイル : %s\n' "$COMPOSE_FILE"
+    printf '点検対象         : %s (logging subsystem の FILE ハンドラが書くファイル)\n' \
+      "$SERVER_LOG_CHECK_BASENAME"
+    printf '実行ユーザー     : %s\n' "$exec_note"
+    printf '判定             : %s\n' "$verdict"
+    case "$kind" in
+      server_log_fd)
+        printf '点検内容         : Log4j_EFS_Rolling の jboss/bin/check-server-log-fd.sh と\n'
+        printf '                   同じ判定。/proc/*/fd から %s* を指す FD を集め、\n' \
+          "$SERVER_LOG_CHECK_BASENAME"
+        printf '                   本数・FD 番号・inode から原因候補を判定する\n'
+        printf '                     同じ JVM に 2 本以上              → 原因候補1／1b\n'
+        printf '                     FD 1/2 (stdout/stderr)            → 原因候補2\n'
+        printf '                     1 本だけで日付ファイル／inode 不一致 → 原因候補3\n'
+        printf '記載内容         : 0. 実行環境 / 1. 対象とディレクトリの状態 /\n'
+        printf '                   2. %s* を開いている FD / 3. 判定 / 結果\n' \
+          "$SERVER_LOG_CHECK_BASENAME"
+        ;;
+      *)
+        printf '点検内容         : Log4j_EFS_Rolling の jboss/bin/audit-logging-config.sh と\n'
+        printf '                   同じ点検。%s を開く／rename する主体が FILE ハンドラ\n' \
+          "$SERVER_LOG_CHECK_BASENAME"
+        printf '                   1 つだけかを、設定・デプロイメント・OS 側の仕組みから調べる\n'
+        printf '記載内容         : 0. 実行環境 / 1. logging subsystem のファイル系ハンドラ /\n'
+        printf '                   2. 起動時ログ設定 / 3. デプロイメント内のログ設定 /\n'
+        printf '                   4. logrotate・cron / 5. 起動コマンド・起動スクリプトの\n'
+        printf '                   リダイレクト / 6. 稼働中サーバーの実行時設定 / 結果\n'
+        ;;
+    esac
+    printf '対策             : Log4j_EFS_Rolling の解説 md の 16.8 節 (J1〜J8)\n'
+    printf '===================================================================\n'
+    redact_healthcheck_text < "$capture_file"
+  } >> "$path" 2>/dev/null || {
+    warn "${title}のテキストを出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
+# JBoss EAP の JVM を動かしているユーザー (uid:gid) を返す。/proc/<pid>/fd は、その
+# プロセスと同じユーザーか CAP_SYS_PTRACE を持つ場合しか読めず、Docker の既定の
+# 権限では root でも別ユーザーのプロセスの FD は見えない。FD 点検はこの uid:gid で行う。
+server_log_fd_jvm_user() {
+  local container_id="$1"
+  docker exec "$container_id" /bin/sh -c '
+    # server-log-fd-user-probe: JBoss EAP の JVM の uid:gid を返す
+    slp_nl="
+"
+    for slp_proc in /proc/[0-9]*; do
+      [ "${slp_proc#/proc/}" = "$$" ] && continue
+      [ -r "$slp_proc/cmdline" ] || continue
+      slp_args="$(tr "\0" "\n" < "$slp_proc/cmdline" 2>/dev/null)"
+      case "${slp_args%%"$slp_nl"*}" in
+        java|*/java) ;;
+        *) continue ;;
+      esac
+      case "$slp_args" in
+        *jboss-modules.jar*|*-Djboss.home.dir=*) ;;
+        *) continue ;;
+      esac
+      awk "/^Uid:/ { u = \$3 } /^Gid:/ { g = \$3 } END { if (u != \"\" && g != \"\") print u \":\" g }" \
+        "$slp_proc/status" 2>/dev/null
+      exit 0
+    done
+    exit 1
+  ' 2>/dev/null
+}
+
+# server.log* を開いている FD を /proc から集め、原因候補を判定して画面とテキストへ出す
+# (check-server-log-fd.sh 相当)。ログディレクトリは起動中の JVM の引数から求めるため、
+# 追加の入力は不要。コンテナ内のファイルは一切変更しない。
+run_interactive_compose_server_log_fd_check() {
+  local service_name="$1" container_id container_name fd_script jvm_user="" exec_note
+  local capture_file="" exec_status=0 verdict_text="" text_path=""
+  local -a container_ids=() exec_args=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  jvm_user="$(server_log_fd_jvm_user "$container_id" || true)"
+  case "$jvm_user" in
+    [0-9]*:[0-9]*)
+      exec_args=(-u "$jvm_user")
+      exec_note="JBoss EAP の JVM と同じ uid:gid (${jvm_user})"
+      ;;
+    *)
+      exec_note="コンテナの既定ユーザー (JBoss EAP の JVM を検出できなかったため)"
+      ;;
+  esac
+
+  fd_script="$(cat <<'SERVER_LOG_FD_SCRIPT'
+set -u
+# server-log-fd-report: JBoss EAP の server.log を「誰が・何本の FD で・どの inode を」
+# 掴んでいるかを /proc/*/fd から調べ、server.log.<前日> へ追記され続ける原因を判定する
+# (Log4j_EFS_Rolling の jboss/bin/check-server-log-fd.sh と同じ判定)。
+#   $1      = 点検対象のファイル名 (既定 server.log)
+#   $2 以降 = JBOSS_HOME の候補 (JVM の引数からログディレクトリを決められないとき用)
+# 判定の考え方: FD は「ファイル名」ではなく inode に結びつく。server.log を開いている FD が
+#   同じ JVM の中に 2 本以上ある                → 原因候補1／1b (複数ハンドラ／同梱ライブラリ)
+#   FD 番号 1/2 (stdout/stderr) である          → 原因候補2 (シェルのリダイレクト)
+#   JVM 以外のプロセス (tee 等) が持っている    → 要確認 (原因候補2 の変形)
+#   1 本だけだが server.log.<日付> を指している → 原因候補3 (外部からの rename)
+#   名前は server.log だが inode が一致しない   → 原因候補3 (別ホストからの rename)
+# 元のスクリプトからの読み替え
+#   - ログディレクトリ (元は引数か $JBOSS_LOG_DIR) は、起動中の JVM の引数から求める。
+#     docker exec のシェルには entrypoint が export した値が引き継がれないため
+#   - 収集結果は一時ファイルではなくシェル変数に持つ (読み取り専用のルートでも動かす)
+#   - 権限の違いで FD を読めないプロセスは、黙って飛ばさずに一覧で示す
+# 終了コード: 0 = 正常 / 1 = 異常を検出 / 2 = 前提不足 (ログディレクトリ・/proc・FD を確認できない)
+
+BASE="${1:-server.log}"
+[ "$#" -gt 0 ] && shift
+SLF_NL='
+'
+SLF_TAB="$(printf '\t')"
+
+slf_section() { printf '\n=== %s ===\n' "$1"; }
+slf_info()    { printf '     %s\n' "$1"; }
+say()         { printf '  [%s] %s\n' "$1" "$2"; }
+
+for slf_tool in awk cat grep head ls sed sort stat tr; do
+  if ! command -v "$slf_tool" >/dev/null 2>&1; then
+    printf 'FD 点検に必要なコマンドがコンテナにありません: %s\n' "$slf_tool"
+    exit 2
+  fi
+done
+if [ ! -d /proc/self/fd ]; then
+  printf '/proc が見えません (Linux のコンテナ内で実行してください)。\n'
+  exit 2
+fi
+
+# ---- JBoss EAP の JVM を特定する ---------------------------------------------
+# argv[0] が java で、jboss-modules.jar か -Djboss.home.dir を持つプロセス。
+# (このスクリプト自身の引数にも同じ文字列が含まれるため、argv[0] で絞る)
+slf_jvm_pid=''
+slf_jvm_args=''
+for slf_proc in /proc/[0-9]*; do
+  [ "${slf_proc#/proc/}" = "$$" ] && continue
+  [ -r "$slf_proc/cmdline" ] || continue
+  slf_args="$(tr '\0' '\n' < "$slf_proc/cmdline" 2>/dev/null)"
+  case "${slf_args%%"$SLF_NL"*}" in
+    java|*/java) ;;
+    *) continue ;;
+  esac
+  case "$slf_args" in
+    *jboss-modules.jar*|*-Djboss.home.dir=*) ;;
+    *) continue ;;
+  esac
+  slf_jvm_pid="${slf_proc#/proc/}"
+  slf_jvm_args="$slf_args"
+  break
+done
+
+# JVM の引数から -D<名前>= の値を取り出す ($1 は sed の正規表現。. はエスケープ済み)。
+slf_dvalue() {
+  printf '%s\n' "$slf_jvm_args" | sed -n "s/^-D$1=//p" | head -n 1
+}
+
+# 実体のパス (EFS をシンボリックリンク越しに指していても /proc の表示とそろえる)。
+slf_physical() {
+  if [ -d "$1" ]; then
+    (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# ---- ログディレクトリ (FILE ハンドラの jboss.server.log.dir) を決める ------------
+# standalone.sh は -Djboss.server.log.dir を自分では付けないので、指定が無ければ
+# サーバーの既定 (jboss.server.base.dir/log) になる。
+LOG_DIR=''
+LOG_DIR_SOURCE=''
+slf_value="$(slf_dvalue 'jboss\.server\.log\.dir')"
+if [ -n "$slf_value" ]; then
+  LOG_DIR="$slf_value"
+  LOG_DIR_SOURCE='JVM の -Djboss.server.log.dir'
+fi
+if [ -z "$LOG_DIR" ]; then
+  slf_value="$(slf_dvalue 'jboss\.server\.base\.dir')"
+  if [ -n "$slf_value" ]; then
+    LOG_DIR="$slf_value/log"
+    LOG_DIR_SOURCE='JVM の -Djboss.server.base.dir 配下の log (jboss.server.log.dir の既定)'
+  fi
+fi
+if [ -z "$LOG_DIR" ]; then
+  slf_value="$(slf_dvalue 'jboss\.home\.dir')"
+  if [ -n "$slf_value" ]; then
+    LOG_DIR="$slf_value/standalone/log"
+    LOG_DIR_SOURCE='JVM の -Djboss.home.dir 配下の standalone/log'
+  fi
+fi
+if [ -z "$LOG_DIR" ] && [ -n "${JBOSS_LOG_DIR:-}" ]; then
+  LOG_DIR="$JBOSS_LOG_DIR"
+  LOG_DIR_SOURCE='環境変数 JBOSS_LOG_DIR'
+fi
+if [ -z "$LOG_DIR" ]; then
+  for slf_cand in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+    [ -n "$slf_cand" ] || continue
+    if [ -d "$slf_cand/standalone/log" ]; then
+      LOG_DIR="$slf_cand/standalone/log"
+      LOG_DIR_SOURCE="JBOSS_HOME の候補 ($slf_cand) 配下の standalone/log"
+      break
+    fi
+  done
+fi
+[ -n "$LOG_DIR" ] && LOG_DIR="$(slf_physical "$LOG_DIR")"
+SLF_BOOT_LOG="$(slf_dvalue 'org\.jboss\.boot\.log\.file')"
+
+# ---- server.log* を開いている FD を集める -------------------------------------
+# 行: pid<TAB>comm<TAB>fd<TAB>リンク先。1 プロセスにつき ls -l を 1 回だけ実行し、
+# リンク先の名前 (server.log / server.log.* / .nfs*) で絞る。
+SLF_ALL=''
+SLF_DENIED=''
+for slf_proc in /proc/[0-9]*; do
+  slf_pid="${slf_proc#/proc/}"
+  [ "$slf_pid" = "$$" ] && continue
+  [ -d "$slf_proc/fd" ] || continue
+  slf_list="$(ls -l "$slf_proc/fd" 2>/dev/null)" || :
+  if [ -z "$slf_list" ]; then
+    # 読めないのは別ユーザーのプロセス (既に終了したものは数えない)。
+    if [ -d "$slf_proc" ]; then
+      slf_comm="$(cat "$slf_proc/comm" 2>/dev/null)"
+      slf_uid="$(awk '/^Uid:/ { print $2; exit }' "$slf_proc/status" 2>/dev/null)"
+      SLF_DENIED="${SLF_DENIED}${slf_pid}${SLF_TAB}${slf_comm:-?}${SLF_TAB}${slf_uid:-?}${SLF_NL}"
+    fi
+    continue
+  fi
+  slf_comm="$(cat "$slf_proc/comm" 2>/dev/null)"
+  slf_rows="$(printf '%s\n' "$slf_list" | awk -v pid="$slf_pid" -v comm="${slf_comm:-?}" -v base="$BASE" '
+    {
+      idx = index($0, " -> ")
+      if (idx == 0) next
+      n = split(substr($0, 1, idx - 1), parts, " ")
+      t = substr($0, idx + 4)
+      b = t
+      sub(/.*\//, "", b)
+      if (b == base || index(b, base ".") == 1 || b == base " (deleted)" || index(b, ".nfs") == 1)
+        printf "%s\t%s\t%s\t%s\n", pid, comm, parts[n], t
+    }')"
+  [ -n "$slf_rows" ] && SLF_ALL="${SLF_ALL}${slf_rows}${SLF_NL}"
+done
+
+# 指定したディレクトリにある server.log* の行だけを取り出す。
+slf_rows_in() {
+  printf '%s' "$SLF_ALL" | awk -F'\t' -v dir="$1" '
+    { d = $4; sub(/\/[^\/]*$/, "", d) }
+    d == dir
+  '
+}
+SLF_NOTE=''
+SLF_ROWS=''
+[ -n "$LOG_DIR" ] && SLF_ROWS="$(slf_rows_in "$LOG_DIR")"
+if [ -z "$SLF_ROWS" ] && [ -n "$SLF_ALL" ]; then
+  # 求めたディレクトリでは誰も開いていないが、別の場所の server.log* が開かれている
+  # (FILE ハンドラの path を絶対パスや別の relative-to にしている構成)。
+  # JVM の FD があればその場所を、無ければ最初に見つかった場所を点検する。
+  slf_other="$(printf '%s' "$SLF_ALL" | awk -F'\t' -v jvm="$slf_jvm_pid" '
+    { d = $4; sub(/\/[^\/]*$/, "", d); b = substr($4, length(d) + 2) }
+    b ~ /^\.nfs/ { next }
+    $1 == jvm && pick == "" { pick = d }
+    first == "" { first = d }
+    END { if (pick != "") print pick; else if (first != "") print first }
+  ')"
+  if [ -n "$slf_other" ]; then
+    SLF_NOTE="求めたログディレクトリ (${LOG_DIR:-不明}) では ${BASE}* を開いているプロセスがありません。${slf_other} の ${BASE}* が開かれているため、こちらを点検します (logging subsystem の FILE ハンドラの path / relative-to を確認してください)。"
+    LOG_DIR="$slf_other"
+    LOG_DIR_SOURCE="${BASE}* を開いている FD の場所"
+    SLF_ROWS="$(slf_rows_in "$LOG_DIR")"
+  fi
+fi
+
+slf_section '0. 実行環境'
+if [ -n "$slf_jvm_pid" ]; then
+  slf_info "JBoss EAP の JVM : pid ${slf_jvm_pid}"
+else
+  slf_info 'JBoss EAP の JVM : 見つかりません (jboss-modules.jar を持つ java プロセスがありません)'
+fi
+slf_info "ログディレクトリ : ${LOG_DIR:-(特定できません)}"
+slf_info "  決め方         : ${LOG_DIR_SOURCE:-(なし)}"
+if [ -n "$SLF_BOOT_LOG" ]; then
+  slf_info "起動時ログ       : ${SLF_BOOT_LOG} (-Dorg.jboss.boot.log.file)"
+fi
+slf_info "実行ユーザー     : $(awk '/^Uid:/ { u = $2 } /^Gid:/ { g = $2 } END { print "uid " u " / gid " g }' /proc/self/status 2>/dev/null)"
+if [ -n "$SLF_NOTE" ]; then
+  say "情報" "$SLF_NOTE"
+fi
+if [ -n "$SLF_BOOT_LOG" ] && [ -n "$LOG_DIR" ]; then
+  slf_boot_dir="$(slf_physical "${SLF_BOOT_LOG%/*}")"
+  if [ "$slf_boot_dir" != "$LOG_DIR" ]; then
+    say "情報" "起動時ログ (standalone.sh の JBOSS_LOG_DIR) は ${slf_boot_dir}、FILE ハンドラ (jboss.server.log.dir) は ${LOG_DIR} です。起動直後だけ別の ${BASE} に書かれます (J6: JBOSS_LOG_DIR と -Djboss.server.log.dir をそろえる)。"
+  fi
+fi
+if [ -n "$SLF_DENIED" ]; then
+  say "情報" "権限の違いで FD を確認できないプロセスがあります。これらが ${BASE}* を開いていても、この点検では検出できません (Docker の既定の権限では、別ユーザーのプロセスの /proc/<pid>/fd は root でも読めません)。"
+  printf '%s' "$SLF_DENIED" | while IFS="$SLF_TAB" read -r slf_p slf_c slf_u; do
+    [ -n "$slf_p" ] || continue
+    printf '         PID %s (%s, uid %s)\n' "$slf_p" "$slf_c" "$slf_u"
+  done
+fi
+
+if [ -z "$LOG_DIR" ] || [ ! -d "$LOG_DIR" ]; then
+  printf '\nログディレクトリがありません: %s\n' "${LOG_DIR:-(特定できません)}"
+  printf '\n=== 結果 ===\n'
+  printf '判定: 判定不能 — %s のあるディレクトリを特定できませんでした。\n' "$BASE"
+  exit 2
+fi
+
+CUR="$LOG_DIR/$BASE"
+CUR_INO=''
+[ -e "$CUR" ] && CUR_INO="$(stat -c '%i' "$CUR" 2>/dev/null)"
+
+# 収集: pid<TAB>comm<TAB>fd<TAB>リンク先<TAB>実inode
+TMP=''
+while IFS="$SLF_TAB" read -r slf_p slf_c slf_f slf_t; do
+  [ -n "$slf_p" ] || continue
+  slf_ino="$(stat -L -c '%i' "/proc/$slf_p/fd/$slf_f" 2>/dev/null)" || slf_ino=''
+  TMP="${TMP}${slf_p}${SLF_TAB}${slf_c}${SLF_TAB}${slf_f}${SLF_TAB}${slf_t}${SLF_TAB}${slf_ino:-?}${SLF_NL}"
+done <<SLF_ROWS_EOF
+$SLF_ROWS
+SLF_ROWS_EOF
+slf_tmp() { printf '%s' "$TMP"; }
+
+slf_section '1. 対象とディレクトリの状態'
+slf_info "対象: $CUR  (現在の inode: ${CUR_INO:-存在しない})"
+slf_listing="$(ls -li "$LOG_DIR" 2>/dev/null | grep -E " ${BASE}(\..*)?\$| \.nfs")"
+if [ -n "$slf_listing" ]; then
+  printf '%s\n' "$slf_listing" | sed 's/^/     /'
+else
+  slf_info '(該当ファイルなし)'
+fi
+
+slf_section "2. ${BASE}* を開いている FD"
+if [ -z "$TMP" ]; then
+  slf_info '(どのプロセスも開いていません。JBoss の起動前か、別コンテナ／別ホストで動いています)'
+  printf '\n=== 結果 ===\n'
+  printf '判定: 判定不能 — %s* を開いているプロセスが見つかりません。\n' "$BASE"
+  exit 2
+fi
+printf '  %-7s %-16s %-4s %-12s %s\n' PID COMM FD INODE 指している名前
+slf_tmp | while IFS="$SLF_TAB" read -r pid comm fd t ino; do
+  [ -n "$pid" ] || continue
+  printf '  %-7s %-16s %-4s %-12s %s\n' "$pid" "$comm" "$fd" "$ino" "${t#"$LOG_DIR"/}"
+done
+
+slf_section '3. 判定'
+NG=0
+
+# --- 判定1: 同一プロセス内に stdout/stderr 以外の FD が2本以上（原因候補1）
+MULTI=$(slf_tmp | awk -F'\t' '$3!=1 && $3!=2 {n[$1]++; c[$1]=$2} END {for (p in n) if (n[p]>=2) print p"\t"c[p]"\t"n[p]}')
+if [ -n "$MULTI" ]; then
+  printf '%s\n' "$MULTI" |
+  while IFS="$SLF_TAB" read -r pid comm n; do
+    say "原因候補1" "PID $pid ($comm) が ${BASE}* を ${n} 本の FD で開いています。同じ JVM の中に ${BASE} を開く書き手が複数あります（原因候補1：subsystem の別名ハンドラ／logging-profile／デプロイメント内の logging.properties・jboss-logging.properties、原因候補1b：アプリが同梱した reload4j の log4j.xml や log4j-core・logback の設定）。ログ設定の静的点検 (audit-logging-config.sh 相当) で特定してください。"
+  done
+  NG=1
+fi
+
+# --- 判定2: FD 1/2（stdout/stderr）が server.log* を指している（原因候補2）
+if slf_tmp | awk -F'\t' '$3==1 || $3==2 {f=1} END {exit !f}'; then
+  slf_tmp | awk -F'\t' '$3==1 || $3==2 {print $1"\t"$2"\t"$3}' | sort -u |
+  while IFS="$SLF_TAB" read -r pid comm fd; do
+    say "原因候補2" "PID $pid ($comm) の FD $fd（stdout/stderr）が ${BASE}* を指しています。entrypoint 等で 'standalone.sh >> ${BASE} 2>&1' のようにリダイレクトしていませんか。シェルが開いた FD は JBoss の回転を知りません。"
+  done
+  NG=1
+fi
+
+# --- 判定2': java 以外のプロセスが開いている（tee、tail -f 以外の書き手など）
+if slf_tmp | awk -F'\t' '$2!="java" && $3!=1 && $3!=2 {f=1} END {exit !f}'; then
+  slf_tmp | awk -F'\t' '$2!="java" && $3!=1 && $3!=2 {print $1"\t"$2}' | sort -u |
+  while IFS="$SLF_TAB" read -r pid comm; do
+    say "要確認" "java 以外のプロセス PID $pid ($comm) が ${BASE}* を開いています。tee や独自の転送プロセスなら書き手になっていないか確認してください（tail -f など読むだけなら無害です）。"
+  done
+fi
+
+# --- 判定3: 現行名以外（回転済みの名前）を指している FD
+if slf_tmp | awk -F'\t' -v cur="$CUR" '$4!=cur && $4 !~ /\(deleted\)$/ {f=1} END {exit !f}'; then
+  slf_tmp | awk -F'\t' -v cur="$CUR" '$4!=cur && $4 !~ /\(deleted\)$/ {print $1"\t"$2"\t"$3"\t"$4}' |
+  while IFS="$SLF_TAB" read -r pid comm fd t; do
+    say "発生中" "PID $pid ($comm) の FD $fd は ${t#"$LOG_DIR"/} に書いています（${BASE} に書いていません）。"
+  done
+  # 判定1・2 に当たらないなら、外部からの rename が原因
+  if [ -z "$MULTI" ] && ! slf_tmp | awk -F'\t' '$3==1 || $3==2 {f=1} END {exit !f}'; then
+    say "原因候補3" "JVM 内の FD は1本だけなのに回転済みの名前を指しています。JBoss 以外の何か（logrotate、収集バッチ、別ホストの cron、運用手順の mv）が ${BASE} を rename しています。"
+  fi
+  NG=1
+fi
+
+# --- 判定3': 名前は server.log のままだが inode が現在の server.log と違う（別ホストからの rename）
+if [ -n "$CUR_INO" ]; then
+  if slf_tmp | awk -F'\t' -v cur="$CUR" -v ci="$CUR_INO" '$4==cur && $5!=ci && $5!="?" {f=1} END {exit !f}'; then
+    slf_tmp | awk -F'\t' -v cur="$CUR" -v ci="$CUR_INO" '$4==cur && $5!=ci && $5!="?" {print $1"\t"$2"\t"$3"\t"$5}' |
+    while IFS="$SLF_TAB" read -r pid comm fd ino; do
+      say "原因候補3" "PID $pid ($comm) の FD $fd は名前上は ${BASE} ですが inode $ino を指しており、現在の ${BASE}（inode $CUR_INO）とは別物です。別ホスト（別の NFS クライアント）が rename した可能性が高いです。"
+    done
+    NG=1
+  fi
+fi
+
+# --- 補足: 削除済み・.nfs*
+if slf_tmp | awk -F'\t' '$4 ~ /\(deleted\)$/ || $4 ~ /\/\.nfs/ {f=1} END {exit !f}'; then
+  say "データ消失" "削除済み（または .nfs* に化けた）inode に書いている FD があります。回転時の上書き（Files.move REPLACE_EXISTING）で前日分が消えています。"
+  NG=1
+fi
+
+if [ "$NG" -eq 0 ]; then
+  say "正常" "${BASE} を開いている FD は JVM 内に1本だけで、現在の ${BASE}（inode $CUR_INO）を指しています。"
+  printf '\n=== 結果 ===\n'
+  printf '判定: 正常 — %s を開いている FD は 1 本だけで、現在の %s を指しています。\n' "$BASE" "$BASE"
+  exit 0
+fi
+printf '\n=== 結果 ===\n'
+printf '判定: 異常 — 上の [原因候補] を確認してください (定義箇所はログ設定の静的点検で特定できます)。\n'
+exit 1
+SERVER_LOG_FD_SCRIPT
+)"
+
+  diag ""
+  diag "════════════ server.log の FD 点検 (check-server-log-fd.sh 相当) ════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "実行ユーザー     : ${exec_note}"
+  diag "日付をまたいでも ${SERVER_LOG_CHECK_BASENAME}.<前日> へ書き続ける原因を、/proc/*/fd から"
+  diag "${SERVER_LOG_CHECK_BASENAME}* を開いている FD の本数・FD 番号・inode を集めて判定します"
+  diag "(Log4j_EFS_Rolling の jboss/bin/check-server-log-fd.sh と同じ判定。追加の入力は不要)。"
+  diag "原因候補 1・2 は日付をまたぐ前でも検出できます。原因候補 3 (外部からの rename) は"
+  diag "日付をまたいだ後でないと見えません。"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "server.log の FD 点検の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  docker exec ${exec_args[@]+"${exec_args[@]}"} "$container_id" /bin/sh -c "$fd_script" \
+    _ "$SERVER_LOG_CHECK_BASENAME" "${JBOSS_HOME_CANDIDATES[@]}" \
+    > "$capture_file" 2>&1 || exec_status=$?
+  print_healthcheck_capture "$capture_file" "(server.log の FD 点検の出力がありません)" 1048576
+
+  case "$exec_status" in
+    0) verdict_text="正常 (${SERVER_LOG_CHECK_BASENAME} を開いている FD は 1 本だけで、現在の ${SERVER_LOG_CHECK_BASENAME} を指しています)" ;;
+    1) verdict_text="異常 (${SERVER_LOG_CHECK_BASENAME} を FILE ハンドラ以外も開いているか、回転済みの名前を指す FD があります)" ;;
+    2) verdict_text="判定不能 (ログディレクトリ・/proc・${SERVER_LOG_CHECK_BASENAME}* を開いている FD のいずれかを確認できませんでした)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 判定不能・エラーで終わった場合も、そこまでに出た内容は残す。
+  text_path="$(resolve_server_log_check_path "$service_name" server_log_fd)"
+  if [ -n "$text_path" ] \
+      && write_server_log_check_text "$text_path" server_log_fd "$service_name" \
+           "$container_name" "$capture_file" "$verdict_text" "$exec_note"; then
+    SERVER_LOG_FD_CHECK_TEXT_OUTPUT="$text_path"
+    diag "server.log の FD 点検のテキスト : ${text_path}"
+    if [ -z "$BUILD_REPORT_DIR" ]; then
+      diag "  (--report-dir を指定すると、その配下へ出力します)"
+    fi
+  fi
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "server.log の FD 点検 : 正常"
+      ;;
+    1)
+      diag "server.log の FD 点検 : 異常 (上の [原因候補] を確認してください。定義箇所は「ログ設定の静的点検」で特定できます)"
+      ;;
+    2)
+      warn "${SERVER_LOG_CHECK_BASENAME} のあるディレクトリか、${SERVER_LOG_CHECK_BASENAME}* を開いているプロセスを確認できなかったため判定できませんでした。"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' で server.log の FD 点検を実行できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
+# server.log を開く／rename する主体を、設定・デプロイメント・OS 側の仕組みまで横断して
+# 点検し、画面とテキストへ出す (audit-logging-config.sh 相当)。JBOSS_HOME・設定ファイル・
+# デプロイ先・起動コマンドはすべてコンテナから求めるため、追加の入力は不要。
+run_interactive_compose_logging_config_audit() {
+  local service_name="$1" container_id container_name audit_script
+  local capture_file="" start_file="" exec_status=0 verdict_text="" text_path=""
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  audit_script="$(cat <<'LOGGING_CONFIG_AUDIT_SCRIPT'
+set -u
+# logging-config-audit-report: server.log を開く／rename する主体が JBoss の FILE
+# ハンドラ 1 つだけかを、設定・デプロイメント・OS 側の仕組みまで横断して静的に点検する
+# (Log4j_EFS_Rolling の jboss/bin/audit-logging-config.sh と同じ点検)。
+# server.log の FD 点検で原因候補 1〜3 が出たときに、その「犯人」の定義箇所を特定する。
+#   $1      = --jboss-config-file の指定 (空文字可)
+#   $2      = --jboss-cli-path の指定 (空文字可)
+#   $3      = 点検対象のファイル名 (既定 server.log)
+#   $4 以降 = JBOSS_HOME の候補
+#   標準入力 = コンテナの起動コマンド (ENTRYPOINT と CMD。1 行 1 要素)
+# 元のスクリプトからの読み替え
+#   - JBOSS_HOME・設定ファイル・デプロイ先は、起動中の JVM の引数 (-Djboss.home.dir /
+#     -Djboss.server.base.dir / -c) と deployment-scanner の設定から求める
+#   - 起動スクリプトの点検対象 (元は引数で指定) は、コンテナの ENTRYPOINT / CMD とする
+#   - 稼働中サーバーの実行時設定 (元は --cli 指定時だけ) は、常に jboss-cli.sh で取得する
+#   - WAR / EAR は unzip → python3 → jar → bsdtar → busybox unzip の順に使えるものを
+#     探して読む (元は unzip だけ)。find の無いイメージでは、展開済みのデプロイメントを
+#     シェルの展開だけで辿る
+#   - use-deployment-logging-config / add-logging-api-dependencies は、standalone.xml に
+#     書かれる要素の形 (<use-deployment-logging-config value="false"/>) で判定する
+#   - デプロイメント内のログ設定は、ファイル名として server.log を指しているかで判定する
+#     (jboss.server.log.dir の中の別ファイル (app.log 等) を指すだけなら [情報])
+# 終了コード: 0 = 指摘なし / 1 = 指摘あり / 2 = 実行不能 (設定ファイルを読めない・作業領域が無い)
+
+LA_CONFIG_HINT="${1:-}"
+LA_CLI_HINT="${2:-}"
+LOG_BASENAME="${3:-server.log}"
+if [ "$#" -ge 3 ]; then
+  shift 3
+else
+  set --
+fi
+LA_START="$(cat 2>/dev/null)"
+LA_NL='
+'
+
+hdr()   { printf '\n=== %s ===\n' "$1"; }
+la_kv() { printf '     %s\n' "$1"; }
+info()  { printf '  [情報] %s\n' "$1"; }
+# 指摘の有無はファイルで持つ（while ループがパイプのサブシェルで動くため、変数では親に伝わらない）
+warn()  { printf '  [指摘] %s\n' "$1"; echo x >> "$FLAG"; }
+
+for la_tool in awk cat grep head ls mktemp sed sort tr; do
+  if ! command -v "$la_tool" >/dev/null 2>&1; then
+    printf 'ログ設定の点検に必要なコマンドがコンテナにありません: %s\n' "$la_tool"
+    exit 2
+  fi
+done
+
+# ---- JBoss EAP の JVM・JBOSS_HOME・設定ファイル・デプロイ先を特定する ----------
+# docker exec のシェルには entrypoint が export した値が引き継がれないため、起動中の
+# JVM の引数から求める。argv[0] が java で、jboss-modules.jar か -Djboss.home.dir を
+# 持つプロセス (このスクリプト自身の引数にも同じ文字列が含まれるため argv[0] で絞る)。
+la_jvm_pid=''
+la_jvm_args=''
+for la_proc in /proc/[0-9]*; do
+  [ "${la_proc#/proc/}" = "$$" ] && continue
+  [ -r "$la_proc/cmdline" ] || continue
+  la_args="$(tr '\0' '\n' < "$la_proc/cmdline" 2>/dev/null)"
+  case "${la_args%%"$LA_NL"*}" in
+    java|*/java) ;;
+    *) continue ;;
+  esac
+  case "$la_args" in
+    *jboss-modules.jar*|*-Djboss.home.dir=*) ;;
+    *) continue ;;
+  esac
+  la_jvm_pid="${la_proc#/proc/}"
+  la_jvm_args="$la_args"
+  break
+done
+
+# JVM の引数から -D<名前>= の値を取り出す ($1 は sed の正規表現。. はエスケープ済み)。
+la_dvalue() {
+  printf '%s\n' "$la_jvm_args" | sed -n "s/^-D$1=//p" | head -n 1
+}
+
+# 起動中サーバーの設定ファイル名 (-c NAME / -c=NAME / --server-config=NAME)。
+la_config_name=''
+la_prev=''
+while IFS= read -r la_arg; do
+  if [ "$la_prev" = '-c' ]; then
+    la_config_name="$la_arg"
+    break
+  fi
+  case "$la_arg" in
+    --server-config=*) la_config_name="${la_arg#--server-config=}"; break ;;
+    -c=*)              la_config_name="${la_arg#-c=}"; break ;;
+  esac
+  la_prev="$la_arg"
+done <<LA_ARGS_EOF
+$la_jvm_args
+LA_ARGS_EOF
+
+LA_HOME="$(la_dvalue 'jboss\.home\.dir')"
+if [ -z "$LA_HOME" ] || [ ! -d "$LA_HOME" ]; then
+  LA_HOME=''
+  for la_cand in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+    [ -n "$la_cand" ] || continue
+    if [ -d "$la_cand/standalone" ] || [ -f "$la_cand/bin/standalone.sh" ]; then
+      LA_HOME="$la_cand"
+      break
+    fi
+  done
+fi
+JBOSS_HOME="${LA_HOME:-/opt/jboss}"
+LA_BASE_DIR="$(la_dvalue 'jboss\.server\.base\.dir')"
+[ -n "$LA_BASE_DIR" ] || LA_BASE_DIR="$JBOSS_HOME/standalone"
+LA_CONFIG_DIR="$(la_dvalue 'jboss\.server\.config\.dir')"
+[ -n "$LA_CONFIG_DIR" ] || LA_CONFIG_DIR="$LA_BASE_DIR/configuration"
+
+if [ -n "$LA_CONFIG_HINT" ]; then
+  JBOSS_CONFIG="$LA_CONFIG_HINT"
+elif [ -n "$la_config_name" ]; then
+  case "$la_config_name" in
+    /*) JBOSS_CONFIG="$la_config_name" ;;
+    *)  JBOSS_CONFIG="$LA_CONFIG_DIR/$la_config_name" ;;
+  esac
+else
+  JBOSS_CONFIG="$LA_CONFIG_DIR/standalone.xml"
+  if [ ! -r "$JBOSS_CONFIG" ]; then
+    for la_name in standalone-full.xml standalone-ha.xml standalone-full-ha.xml; do
+      if [ -r "$LA_CONFIG_DIR/$la_name" ]; then
+        JBOSS_CONFIG="$LA_CONFIG_DIR/$la_name"
+        break
+      fi
+    done
+  fi
+fi
+BOOT_PROPS="${JBOSS_CONFIG%/*}/logging.properties"
+
+# デプロイ先は deployment-scanner の path / relative-to に従う (既定 jboss.server.base.dir/deployments)。
+DEPLOY_DIR="$LA_BASE_DIR/deployments"
+if [ -r "$JBOSS_CONFIG" ]; then
+  la_scanner="$(grep -o '<deployment-scanner[^>]*>' "$JBOSS_CONFIG" 2>/dev/null | head -n 1)"
+  la_scan_path="$(printf '%s' "$la_scanner" | sed -n 's/.*[[:space:]]path="\([^"]*\)".*/\1/p')"
+  la_scan_rel="$(printf '%s' "$la_scanner" | sed -n 's/.*[[:space:]]relative-to="\([^"]*\)".*/\1/p')"
+  case "$la_scan_path" in
+    ''|*'${'*) ;;
+    /*) DEPLOY_DIR="$la_scan_path" ;;
+    *)
+      case "$la_scan_rel" in
+        jboss.server.base.dir) DEPLOY_DIR="$LA_BASE_DIR/$la_scan_path" ;;
+        jboss.home.dir)        DEPLOY_DIR="$JBOSS_HOME/$la_scan_path" ;;
+      esac
+      ;;
+  esac
+fi
+
+# 作業用の一時ディレクトリ (入れ子のアーカイブの取り出しと、指摘の有無の記録に使う)。
+# 読み取り専用のルートでも JBoss 自身が書く jboss.server.base.dir/tmp は書ける。
+umask 077
+LA_TMP=''
+for la_base in "${TMPDIR:-}" /tmp /var/tmp /dev/shm "$LA_BASE_DIR/tmp"; do
+  [ -n "$la_base" ] && [ -d "$la_base" ] || continue
+  if LA_TMP="$(mktemp -d "$la_base/logging-config-audit.XXXXXX" 2>/dev/null)"; then
+    break
+  fi
+  LA_TMP=''
+done
+if [ -z "$LA_TMP" ]; then
+  printf '作業用の一時ディレクトリを作成できる場所がありません (書き込み可能な一時領域が必要です)。\n'
+  exit 2
+fi
+trap 'rm -rf -- "$LA_TMP"' EXIT
+trap 'exit 2' HUP INT TERM
+FLAG="$LA_TMP/flag"
+: > "$FLAG"
+
+# ---- WAR / EAR を読む手段 -----------------------------------------------------
+# 元のスクリプトは unzip だけを使う。UBI minimal 系のイメージ (WildFly の公式イメージ等) には
+# unzip も python3 も無いことがあるが、JDK なら jar がある。使えるものを順に探す。
+LA_ZIP=''
+LA_ZIP_CMD=''
+if command -v unzip >/dev/null 2>&1; then
+  LA_ZIP_CMD="$(command -v unzip)"
+  # 名前だけの一覧 (-Z1) は Info-ZIP の unzip だけが持つ。BusyBox の unzip は
+  # -Z を知らないため、-l の一覧から名前を取り出す。
+  if "$LA_ZIP_CMD" -Z 2>&1 | grep -qi 'zipinfo'; then
+    LA_ZIP='unzip'
+  else
+    LA_ZIP='unzip-l'
+  fi
+fi
+if [ -z "$LA_ZIP" ]; then
+  for la_py in python3 python; do
+    if command -v "$la_py" >/dev/null 2>&1; then
+      LA_ZIP='python'
+      LA_ZIP_CMD="$(command -v "$la_py")"
+      break
+    fi
+  done
+fi
+if [ -z "$LA_ZIP" ]; then
+  la_jvm_bin=''
+  if [ -n "$la_jvm_pid" ]; then
+    la_jvm_exe="$(readlink "/proc/$la_jvm_pid/exe" 2>/dev/null)"
+    [ -n "$la_jvm_exe" ] && la_jvm_bin="${la_jvm_exe%/*}"
+  fi
+  for la_jar in "${JAVA_HOME:+$JAVA_HOME/bin/jar}" "${la_jvm_bin:+$la_jvm_bin/jar}" \
+      "$(command -v jar 2>/dev/null)"; do
+    [ -n "$la_jar" ] && [ -x "$la_jar" ] || continue
+    LA_ZIP='jar'
+    LA_ZIP_CMD="$la_jar"
+    break
+  done
+fi
+if [ -z "$LA_ZIP" ] && command -v bsdtar >/dev/null 2>&1; then
+  LA_ZIP='bsdtar'
+  LA_ZIP_CMD="$(command -v bsdtar)"
+fi
+if [ -z "$LA_ZIP" ] && command -v busybox >/dev/null 2>&1 \
+    && busybox --list 2>/dev/null | grep -qx unzip; then
+  LA_ZIP='busybox'
+  LA_ZIP_CMD="$(command -v busybox)"
+fi
+
+# unzip -l の一覧 (長さ・日付・時刻・名前) から名前だけを取り出す。一覧は区切り行
+# (---- の並び) の 1 本目と 2 本目の間にある。
+la_unzip_l_names() {
+  awk '
+    /^[ -]*-----/ { sep++; next }
+    sep == 1 { sub(/^[ \t]*[0-9]+[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]+/, ""); print }
+  '
+}
+
+# $1 = アーカイブ。エントリ名を 1 行 1 件で出す。
+la_zip_list() {
+  case "$LA_ZIP" in
+    unzip)
+      "$LA_ZIP_CMD" -Z1 "$1" 2>/dev/null ;;
+    unzip-l)
+      "$LA_ZIP_CMD" -l "$1" 2>/dev/null | la_unzip_l_names ;;
+    python)
+      PYTHONIOENCODING=utf-8 "$LA_ZIP_CMD" -c 'import sys, zipfile
+for n in zipfile.ZipFile(sys.argv[1]).namelist():
+    sys.stdout.write(n + "\n")' "$1" 2>/dev/null ;;
+    jar)
+      "$LA_ZIP_CMD" tf "$1" 2>/dev/null ;;
+    bsdtar)
+      "$LA_ZIP_CMD" -tf "$1" 2>/dev/null ;;
+    busybox)
+      "$LA_ZIP_CMD" unzip -l "$1" 2>/dev/null | la_unzip_l_names ;;
+  esac
+}
+
+# $1 = アーカイブ, $2 = エントリ名。中身を標準出力へ出す。
+la_zip_cat() {
+  case "$LA_ZIP" in
+    unzip|unzip-l)
+      "$LA_ZIP_CMD" -p "$1" "$2" 2>/dev/null ;;
+    python)
+      "$LA_ZIP_CMD" -c 'import sys, zipfile
+out = getattr(sys.stdout, "buffer", sys.stdout)
+out.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))' "$1" "$2" 2>/dev/null ;;
+    jar)
+      # jar は標準出力へ取り出せないため、作業ディレクトリへ取り出してから読む。
+      case "$1" in
+        /*) la_zc_src="$1" ;;
+        *)  la_zc_src="$PWD/$1" ;;
+      esac
+      la_zc_dir="$(mktemp -d "$LA_TMP/jar.XXXXXX" 2>/dev/null)" || return 1
+      ( cd "$la_zc_dir" && "$LA_ZIP_CMD" xf "$la_zc_src" "$2" ) >/dev/null 2>&1 \
+        && cat "$la_zc_dir/$2" 2>/dev/null
+      rm -rf -- "$la_zc_dir" ;;
+    bsdtar)
+      "$LA_ZIP_CMD" -xOf "$1" "$2" 2>/dev/null ;;
+    busybox)
+      "$LA_ZIP_CMD" unzip -p "$1" "$2" 2>/dev/null ;;
+  esac
+}
+
+# $1 = ディレクトリ。配下の通常ファイルを相対パスで 1 行 1 件出す (find -type f 相当)。
+la_list_files() {
+  if command -v find >/dev/null 2>&1; then
+    (cd "$1" && find . -type f 2>/dev/null) | sed 's#^\./##'
+  else
+    # find の無いイメージ (UBI minimal 系の WildFly 等) では、シェルの展開だけで辿る。
+    la_walk "$1" ''
+  fi
+}
+# $1 = ディレクトリ, $2 = 出力する相対パスの接頭辞。シンボリックリンクは辿らない。
+la_walk() {
+  for la_w in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$la_w" ] || continue
+    [ -L "$la_w" ] && continue
+    if [ -d "$la_w" ]; then
+      ( la_walk "$la_w" "$2${la_w##*/}/" )
+    elif [ -f "$la_w" ]; then
+      printf '%s\n' "$2${la_w##*/}"
+    fi
+  done
+}
+
+# logging subsystem の真偽値の設定が false か。standalone.xml では
+# <use-deployment-logging-config value="false"/> のような要素で書かれる
+# (jboss-cli の write-attribute もこの形で保存する)。属性の形も念のため拾う。
+la_flag_false() {
+  [ -r "$JBOSS_CONFIG" ] || return 1
+  grep -Eq "<$1[[:space:]][^>]*value=\"false\"|$1=\"false\"" "$JBOSS_CONFIG"
+}
+
+hdr '0. 実行環境'
+if [ -n "$la_jvm_pid" ]; then
+  la_kv "JBoss EAP の JVM     : pid ${la_jvm_pid}"
+else
+  la_kv 'JBoss EAP の JVM     : 見つかりません (設定ファイルとデプロイ先だけを点検します)'
+fi
+la_kv "JBOSS_HOME           : ${JBOSS_HOME}"
+la_kv "設定ファイル         : ${JBOSS_CONFIG}"
+la_kv "起動時ログ設定       : ${BOOT_PROPS}"
+la_kv "デプロイ先           : ${DEPLOY_DIR}"
+if [ -n "$LA_ZIP" ]; then
+  la_kv "WAR / EAR の読み取り : ${LA_ZIP} (${LA_ZIP_CMD})"
+else
+  la_kv 'WAR / EAR の読み取り : 使えるコマンドがありません (unzip / python3 / jar / bsdtar / busybox unzip)'
+fi
+la_kv "点検対象             : ${LOG_BASENAME}"
+
+# -------------------------------------------------------------------------------------------
+# 1. standalone.xml：ファイル系ハンドラ（logging-profile 内を含む）の出力先一覧と重複検出
+# -------------------------------------------------------------------------------------------
+hdr "1. logging subsystem のファイル系ハンドラ（$JBOSS_CONFIG）"
+LA_CONFIG_READ=false
+if [ -r "$JBOSS_CONFIG" ]; then
+  LA_CONFIG_READ=true
+  LIST=$(awk '
+    /<subsystem xmlns="urn:jboss:domain:logging:/ { inlog=1 }
+    inlog && /<\/subsystem>/                      { inlog=0 }
+    !inlog { next }
+    /<logging-profile / { match($0, /name="[^"]*"/); prof=substr($0, RSTART+6, RLENGTH-7) }
+    /<\/logging-profile>/ { prof="" }
+    /<(periodic-rotating-file-handler|size-rotating-file-handler|periodic-size-rotating-file-handler|file-handler) / {
+      match($0, /<[a-z-]+/); type=substr($0, RSTART+1, RLENGTH-1)
+      match($0, /name="[^"]*"/); h=substr($0, RSTART+6, RLENGTH-7)
+    }
+    /<file / {
+      rel="(絶対パス)"; path=""
+      if (match($0, /relative-to="[^"]*"/)) rel=substr($0, RSTART+13, RLENGTH-14)
+      if (match($0, /path="[^"]*"/))        path=substr($0, RSTART+6, RLENGTH-7)
+      printf "%s\t%s\t%s\t%s\t%s\n", (prof=="" ? "(subsystem直下)" : "profile=" prof), h, type, rel, path
+    }
+  ' "$JBOSS_CONFIG")
+  if [ -z "$LIST" ]; then
+    info "ファイル系ハンドラは定義されていません"
+  else
+    printf '  %-24s %-20s %-36s %s\n' 場所 ハンドラ 種別 出力先
+    printf '%s\n' "$LIST" | while IFS="$(printf '\t')" read -r where h type rel path; do
+      printf '  %-24s %-20s %-36s %s/%s\n' "$where" "$h" "$type" "$rel" "$path"
+    done
+    DUP=$(printf '%s\n' "$LIST" | awk -F'\t' '{k=$4"/"$5; n[k]++; hs[k]=hs[k] " " $2 "(" $1 ")"} END {for (k in n) if (n[k]>1) print k "\t" hs[k]}')
+    if [ -n "$DUP" ]; then
+      printf '%s\n' "$DUP" | while IFS="$(printf '\t')" read -r k hs; do
+        warn "同じファイル ${k} を複数のハンドラが開きます:${hs}  → 原因候補1。1ファイル=1ハンドラにしてください（Log4j_EFS_Rolling の jboss/cli/fix-server-log-single-writer.cli）。"
+      done
+    fi
+    printf '%s\n' "$LIST" | awk -F'\t' -v b="$LOG_BASENAME" '$5==b' | grep -q . ||
+      info "${LOG_BASENAME} を出力先に持つハンドラが見つかりません（ハンドラ名やパスを確認してください）"
+  fi
+  if la_flag_false 'use-deployment-logging-config'; then
+    info "use-deployment-logging-config=false（デプロイメント内のログ設定ファイルは無視されます）"
+  else
+    info "use-deployment-logging-config は既定（true）です。デプロイメント内のログ設定ファイルが有効になります → 3 を確認"
+  fi
+else
+  info "読めません: $JBOSS_CONFIG"
+fi
+
+# -------------------------------------------------------------------------------------------
+# 2. 起動時ログ設定（logging.properties）
+# -------------------------------------------------------------------------------------------
+hdr "2. 起動時ログ設定（$BOOT_PROPS）"
+if [ -r "$BOOT_PROPS" ]; then
+  grep -nE '^handler\.[^.]+\.fileName=|^handler\.[^.]+=' "$BOOT_PROPS" | sed 's/^/  /'
+  N=$(grep -cE '^handler\.[^.]+\.fileName=' "$BOOT_PROPS")
+  if [ "${N:-0}" -gt 1 ]; then
+    warn "起動時設定に fileName を持つハンドラが ${N} 個あります。同じファイルを指していないか確認してください。"
+  fi
+  info "logging.properties は subsystem 設定から自動生成されます。手で編集している場合は standalone.xml と食い違っていないか確認してください。"
+else
+  info "読めません: $BOOT_PROPS"
+fi
+
+# -------------------------------------------------------------------------------------------
+# 3. デプロイメント内のログ設定（EAP 8.1 の扱いに合わせて「誰が読むか」で分類する）
+#
+#   (a) logging.properties / jboss-logging.properties（META-INF か WEB-INF/classes）
+#       … コンテナ（logging サブシステム）が読み、デプロイメント専用の LogContext を作る。
+#         use-deployment-logging-config=false で無効化できる。
+#   (b) log4j.xml / log4j.properties … EAP 8 からコンテナは読まない（log4j 1.x の提供が廃止）。
+#         アプリが reload4j / log4j 1.2 の jar を同梱していれば、そのライブラリ自身が読み、
+#         DailyRollingFileAppender 等が自分で server.log を開いて rename する。
+#         ★ use-deployment-logging-config では止まらない。
+#   (c) log4j2*.xml … コンテナは log4j-api を JBoss LogManager に流すため通常は使われない。
+#         アプリが log4j-core を同梱し、org.apache.logging.log4j.api モジュールを除外している
+#         （jboss-deployment-structure.xml か add-logging-api-dependencies=false）場合だけ有効。
+#   (d) logback*.xml … (c) と同様。logback-classic 同梱かつ org.slf4j 系モジュールを除外している場合だけ有効。
+#   (e) jboss-log4j.xml … EAP 8 では無視される。
+# -------------------------------------------------------------------------------------------
+hdr "3. デプロイメント内のログ設定ファイル（$DEPLOY_DIR）"
+CONF_RE='(^|/)(logging\.properties|jboss-logging\.properties|log4j\.xml|jboss-log4j\.xml|log4j\.properties|log4j2[^/]*\.(xml|json|ya?ml|properties)|logback[^/]*\.xml)$'
+# ファイル名としての server.log (jboss.server.log.dir の "server.log" の部分は含めない)
+# と、ログディレクトリ (jboss.server.log.dir) への参照。
+LA_BASE_RE="$(printf '%s' "$LOG_BASENAME" | sed 's/\./\\./g')"
+FILE_RE="(^|[^A-Za-z0-9_.-])${LA_BASE_RE}([^A-Za-z0-9_.-]|\\.[^d]|\$)"
+DIR_RE='jboss\.server\.log\.dir'
+USE_DEPLOY=true
+ADD_API=true
+la_flag_false 'use-deployment-logging-config' && USE_DEPLOY=false
+la_flag_false 'add-logging-api-dependencies' && ADD_API=false
+
+# $1 = 表示名, $2 = エントリ名, $3 = 同梱 jar・除外設定の一覧（改行区切り）,
+# $4 = 参照: 1 = server.log をファイル名として参照 / 2 = jboss.server.log.dir だけを参照 / 0 = なし
+judge_entry() {
+  name=$1; e=$2; libs=$3; hit=$4
+  case "$e" in
+    META-INF/logging.properties|META-INF/jboss-logging.properties|WEB-INF/classes/logging.properties|WEB-INF/classes/jboss-logging.properties)
+      kind="(a) コンテナが読む設定"
+      if [ "$USE_DEPLOY" = true ]; then eff="有効（use-deployment-logging-config=true）"; else eff="無効（use-deployment-logging-config=false）"; fi ;;
+    */jboss-log4j.xml|jboss-log4j.xml)
+      kind="(e) EAP 8 では無視"; eff="無効" ;;
+    *log4j.xml|*log4j.properties)
+      kind="(b) アプリ同梱の log4j 1.x 系が読む設定"
+      if printf '%s\n' "$libs" | grep -qE '(^|/)(reload4j[^/]*|log4j-1\.[^/]*|log4j)\.jar$'; then
+        eff="有効（reload4j / log4j 1.2 を同梱）★use-deployment-logging-config では止まらない"
+      else
+        eff="無効の見込み（log4j 1.x の jar を同梱していない。EAP 8 はコンテナから提供しない）"
+      fi ;;
+    *log4j2*)
+      kind="(c) アプリ同梱の log4j-core が読む設定"
+      if printf '%s\n' "$libs" | grep -qE '(^|/)log4j-core[^/]*\.jar$' && { [ "$ADD_API" = false ] || printf '%s\n' "$libs" | grep -q 'EXCLUDE:org.apache.logging.log4j.api'; }; then
+        eff="有効（log4j-core 同梱＋API モジュール除外）"
+      elif printf '%s\n' "$libs" | grep -qE '(^|/)log4j-core[^/]*\.jar$'; then
+        eff="無効の見込み（log4j-core は同梱だが、API はコンテナの JBoss LogManager 経由になる）"
+      else
+        eff="無効の見込み（log4j-core を同梱していない）"
+      fi ;;
+    *logback*)
+      kind="(d) アプリ同梱の logback が読む設定"
+      if printf '%s\n' "$libs" | grep -qE '(^|/)logback-classic[^/]*\.jar$' && { [ "$ADD_API" = false ] || printf '%s\n' "$libs" | grep -q 'EXCLUDE:org.slf4j'; }; then
+        eff="有効（logback-classic 同梱＋slf4j モジュール除外）"
+      else
+        eff="無効の見込み"
+      fi ;;
+    *)
+      kind="(a?) 場所が標準外の logging.properties 等"; eff="無効の見込み（META-INF / WEB-INF/classes 以外はコンテナが読まない）" ;;
+  esac
+  case "$hit" in
+    1)
+      case "$eff" in
+        有効*) warn "$name!/$e … ${kind}・${eff}。${LOG_BASENAME} を参照しています → 原因候補1（JBoss の FILE とは別の FD で同じファイルを開き、独自に rename する）。出力先を ${LOG_BASENAME} 以外へ変えてください。" ;;
+        *)     info "$name!/$e … ${kind}・${eff}。ただし ${LOG_BASENAME} を参照しているので、将来有効になったときに備えて出力先を変えることを推奨" ;;
+      esac ;;
+    2)
+      info "$name!/$e … ${kind}・${eff}。jboss.server.log.dir を参照していますが、ファイル名は ${LOG_BASENAME} ではありません（別ファイルなら ${LOG_BASENAME} と競合しません。下の行で出力先を確認してください）" ;;
+    *)
+      info "$name!/$e … ${kind}・${eff}（${LOG_BASENAME} への参照なし）" ;;
+  esac
+}
+
+# 設定ファイルの中身 (標準入力) が server.log をどう参照しているか (judge_entry の $4)。
+la_ref_level() {
+  la_rl_text="$(cat)"
+  if printf '%s\n' "$la_rl_text" | grep -qE "$FILE_RE"; then
+    printf '1'
+  elif printf '%s\n' "$la_rl_text" | grep -qE "$DIR_RE"; then
+    printf '2'
+  else
+    printf '0'
+  fi
+}
+
+# 参照している行 (標準入力のうち server.log / jboss.server.log.dir を含む行) を行番号付きで出す。
+la_ref_lines() {
+  grep -nE "${FILE_RE}|${DIR_RE}" | sed 's/^/        /'
+}
+
+# jboss-deployment-structure.xml の <exclusions> にあるモジュール名を "EXCLUDE:<名前>" として返す
+exclusions_of() {
+  sed -n '/<exclusions>/,/<\/exclusions>/p' | grep -o 'name="[^"]*"' | sed 's/name="\(.*\)"/EXCLUDE:\1/'
+}
+
+scan_archive() {
+  # $1 = アーカイブ, $2 = 表示用の名前, $3 = 親アーカイブの同梱 jar 一覧（EAR の lib 等）
+  if [ -z "$LA_ZIP" ]; then
+    info "WAR / EAR を読むコマンド (unzip / python3 / jar / bsdtar / busybox unzip) が無いため $2 の中身を点検できません（docker cp で取り出して unzip -l で確認してください）"
+    return
+  fi
+  entries=$(la_zip_list "$1")
+  libs=$(printf '%s\n%s\n' "${3:-}" "$(printf '%s\n' "$entries" | grep -E '\.jar$')")
+  dsx=$(printf '%s\n' "$entries" | grep -E '(^|/)jboss-deployment-structure\.xml$' | head -n 1)
+  [ -n "$dsx" ] && libs=$(printf '%s\n%s\n' "$libs" "$(la_zip_cat "$1" "$dsx" | exclusions_of)")
+  printf '%s\n' "$entries" | grep -E "$CONF_RE" | while IFS= read -r e; do
+    la_text="$(la_zip_cat "$1" "$e")"
+    la_hit="$(printf '%s\n' "$la_text" | la_ref_level)"
+    judge_entry "$2" "$e" "$libs" "$la_hit"
+    [ "$la_hit" = 0 ] || printf '%s\n' "$la_text" | la_ref_lines
+  done
+  # EAR の中の WAR / EJB jar を1階層だけ展開して点検（WEB-INF/lib の jar には潜らない）。
+  # 入れ子の呼び出しはサブシェルで行い、親の entries / libs を書き換えさせない。
+  printf '%s\n' "$entries" | grep -E '\.(war|jar)$' | grep -vE '(^|/)(lib|WEB-INF/lib)/' | while IFS= read -r inner; do
+    t=$(mktemp "$LA_TMP/inner.XXXXXX" 2>/dev/null) || continue
+    if la_zip_cat "$1" "$inner" > "$t"; then
+      ( scan_archive "$t" "$2!/$inner" "$libs" )
+    fi
+    rm -f -- "$t"
+  done
+}
+
+scan_exploded() {
+  # $1 = 展開済みディレクトリ
+  entries=$(la_list_files "$1")
+  libs=$(printf '%s\n' "$entries" | grep -E '\.jar$')
+  dsx=$(printf '%s\n' "$entries" | grep -E '(^|/)jboss-deployment-structure\.xml$' | head -n 1)
+  [ -n "$dsx" ] && libs=$(printf '%s\n%s\n' "$libs" "$(exclusions_of < "$1/$dsx")")
+  printf '%s\n' "$entries" | grep -E "$CONF_RE" | while IFS= read -r e; do
+    la_hit="$(la_ref_level < "$1/$e")"
+    judge_entry "${1##*/}" "$e" "$libs" "$la_hit"
+    [ "$la_hit" = 0 ] || la_ref_lines < "$1/$e"
+  done
+}
+
+info "use-deployment-logging-config=${USE_DEPLOY} / add-logging-api-dependencies=${ADD_API}"
+if [ -d "$DEPLOY_DIR" ]; then
+  la_found=0
+  for d in "$DEPLOY_DIR"/*; do
+    [ -e "$d" ] || continue
+    case "$d" in
+      *.war|*.ear|*.jar)
+        la_found=1
+        if [ -d "$d" ]; then
+          scan_exploded "$d"
+        else
+          scan_archive "$d" "${d##*/}" ""
+        fi
+        ;;
+    esac
+  done
+  [ "$la_found" = 1 ] || info "デプロイメント（*.war / *.ear / *.jar）がありません"
+else
+  info "ディレクトリがありません: $DEPLOY_DIR"
+fi
+
+# -------------------------------------------------------------------------------------------
+# 4. JBoss 以外に server.log を rename する仕組み（logrotate / cron）
+# -------------------------------------------------------------------------------------------
+hdr "4. JBoss 以外のローテーション（logrotate / cron）"
+for la_dir in /etc/logrotate.d /etc/cron.d /etc/cron.daily /etc/cron.hourly /var/spool/cron /var/spool/cron/crontabs; do
+  if [ -d "$la_dir" ] && ! ls "$la_dir" >/dev/null 2>&1; then
+    info "権限不足で中を確認できません: $la_dir（root ユーザで bash へ接続して確認できます）"
+  fi
+done
+for f in /etc/logrotate.conf /etc/logrotate.d/* /etc/crontab /etc/cron.d/* /etc/cron.daily/* /etc/cron.hourly/* /var/spool/cron/* /var/spool/cron/crontabs/*; do
+  [ -f "$f" ] || continue
+  if grep -nE "${LOG_BASENAME}|jboss|/mnt/efs" "$f" >/dev/null 2>&1; then
+    warn "$f が ${LOG_BASENAME}／jboss／EFS パスを扱っています → 原因候補3（JBoss は外部 rename 後にファイルを開き直しません）"
+    grep -nE "${LOG_BASENAME}|jboss|/mnt/efs" "$f" | sed 's/^/        /'
+  fi
+done
+info "このコンテナ外（ログ収集用 EC2・バッチ・運用手順）で ${LOG_BASENAME} を mv/rename していないかは別途確認してください。"
+
+# -------------------------------------------------------------------------------------------
+# 5. 起動コマンド（ENTRYPOINT / CMD）と、それが指す起動スクリプトのリダイレクト
+# -------------------------------------------------------------------------------------------
+hdr "5. 起動コマンド・起動スクリプトのリダイレクト"
+LA_REDIRECT_RE="(>>?|tee( -a)?) *[^ ]*${LOG_BASENAME}"
+if [ -z "$LA_START" ]; then
+  info "起動コマンド（ENTRYPOINT / CMD）を取得できませんでした"
+else
+  info "起動コマンド（ENTRYPOINT / CMD）: $(printf '%s\n' "$LA_START" | tr '\n' ' ')"
+  if printf '%s\n' "$LA_START" | grep -qE "$LA_REDIRECT_RE"; then
+    warn "起動コマンドで ${LOG_BASENAME} へのリダイレクト／tee があります → 原因候補2"
+    printf '%s\n' "$LA_START" | grep -nE "$LA_REDIRECT_RE" | sed 's/^/        /'
+  fi
+  # 起動コマンドが指すスクリプト (#! で始まるファイル) の中身も点検する。
+  printf '%s\n' "$LA_START" | while IFS= read -r la_word; do
+    case "$la_word" in
+      ''|-*) continue ;;
+      /*) la_path="$la_word" ;;
+      */*) continue ;;
+      *) la_path="$(command -v "$la_word" 2>/dev/null)" ;;
+    esac
+    [ -n "$la_path" ] && [ -f "$la_path" ] || continue
+    [ "$(head -c 2 "$la_path" 2>/dev/null)" = '#!' ] || continue
+    if grep -nE "$LA_REDIRECT_RE" "$la_path" >/dev/null 2>&1; then
+      warn "$la_path で ${LOG_BASENAME} へのリダイレクト／tee があります → 原因候補2"
+      grep -nE "$LA_REDIRECT_RE" "$la_path" | sed 's/^/        /'
+    else
+      info "$la_path（${LOG_BASENAME} へのリダイレクトなし）"
+    fi
+  done
+fi
+
+# -------------------------------------------------------------------------------------------
+# 6. 稼働中サーバーの実行時設定（元のスクリプトの --cli 相当。常に実行する）
+# -------------------------------------------------------------------------------------------
+hdr "6. 稼働中サーバーの実行時設定（jboss-cli.sh）"
+CLI=''
+if [ -n "$LA_CLI_HINT" ] && [ -f "$LA_CLI_HINT" ]; then
+  CLI="$LA_CLI_HINT"
+elif [ -f "$JBOSS_HOME/bin/jboss-cli.sh" ]; then
+  CLI="$JBOSS_HOME/bin/jboss-cli.sh"
+fi
+if [ -z "$CLI" ]; then
+  info "jboss-cli.sh が見つかりません: $JBOSS_HOME/bin/jboss-cli.sh"
+else
+  LA_CLI_COMMANDS='/subsystem=logging/periodic-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/size-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/periodic-size-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/file-handler=*:read-attribute(name=file),/subsystem=logging/logging-profile=*/periodic-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging:read-attribute(name=use-deployment-logging-config),/deployment=*/subsystem=logging/configuration=*:read-resource(recursive=true,include-runtime=true)'
+  la_cli_status=0
+  if [ -x "$CLI" ]; then
+    la_cli_out="$("$CLI" --connect --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
+  else
+    la_cli_out="$(sh "$CLI" --connect --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
+  fi
+  printf '%s\n' "$la_cli_out" | sed 's/^/  /'
+  if [ "$la_cli_status" -ne 0 ]; then
+    info "jboss-cli.sh --connect が失敗しました (exit=${la_cli_status})。AP サーバーが起動しているか、管理インターフェース（既定 9990）とこのユーザーでのローカル認証を確認してください。"
+  fi
+  info "最後の /deployment=*/subsystem=logging/configuration=* は、コンテナが読んだデプロイメント内ログ設定（logging.properties 等）の実行時リソースです。handler に FILE 以外で ${LOG_BASENAME} を指すものがあれば原因候補1です。アプリ同梱の reload4j 等（原因候補1b）はここに現れないため、3. の結果で確認してください。"
+fi
+
+printf '\n=== 結果 ===\n'
+if [ -s "$FLAG" ]; then
+  printf '指摘あり。上の [指摘] を修正してください（対策は Log4j_EFS_Rolling の解説 md の 16.8 節／Excel の 18_JBoss_対策と設定）。\n'
+  printf '判定: 指摘あり — [指摘] %s 件\n' "$(grep -c . "$FLAG")"
+  exit 1
+fi
+if [ "$LA_CONFIG_READ" != true ]; then
+  printf '判定: 実行不能 — 設定ファイル (%s) を読めないため、ハンドラの定義を点検できていません。\n' "$JBOSS_CONFIG"
+  exit 2
+fi
+printf '指摘なし。server.log の FD 点検の結果が異常なら、コンテナ外（別ホスト・運用手順）の rename を疑ってください。\n'
+printf '判定: 指摘なし\n'
+exit 0
+LOGGING_CONFIG_AUDIT_SCRIPT
+)"
+
+  diag ""
+  diag "════════════ ログ設定の静的点検 (audit-logging-config.sh 相当) ════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "${SERVER_LOG_CHECK_BASENAME} を開く／rename する主体が JBoss の FILE ハンドラ 1 つだけかを、"
+  diag "standalone.xml (logging-profile 含む)・logging.properties・WAR/EAR 内のログ設定・"
+  diag "logrotate/cron・起動コマンド (ENTRYPOINT / CMD)・jboss-cli.sh の実行時設定から点検します"
+  diag "(Log4j_EFS_Rolling の jboss/bin/audit-logging-config.sh と同じ点検。追加の入力は不要)。"
+  diag "jboss-cli.sh の起動を含むため、完了まで十数秒かかることがあります。"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "ログ設定の静的点検の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  if ! start_file="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$capture_file"
+    err "ログ設定の静的点検の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  # 起動コマンド (ENTRYPOINT + CMD) は compose の entrypoint / command による上書きも
+  # 反映された実効値。機微な引数を含み得るため、docker のコマンドライン (ホストの
+  # プロセス引数) には載せず、標準入力で渡す (標準入力はファイルなので端末を奪わない)。
+  docker inspect \
+    -f '{{range .Config.Entrypoint}}{{.}}{{"\n"}}{{end}}{{range .Config.Cmd}}{{.}}{{"\n"}}{{end}}' \
+    "$container_id" > "$start_file" 2>/dev/null || : > "$start_file"
+  docker exec -i "$container_id" /bin/sh -c "$audit_script" \
+    _ "$JBOSS_CONFIG_FILE" "$JBOSS_CLI_PATH" "$SERVER_LOG_CHECK_BASENAME" "${JBOSS_HOME_CANDIDATES[@]}" \
+    < "$start_file" > "$capture_file" 2>&1 || exec_status=$?
+  rm -f -- "$start_file"
+  print_healthcheck_capture "$capture_file" "(ログ設定の静的点検の出力がありません)" 1048576
+
+  case "$exec_status" in
+    0) verdict_text="指摘なし (${SERVER_LOG_CHECK_BASENAME} を開く／rename する主体は FILE ハンドラだけです)" ;;
+    1) verdict_text="指摘あり (${SERVER_LOG_CHECK_BASENAME} を FILE ハンドラ以外が開く／rename する定義があります)" ;;
+    2) verdict_text="実行不能 (設定ファイルを読めないか、作業用の一時領域がありません)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 実行不能・エラーで終わった場合も、そこまでに出た内容は残す。
+  text_path="$(resolve_server_log_check_path "$service_name" logging_config_audit)"
+  if [ -n "$text_path" ] \
+      && write_server_log_check_text "$text_path" logging_config_audit "$service_name" \
+           "$container_name" "$capture_file" "$verdict_text" "コンテナの既定ユーザー"; then
+    LOGGING_CONFIG_AUDIT_TEXT_OUTPUT="$text_path"
+    diag "ログ設定の静的点検のテキスト : ${text_path}"
+    if [ -z "$BUILD_REPORT_DIR" ]; then
+      diag "  (--report-dir を指定すると、その配下へ出力します)"
+    fi
+  fi
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "ログ設定の静的点検 : 指摘なし"
+      ;;
+    1)
+      diag "ログ設定の静的点検 : 指摘あり (上の [指摘] を確認してください。対策は Log4j_EFS_Rolling の解説 md の 16.8 節)"
+      ;;
+    2)
+      warn "設定ファイルを読めないか、コンテナに作業用の一時領域が無いため点検できませんでした。"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' でログ設定の静的点検を実行できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
 # ---- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービスのコンテナ内 CLI を実行する共通経路。
 # CLI のパスとインタプリタはコンテナ内で解決するため、ホスト側に Python は不要。
@@ -27517,6 +28850,7 @@ run_interactive_compose_service_actions() {
   local valkey_action=0
   local truststore_inventory_action=0
   local jmeter_run_action=0 jmeter_status_action=0
+  local server_log_fd_action=0 logging_audit_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -27579,6 +28913,17 @@ run_interactive_compose_service_actions() {
     max_action=$(( max_action + 1 ))
     jmeter_status_action="$max_action"
   fi
+  # server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ
+  # 書き続ける事象の切り分け) は、JBoss モジュール一覧と同じ JBoss EAP のコンテナ
+  # (frontend / backend) で選べる。判定を二重に持たないよう、モジュール一覧が採番
+  # されたかどうかだけを見る。既存の番号 (root bash / Valkey 操作まで) を動かさない
+  # よう、最後へ採番する。
+  if [ "$jboss_module_action" -gt 0 ]; then
+    max_action=$(( max_action + 1 ))
+    server_log_fd_action="$max_action"
+    max_action=$(( max_action + 1 ))
+    logging_audit_action="$max_action"
+  fi
   while :; do
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
@@ -27626,6 +28971,12 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$jmeter_status_action" -gt 0 ]; then
       diag "  ${jmeter_status_action}) JMeter 実行状況を確認 (実行中のコンテナ / 進捗 / 結果と HTML レポートの出力先)"
+    fi
+    if [ "$server_log_fd_action" -gt 0 ]; then
+      diag "  ${server_log_fd_action}) server.log の FD 点検 (日付をまたいでも server.log.<前日> へ書き続ける原因を /proc の FD から判定 / check-server-log-fd.sh 相当)"
+    fi
+    if [ "$logging_audit_action" -gt 0 ]; then
+      diag "  ${logging_audit_action}) ログ設定の静的点検 (server.log を開く・rename する主体を standalone.xml / WAR・EAR / logrotate・cron / 起動コマンドから特定 / audit-logging-config.sh 相当)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -27729,6 +29080,16 @@ run_interactive_compose_service_actions() {
             warn "JMeter 実行状況の確認に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
+        elif [ "$server_log_fd_action" -gt 0 ] && [ "$action" = "$server_log_fd_action" ]; then
+          if ! run_interactive_compose_server_log_fd_check "$service_name"; then
+            warn "server.log の FD 点検に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
+        elif [ "$logging_audit_action" -gt 0 ] && [ "$action" = "$logging_audit_action" ]; then
+          if ! run_interactive_compose_logging_config_audit "$service_name"; then
+            warn "ログ設定の静的点検に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -27821,7 +29182,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、同じ JBoss EAP コンテナの server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の check-server-log-fd.sh / audit-logging-config.sh と同じ判定で、結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力)、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

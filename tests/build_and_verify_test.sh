@@ -53,7 +53,9 @@ assert_matches() {
 # テキスト (build_and_verify_<日時>_cert_check_<サービス名>.txt)、JBoss
 # モジュール一覧 (build_and_verify_<日時>_jboss_modules_<サービス名>.txt)、
 # トラストストア一覧
-# (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt) も出力される
+# (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt)、server.log の
+# FD 点検 (_server_log_fd_<サービス名>.txt) とログ設定の静的点検
+# (_logging_config_audit_<サービス名>.txt) も出力される
 # ため、素の glob では件数が増えてしまう。サービス別ビルドログ
 # (build_and_verify_<日時>_build_log_<サービス名>.txt) はビルドを実行した
 # 実行では必ず出るため、こちらも除外する。ECS サーキットブレーカ再現の
@@ -71,6 +73,7 @@ collect_report_files() {
       *_cert_check_*.txt) continue ;;
       *_jboss_modules_*.txt) continue ;;
       *_truststore_inventory_*.txt) continue ;;
+      *_server_log_fd_*.txt|*_logging_config_audit_*.txt) continue ;;
       *_build_log_*.txt) continue ;;
       *_deployed_class_*.txt) continue ;;
     esac
@@ -3078,6 +3081,208 @@ if (
 fi
 assert_contains "$jboss_modules_conflict_output" \
   "--jboss-module-list-text と --no-jboss-module-list-text は同時に指定できません。"
+
+# --- server.log の FD 点検 / ログ設定の静的点検 ------------------------------
+# JBoss モジュール一覧と同じ JBoss EAP のコンテナ (frontend / backend) だけで、
+# 操作一覧の最後に 2 つ増えること (既存の番号は変わらない)。FD 点検は JBoss EAP の
+# JVM と同じ uid:gid で docker exec し、静的点検へは起動コマンド (ENTRYPOINT / CMD) を
+# docker のコマンドラインではなく標準入力で渡すこと。結果は --report-dir 配下へ残る。
+server_log_check_output="$TEST_TMP/keep-mode-server-log-check.out"
+server_log_check_reports="$TEST_TMP/server-log-check-reports"
+server_log_check_stdin="$TEST_TMP/server-log-check-start-command.txt"
+: > "$FAKE_DOCKER_CALLS"
+# 前のシナリオの export に頼らず、起動成功の fixture を明示する。
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_PS_SERVICES="app eapapp"
+export FAKE_SERVER_LOG_JVM_USER="185:0"
+export FAKE_SERVER_LOG_FD_RESULT="ng"
+export FAKE_LOGGING_AUDIT_STDIN="$server_log_check_stdin"
+export FAKE_CONTAINER_ENTRYPOINT="/opt/jboss-eap/bin/entrypoint.sh"
+export FAKE_CONTAINER_CMD="-Djboss.server.log.dir=/mnt/efs/logs/task-1/front"
+if ! printf '2\n6\n\n7\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,eapapp \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$server_log_check_reports" \
+    --suppress-removed-logs
+) >"$server_log_check_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_SERVER_LOG_FD_RESULT \
+    FAKE_LOGGING_AUDIT_STDIN FAKE_CONTAINER_ENTRYPOINT FAKE_CONTAINER_CMD
+  cat "$server_log_check_output" >&2
+  fail "server.log check helpers returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_SERVER_LOG_FD_RESULT \
+  FAKE_LOGGING_AUDIT_STDIN FAKE_CONTAINER_ENTRYPOINT FAKE_CONTAINER_CMD
+
+# eapapp の操作一覧は root bash (5) の後ろに 6 / 7 が並び、app (JBoss モジュール一覧の
+# 対象外) には出ない (eapapp の一覧は最初と 2 つの操作の後の 3 回だけ表示される)。
+assert_contains "$server_log_check_output" \
+  "  6) server.log の FD 点検 (日付をまたいでも server.log.<前日> へ書き続ける原因を /proc の FD から判定 / check-server-log-fd.sh 相当)"
+assert_contains "$server_log_check_output" \
+  "  7) ログ設定の静的点検 (server.log を開く・rename する主体を standalone.xml / WAR・EAR / logrotate・cron / 起動コマンドから特定 / audit-logging-config.sh 相当)"
+assert_contains "$server_log_check_output" "  5) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
+assert_contains "$server_log_check_output" "選択番号 [0-7]: "
+assert_occurrences "$server_log_check_output" "  6) server.log の FD 点検 (" 3
+assert_contains "$server_log_check_output" "Compose サービス 'app' で実行する操作を選択してください:"
+assert_contains "$server_log_check_output" "選択番号 [0-4]: "
+assert_not_contains "$server_log_check_output" "0 から 7 の番号を入力してください。"
+
+# FD 点検: JVM と同じ uid:gid で実行し、原因候補の判定をそのまま表示する。
+assert_contains "$server_log_check_output" \
+  "════════════ server.log の FD 点検 (check-server-log-fd.sh 相当) ════════════"
+assert_contains "$server_log_check_output" "実行ユーザー     : JBoss EAP の JVM と同じ uid:gid (185:0)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -u 185:0 cid-eapapp /bin/sh -c set -u"
+assert_contains "$server_log_check_output" \
+  "  [原因候補1] PID 108 (java) が server.log* を 2 本の FD で開いています。"
+assert_contains "$server_log_check_output" \
+  "server.log の FD 点検 : 異常 (上の [原因候補] を確認してください。定義箇所は「ログ設定の静的点検」で特定できます)"
+assert_not_contains "$server_log_check_output" "server.log の FD 点検に失敗しました。"
+
+# 静的点検: 起動コマンドは標準入力で渡し、docker のコマンドラインへ載せない。
+assert_contains "$server_log_check_output" \
+  "════════════ ログ設定の静的点検 (audit-logging-config.sh 相当) ════════════"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -i cid-eapapp /bin/sh -c set -u"
+assert_not_contains "$FAKE_DOCKER_CALLS" "/mnt/efs/logs/task-1/front"
+[ -s "$server_log_check_stdin" ] || fail "the start command was not passed to the audit via stdin"
+assert_contains "$server_log_check_stdin" "/opt/jboss-eap/bin/entrypoint.sh"
+assert_contains "$server_log_check_stdin" "-Djboss.server.log.dir=/mnt/efs/logs/task-1/front"
+assert_contains "$server_log_check_output" "=== 6. 稼働中サーバーの実行時設定（jboss-cli.sh） ==="
+assert_contains "$server_log_check_output" "ログ設定の静的点検 : 指摘なし"
+
+# 画面と同じ内容が --report-dir 配下へサービス名付きで残る (一時ディレクトリの案内は出さない)。
+server_log_fd_text="$(ls -1 "$server_log_check_reports"/build_and_verify_*_server_log_fd_eapapp.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_fd_text" ] && [ -s "$server_log_fd_text" ] \
+  || fail "server.log FD check text was not written under $server_log_check_reports"
+assert_contains "$server_log_check_output" "server.log の FD 点検のテキスト : ${server_log_fd_text}"
+assert_contains "$server_log_fd_text" "server.log の FD 点検 (build_and_verify.sh)"
+assert_contains "$server_log_fd_text" "Compose サービス : eapapp"
+assert_contains "$server_log_fd_text" "実行ユーザー     : JBoss EAP の JVM と同じ uid:gid (185:0)"
+assert_contains "$server_log_fd_text" \
+  "判定             : 異常 (server.log を FILE ハンドラ以外も開いているか、回転済みの名前を指す FD があります)"
+assert_contains "$server_log_fd_text" "点検内容         : Log4j_EFS_Rolling の jboss/bin/check-server-log-fd.sh と"
+assert_contains "$server_log_fd_text" "  108     java             577  124886       server.log"
+server_log_audit_text="$(ls -1 "$server_log_check_reports"/build_and_verify_*_logging_config_audit_eapapp.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_audit_text" ] && [ -s "$server_log_audit_text" ] \
+  || fail "logging config audit text was not written under $server_log_check_reports"
+assert_contains "$server_log_check_output" "ログ設定の静的点検のテキスト : ${server_log_audit_text}"
+assert_contains "$server_log_audit_text" "ログ設定の静的点検 (build_and_verify.sh)"
+assert_contains "$server_log_audit_text" \
+  "判定             : 指摘なし (server.log を開く／rename する主体は FILE ハンドラだけです)"
+assert_contains "$server_log_audit_text" "点検内容         : Log4j_EFS_Rolling の jboss/bin/audit-logging-config.sh と"
+assert_contains "$server_log_audit_text" "=== 1. logging subsystem のファイル系ハンドラ（/opt/jboss-eap/standalone/configuration/standalone.xml） ==="
+assert_not_contains "$server_log_check_output" "(--report-dir を指定すると、その配下へ出力します)"
+collect_report_files "$server_log_check_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected a single build report next to the server.log check texts"
+
+# JVM を検出できない (uid:gid を決められない) 場合は既定ユーザーで点検する。
+# 静的点検の「指摘あり」は診断結果として扱い、操作自体は成功させる。
+# --report-dir が無ければ一時ディレクトリへ出し、繰り返した点検は連番で残す。
+server_log_check_tmp_output="$TEST_TMP/keep-mode-server-log-check-tmp.out"
+server_log_check_tmpdir="$TEST_TMP/server-log-check-tmpdir"
+mkdir -p "$server_log_check_tmpdir"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+export FAKE_LOGGING_CONFIG_AUDIT_RESULT="ng"
+if ! printf '1\n6\n\n7\n\n6\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$server_log_check_tmpdir" bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$server_log_check_tmp_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_LOGGING_CONFIG_AUDIT_RESULT
+  cat "$server_log_check_tmp_output" >&2
+  fail "server.log check helpers without --report-dir returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_LOGGING_CONFIG_AUDIT_RESULT
+
+assert_contains "$server_log_check_tmp_output" \
+  "実行ユーザー     : コンテナの既定ユーザー (JBoss EAP の JVM を検出できなかったため)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-eapapp /bin/sh -c set -u"
+assert_not_contains "$FAKE_DOCKER_CALLS" "exec -u 185:0"
+assert_occurrences "$server_log_check_tmp_output" "server.log の FD 点検 : 正常" 2
+assert_contains "$server_log_check_tmp_output" \
+  "ログ設定の静的点検 : 指摘あり (上の [指摘] を確認してください。対策は Log4j_EFS_Rolling の解説 md の 16.8 節)"
+assert_not_contains "$server_log_check_tmp_output" "ログ設定の静的点検に失敗しました。"
+assert_occurrences "$server_log_check_tmp_output" \
+  "Compose サービス 'eapapp' で実行する操作を選択してください:" 4
+assert_occurrences "$server_log_check_tmp_output" "  (--report-dir を指定すると、その配下へ出力します)" 3
+server_log_tmp_fd_text="$(ls -1 "$server_log_check_tmpdir"/build_and_verify_*_server_log_fd_eapapp.txt 2>/dev/null | head -n 1)"
+server_log_tmp_fd_text_2="$(ls -1 "$server_log_check_tmpdir"/build_and_verify_*_server_log_fd_eapapp_1.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_tmp_fd_text" ] && [ -s "$server_log_tmp_fd_text" ] \
+  || fail "server.log FD check text was not written to the temporary directory fallback"
+[ -n "$server_log_tmp_fd_text_2" ] && [ -s "$server_log_tmp_fd_text_2" ] \
+  || fail "the repeated server.log FD check overwrote the previous text instead of numbering it"
+assert_contains "$server_log_check_tmp_output" "server.log の FD 点検のテキスト : ${server_log_tmp_fd_text}"
+assert_contains "$server_log_check_tmp_output" "server.log の FD 点検のテキスト : ${server_log_tmp_fd_text_2}"
+assert_contains "$server_log_tmp_fd_text" \
+  "判定             : 正常 (server.log を開いている FD は 1 本だけで、現在の server.log を指しています)"
+server_log_tmp_audit_text="$(ls -1 "$server_log_check_tmpdir"/build_and_verify_*_logging_config_audit_eapapp.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_tmp_audit_text" ] && [ -s "$server_log_tmp_audit_text" ] \
+  || fail "logging config audit text was not written to the temporary directory fallback"
+assert_contains "$server_log_tmp_audit_text" \
+  "判定             : 指摘あり (server.log を FILE ハンドラ以外が開く／rename する定義があります)"
+assert_contains "$server_log_tmp_audit_text" \
+  "  [指摘] orders.war!/WEB-INF/classes/log4j.xml … (b) アプリ同梱の log4j 1.x 系が読む設定"
+
+# 判定に必要なものを確認できない場合は、ヘルパーの失敗として操作選択へ戻る。
+# そこまでに出た内容はテキストへ残す。
+server_log_check_unavailable_output="$TEST_TMP/keep-mode-server-log-check-unavailable.out"
+server_log_check_unavailable_tmpdir="$TEST_TMP/server-log-check-unavailable-tmpdir"
+mkdir -p "$server_log_check_unavailable_tmpdir"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+export FAKE_SERVER_LOG_FD_RESULT="unavailable"
+export FAKE_LOGGING_CONFIG_AUDIT_RESULT="unavailable"
+if ! printf '1\n6\n\n7\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$server_log_check_unavailable_tmpdir" bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$server_log_check_unavailable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_FD_RESULT FAKE_LOGGING_CONFIG_AUDIT_RESULT
+  cat "$server_log_check_unavailable_output" >&2
+  fail "unavailable server.log checks did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_FD_RESULT FAKE_LOGGING_CONFIG_AUDIT_RESULT
+
+assert_contains "$server_log_check_unavailable_output" \
+  "server.log のあるディレクトリか、server.log* を開いているプロセスを確認できなかったため判定できませんでした。"
+assert_contains "$server_log_check_unavailable_output" \
+  "server.log の FD 点検に失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$server_log_check_unavailable_output" \
+  "設定ファイルを読めないか、コンテナに作業用の一時領域が無いため点検できませんでした。"
+assert_contains "$server_log_check_unavailable_output" \
+  "ログ設定の静的点検に失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$server_log_check_unavailable_output" \
+  "Compose サービス 'eapapp' で実行する操作を選択してください:" 3
+server_log_unavailable_fd_text="$(ls -1 "$server_log_check_unavailable_tmpdir"/build_and_verify_*_server_log_fd_eapapp.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_unavailable_fd_text" ] \
+  || fail "unavailable server.log FD check did not keep its text"
+assert_contains "$server_log_unavailable_fd_text" \
+  "判定             : 判定不能 (ログディレクトリ・/proc・server.log* を開いている FD のいずれかを確認できませんでした)"
+assert_contains "$server_log_unavailable_fd_text" \
+  "判定: 判定不能 — server.log* を開いているプロセスが見つかりません。"
+server_log_unavailable_audit_text="$(ls -1 "$server_log_check_unavailable_tmpdir"/build_and_verify_*_logging_config_audit_eapapp.txt 2>/dev/null | head -n 1)"
+[ -n "$server_log_unavailable_audit_text" ] \
+  || fail "unavailable logging config audit did not keep its text"
+assert_contains "$server_log_unavailable_audit_text" \
+  "判定             : 実行不能 (設定ファイルを読めないか、作業用の一時領域がありません)"
 
 # --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された

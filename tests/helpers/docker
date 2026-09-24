@@ -1974,6 +1974,182 @@ FAKE_TI_OK
   esac
 fi
 
+# ---- server.log の FD 点検 / ログ設定の静的点検 -----------------------------
+# 対象判定は JBoss モジュール一覧 (jboss-module-list-probe) と共有するため、ここでは
+# 本体だけを模擬する。スクリプト本文には jboss-modules.jar や /proc/[0-9] が含まれ、
+# 後ろの伝搬検証・JVM パラメータ収集のハンドラへ吸い込まれるため、必ずそれより前で拾う。
+# docker exec -u <uid:gid> / -i の有無で引数の位置が変わるので、目印は $* で探す。
+#
+# FD を読むユーザー (JBoss EAP の JVM の uid:gid) の特定。FAKE_SERVER_LOG_JVM_USER を
+# 指定したときだけ返し、未指定なら「JVM を検出できない」状態 (= 既定ユーザーで点検) にする。
+if [ "${1:-}" = "exec" ] && [[ "$*" == *"server-log-fd-user-probe"* ]]; then
+  [ -n "${FAKE_SERVER_LOG_JVM_USER:-}" ] || exit 1
+  printf '%s\n' "$FAKE_SERVER_LOG_JVM_USER"
+  exit 0
+fi
+
+# server.log の FD 点検 (check-server-log-fd.sh 相当) の本体。
+#   FAKE_SERVER_LOG_FD_RESULT : ok (既定) / ng / unavailable
+if [ "${1:-}" = "exec" ] && [[ "$*" == *"server-log-fd-report"* ]]; then
+  case "${FAKE_SERVER_LOG_FD_RESULT:-ok}" in
+    unavailable)
+      cat <<'FAKE_SLF_UNAVAILABLE'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM : 見つかりません (jboss-modules.jar を持つ java プロセスがありません)
+     ログディレクトリ : /opt/jboss-eap/standalone/log
+       決め方         : JBOSS_HOME の候補 (/opt/jboss-eap) 配下の standalone/log
+
+=== 1. 対象とディレクトリの状態 ===
+     対象: /opt/jboss-eap/standalone/log/server.log  (現在の inode: 存在しない)
+     (該当ファイルなし)
+
+=== 2. server.log* を開いている FD ===
+     (どのプロセスも開いていません。JBoss の起動前か、別コンテナ／別ホストで動いています)
+
+=== 結果 ===
+判定: 判定不能 — server.log* を開いているプロセスが見つかりません。
+FAKE_SLF_UNAVAILABLE
+      exit 2
+      ;;
+    ng)
+      cat <<'FAKE_SLF_NG'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM : pid 108
+     ログディレクトリ : /opt/jboss-eap/standalone/log
+       決め方         : JVM の -Djboss.server.base.dir 配下の log (jboss.server.log.dir の既定)
+     起動時ログ       : /opt/jboss-eap/standalone/log/server.log (-Dorg.jboss.boot.log.file)
+     実行ユーザー     : uid 185 / gid 0
+
+=== 1. 対象とディレクトリの状態 ===
+     対象: /opt/jboss-eap/standalone/log/server.log  (現在の inode: 124886)
+     124886 -rw-r--r-- 1 jboss root 14583 Sep 24 13:01 server.log
+
+=== 2. server.log* を開いている FD ===
+  PID     COMM             FD   INODE        指している名前
+  108     java             577  124886       server.log
+  108     java             81   124886       server.log
+
+=== 3. 判定 ===
+  [原因候補1] PID 108 (java) が server.log* を 2 本の FD で開いています。同じ JVM の中に server.log を開く書き手が複数あります（原因候補1：subsystem の別名ハンドラ／logging-profile／デプロイメント内の logging.properties・jboss-logging.properties、原因候補1b：アプリが同梱した reload4j の log4j.xml や log4j-core・logback の設定）。ログ設定の静的点検 (audit-logging-config.sh 相当) で特定してください。
+
+=== 結果 ===
+判定: 異常 — 上の [原因候補] を確認してください (定義箇所はログ設定の静的点検で特定できます)。
+FAKE_SLF_NG
+      exit 1
+      ;;
+    *)
+      cat <<'FAKE_SLF_OK'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM : pid 108
+     ログディレクトリ : /opt/jboss-eap/standalone/log
+       決め方         : JVM の -Djboss.server.base.dir 配下の log (jboss.server.log.dir の既定)
+     起動時ログ       : /opt/jboss-eap/standalone/log/server.log (-Dorg.jboss.boot.log.file)
+     実行ユーザー     : uid 185 / gid 0
+
+=== 1. 対象とディレクトリの状態 ===
+     対象: /opt/jboss-eap/standalone/log/server.log  (現在の inode: 124097)
+     124097 -rw-r--r-- 1 jboss root 11545 Sep 24 12:59 server.log
+
+=== 2. server.log* を開いている FD ===
+  PID     COMM             FD   INODE        指している名前
+  108     java             81   124097       server.log
+
+=== 3. 判定 ===
+  [正常] server.log を開いている FD は JVM 内に1本だけで、現在の server.log（inode 124097）を指しています。
+
+=== 結果 ===
+判定: 正常 — server.log を開いている FD は 1 本だけで、現在の server.log を指しています。
+FAKE_SLF_OK
+      exit 0
+      ;;
+  esac
+fi
+
+# ログ設定の静的点検 (audit-logging-config.sh 相当) の本体。
+#   FAKE_LOGGING_CONFIG_AUDIT_RESULT : ok (既定) / ng / unavailable
+#   FAKE_LOGGING_AUDIT_STDIN        : 標準入力で渡された起動コマンドを控えるファイル
+if [ "${1:-}" = "exec" ] && [[ "$*" == *"logging-config-audit-report"* ]]; then
+  if [ -n "${FAKE_LOGGING_AUDIT_STDIN:-}" ]; then
+    cat > "$FAKE_LOGGING_AUDIT_STDIN"
+  fi
+  case "${FAKE_LOGGING_CONFIG_AUDIT_RESULT:-ok}" in
+    unavailable)
+      cat <<'FAKE_LCA_UNAVAILABLE'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM     : 見つかりません (設定ファイルとデプロイ先だけを点検します)
+     JBOSS_HOME           : /opt/jboss
+     設定ファイル         : /opt/jboss/standalone/configuration/standalone.xml
+
+=== 1. logging subsystem のファイル系ハンドラ（/opt/jboss/standalone/configuration/standalone.xml） ===
+  [情報] 読めません: /opt/jboss/standalone/configuration/standalone.xml
+
+=== 結果 ===
+判定: 実行不能 — 設定ファイル (/opt/jboss/standalone/configuration/standalone.xml) を読めないため、ハンドラの定義を点検できていません。
+FAKE_LCA_UNAVAILABLE
+      exit 2
+      ;;
+    ng)
+      cat <<'FAKE_LCA_NG'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM     : pid 108
+     JBOSS_HOME           : /opt/jboss-eap
+     設定ファイル         : /opt/jboss-eap/standalone/configuration/standalone.xml
+     WAR / EAR の読み取り : jar (/opt/java/openjdk/bin/jar)
+
+=== 1. logging subsystem のファイル系ハンドラ（/opt/jboss-eap/standalone/configuration/standalone.xml） ===
+  場所                   ハンドラ         種別                               出力先
+  (subsystem直下)        FILE                 periodic-rotating-file-handler       jboss.server.log.dir/server.log
+  (subsystem直下)        APP_FILE             periodic-rotating-file-handler       jboss.server.log.dir/server.log
+  [指摘] 同じファイル jboss.server.log.dir/server.log を複数のハンドラが開きます: FILE((subsystem直下)) APP_FILE((subsystem直下))  → 原因候補1。1ファイル=1ハンドラにしてください（Log4j_EFS_Rolling の jboss/cli/fix-server-log-single-writer.cli）。
+
+=== 3. デプロイメント内のログ設定ファイル（/opt/jboss-eap/standalone/deployments） ===
+  [指摘] orders.war!/WEB-INF/classes/log4j.xml … (b) アプリ同梱の log4j 1.x 系が読む設定・有効（reload4j / log4j 1.2 を同梱）★use-deployment-logging-config では止まらない。server.log を参照しています → 原因候補1（JBoss の FILE とは別の FD で同じファイルを開き、独自に rename する）。出力先を server.log 以外へ変えてください。
+        5:    <param name="File" value="${jboss.server.log.dir}/server.log"/>
+
+=== 5. 起動コマンド・起動スクリプトのリダイレクト ===
+  [情報] 起動コマンド（ENTRYPOINT / CMD）: /opt/jboss-eap/bin/entrypoint.sh
+  [情報] /opt/jboss-eap/bin/entrypoint.sh（server.log へのリダイレクトなし）
+
+=== 結果 ===
+指摘あり。上の [指摘] を修正してください（対策は Log4j_EFS_Rolling の解説 md の 16.8 節／Excel の 18_JBoss_対策と設定）。
+判定: 指摘あり — [指摘] 2 件
+FAKE_LCA_NG
+      exit 1
+      ;;
+    *)
+      cat <<'FAKE_LCA_OK'
+
+=== 0. 実行環境 ===
+     JBoss EAP の JVM     : pid 108
+     JBOSS_HOME           : /opt/jboss-eap
+     設定ファイル         : /opt/jboss-eap/standalone/configuration/standalone.xml
+     WAR / EAR の読み取り : jar (/opt/java/openjdk/bin/jar)
+
+=== 1. logging subsystem のファイル系ハンドラ（/opt/jboss-eap/standalone/configuration/standalone.xml） ===
+  場所                   ハンドラ         種別                               出力先
+  (subsystem直下)        FILE                 periodic-rotating-file-handler       jboss.server.log.dir/server.log
+  [情報] use-deployment-logging-config は既定（true）です。デプロイメント内のログ設定ファイルが有効になります → 3 を確認
+
+=== 6. 稼働中サーバーの実行時設定（jboss-cli.sh） ===
+  {
+      "outcome" => "success",
+      "result" => true
+  }
+
+=== 結果 ===
+指摘なし。server.log の FD 点検の結果が異常なら、コンテナ外（別ホスト・運用手順）の rename を疑ってください。
+判定: 指摘なし
+FAKE_LCA_OK
+      exit 0
+      ;;
+  esac
+fi
+
 # コンテナ内シェルで実行される伝搬検証のプローブ。
 # build_and_verify.sh は次の形で呼ぶため、スクリプト本文の特徴で処理を振り分ける。
 #   docker exec    <cid> /bin/sh -c '<script>' _ <引数...>   → script は $5
