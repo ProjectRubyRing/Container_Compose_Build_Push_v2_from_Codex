@@ -635,6 +635,7 @@ compose down (削除)
 | `--no-jboss-module-list-text` | フラグ | `false` | 不可 | JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) |
 | `--truststore-inventory-text FILE` | ファイルパス | (なし) | 不可 | トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先。`--no-truststore-inventory-text` とは排他 |
 | `--no-truststore-inventory-text` | フラグ | `false` | 不可 | トラストストア一覧のテキスト出力を行わない (画面表示だけにする) |
+| `--backend-port-offset N` | 0〜55545 の整数 | `10000` | 不可 | ログ設定の静的点検 (`--keep-container-mode logs` の操作) で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する backend の port-offset。サービス名に `backend` を含むサービスは `--controller=localhost:<9990 + N>` (既定 19990) で接続し、それ以外は 0 (9990)。JVM の `-Djboss.socket.binding.port-offset` があればそちらを優先 |
 
 ### 4.8 終了時のクリーンアップ
 
@@ -1610,7 +1611,7 @@ FILE ハンドラは回転時に**自分の FD だけ**を閉じて開き直す�
 | 対象の特定 | 起動中の JVM (argv[0] が `java` で `jboss-modules.jar` / `-Djboss.home.dir` を持つもの) の引数から、ログディレクトリを `-Djboss.server.log.dir` → `-Djboss.server.base.dir` 配下の `log` → `-Djboss.home.dir` 配下の `standalone/log` → `JBOSS_HOME` の候補の順に決める。そこで誰も開いていなければ、実際に `server.log*` が開かれている場所へ切り替える | `JBOSS_HOME` は JVM の `-Djboss.home.dir` → 環境変数 → 既定の候補、設定ファイルは `--jboss-config-file` → JVM の `-c` → `standalone.xml`、デプロイ先は `deployment-scanner` の `path` / `relative-to` |
 | 実行ユーザー | JBoss EAP の JVM と同じ uid:gid (`docker exec -u`)。`/proc/<pid>/fd` は同じユーザーか `CAP_SYS_PTRACE` でしか読めず、Docker の既定の権限では root でも別ユーザーの FD は見えないため。読めなかったプロセスは `[情報]` で一覧にする | コンテナの既定ユーザー。権限で読めない cron のディレクトリは `[情報]` で示す |
 | 判定 | 同じ JVM に 2 本以上 → 原因候補1／1b、FD 1/2 → 原因候補2、java 以外が開いている → 要確認、1 本だけで日付ファイル / inode 不一致 → 原因候補3、削除済み・`.nfs*` → データ消失 | `1.` 同じファイルを開く複数のハンドラ、`2.` `fileName` を持つ起動時ハンドラが複数、`3.` デプロイメント内のログ設定 ((a) コンテナが読む `logging.properties` / (b) 同梱 reload4j の `log4j.xml` / (c) 同梱 log4j-core / (d) 同梱 logback / (e) 無視) が有効で `server.log` を指す、`4.` logrotate / cron、`5.` 起動コマンド・起動スクリプトのリダイレクトを `[指摘]` とする。`6.` は jboss-cli.sh の実行時設定の表示 |
-| 元のスクリプトからの読み替え | ログディレクトリの自動特定、JVM と同じ uid:gid での実行、収集結果を一時ファイルではなく変数に持つ (読み取り専用のルートでも動く) | WAR / EAR を `unzip` (Info-ZIP / BusyBox) → `python3` → `jar` → `bsdtar` → `busybox unzip` の順で読む (元は `unzip` だけ)、`find` が無ければシェルの展開で辿る、`use-deployment-logging-config` を要素の形 (`<… value="false"/>`) で判定、起動スクリプトを `ENTRYPOINT` / `CMD` から自動で点検 (起動コマンドは標準入力で渡す)、実行時設定を常に取得、`jboss.server.log.dir` 内の別ファイル (`app.log` 等) を指すだけなら `[情報]` |
+| 元のスクリプトからの読み替え | ログディレクトリの自動特定、JVM と同じ uid:gid での実行、収集結果を一時ファイルではなく変数に持つ (読み取り専用のルートでも動く) | WAR / EAR を `unzip` (Info-ZIP / BusyBox) → `python3` → `jar` → `bsdtar` → `busybox unzip` の順で読む (元は `unzip` だけ)、`find` が無ければシェルの展開で辿る、`use-deployment-logging-config` を要素の形 (`<… value="false"/>`) で判定、起動スクリプトを `ENTRYPOINT` / `CMD` から自動で点検 (起動コマンドは標準入力で渡す)、実行時設定を常に取得、jboss-cli.sh の接続先は port-offset を考慮 (backend サービスは既定で 9990 + 10000 = 19990。下記)、`jboss.server.log.dir` 内の別ファイル (`app.log` 等) を指すだけなら `[情報]` |
 | ファイル出力 | `--report-dir` 配下の `build_and_verify_<日時>_server_log_fd_<サービス名>.txt` → 一時ディレクトリ | `--report-dir` 配下の `build_and_verify_<日時>_logging_config_audit_<サービス名>.txt` → 一時ディレクトリ |
 | 終了扱い | `判定: 異常` は診断結果として操作選択へ戻る。ログディレクトリ・`server.log*` を開いているプロセスを確認できない (`判定不能`) 場合だけヘルパー失敗 | `判定: 指摘あり` は診断結果として操作選択へ戻る。設定ファイルを読めない・作業用の一時領域が無い (`実行不能`) 場合だけヘルパー失敗 |
 
@@ -1619,6 +1620,19 @@ FILE ハンドラは回転時に**自分の FD だけ**を閉じて開き直す�
 日付をまたぐ前と後の結果を見比べられます。原因候補 1・2 は日付をまたぐ前でも検出でき、
 原因候補 3 (外部からの rename) は日付をまたいだ後でないと見えません。どちらの点検も読むだけで、
 コンテナ内のファイルは変更しません。
+
+静的点検の `6.` (稼働中サーバーの実行時設定) で使う `jboss-cli.sh --connect` の接続先は、
+port-offset を考慮して決めます。backend の JBoss EAP は `port-offset` 10000 で起動するため、
+管理ポートは 9990 ではなく **19990** です。
+
+| サービス | port-offset | jboss-cli.sh の接続 |
+| --- | --- | --- |
+| サービス名に `backend` を含む (`--backend-context` と同じ判定) | `--backend-port-offset` (既定 `10000`) | `--connect --controller=localhost:19990` |
+| それ以外 (frontend 等) | `0` | `--connect` (従来どおり 9990) |
+| JVM の引数に `-Djboss.socket.binding.port-offset=N` がある | `N` (サービスによらず優先) | `--connect --controller=localhost:<9990 + N>` |
+
+管理ポート自体を `-Djboss.management.http.port` で変えている場合は、その値へ port-offset を加算します。
+実際の接続先は出力の `0. 実行環境` の `jboss-cli.sh 接続先` と、`6.` の `接続先` に表示します。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 

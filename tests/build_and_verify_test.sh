@@ -3284,6 +3284,118 @@ server_log_unavailable_audit_text="$(ls -1 "$server_log_check_unavailable_tmpdir
 assert_contains "$server_log_unavailable_audit_text" \
   "判定             : 実行不能 (設定ファイルを読めないか、作業用の一時領域がありません)"
 
+# 静的点検の jboss-cli.sh は port-offset を考慮して接続する。サービス名に backend を
+# 含むサービス (ここでは backend-api) は既定で管理ポート 9990 に 10000 を加算 (= 19990) し、
+# それ以外 (eapapp) は 0 のまま (9990)。--backend-port-offset で backend の既定値を変えられる。
+# コンテナ内スクリプトへは「_ 設定ファイル jboss-cli.sh 対象ファイル オフセット 説明
+# JBOSS_HOME候補...」の順で渡るため、4 番目がオフセット、5 番目がその決め方になる。
+audit_port_offset_output="$TEST_TMP/keep-mode-audit-port-offset.out"
+audit_port_offset_reports="$TEST_TMP/audit-port-offset-reports"
+audit_port_offset_args="$TEST_TMP/audit-port-offset-args.txt"
+audit_port_offset_eapapp_args="$TEST_TMP/audit-port-offset-eapapp-args.txt"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_PS_SERVICES="eapapp backend-api"
+export FAKE_JBOSS_EAP_CONTAINERS="cid-eapapp cid-backend-api"
+export FAKE_LOGGING_AUDIT_ARGS="$audit_port_offset_eapapp_args"
+if ! printf '1\n7\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp,backend-api \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$audit_port_offset_reports" \
+    --suppress-removed-logs
+) >"$audit_port_offset_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOGGING_AUDIT_ARGS
+  cat "$audit_port_offset_output" >&2
+  fail "logging config audit on a non-backend service returned a non-zero status"
+fi
+[ "$(sed -n 3p "$audit_port_offset_eapapp_args")" = "server.log" ] \
+  || fail "the audit did not receive the target file name as its 3rd argument"
+[ "$(sed -n 4p "$audit_port_offset_eapapp_args")" = "0" ] \
+  || fail "a non-backend service should not add a port-offset to the jboss-cli management port"
+assert_contains "$audit_port_offset_eapapp_args" "backend 以外のサービスの既定"
+assert_contains "$audit_port_offset_output" \
+  "jboss-cli.sh の接続先 : 管理ポート 9990 + port-offset 0 (backend 以外のサービスの既定) = 9990"
+
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_LOGGING_AUDIT_ARGS="$audit_port_offset_args"
+if ! printf '2\n7\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp,backend-api \
+    --startup-service backend-api \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$audit_port_offset_reports" \
+    --suppress-removed-logs
+) >"$audit_port_offset_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOGGING_AUDIT_ARGS
+  cat "$audit_port_offset_output" >&2
+  fail "logging config audit on the backend service returned a non-zero status"
+fi
+assert_contains "$audit_port_offset_output" "Compose サービス : backend-api"
+[ "$(sed -n 4p "$audit_port_offset_args")" = "10000" ] \
+  || fail "the backend service should add port-offset 10000 (management port 19990) by default"
+assert_contains "$audit_port_offset_args" "backend サービスの既定 (--backend-port-offset)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -i cid-backend-api /bin/sh -c set -u"
+assert_contains "$audit_port_offset_output" \
+  "jboss-cli.sh の接続先 : 管理ポート 9990 + port-offset 10000 (backend サービスの既定 (--backend-port-offset)) = 19990"
+audit_port_offset_text="$(ls -1 "$audit_port_offset_reports"/build_and_verify_*_logging_config_audit_backend-api.txt 2>/dev/null | head -n 1)"
+[ -n "$audit_port_offset_text" ] && [ -s "$audit_port_offset_text" ] \
+  || fail "logging config audit text for the backend service was not written"
+assert_contains "$audit_port_offset_text" \
+  "jboss-cli 接続先 : 管理ポート 9990 + port-offset (backend サービスは既定 10000、"
+
+# --backend-port-offset で backend の既定値を変えられる (先頭の 0 は落として渡す)。
+: > "$FAKE_DOCKER_CALLS"
+if ! printf '2\n7\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp,backend-api \
+    --startup-service backend-api \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --backend-port-offset 0200 \
+    --suppress-removed-logs
+) >"$audit_port_offset_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOGGING_AUDIT_ARGS
+  cat "$audit_port_offset_output" >&2
+  fail "logging config audit with --backend-port-offset returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOGGING_AUDIT_ARGS
+[ "$(sed -n 4p "$audit_port_offset_args")" = "200" ] \
+  || fail "--backend-port-offset 0200 was not passed to the audit as port-offset 200"
+assert_contains "$audit_port_offset_output" \
+  "jboss-cli.sh の接続先 : 管理ポート 9990 + port-offset 200 (backend サービスの既定 (--backend-port-offset)) = 10190"
+
+# 整数でない値や、管理ポート (9990 + N) が 65535 を超える値は起動前に弾く。
+for bad_backend_port_offset in abc -1 55546 1000000; do
+  bad_backend_port_offset_output="$TEST_TMP/bad-backend-port-offset.out"
+  if (
+    cd "$REPO_ROOT"
+    bash ./build_and_verify.sh --backend-port-offset "$bad_backend_port_offset" --dry-run
+  ) >"$bad_backend_port_offset_output" 2>&1; then
+    fail "--backend-port-offset ${bad_backend_port_offset} should be rejected"
+  fi
+  assert_contains "$bad_backend_port_offset_output" "--backend-port-offset には"
+done
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --backend-port-offset 55545 --dry-run
+) >"$bad_backend_port_offset_output" 2>&1; then
+  cat "$bad_backend_port_offset_output" >&2
+  fail "--backend-port-offset 55545 (management port 65535) should be accepted"
+fi
+
 # --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された
 # サービスだけで操作が増え、既存操作の番号は変わらないこと。
