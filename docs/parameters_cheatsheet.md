@@ -302,6 +302,7 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 | `--no-jboss-module-list-text` | フラグ | `false` | JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) |
 | `--truststore-inventory-text FILE` | ファイルパス | (なし) | トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先 |
 | `--no-truststore-inventory-text` | フラグ | `false` | トラストストア一覧のテキスト出力を行わない (画面表示だけにする) |
+| `--backend-port-offset N` | 0〜55545 の整数 | `10000` | ログ設定の静的点検で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する backend の port-offset (backend サービスは既定 19990 へ接続。それ以外は 9990。JVM の `-Djboss.socket.binding.port-offset` を優先) |
 
 ### 終了時のクリーンアップ
 

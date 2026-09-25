@@ -2071,9 +2071,23 @@ fi
 # ログ設定の静的点検 (audit-logging-config.sh 相当) の本体。
 #   FAKE_LOGGING_CONFIG_AUDIT_RESULT : ok (既定) / ng / unavailable
 #   FAKE_LOGGING_AUDIT_STDIN        : 標準入力で渡された起動コマンドを控えるファイル
+#   FAKE_LOGGING_AUDIT_ARGS         : スクリプトへ渡された引数 ("_" の後ろ) を 1 行 1 件で
+#                                     控えるファイル (jboss-cli の port-offset の確認用)
 if [ "${1:-}" = "exec" ] && [[ "$*" == *"logging-config-audit-report"* ]]; then
   if [ -n "${FAKE_LOGGING_AUDIT_STDIN:-}" ]; then
     cat > "$FAKE_LOGGING_AUDIT_STDIN"
+  fi
+  if [ -n "${FAKE_LOGGING_AUDIT_ARGS:-}" ]; then
+    fake_lca_seen_marker=false
+    : > "$FAKE_LOGGING_AUDIT_ARGS"
+    for fake_lca_arg in "$@"; do
+      if [ "$fake_lca_seen_marker" = true ]; then
+        printf '%s\n' "$fake_lca_arg" >> "$FAKE_LOGGING_AUDIT_ARGS"
+      elif [ "$fake_lca_arg" = "_" ]; then
+        fake_lca_seen_marker=true
+      fi
+    done
+    unset fake_lca_seen_marker fake_lca_arg
   fi
   case "${FAKE_LOGGING_CONFIG_AUDIT_RESULT:-ok}" in
     unavailable)
@@ -2395,9 +2409,12 @@ fi
 
 # JBoss モジュール一覧の対象判定。jboss-cli.sh と modules を持つコンテナだけ成功させる。
 # ここで拾わないと、汎用 exec ハンドラが成功を返して全サービスへ操作が出てしまう。
+#   FAKE_JBOSS_EAP_CONTAINERS : JBoss EAP として扱うコンテナ ID (空白区切り。既定 cid-eapapp)
 if [ "${1:-}" = "exec" ] && [ "${3:-}" = "/bin/sh" ] && [ "${4:-}" = "-c" ] \
     && [[ "${5:-}" == *"jboss-module-list-probe"* ]]; then
-  [ "${2:-}" = "cid-eapapp" ] && exit 0
+  case " ${FAKE_JBOSS_EAP_CONTAINERS:-cid-eapapp} " in
+    *" ${2:-} "*) exit 0 ;;
+  esac
   exit 1
 fi
 

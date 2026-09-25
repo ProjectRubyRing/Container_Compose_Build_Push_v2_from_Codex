@@ -359,6 +359,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--no-jboss-module-list-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。JBoss モジュール一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--truststore-inventory-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。有効なトラストストアのフルパス・登録証明書の種別・ドメイン URL・カスタム証明書の強調・接続確認コマンドを、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-truststore-inventory-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
+| `--backend-port-offset N` | **`build_and_verify.sh` / `--build-only` 委譲時**。ログ設定の静的点検 (`--keep-container-mode logs` の操作) で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する、backend の JBoss EAP の port-offset。サービス名に `backend` を含むサービスでは `--controller=localhost:<9990 + N>` (既定 19990) で接続する。それ以外のサービスは 0 (9990)。JVM の `-Djboss.socket.binding.port-offset` があればそちらを優先。`0` 〜 `55545` | `10000` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -3185,7 +3186,7 @@ FILE ハンドラ以外の書き手（2 つ目のハンドラ・アプリ同梱�
 | `3.` | WAR / EAR（展開済みを含む。EAR の中の WAR / EJB jar は 1 階層だけ）のログ設定を、EAP 8.1 の扱いに合わせて「誰が読むか」で分類し、同梱 jar と `jboss-deployment-structure.xml` の除外設定から**実際に有効か**を判定する（下表）。有効で `server.log` を指していれば `[指摘]`（原因候補1 / 1b） |
 | `4.` | `/etc/logrotate.*`・`/etc/cron*`・`/var/spool/cron` が `server.log` / jboss / EFS パスを扱っていれば `[指摘]`（原因候補3） |
 | `5.` | コンテナの起動コマンド（`ENTRYPOINT` / `CMD`。compose の `entrypoint` / `command` による上書きも反映された実効値）と、それが指す起動スクリプトに `>> server.log` / `tee` があれば `[指摘]`（原因候補2） |
-| `6.` | `jboss-cli.sh --connect` で稼働中サーバーの実行時設定（各ハンドラの `file`、`use-deployment-logging-config`、`/deployment=*/subsystem=logging/configuration=*`）を表示する |
+| `6.` | `jboss-cli.sh --connect` で稼働中サーバーの実行時設定（各ハンドラの `file`、`use-deployment-logging-config`、`/deployment=*/subsystem=logging/configuration=*`）を表示する。接続先は port-offset を考慮し、**backend サービスでは既定で管理ポート 9990 に 10000 を加算した 19990** へ接続する（下記「jboss-cli.sh の接続先」） |
 
 | 分類 | 対象ファイル | 読むのは | 有効になる条件 |
 |------|-------------|---------|----------------|
@@ -3221,6 +3222,14 @@ FILE ハンドラ以外の書き手（2 つ目のハンドラ・アプリ同梱�
   スクリプト（`#!` で始まるもの）を自動で点検します。起動コマンドは機微な引数を含み得るため、
   `docker` のコマンドライン（ホストのプロセス引数）には載せず標準入力で渡します
 - **稼働中サーバーの実行時設定**（元は `--cli` 指定時だけ）は常に取得します
+- **jboss-cli.sh の接続先**（元は `--connect` の既定 = `localhost:9990`）は port-offset を考慮します。
+  backend の JBoss EAP は `port-offset` 10000 で起動するため管理ポートが **19990** になり、既定の 9990 では
+  接続できません。サービス名に `backend` を含むサービス（`--backend-context` と同じ判定）では既定で
+  管理ポート 9990 に 10000 を加算し、`--controller=localhost:19990` を付けて接続します。frontend 等の
+  それ以外のサービスはオフセット 0 のまま（従来どおり `--connect` だけ）です。JVM の引数に
+  `-Djboss.socket.binding.port-offset`（管理ポート自体は `-Djboss.management.http.port`）があれば、
+  サービスによらずそちらを優先します。backend の既定値は `--backend-port-offset N` で変えられます
+  （`0` で 9990）。実際の接続先は `0. 実行環境` の `jboss-cli.sh 接続先` と `6.` の `接続先` に表示します
 - デプロイメント内のログ設定は、**ファイル名として `server.log` を指しているか**で判定します。
   `jboss.server.log.dir` の中の別ファイル（`app.log` 等）を指すだけなら `[情報]` に留めます
 

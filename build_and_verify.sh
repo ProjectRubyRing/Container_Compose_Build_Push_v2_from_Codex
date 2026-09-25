@@ -1354,6 +1354,16 @@ TRUSTSTORE_INVENTORY_TEXT_OUTPUT=""      # 直近に出力したテキストの�
 SERVER_LOG_CHECK_BASENAME="server.log"   # 点検対象のファイル名 (FILE ハンドラの path)
 SERVER_LOG_FD_CHECK_TEXT_OUTPUT=""       # 直近に出力した FD 点検テキストのパス
 LOGGING_CONFIG_AUDIT_TEXT_OUTPUT=""      # 直近に出力した静的点検テキストのパス
+# 静的点検の「6. 稼働中サーバーの実行時設定」で jboss-cli.sh --connect が接続する
+# 管理インターフェースのポートは、management-http (既定 9990) に socket-binding-group の
+# port-offset を足した値。backend の JBoss EAP は port-offset 10000 で起動するため
+# 19990 で待ち受け、オフセットを考慮しないと接続に失敗する。サービス名に backend を
+# 含むサービス (--backend-context と同じ判定) では、既定でこの値を加算して
+# --controller で接続先を明示する (frontend 等は 0 = 従来どおり 9990)。
+# JVM の引数に -Djboss.socket.binding.port-offset があれば、そちらを優先する。
+JBOSS_MANAGEMENT_HTTP_PORT="9990"        # management-http の既定ポート
+BACKEND_PORT_OFFSET="10000"              # --backend-port-offset: backend の port-offset
+BACKEND_PORT_OFFSET_KEYWORD="backend"    # port-offset を加算するサービス名のキーワード
 
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
@@ -4400,6 +4410,10 @@ JBoss マスターパスワードの伝搬検証:
                                     起動コマンドと jboss-cli.sh の実行時設定を
                                     横断して、server.log を開く／rename する
                                     主体を特定する (パラメータ入力なし)。
+                                    jboss-cli.sh の接続先は port-offset を
+                                    考慮し、backend サービスでは既定で管理
+                                    ポート 9990 に 10000 を加算した 19990 へ
+                                    接続する (--backend-port-offset)。
                                     結果は画面へ表示し、同じ内容を --report-dir
                                     配下の build_and_verify_<日時>_
                                     server_log_fd_<サービス名>.txt /
@@ -4653,6 +4667,16 @@ JBoss マスターパスワードの伝搬検証:
   --no-truststore-inventory-text
                            トラストストア一覧のテキスト出力を行わない
                            (画面表示だけにする)
+  --backend-port-offset N  ログ設定の静的点検 (--keep-container-mode logs の操作) で
+                           jboss-cli.sh --connect が接続する管理ポートへ加算する、
+                           backend の JBoss EAP の port-offset (既定: 10000)。
+                           サービス名に backend を含むサービス (--backend-context と
+                           同じ判定) では、管理ポート 9990 + N (既定 19990) を
+                           --controller=localhost:<ポート> で指定して接続する。
+                           frontend 等のそれ以外のサービスはオフセット 0 (9990) の
+                           まま。JVM の引数に -Djboss.socket.binding.port-offset が
+                           あれば、サービスによらずそちらを優先する。
+                           0 を指定すると backend も 9990 へ接続する
 
 Valkey (Redis 互換) の操作・登録内容の確認:
   (--keep-container-mode logs の「Valkey 操作」と、同メニューの bash 接続で使う。
@@ -5319,6 +5343,7 @@ while [ $# -gt 0 ]; do
     --jboss-password-mask)  JBOSS_PASSWORD_SHOW="false"; shift ;;
     --jboss-config-file)    need_value "$1" $#; JBOSS_CONFIG_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --jboss-cli-path)       need_value "$1" $#; JBOSS_CLI_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
+    --backend-port-offset)  need_value "$1" $#; BACKEND_PORT_OFFSET="$2"; shift 2 ;;
     --jboss-elytron-tool)   need_value "$1" $#; JBOSS_ELYTRON_TOOL_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --jboss-credential-store) need_value "$1" $#; JBOSS_CREDENTIAL_STORE_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --verify-startup)      VERIFY_STARTUP="true"; shift ;;
@@ -5561,6 +5586,18 @@ validate_non_negative_integer "$UP_RETRY_INTERVAL" "--up-retry-interval" || exit
 # 0 を許すと SIGTERM 直後に SIGKILL となり、終了処理のログが残らないため 1 以上とする。
 validate_positive_integer "$SHUTDOWN_LOG_TIMEOUT" "--shutdown-timeout" || exit 2
 validate_positive_integer "$URL_TIMEOUT" "--url-timeout" || exit 2
+# port-offset は 0 (オフセットなし) も有効。コンテナ内の sh で加算するため先頭の 0 を
+# 落として 10 進に揃え (sh の算術は 010000 を 8 進と読む)、管理ポート (9990 + N) が
+# ポート番号の上限 65535 を超える値は弾く。
+validate_non_negative_integer "$BACKEND_PORT_OFFSET" "--backend-port-offset" || exit 2
+_backend_port_offset="${BACKEND_PORT_OFFSET#"${BACKEND_PORT_OFFSET%%[!0]*}"}"
+if [ "${#_backend_port_offset}" -gt 5 ] \
+    || [ $(( ${_backend_port_offset:-0} + JBOSS_MANAGEMENT_HTTP_PORT )) -gt 65535 ]; then
+  err "--backend-port-offset には 0 から $(( 65535 - JBOSS_MANAGEMENT_HTTP_PORT )) の整数を指定してください (管理ポート ${JBOSS_MANAGEMENT_HTTP_PORT} + N が 65535 を超えます): ${BACKEND_PORT_OFFSET}"
+  exit 2
+fi
+BACKEND_PORT_OFFSET="${_backend_port_offset:-0}"
+unset _backend_port_offset
 if [ "$ENV_LIST_LIMIT" != "all" ]; then
   validate_positive_integer "$ENV_LIST_LIMIT" "--env-list-limit" || exit 2
 fi
@@ -20474,6 +20511,10 @@ write_server_log_check_text() {
         printf '                   2. 起動時ログ設定 / 3. デプロイメント内のログ設定 /\n'
         printf '                   4. logrotate・cron / 5. 起動コマンド・起動スクリプトの\n'
         printf '                   リダイレクト / 6. 稼働中サーバーの実行時設定 / 結果\n'
+        printf 'jboss-cli 接続先 : 管理ポート %s + port-offset (backend サービスは既定 %s、\n' \
+          "$JBOSS_MANAGEMENT_HTTP_PORT" "$BACKEND_PORT_OFFSET"
+        printf '                   それ以外は 0。JVM の -Djboss.socket.binding.port-offset を\n'
+        printf '                   優先)。実際の接続先は「0. 実行環境」の jboss-cli.sh 接続先\n'
         ;;
     esac
     printf '対策             : Log4j_EFS_Rolling の解説 md の 16.8 節 (J1〜J8)\n'
@@ -20932,12 +20973,30 @@ SERVER_LOG_FD_SCRIPT
   return 0
 }
 
+# ログ設定の静的点検で jboss-cli.sh の管理ポート (9990) へ加算する port-offset の既定値を
+# "オフセット<TAB>説明" で返す。サービス名に backend を含むサービス (--backend-context と
+# 同じ判定) は --backend-port-offset (既定 10000 = 管理ポート 19990)、それ以外は 0。
+# コンテナ内では JVM の -Djboss.socket.binding.port-offset がこの値より優先される。
+logging_config_audit_port_offset() {
+  local service_name="$1"
+  case "$service_name" in
+    *"$BACKEND_PORT_OFFSET_KEYWORD"*)
+      printf '%s\t%s\n' "$BACKEND_PORT_OFFSET" \
+        "${BACKEND_PORT_OFFSET_KEYWORD} サービスの既定 (--backend-port-offset)"
+      ;;
+    *)
+      printf '0\t%s\n' "${BACKEND_PORT_OFFSET_KEYWORD} 以外のサービスの既定"
+      ;;
+  esac
+}
+
 # server.log を開く／rename する主体を、設定・デプロイメント・OS 側の仕組みまで横断して
 # 点検し、画面とテキストへ出す (audit-logging-config.sh 相当)。JBOSS_HOME・設定ファイル・
 # デプロイ先・起動コマンドはすべてコンテナから求めるため、追加の入力は不要。
 run_interactive_compose_logging_config_audit() {
   local service_name="$1" container_id container_name audit_script
   local capture_file="" start_file="" exec_status=0 verdict_text="" text_path=""
+  local port_offset_line port_offset port_offset_source
   local -a container_ids=()
 
   mapfile -t container_ids < <(compose_container_ids "$service_name")
@@ -20960,13 +21019,20 @@ set -u
 #   $1      = --jboss-config-file の指定 (空文字可)
 #   $2      = --jboss-cli-path の指定 (空文字可)
 #   $3      = 点検対象のファイル名 (既定 server.log)
-#   $4 以降 = JBOSS_HOME の候補
+#   $4      = 管理ポートへ加算する port-offset の既定値 (backend は 10000、それ以外は 0)
+#   $5      = $4 の決め方の説明 (画面表示用)
+#   $6 以降 = JBOSS_HOME の候補
 #   標準入力 = コンテナの起動コマンド (ENTRYPOINT と CMD。1 行 1 要素)
 # 元のスクリプトからの読み替え
 #   - JBOSS_HOME・設定ファイル・デプロイ先は、起動中の JVM の引数 (-Djboss.home.dir /
 #     -Djboss.server.base.dir / -c) と deployment-scanner の設定から求める
 #   - 起動スクリプトの点検対象 (元は引数で指定) は、コンテナの ENTRYPOINT / CMD とする
 #   - 稼働中サーバーの実行時設定 (元は --cli 指定時だけ) は、常に jboss-cli.sh で取得する
+#   - jboss-cli.sh の接続先 (元は --connect の既定 = 9990) は port-offset を考慮する。
+#     backend は port-offset 10000 で起動するため管理ポートが 19990 になり、既定の
+#     9990 では接続できない。JVM の -Djboss.socket.binding.port-offset があればその値、
+#     無ければ $4 を 9990 (-Djboss.management.http.port があればその値) へ加算し、
+#     9990 以外になるときは --controller=localhost:<ポート> で明示する
 #   - WAR / EAR は unzip → python3 → jar → bsdtar → busybox unzip の順に使えるものを
 #     探して読む (元は unzip だけ)。find の無いイメージでは、展開済みのデプロイメントを
 #     シェルの展開だけで辿る
@@ -20979,8 +21045,10 @@ set -u
 LA_CONFIG_HINT="${1:-}"
 LA_CLI_HINT="${2:-}"
 LOG_BASENAME="${3:-server.log}"
-if [ "$#" -ge 3 ]; then
-  shift 3
+LA_PORT_OFFSET_DEFAULT="${4:-0}"
+LA_PORT_OFFSET_DEFAULT_SOURCE="${5:-既定}"
+if [ "$#" -ge 5 ]; then
+  shift 5
 else
   set --
 fi
@@ -21100,6 +21168,43 @@ if [ -r "$JBOSS_CONFIG" ]; then
       ;;
   esac
 fi
+
+# ---- jboss-cli.sh の接続先 (管理インターフェースのポート) ------------------------
+# 管理ポートは socket-binding management-http (${jboss.management.http.port:9990}) に
+# socket-binding-group の port-offset (${jboss.socket.binding.port-offset:0}) を足した値。
+# backend は port-offset 10000 で起動するため 19990 で待ち受ける。port-offset は JVM の
+# 引数にあればその値を、無ければ呼び出し側がサービスごとに決めた既定値 ($4) を使う。
+# 加算は awk で行う (sh の算術は先頭が 0 の値を 8 進として読むため)。
+la_is_port_number() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+LA_MGMT_BASE_PORT=9990
+LA_MGMT_BASE_SOURCE='management-http の既定'
+la_value="$(la_dvalue 'jboss\.management\.http\.port')"
+if la_is_port_number "$la_value"; then
+  LA_MGMT_BASE_PORT="$la_value"
+  LA_MGMT_BASE_SOURCE='JVM の -Djboss.management.http.port'
+fi
+LA_PORT_OFFSET="$LA_PORT_OFFSET_DEFAULT"
+LA_PORT_OFFSET_SOURCE="$LA_PORT_OFFSET_DEFAULT_SOURCE"
+la_value="$(la_dvalue 'jboss\.socket\.binding\.port-offset')"
+if la_is_port_number "$la_value"; then
+  LA_PORT_OFFSET="$la_value"
+  LA_PORT_OFFSET_SOURCE='JVM の -Djboss.socket.binding.port-offset'
+fi
+la_is_port_number "$LA_PORT_OFFSET" || LA_PORT_OFFSET=0
+LA_PORT_OFFSET="$(awk -v o="$LA_PORT_OFFSET" 'BEGIN { printf "%d", o }')"
+LA_MGMT_BASE_PORT="$(awk -v p="$LA_MGMT_BASE_PORT" 'BEGIN { printf "%d", p }')"
+LA_MGMT_PORT="$(awk -v p="$LA_MGMT_BASE_PORT" -v o="$LA_PORT_OFFSET" 'BEGIN { printf "%d", p + o }')"
+# 9990 のままなら従来どおり --connect の既定 (jboss-cli.xml の default-controller) に任せる。
+LA_CONTROLLER=''
+if [ "$LA_MGMT_PORT" != 9990 ]; then
+  LA_CONTROLLER="localhost:${LA_MGMT_PORT}"
+fi
+LA_CONTROLLER_DESC="localhost:${LA_MGMT_PORT} (管理ポート ${LA_MGMT_BASE_PORT} [${LA_MGMT_BASE_SOURCE}] + port-offset ${LA_PORT_OFFSET} [${LA_PORT_OFFSET_SOURCE}])"
 
 # 作業用の一時ディレクトリ (入れ子のアーカイブの取り出しと、指摘の有無の記録に使う)。
 # 読み取り専用のルートでも JBoss 自身が書く jboss.server.base.dir/tmp は書ける。
@@ -21270,6 +21375,7 @@ else
   la_kv 'WAR / EAR の読み取り : 使えるコマンドがありません (unzip / python3 / jar / bsdtar / busybox unzip)'
 fi
 la_kv "点検対象             : ${LOG_BASENAME}"
+la_kv "jboss-cli.sh 接続先  : ${LA_CONTROLLER_DESC}"
 
 # -------------------------------------------------------------------------------------------
 # 1. standalone.xml：ファイル系ハンドラ（logging-profile 内を含む）の出力先一覧と重複検出
@@ -21559,15 +21665,24 @@ if [ -z "$CLI" ]; then
   info "jboss-cli.sh が見つかりません: $JBOSS_HOME/bin/jboss-cli.sh"
 else
   LA_CLI_COMMANDS='/subsystem=logging/periodic-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/size-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/periodic-size-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging/file-handler=*:read-attribute(name=file),/subsystem=logging/logging-profile=*/periodic-rotating-file-handler=*:read-attribute(name=file),/subsystem=logging:read-attribute(name=use-deployment-logging-config),/deployment=*/subsystem=logging/configuration=*:read-resource(recursive=true,include-runtime=true)'
+  la_cli_run() {
+    if [ -x "$CLI" ]; then
+      "$CLI" "$@"
+    else
+      sh "$CLI" "$@"
+    fi
+  }
+  la_kv "接続先 : ${LA_CONTROLLER_DESC}"
   la_cli_status=0
-  if [ -x "$CLI" ]; then
-    la_cli_out="$("$CLI" --connect --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
+  if [ -n "$LA_CONTROLLER" ]; then
+    la_cli_out="$(la_cli_run --connect --controller="$LA_CONTROLLER" --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
   else
-    la_cli_out="$(sh "$CLI" --connect --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
+    la_cli_out="$(la_cli_run --connect --commands="$LA_CLI_COMMANDS" 2>&1)" || la_cli_status=$?
   fi
   printf '%s\n' "$la_cli_out" | sed 's/^/  /'
   if [ "$la_cli_status" -ne 0 ]; then
-    info "jboss-cli.sh --connect が失敗しました (exit=${la_cli_status})。AP サーバーが起動しているか、管理インターフェース（既定 9990）とこのユーザーでのローカル認証を確認してください。"
+    info "jboss-cli.sh --connect が失敗しました (exit=${la_cli_status})。AP サーバーが起動しているか、管理インターフェース（localhost:${LA_MGMT_PORT}）とこのユーザーでのローカル認証を確認してください。"
+    info "管理ポートは ${LA_MGMT_BASE_PORT} + port-offset ${LA_PORT_OFFSET}（${LA_PORT_OFFSET_SOURCE}）として求めています。実際の port-offset と異なる場合は、JVM の -Djboss.socket.binding.port-offset か、build_and_verify.sh の --backend-port-offset（backend サービスの既定 10000）を確認してください。"
   fi
   info "最後の /deployment=*/subsystem=logging/configuration=* は、コンテナが読んだデプロイメント内ログ設定（logging.properties 等）の実行時リソースです。handler に FILE 以外で ${LOG_BASENAME} を指すものがあれば原因候補1です。アプリ同梱の reload4j 等（原因候補1b）はここに現れないため、3. の結果で確認してください。"
 fi
@@ -21598,6 +21713,12 @@ LOGGING_CONFIG_AUDIT_SCRIPT
   diag "(Log4j_EFS_Rolling の jboss/bin/audit-logging-config.sh と同じ点検。追加の入力は不要)。"
   diag "jboss-cli.sh の起動を含むため、完了まで十数秒かかることがあります。"
 
+  port_offset_line="$(logging_config_audit_port_offset "$service_name")"
+  port_offset="${port_offset_line%%$'\t'*}"
+  port_offset_source="${port_offset_line#*$'\t'}"
+  diag "jboss-cli.sh の接続先 : 管理ポート ${JBOSS_MANAGEMENT_HTTP_PORT} + port-offset ${port_offset} (${port_offset_source}) = $((JBOSS_MANAGEMENT_HTTP_PORT + port_offset))"
+  diag "  (JVM の引数に -Djboss.socket.binding.port-offset があれば、そちらを優先します)"
+
   if ! capture_file="$(mktemp 2>/dev/null)"; then
     err "ログ設定の静的点検の保存用一時ファイルを作成できませんでした。"
     return 1
@@ -21614,7 +21735,8 @@ LOGGING_CONFIG_AUDIT_SCRIPT
     -f '{{range .Config.Entrypoint}}{{.}}{{"\n"}}{{end}}{{range .Config.Cmd}}{{.}}{{"\n"}}{{end}}' \
     "$container_id" > "$start_file" 2>/dev/null || : > "$start_file"
   docker exec -i "$container_id" /bin/sh -c "$audit_script" \
-    _ "$JBOSS_CONFIG_FILE" "$JBOSS_CLI_PATH" "$SERVER_LOG_CHECK_BASENAME" "${JBOSS_HOME_CANDIDATES[@]}" \
+    _ "$JBOSS_CONFIG_FILE" "$JBOSS_CLI_PATH" "$SERVER_LOG_CHECK_BASENAME" \
+    "$port_offset" "$port_offset_source" "${JBOSS_HOME_CANDIDATES[@]}" \
     < "$start_file" > "$capture_file" 2>&1 || exec_status=$?
   rm -f -- "$start_file"
   print_healthcheck_capture "$capture_file" "(ログ設定の静的点検の出力がありません)" 1048576
