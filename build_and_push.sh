@@ -458,7 +458,7 @@ arg_takes_value() {
     --ecs-circuit-breaker-reload-delay|--ecs-circuit-breaker-replace-timeout) return 0 ;;
     --ecs-server-log|--ecs-circuit-breaker-text) return 0 ;;
     --ecs-circuit-breaker-watch-timeout) return 0 ;;
-    --cert-check-text) return 0 ;;
+    --cert-check-text|--log-rotation-tz-md) return 0 ;;
     --jmeter-service|--jmeter-profile|--jmeter-report-dir|--jmeter-plan) return 0 ;;
     --jmeter-threads|--jmeter-rampup|--jmeter-loops) return 0 ;;
     --jmeter-target|--jmeter-duration) return 0 ;;

@@ -332,6 +332,10 @@ if [ "${1:-}" = "compose" ]; then
       elif [ "$last_arg" = "cwagent" ]; then
         printf 'cwagent  | I! CloudWatch agent started\n'
         printf 'cwagent  | I! Log collection configured\n'
+        # CloudWatch Logs に拒否されたイベントなど、シナリオごとに足す行。
+        if [ -n "${FAKE_CWAGENT_LOG_EXTRA:-}" ]; then
+          printf '%s\n' "$FAKE_CWAGENT_LOG_EXTRA"
+        fi
       elif [ "$last_arg" = "adot-collector" ] || [ "$last_arg" = "otel" ]; then
         printf 'adot-collector  | TracesExporter resource spans: 2, spans: 4\n'
         # SIGTERM 受信後は ECS と同じく graceful shutdown のログが追記される。
@@ -750,6 +754,23 @@ if [ "${1:-}" = "create" ]; then
   exit 0
 fi
 
+# ログローテーションのタイムゾーン点検: cwagent の zoneinfo / /etc/localtime を
+# docker cp -L で取り出す (公式イメージは FROM scratch でシェルが無いため)。
+#   FAKE_LTZ_CWAGENT_TZIF_PATHS : "コンテナ内のパス=ホスト側のファイル" の行
+if [ "${1:-}" = "cp" ] && [ "${2:-}" = "-L" ]; then
+  fake_ltz_path="${3#*:}"
+  while IFS='=' read -r fake_ltz_key fake_ltz_file; do
+    [ -n "$fake_ltz_key" ] || continue
+    if [ "$fake_ltz_key" = "$fake_ltz_path" ] && [ -f "$fake_ltz_file" ]; then
+      cp "$fake_ltz_file" "${4:-}" || exit 1
+      exit 0
+    fi
+  done <<< "${FAKE_LTZ_CWAGENT_TZIF_PATHS:-}"
+  printf 'Error response from daemon: Could not find the file %s in container %s\n' \
+    "$fake_ltz_path" "${3%%:*}" >&2
+  exit 1
+fi
+
 if [ "${1:-}" = "cp" ]; then
   fake_cp_src="${2:-}"
   fake_cp_dst="${3:-}"
@@ -964,6 +985,42 @@ if [ "${1:-}" = "inspect" ]; then
     # .State.ExitCode は既存の分岐に無いため、専用の目印で先に拾う。
     *"ecs-cb-exit:"*)
       printf 'ecs-cb-exit:%s\n' "${FAKE_ECS_STOP_EXIT:-137}"
+      ;;
+    # ログローテーションのタイムゾーン点検: 環境変数を「開始行 + 本文 + 終了行」で返す。
+    # 書式に .Config.Env を含むため、その分岐より前で拾う。
+    #   FAKE_LTZ_CWAGENT_ENV   : cwagent (cid-cwagent) の環境変数 (1 行 1 変数)
+    #   FAKE_LTZ_CONTAINER_ENV : それ以外のコンテナの環境変数
+    *"ltz-env-begin:"*)
+      case "$*" in
+        *"cid-cwagent"*)
+          fake_ltz_env="${FAKE_LTZ_CWAGENT_ENV:-AWS_REGION=ap-northeast-1
+PATH=/usr/bin}"
+          ;;
+        *)
+          fake_ltz_env="${FAKE_LTZ_CONTAINER_ENV:-PATH=/usr/bin}"
+          ;;
+      esac
+      while IFS= read -r fake_ltz_line; do
+        [ -n "$fake_ltz_line" ] || continue
+        printf 'ltz-env-begin:%s\n' "$fake_ltz_line"
+        printf 'ltz-env-end:\n'
+      done <<< "$fake_ltz_env"
+      ;;
+    # ログローテーションのタイムゾーン点検: マウント ("種類|ボリューム名|ホスト側|コンテナ側")。
+    # 書式に range .Mounts を含むため、その分岐より前で拾う。
+    #   FAKE_LTZ_MOUNTS : "コンテナ ID|種類|ボリューム名|ホスト側|コンテナ側" の行
+    *"ltz-mount:"*)
+      fake_ltz_cid=""
+      for fake_ltz_arg in "$@"; do
+        case "$fake_ltz_arg" in
+          cid-*) fake_ltz_cid="$fake_ltz_arg" ;;
+        esac
+      done
+      while IFS='|' read -r fake_ltz_m_cid fake_ltz_m_rest; do
+        [ -n "$fake_ltz_m_cid" ] || continue
+        [ "$fake_ltz_m_cid" = "$fake_ltz_cid" ] || continue
+        printf 'ltz-mount:%s\n' "$fake_ltz_m_rest"
+      done <<< "${FAKE_LTZ_MOUNTS:-}"
       ;;
     # ADOT Collector の設定チェック: ENTRYPOINT + CMD を 1 行 1 引数で返す。
     # 実装側は otel-argv: の目印付きで問い合わせるので、.Config.Entrypoint の
@@ -2162,6 +2219,178 @@ FAKE_LCA_OK
       exit 0
       ;;
   esac
+fi
+
+# ---- ログローテーションのタイムゾーン点検 (log-rotation-tz-probe) -------------
+# 対象判定は JBoss モジュール一覧 (jboss-module-list-probe) と共有するため、本体だけを
+# 模擬する。プローブのレコードは US 区切りだが、読みやすさのため | で書いて tr で直す。
+# スクリプト本文に jboss-modules.jar や /proc/[0-9] が含まれ、後ろの汎用ハンドラへ
+# 吸い込まれるため、必ずそれより前で拾う。
+#   FAKE_LOG_ROTATION_TZ_SCENARIO : jst (既定) / utc / mixed / nojvm
+#   FAKE_LOG_ROTATION_TZ_ARGS     : スクリプトへ渡された引数 ("_" の後ろ) を控えるファイル
+if [ "${1:-}" = "exec" ] && [[ "$*" == *"log-rotation-tz-probe"* ]]; then
+  if [ -n "${FAKE_LOG_ROTATION_TZ_ARGS:-}" ]; then
+    fake_ltz_seen_marker=false
+    : > "$FAKE_LOG_ROTATION_TZ_ARGS"
+    for fake_ltz_arg in "$@"; do
+      if [ "$fake_ltz_seen_marker" = true ]; then
+        printf '%s\n' "$fake_ltz_arg" >> "$FAKE_LOG_ROTATION_TZ_ARGS"
+      elif [ "$fake_ltz_arg" = "_" ]; then
+        fake_ltz_seen_marker=true
+      fi
+    done
+    unset fake_ltz_seen_marker fake_ltz_arg
+  fi
+  case "${FAKE_LOG_ROTATION_TZ_SCENARIO:-jst}" in
+    utc)
+      cat <<'FAKE_LTZ_UTC'
+meta|now|1790392800
+meta|user|185:0
+jvm|pid|108
+jvm|env_readable|yes
+jvmenv|TZ|unset|
+jvmenv|JAVA_OPTS|unset|
+jvmenv|JAVA_OPTS_APPEND|unset|
+jvmenv|JDK_JAVA_OPTIONS|unset|
+jvmenv|JAVA_TOOL_OPTIONS|unset|
+jvmenv|_JAVA_OPTIONS|unset|
+execenv|TZ|unset|
+execenv|JAVA_OPTS|unset|
+execenv|JAVA_OPTS_APPEND|unset|
+execenv|JDK_JAVA_OPTIONS|unset|
+execenv|JAVA_TOOL_OPTIONS|unset|
+execenv|_JAVA_OPTIONS|unset|
+os|localtime|symlink|../usr/share/zoneinfo/UTC|UTC0|yes
+os|zoneinfo|yes|no|
+os|date|jvm|+0000|UTC|unset|
+os|date|exec|+0000|UTC|unset|
+cfg|jboss_home|/opt/jboss-eap
+cfg|config|/opt/jboss-eap/standalone/configuration/standalone.xml|yes
+cfg|standalone_conf|/opt/jboss-eap/bin/standalone.conf|yes
+handler||FILE|periodic-rotating-file-handler|jboss.server.log.dir|server.log|.yyyy-MM-dd|named|PATTERN
+formatter|PATTERN|pattern|%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n|||||
+cli|path|/opt/jboss-eap/bin/jboss-cli.sh
+cli|controller|localhost:19990|管理ポート 9990 [management-http の既定] + port-offset 10000 [backend サービスの既定 (--backend-port-offset)]
+cli|status|0|3
+cli|runtime_tz|UTC
+log|dir|/opt/jboss-eap/standalone/log|JVM の -Djboss.server.base.dir 配下の log
+log|file|/opt/jboss-eap/standalone/log/server.log|yes|1790392798|14583|2026-09-26 00:00:02,001|2026-09-26 03:19:58,456
+rotated|server.log.2026-09-25|1790380799|20480|2026-09-25 00:00:01,001|2026-09-25 23:59:59,120
+end|ok
+FAKE_LTZ_UTC
+      ;;
+    mixed)
+      cat <<'FAKE_LTZ_MIXED'
+meta|now|1790392800
+meta|user|185:0
+jvm|pid|108
+jvm|arg_tz|Asia/Tokyo
+jvm|env_readable|yes
+jvmenv|TZ|unset|
+jvmenv|JAVA_OPTS|unset|
+jvmenv|JAVA_OPTS_APPEND|unset|
+jvmenv|JDK_JAVA_OPTIONS|unset|
+jvmenv|JAVA_TOOL_OPTIONS|unset|
+jvmenv|_JAVA_OPTIONS|unset|
+execenv|TZ|unset|
+execenv|JAVA_OPTS|unset|
+execenv|JAVA_OPTS_APPEND|unset|
+execenv|JDK_JAVA_OPTIONS|unset|
+execenv|JAVA_TOOL_OPTIONS|unset|
+execenv|_JAVA_OPTIONS|unset|
+os|localtime|symlink|../usr/share/zoneinfo/UTC|UTC0|yes
+os|zoneinfo|yes|no|
+os|date|jvm|+0000|UTC|unset|
+os|date|exec|+0000|UTC|unset|
+cfg|jboss_home|/opt/jboss-eap
+cfg|config|/opt/jboss-eap/standalone/configuration/standalone.xml|yes
+cfg|standalone_conf|/opt/jboss-eap/bin/standalone.conf|yes
+cfg|conf_tz|73|Asia/Tokyo
+sysprop|xml|Asia/Tokyo||||||
+handler||FILE|periodic-rotating-file-handler|jboss.server.log.dir|server.log|.yyyy-MM-dd|named|PATTERN
+formatter|PATTERN|pattern|%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n|||||
+cli|path|/opt/jboss-eap/bin/jboss-cli.sh
+cli|controller|localhost:9990|管理ポート 9990 [management-http の既定] + port-offset 0 [backend 以外のサービスの既定]
+cli|status|0|3
+cli|input_tz|Asia/Tokyo
+cli|runtime_tz|Asia/Tokyo
+cli|sysprop|defined
+log|dir|/mnt/efs/logs/task-1/front|JVM の -Djboss.server.log.dir
+log|file|/mnt/efs/logs/task-1/front/server.log|yes|1790392798|14583|2026-09-26 10:00:00,123|2026-09-26 12:19:58,456
+rotated|server.log.2026-09-24|1790294399|20480|2026-09-24 09:00:00,001|2026-09-25 08:59:59,999
+end|ok
+FAKE_LTZ_MIXED
+      ;;
+    nojvm)
+      cat <<'FAKE_LTZ_NOJVM'
+meta|now|1790392800
+meta|user|0:0
+jvm|pid|
+jvm|env_readable|no
+execenv|TZ|unset|
+execenv|JAVA_OPTS|unset|
+execenv|JAVA_OPTS_APPEND|unset|
+execenv|JDK_JAVA_OPTIONS|unset|
+execenv|JAVA_TOOL_OPTIONS|unset|
+execenv|_JAVA_OPTIONS|unset|
+os|localtime|missing|||no
+os|zoneinfo|no|no|
+os|date|jvm|+0000|UTC|unset|
+os|date|exec|+0000|UTC|unset|
+cfg|jboss_home|/opt/jboss-eap
+cfg|config|/opt/jboss-eap/standalone/configuration/standalone.xml|yes
+cfg|standalone_conf|/opt/jboss-eap/bin/standalone.conf|yes
+handler||FILE|periodic-rotating-file-handler|jboss.server.log.dir|server.log|.yyyy-MM-dd|named|PATTERN
+formatter|PATTERN|pattern|%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n|||||
+cli|path|/opt/jboss-eap/bin/jboss-cli.sh
+log|dir|/opt/jboss-eap/standalone/log|JBOSS_HOME 配下の standalone/log
+log|file|/opt/jboss-eap/standalone/log/server.log|no
+end|ok
+FAKE_LTZ_NOJVM
+      ;;
+    *)
+      cat <<'FAKE_LTZ_JST'
+meta|now|1790392800
+meta|user|185:0
+jvm|pid|108
+jvm|arg_tz|Asia/Tokyo
+jvm|env_readable|yes
+jvmenv|TZ|set|Asia/Tokyo
+jvmenv|JAVA_OPTS|unset|
+jvmenv|JAVA_OPTS_APPEND|unset|
+jvmenv|JDK_JAVA_OPTIONS|unset|
+jvmenv|JAVA_TOOL_OPTIONS|unset|
+jvmenv|_JAVA_OPTIONS|unset|
+execenv|TZ|set|Asia/Tokyo
+execenv|JAVA_OPTS|unset|
+execenv|JAVA_OPTS_APPEND|unset|
+execenv|JDK_JAVA_OPTIONS|unset|
+execenv|JAVA_TOOL_OPTIONS|unset|
+execenv|_JAVA_OPTIONS|unset|
+os|localtime|symlink|../usr/share/zoneinfo/Asia/Tokyo|JST-9|yes
+os|zoneinfo|yes|yes|JST-9
+os|date|jvm|+0900|JST|set|Asia/Tokyo
+os|date|exec|+0900|JST|set|Asia/Tokyo
+cfg|jboss_home|/opt/jboss-eap
+cfg|config|/opt/jboss-eap/standalone/configuration/standalone.xml|yes
+cfg|standalone_conf|/opt/jboss-eap/bin/standalone.conf|yes
+cfg|conf_tz|72|Asia/Tokyo
+handler||FILE|periodic-rotating-file-handler|jboss.server.log.dir|server.log|.yyyy-MM-dd|named|PATTERN
+formatter|PATTERN|pattern|%d{yyyy-MM-dd HH:mm:ss,SSSZ} %-5p [%c] (%t) %s%e%n|||||
+formatter|COLOR-PATTERN|pattern|%K{level}%d{HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n|||||
+cli|path|/opt/jboss-eap/bin/jboss-cli.sh
+cli|controller|localhost:9990|管理ポート 9990 [management-http の既定] + port-offset 0 [backend 以外のサービスの既定]
+cli|status|0|3
+cli|input_tz|Asia/Tokyo
+cli|runtime_tz|Asia/Tokyo
+log|dir|/mnt/efs/logs/task-1/front|JVM の -Djboss.server.log.dir
+log|file|/mnt/efs/logs/task-1/front/server.log|yes|1790392798|14583|2026-09-26 10:00:00,123+0900|2026-09-26 12:19:58,456+0900
+rotated|server.log.2026-09-25|1790348398|20480|2026-09-25 00:00:01,001+0900|2026-09-25 23:59:58,999+0900
+end|ok
+FAKE_LTZ_JST
+      ;;
+  esac | tr '|' '\037'
+  exit 0
 fi
 
 # コンテナ内シェルで実行される伝搬検証のプローブ。

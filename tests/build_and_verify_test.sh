@@ -55,7 +55,8 @@ assert_matches() {
 # トラストストア一覧
 # (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt)、server.log の
 # FD 点検 (_server_log_fd_<サービス名>.txt) とログ設定の静的点検
-# (_logging_config_audit_<サービス名>.txt) も出力される
+# (_logging_config_audit_<サービス名>.txt) も出力される (ログローテーションの
+# タイムゾーン点検は _log_rotation_tz_<サービス名>.md で、この glob には掛からない)
 # ため、素の glob では件数が増えてしまう。サービス別ビルドログ
 # (build_and_verify_<日時>_build_log_<サービス名>.txt) はビルドを実行した
 # 実行では必ず出るため、こちらも除外する。ECS サーキットブレーカ再現の
@@ -3121,16 +3122,17 @@ unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_SERVER_LOG_FD_RESUL
 
 # eapapp の操作一覧は root bash (5) の後ろに 6 / 7 が並び、app (JBoss モジュール一覧の
 # 対象外) には出ない (eapapp の一覧は最初と 2 つの操作の後の 3 回だけ表示される)。
+# 最後の 8 はログローテーションのタイムゾーン点検 (後から加わった操作)。
 assert_contains "$server_log_check_output" \
   "  6) server.log の FD 点検 (日付をまたいでも server.log.<前日> へ書き続ける原因を /proc の FD から判定 / check-server-log-fd.sh 相当)"
 assert_contains "$server_log_check_output" \
   "  7) ログ設定の静的点検 (server.log を開く・rename する主体を standalone.xml / WAR・EAR / logrotate・cron / 起動コマンドから特定 / audit-logging-config.sh 相当)"
 assert_contains "$server_log_check_output" "  5) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)"
-assert_contains "$server_log_check_output" "選択番号 [0-7]: "
+assert_contains "$server_log_check_output" "選択番号 [0-8]: "
 assert_occurrences "$server_log_check_output" "  6) server.log の FD 点検 (" 3
 assert_contains "$server_log_check_output" "Compose サービス 'app' で実行する操作を選択してください:"
 assert_contains "$server_log_check_output" "選択番号 [0-4]: "
-assert_not_contains "$server_log_check_output" "0 から 7 の番号を入力してください。"
+assert_not_contains "$server_log_check_output" "0 から 8 の番号を入力してください。"
 
 # FD 点検: JVM と同じ uid:gid で実行し、原因候補の判定をそのまま表示する。
 assert_contains "$server_log_check_output" \
@@ -3395,6 +3397,307 @@ if ! (
   cat "$bad_backend_port_offset_output" >&2
   fail "--backend-port-offset 55545 (management port 65535) should be accepted"
 fi
+
+# --- ログローテーションのタイムゾーン点検 (UTC / JST) ---------------------------
+# JBoss EAP のコンテナ (JBoss モジュール一覧と同じ判定) の操作一覧の最後 (ログ設定の
+# 静的点検の後ろ) に 1 つ増えること。コンテナ内プローブは JVM と同じ uid:gid で実行し、
+# 結果は既定で --report-dir 配下の Markdown へ残す。
+# 正常系: OS・JVM・EAP ロギング・実測が JST で、cwagent も %z でオフセットを読む構成。
+log_rotation_tz_output="$TEST_TMP/keep-mode-log-rotation-tz.out"
+log_rotation_tz_reports="$TEST_TMP/log-rotation-tz-reports"
+log_rotation_tz_args="$TEST_TMP/log-rotation-tz-args.txt"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_LOG_FILE="$TEST_DIR/fixtures/jboss-eap-8.1-success.log"
+export FAKE_COMPOSE_PS_SERVICES="app eapapp cwagent cloudwatch-logs-mock"
+export FAKE_SERVER_LOG_JVM_USER="185:0"
+export FAKE_LOG_ROTATION_TZ_ARGS="$log_rotation_tz_args"
+export FAKE_CWAGENT_CONFIG_FILE="$TEST_DIR/fixtures/cwagent/cwagent-config-server-log-jst.json"
+export FAKE_LTZ_CWAGENT_ENV="AWS_REGION=ap-northeast-1
+TZ=Asia/Tokyo"
+export FAKE_LTZ_CWAGENT_TZIF_PATHS="/usr/share/zoneinfo/Asia/Tokyo=$TEST_DIR/fixtures/tzif/Asia_Tokyo"
+export FAKE_LTZ_MOUNTS="cid-eapapp|volume|efs-logs||/mnt/efs/logs
+cid-cwagent|volume|efs-logs||/mnt/logs"
+export FAKE_CLOUDWATCH_JOURNAL_FILE="$TEST_DIR/fixtures/cloudwatch-wiremock-server-log-jst.json"
+if ! printf '2\n8\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service app,eapapp,cwagent,cloudwatch-logs-mock \
+    --startup-service app \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$log_rotation_tz_reports" \
+    --suppress-removed-logs
+) >"$log_rotation_tz_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_LOG_ROTATION_TZ_ARGS \
+    FAKE_CWAGENT_CONFIG_FILE FAKE_LTZ_CWAGENT_ENV FAKE_LTZ_CWAGENT_TZIF_PATHS FAKE_LTZ_MOUNTS \
+    FAKE_CLOUDWATCH_JOURNAL_FILE
+  cat "$log_rotation_tz_output" >&2
+  fail "log rotation timezone check (JST) returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_LOG_ROTATION_TZ_ARGS \
+  FAKE_CWAGENT_CONFIG_FILE FAKE_LTZ_CWAGENT_ENV FAKE_LTZ_CWAGENT_TZIF_PATHS FAKE_LTZ_MOUNTS \
+  FAKE_CLOUDWATCH_JOURNAL_FILE
+
+# eapapp の操作一覧は、ログ設定の静的点検 (7) の後ろに 8 が並ぶ。
+assert_contains "$log_rotation_tz_output" \
+  "  8) ログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・CloudWatch Agent の時刻設定が UTC か JST かを判定 / 結果を Markdown へ出力)"
+assert_contains "$log_rotation_tz_output" "選択番号 [0-8]: "
+assert_contains "$log_rotation_tz_output" \
+  "════════════ ログローテーションのタイムゾーン点検 (UTC / JST) ════════════"
+assert_contains "$log_rotation_tz_output" "実行ユーザー     : JBoss EAP の JVM と同じ uid:gid (185:0)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec -u 185:0 cid-eapapp /bin/sh -c set -u"
+# プローブへは「_ 設定ファイル jboss-cli.sh 対象ファイル オフセット 説明 読む数 JBOSS_HOME候補...」
+# の順で渡る。eapapp は backend ではないので port-offset は 0。
+[ "$(sed -n 3p "$log_rotation_tz_args")" = "server.log" ] \
+  || fail "the log rotation timezone probe did not receive the target file name as its 3rd argument"
+[ "$(sed -n 4p "$log_rotation_tz_args")" = "0" ] \
+  || fail "a non-backend service should not add a port-offset for the log rotation timezone probe"
+[ "$(sed -n 6p "$log_rotation_tz_args")" = "7" ] \
+  || fail "the log rotation timezone probe did not receive the rotated file limit"
+assert_contains "$log_rotation_tz_output" \
+  "jboss-cli.sh の接続先 : 管理ポート 9990 + port-offset 0 (backend 以外のサービスの既定) = 9990"
+# 各レイヤーの判定がそろって JST。
+assert_contains "$log_rotation_tz_output" "  [JST]    TZ (JVM プロセスの環境変数) : Asia/Tokyo"
+assert_contains "$log_rotation_tz_output" "  [JST]    /etc/localtime : → ../usr/share/zoneinfo/Asia/Tokyo"
+assert_contains "$log_rotation_tz_output" "  [JST]    -Duser.timezone (JVM の起動引数) : Asia/Tokyo"
+assert_contains "$log_rotation_tz_output" "指定元: /opt/jboss-eap/bin/standalone.conf の 72 行目"
+assert_contains "$log_rotation_tz_output" "  [JST]    JVM の既定タイムゾーン (実効) : Asia/Tokyo"
+assert_contains "$log_rotation_tz_output" \
+  "  [JST]    FILE (periodic-rotating-file-handler) の切替 : suffix=.yyyy-MM-dd (日次)"
+assert_contains "$log_rotation_tz_output" "→ 毎日 00:00 JST。出力先 jboss.server.log.dir/server.log"
+assert_contains "$log_rotation_tz_output" \
+  "  [JST]    PATTERN の %d (server.log の行頭の時刻) : %d{yyyy-MM-dd HH:mm:ss,SSSZ} (オフセット +0900 形式)"
+assert_contains "$log_rotation_tz_output" \
+  "  [JST]    ローテート済み server.log.2026-09-25 : 最終更新 2026-09-25 23:59:58 JST"
+assert_contains "$log_rotation_tz_output" \
+  "  [ - ]    次のローテーション予定 : 2026-09-27 00:00:00 JST 以降の最初のログ"
+# cwagent: 共有ボリュームで server.log の見え方を読み替え、%z で読むエントリを点検する。
+assert_contains "$log_rotation_tz_output" \
+  "/mnt/logs/*/front/server.log。このサービスの server.log (cwagent から /mnt/logs/task-1/front/server.log) を収集"
+assert_contains "$log_rotation_tz_output" \
+  "  [JST]    cwagent の timezone:\"Local\" の解決先 : TZ=Asia/Tokyo"
+assert_contains "$log_rotation_tz_output" \
+  "オフセットどおり 1 件"
+assert_contains "$log_rotation_tz_output" "判定: 正常 — 関係する時刻設定はすべて JST です"
+assert_contains "$log_rotation_tz_output" "。server.log の切替: 毎日 00:00 JST"
+assert_contains "$log_rotation_tz_output" "ログローテーションのタイムゾーン点検 : 正常"
+assert_not_contains "$log_rotation_tz_output" "── 指摘と追加情報 ──"
+assert_not_contains "$log_rotation_tz_output" "── 追加情報: UTC と JST の対応"
+assert_not_contains "$log_rotation_tz_output" "ログローテーションのタイムゾーン点検に失敗しました。"
+# 画面と同じ内容が --report-dir 配下の Markdown へ残る (一時ディレクトリの案内は出さない)。
+log_rotation_tz_md="$(ls -1 "$log_rotation_tz_reports"/build_and_verify_*_log_rotation_tz_eapapp.md 2>/dev/null | head -n 1)"
+[ -n "$log_rotation_tz_md" ] && [ -s "$log_rotation_tz_md" ] \
+  || fail "log rotation timezone Markdown was not written under $log_rotation_tz_reports"
+assert_contains "$log_rotation_tz_output" "ログローテーションのタイムゾーン点検の Markdown : ${log_rotation_tz_md}"
+assert_not_contains "$log_rotation_tz_output" "(--report-dir または --log-rotation-tz-md を指定すると出力先を変えられます)"
+assert_contains "$log_rotation_tz_md" "# ログローテーションのタイムゾーン点検 (UTC / JST)"
+assert_contains "$log_rotation_tz_md" "**判定: 正常 — 関係する時刻設定はすべて JST です"
+assert_contains "$log_rotation_tz_md" "| Compose サービス | eapapp |"
+assert_contains "$log_rotation_tz_md" "| 区分 | 項目 | 値 | 判定 | 集計 | 補足 |"
+assert_contains "$log_rotation_tz_md" "| OS | TZ (JVM プロセスの環境変数) | \`Asia/Tokyo\` | JST | ○ |"
+assert_contains "$log_rotation_tz_md" "| JVM | JVM の既定タイムゾーン (実効) | \`Asia/Tokyo\` | JST | ○ |"
+assert_contains "$log_rotation_tz_md" "## 点検の方法"
+assert_contains "$log_rotation_tz_md" "<details><summary>プローブの出力 (機微な値は伏せ字)</summary>"
+assert_not_contains "$log_rotation_tz_md" "## 追加情報"
+collect_report_files "$log_rotation_tz_reports"
+[ "${#REPORT_FILES[@]}" -eq 1 ] \
+  || fail "expected a single build report next to the log rotation timezone Markdown"
+
+# 混在 + CloudWatch Logs への転送の問題: JVM は起動引数で JST だが OS は UTC、
+# standalone.xml に効かない system-property があり、cwagent は JST の行を UTC として読む
+# (偽装 CloudWatch Logs には 9 時間未来のイベントが届き、エージェントのログに too new)。
+# --report-dir が無ければ一時ディレクトリへ出し、繰り返した点検は連番で残す。
+log_rotation_tz_mixed_output="$TEST_TMP/keep-mode-log-rotation-tz-mixed.out"
+log_rotation_tz_tmpdir="$TEST_TMP/log-rotation-tz-tmpdir"
+mkdir -p "$log_rotation_tz_tmpdir"
+: > "$FAKE_DOCKER_CALLS"
+: > "$FAKE_CURL_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp cwagent cloudwatch-logs-mock"
+export FAKE_SERVER_LOG_JVM_USER="185:0"
+export FAKE_LOG_ROTATION_TZ_SCENARIO="mixed"
+export FAKE_CWAGENT_CONFIG_FILE="$TEST_DIR/fixtures/cwagent/cwagent-config-server-log-utc.json"
+export FAKE_LTZ_MOUNTS="cid-eapapp|volume|efs-logs||/mnt/efs/logs
+cid-cwagent|volume|efs-logs||/mnt/logs"
+export FAKE_CWAGENT_LOG_EXTRA="cwagent  | 2026-09-26T03:20:05Z W! [outputs.cloudwatchlogs] 2 log events for log '/local/myapp/efs/server-front/front-local' are too new"
+export FAKE_CLOUDWATCH_JOURNAL_FILE="$TEST_DIR/fixtures/cloudwatch-wiremock-server-log-jst-as-utc.json"
+if ! printf '1\n8\n\n8\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$log_rotation_tz_tmpdir" bash ./build_and_verify.sh \
+    --compose-service eapapp,cwagent,cloudwatch-logs-mock \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$log_rotation_tz_mixed_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_LOG_ROTATION_TZ_SCENARIO \
+    FAKE_CWAGENT_CONFIG_FILE FAKE_LTZ_MOUNTS FAKE_CWAGENT_LOG_EXTRA FAKE_CLOUDWATCH_JOURNAL_FILE
+  cat "$log_rotation_tz_mixed_output" >&2
+  fail "log rotation timezone check (mixed) returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_SERVER_LOG_JVM_USER FAKE_LOG_ROTATION_TZ_SCENARIO \
+  FAKE_CWAGENT_CONFIG_FILE FAKE_LTZ_MOUNTS FAKE_CWAGENT_LOG_EXTRA FAKE_CLOUDWATCH_JOURNAL_FILE
+
+assert_contains "$log_rotation_tz_mixed_output" "  [UTC]    OS の実効タイムゾーン (date) : +0000 UTC"
+assert_contains "$log_rotation_tz_mixed_output" "  [JST]    JVM の既定タイムゾーン (実効) : Asia/Tokyo"
+assert_contains "$log_rotation_tz_mixed_output" "判定: 異常 (混在) — 一部だけが JST で、UTC の設定が残っています"
+assert_contains "$log_rotation_tz_mixed_output" "。CloudWatch Logs への転送の問題 "
+assert_contains "$log_rotation_tz_mixed_output" "ログローテーションのタイムゾーン点検 : 異常 (混在)"
+assert_not_contains "$log_rotation_tz_mixed_output" "ログローテーションのタイムゾーン点検に失敗しました。"
+# 問題があるときだけ、指摘の影響・対処・確認と、追加情報を出す。
+assert_contains "$log_rotation_tz_mixed_output" "── 指摘と追加情報 ──"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(JVM) standalone.xml の system-property user.timezone (Asia/Tokyo) は効きません"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(OS) OS (date・シェル・cron・ヘルスチェック) は UTC で動いています (JVM は JST)"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(CloudWatch) collect_list[1] が JST のログ行を UTC として解釈します (timezone=UTC / UTC)"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "PutLogEvents は 2 時間より先の未来のイベントを拒否するため"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(CloudWatch) CloudWatch Logs が時刻の範囲外としてイベントを拒否しています (too new 1 / too old 0 / expired 0)"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(CloudWatch) 偽装 CloudWatch Logs に、行の時刻より 9 時間未来のイベントが届いています (2 件)"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(CloudWatch) collect_list[1] の file_path (/mnt/logs/*/front/server.log*) はローテート済みのファイルにも一致します"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "(実測) ローテート済みファイルが UTC の 0:00 で区切られています (server.log.2026-09-24)"
+assert_contains "$log_rotation_tz_mixed_output" "      影響: "
+assert_contains "$log_rotation_tz_mixed_output" "      対処: "
+assert_contains "$log_rotation_tz_mixed_output" "── 追加情報: UTC と JST の対応 (server.log の見え方) ──"
+assert_contains "$log_rotation_tz_mixed_output" \
+  "UTC で区切る場合: server.log.2026-09-25 = JST 2026-09-25 09:00:00 〜 2026-09-26 08:59:59"
+assert_contains "$log_rotation_tz_mixed_output" "── 追加情報: 推奨設定 (JST にそろえる) ──"
+assert_contains "$log_rotation_tz_mixed_output" "── 追加情報: 確認コマンド ──"
+assert_occurrences "$log_rotation_tz_mixed_output" "  (--report-dir または --log-rotation-tz-md を指定すると出力先を変えられます)" 2
+log_rotation_tz_tmp_md="$(ls -1 "$log_rotation_tz_tmpdir"/build_and_verify_*_log_rotation_tz_eapapp.md 2>/dev/null | head -n 1)"
+log_rotation_tz_tmp_md_2="$(ls -1 "$log_rotation_tz_tmpdir"/build_and_verify_*_log_rotation_tz_eapapp_1.md 2>/dev/null | head -n 1)"
+[ -n "$log_rotation_tz_tmp_md" ] && [ -s "$log_rotation_tz_tmp_md" ] \
+  || fail "log rotation timezone Markdown was not written to the temporary directory fallback"
+[ -n "$log_rotation_tz_tmp_md_2" ] && [ -s "$log_rotation_tz_tmp_md_2" ] \
+  || fail "the repeated log rotation timezone check overwrote the previous Markdown instead of numbering it"
+assert_contains "$log_rotation_tz_tmp_md" "**判定: 異常 (混在) — 一部だけが JST で、UTC の設定が残っています"
+assert_contains "$log_rotation_tz_tmp_md" "## 指摘と追加情報"
+assert_contains "$log_rotation_tz_tmp_md" "### [指摘 "
+assert_contains "$log_rotation_tz_tmp_md" "- **影響**: "
+assert_contains "$log_rotation_tz_tmp_md" "## 追加情報: UTC と JST の対応 (server.log の見え方)"
+assert_contains "$log_rotation_tz_tmp_md" "| 優先度 | 場所 | 設定 |"
+assert_contains "$log_rotation_tz_tmp_md" "## 参考: このサービスの server.log 以外を収集する collect_list"
+assert_contains "$log_rotation_tz_tmp_md" "| OS | OS の実効タイムゾーン (date) | \`+0000 UTC\` | **UTC** | ○ |"
+
+# すべて UTC: backend サービス (port-offset 10000) で、JVM も OS も UTC のまま。
+# --no-log-rotation-tz-md なら Markdown は作らず、その旨だけを表示する。
+log_rotation_tz_utc_output="$TEST_TMP/keep-mode-log-rotation-tz-utc.out"
+log_rotation_tz_utc_reports="$TEST_TMP/log-rotation-tz-utc-reports"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="backend-api"
+export FAKE_JBOSS_EAP_CONTAINERS="cid-backend-api"
+export FAKE_LOG_ROTATION_TZ_SCENARIO="utc"
+export FAKE_LOG_ROTATION_TZ_ARGS="$log_rotation_tz_args"
+if ! printf '1\n8\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service backend-api \
+    --startup-service backend-api \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --report-dir "$log_rotation_tz_utc_reports" \
+    --no-log-rotation-tz-md \
+    --suppress-removed-logs
+) >"$log_rotation_tz_utc_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOG_ROTATION_TZ_SCENARIO \
+    FAKE_LOG_ROTATION_TZ_ARGS
+  cat "$log_rotation_tz_utc_output" >&2
+  fail "log rotation timezone check (UTC) returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_JBOSS_EAP_CONTAINERS FAKE_LOG_ROTATION_TZ_SCENARIO \
+  FAKE_LOG_ROTATION_TZ_ARGS
+
+assert_contains "$log_rotation_tz_utc_output" "Compose サービス : backend-api"
+[ "$(sed -n 4p "$log_rotation_tz_args")" = "10000" ] \
+  || fail "the backend service should pass port-offset 10000 to the log rotation timezone probe"
+assert_contains "$log_rotation_tz_utc_output" \
+  "jboss-cli.sh の接続先 : 管理ポート 9990 + port-offset 10000 (backend サービスの既定 (--backend-port-offset)) = 19990"
+assert_contains "$log_rotation_tz_utc_output" "判定: 異常 (UTC) — 関係する時刻設定がすべて UTC です"
+assert_contains "$log_rotation_tz_utc_output" "server.log の切替: 毎日 09:00 JST (= 00:00 UTC)"
+assert_contains "$log_rotation_tz_utc_output" "(JVM) JVM の既定タイムゾーンが UTC です (UTC)"
+assert_contains "$log_rotation_tz_utc_output" \
+  "  [UTC]    ローテート済み server.log.2026-09-25 : 最終更新 2026-09-26 08:59:59 JST"
+assert_contains "$log_rotation_tz_utc_output" "JST の翌日 0:00〜8:59 まで書かれている → UTC の 0:00 で区切られた"
+assert_contains "$log_rotation_tz_utc_output" \
+  "  [ - ]    次のローテーション予定 : 2026-09-27 09:00:00 JST 以降の最初のログ"
+assert_contains "$log_rotation_tz_utc_output" \
+  "ログローテーションのタイムゾーン点検の Markdown : 出力しません (--no-log-rotation-tz-md)"
+if ls "$log_rotation_tz_utc_reports"/build_and_verify_*_log_rotation_tz_*.md >/dev/null 2>&1; then
+  fail "--no-log-rotation-tz-md should not write the log rotation timezone Markdown"
+fi
+
+# JVM が見つからない場合は判定不能 (ヘルパーの失敗) として操作選択へ戻る。
+# --log-rotation-tz-md で明示した出力先へは、そこまでに分かった内容を残す。
+log_rotation_tz_nojvm_output="$TEST_TMP/keep-mode-log-rotation-tz-nojvm.out"
+log_rotation_tz_explicit_md="$TEST_TMP/log-rotation-tz-explicit/eapapp-timezone.md"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="eapapp"
+export FAKE_LOG_ROTATION_TZ_SCENARIO="nojvm"
+if ! printf '1\n8\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service eapapp \
+    --startup-service eapapp \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --log-rotation-tz-md "$log_rotation_tz_explicit_md" \
+    --suppress-removed-logs
+) >"$log_rotation_tz_nojvm_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_LOG_ROTATION_TZ_SCENARIO
+  cat "$log_rotation_tz_nojvm_output" >&2
+  fail "log rotation timezone check without a JVM did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_LOG_ROTATION_TZ_SCENARIO
+
+assert_contains "$log_rotation_tz_nojvm_output" \
+  "実行ユーザー     : コンテナの既定ユーザー (JBoss EAP の JVM を検出できなかったため)"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-eapapp /bin/sh -c set -u"
+assert_contains "$log_rotation_tz_nojvm_output" "判定: 判定不能 — JBoss EAP の JVM が見つからないため"
+assert_contains "$log_rotation_tz_nojvm_output" \
+  "JBoss EAP の JVM が見つからないため、実際に効いているタイムゾーンを判定できませんでした。"
+assert_contains "$log_rotation_tz_nojvm_output" \
+  "ログローテーションのタイムゾーン点検に失敗しました。サービス操作の選択へ戻ります。"
+assert_occurrences "$log_rotation_tz_nojvm_output" \
+  "Compose サービス 'eapapp' で実行する操作を選択してください:" 2
+[ -s "$log_rotation_tz_explicit_md" ] \
+  || fail "--log-rotation-tz-md did not receive the Markdown of an undeterminable check"
+assert_contains "$log_rotation_tz_nojvm_output" \
+  "ログローテーションのタイムゾーン点検の Markdown : ${log_rotation_tz_explicit_md}"
+assert_contains "$log_rotation_tz_explicit_md" "**判定: 判定不能 — JBoss EAP の JVM が見つからないため"
+
+# 出力先の指定の誤り (空・標準出力・--no-log-rotation-tz-md との併用) は起動前に弾く。
+log_rotation_tz_bad_output="$TEST_TMP/log-rotation-tz-bad.out"
+for log_rotation_tz_bad_value in "" "-"; do
+  if (
+    cd "$REPO_ROOT"
+    bash ./build_and_verify.sh --log-rotation-tz-md "$log_rotation_tz_bad_value" --dry-run
+  ) >"$log_rotation_tz_bad_output" 2>&1; then
+    fail "--log-rotation-tz-md '${log_rotation_tz_bad_value}' should be rejected"
+  fi
+  assert_contains "$log_rotation_tz_bad_output" "--log-rotation-tz-md にはファイルパスを指定してください"
+done
+if (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --log-rotation-tz-md "$TEST_TMP/x.md" --no-log-rotation-tz-md --dry-run
+) >"$log_rotation_tz_bad_output" 2>&1; then
+  fail "--log-rotation-tz-md with --no-log-rotation-tz-md should be rejected"
+fi
+assert_contains "$log_rotation_tz_bad_output" \
+  "--log-rotation-tz-md と --no-log-rotation-tz-md は同時に指定できません。"
 
 # --- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービス (alb-healthcheck) のターゲットに登録された

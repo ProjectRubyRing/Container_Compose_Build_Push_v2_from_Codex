@@ -272,7 +272,7 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | ツリーの最大深さ (指定すると画面表示を自動で有効化) |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 通常ファイルも表示する (N 件超過時は拡張子別の件数)。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名<br>(繰り返し可) | (なし) | ディレクトリパスを値に持つ環境変数。その配下を階層表示 (画面表示を自動で有効化) |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 (サービス別ビルドログ `..._build_log_<サービス名>.txt` と読み取り専用 FS 分析の Excel / テキスト、`logs` モードの server.log の FD 点検 / ログ設定の静的点検の結果 `..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt` も同じ場所へ) |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存 (サービス別ビルドログ `..._build_log_<サービス名>.txt` と読み取り専用 FS 分析の Excel / テキスト、`logs` モードの server.log の FD 点検 / ログ設定の静的点検の結果 `..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt`、ログローテーションのタイムゾーン点検の結果 `..._log_rotation_tz_<サービス名>.md` も同じ場所へ) |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | WAR デプロイ時 Java 例外解析の結果を画面へ表示する |
 | `--no-deploy-exception-display` | フラグ | — | 画面表示を行わない (既定と同じ) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 全量レポートの `[10]` へ解析結果を出力する (`--report-dir` と併用) |
@@ -303,6 +303,8 @@ tools/valkey_shell_cli.sh -h valkey --tls --cacert ca.crt PING
 | `--truststore-inventory-text FILE` | ファイルパス | (なし) | トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先 |
 | `--no-truststore-inventory-text` | フラグ | `false` | トラストストア一覧のテキスト出力を行わない (画面表示だけにする) |
 | `--backend-port-offset N` | 0〜55545 の整数 | `10000` | ログ設定の静的点検で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する backend の port-offset (backend サービスは既定 19990 へ接続。それ以外は 9990。JVM の `-Djboss.socket.binding.port-offset` を優先) |
+| `--log-rotation-tz-md FILE` | ファイルパス | (なし) | ログローテーションのタイムゾーン点検 (`--keep-container-mode logs` の操作) の結果を Markdown で出力する先 (未指定時は `--report-dir` 配下、無ければ一時ディレクトリへ自動命名) |
+| `--no-log-rotation-tz-md` | フラグ | `false` | ログローテーションのタイムゾーン点検の Markdown 出力を行わない (画面表示だけにする) |
 
 ### 終了時のクリーンアップ
 

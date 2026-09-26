@@ -274,7 +274,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、同じコンテナでは server.log の FD 点検とログ設定の静的点検 (日付をまたいでも `server.log.<前日>` へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の `check-server-log-fd.sh` / `audit-logging-config.sh` と同じ判定で、結果は `--report-dir` 配下へも出力)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド)、valkey / redis サーバーのサービスがあれば Valkey 操作 (選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは使い捨てコンテナか `openssl` / bash の代替シェルを使い、確認対象コンテナへはインストールしない) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、同じコンテナでは server.log の FD 点検とログ設定の静的点検 (日付をまたいでも `server.log.<前日>` へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の `check-server-log-fd.sh` / `audit-logging-config.sh` と同じ判定で、結果は `--report-dir` 配下へも出力)、同じコンテナではログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定を 1 件ずつ UTC / JST で判定し、すべて JST か・すべて UTC か・混在かを表示。問題があれば影響・対処・確認コマンドの追加情報も表示し、結果は既定で `--report-dir` 配下の Markdown へ出力)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド)、valkey / redis サーバーのサービスがあれば Valkey 操作 (選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは使い捨てコンテナか `openssl` / bash の代替シェルを使い、確認対象コンテナへはインストールしない) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--valkey-service NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作 (`--keep-container-mode logs` の操作) の接続先となる valkey サーバーの Compose サービス名。未指定時は起動中サービスを順に調べ、`valkey-server` / `redis-server` を持つコンテナのサービスを自動検出する | (自動検出) |
 | `--valkey-port PORT` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の接続先ポート (コンテナ側)。未指定時は valkey コンテナの環境変数・`valkey.conf` / `redis.conf`・起動コマンドから検出する | (自動検出。既定 `6379`) |
 | `--valkey-tls` / `--no-valkey-tls` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の通信を TLS (`openssl s_client`) か平文 (bash の `/dev/tcp`) に固定する | (自動判定) |
@@ -317,7 +317,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--directory-tree-depth N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。環境変数一覧後のコンテナ内ツリーと JBoss EAP デプロイ構造の最大深さ。各表示ルート直下を深さ `1` とする。指定すると画面表示を自動で有効にする | `all` (最下層まで) |
 | `--directory-file-limit N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時**。通常ファイルの画面表示を有効にする。各ディレクトリ直下が `N` ファイル以下なら全ファイル名、超過時は拡張子別件数へ切り替える。`all` は常に全ファイル名を表示する。指定すると画面表示を自動で有効にする | 未指定時はファイル非表示 |
 | `--deployment-dir-env NAME` | **`build_and_verify.sh` / `--build-only` 委譲時**。ディレクトリの絶対パスを値に持つコンテナ環境変数名。繰り返しまたはカンマ区切りで複数指定でき、その配下を JBoss EAP デプロイ構造と併せて表示する。指定すると画面表示を自動で有効にする | (なし) |
-| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を、WAR デプロイ時 Java 例外解析 `[10]` は `--deploy-exception-report` を、読み取り専用ファイルシステム分析 `[11]` は `--readonly-analysis-report` を併用したときだけ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する。あわせて `docker compose build` の出力をサービス単位へ切り分けたビルドログを `..._build_log_<サービス名>.txt` としてサービスごとに出力する (指定が無い実行では一時ディレクトリへ出力し、どちらの場合も出力先を画面へ表示する)。`--keep-container-mode logs` で server.log の FD 点検 / ログ設定の静的点検を実行したときは、その結果も `..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt` として同じディレクトリへ出力する (指定が無い実行では一時ディレクトリ) | (なし) |
+| `--report-dir DIR` | **`build_and_verify.sh` / `--build-only` 委譲時**。ビルド結果、環境変数全件、Java の JVM パラメータ、OpenTelemetry 環境変数・JVM パラメータを、画面の制限にかかわらず全量で日時付きテキストへ保存する。コンテナ内ツリーと JBoss EAP デプロイ構造は `--directory-tree-report` を、WAR デプロイ時 Java 例外解析 `[10]` は `--deploy-exception-report` を、読み取り専用ファイルシステム分析 `[11]` は `--readonly-analysis-report` を併用したときだけ保存する。失敗時は全 Compose サービスのログ全文もサービス単位で追記する。あわせて読み取り専用ファイルシステム分析を `..._readonly_filesystem.xlsx` と `..._readonly_filesystem.txt` (Excel とテキストは同じ内容) として同じディレクトリへ追加出力する。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` を指定したときだけ出力する。あわせて `docker compose build` の出力をサービス単位へ切り分けたビルドログを `..._build_log_<サービス名>.txt` としてサービスごとに出力する (指定が無い実行では一時ディレクトリへ出力し、どちらの場合も出力先を画面へ表示する)。`--keep-container-mode logs` で server.log の FD 点検 / ログ設定の静的点検を実行したときは、その結果も `..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt` として同じディレクトリへ出力する (指定が無い実行では一時ディレクトリ)。ログローテーションのタイムゾーン点検の結果は `..._log_rotation_tz_<サービス名>.md` (Markdown) として既定で同じディレクトリへ出力する (`--no-log-rotation-tz-md` で抑制。指定が無い実行では一時ディレクトリ) | (なし) |
 | `--deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない | `false` (非表示) |
 | `--no-deploy-exception-display` | **`build_and_verify.sh` / `--build-only` 委譲時**。画面表示を行わない (`--deploy-exception-display` を打ち消す) | `true` (既定) |
 | `--deploy-exception-report` | **`build_and_verify.sh` / `--build-only` 委譲時**。`--report-dir` の全量レポート `[10]` へ解析結果を出力する。**指定したときだけ出力**し、既定では見出しの下に未出力である旨だけを残す | `false` (記載しない) |
@@ -360,6 +360,8 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--truststore-inventory-text FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先を明示する。有効なトラストストアのフルパス・登録証明書の種別・ドメイン URL・カスタム証明書の強調・接続確認コマンドを、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
 | `--no-truststore-inventory-text` | **`build_and_verify.sh` / `--build-only` 委譲時**。トラストストア一覧のテキスト出力を行わない (画面表示だけにする) | `false` |
 | `--backend-port-offset N` | **`build_and_verify.sh` / `--build-only` 委譲時**。ログ設定の静的点検 (`--keep-container-mode logs` の操作) で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する、backend の JBoss EAP の port-offset。サービス名に `backend` を含むサービスでは `--controller=localhost:<9990 + N>` (既定 19990) で接続する。それ以外のサービスは 0 (9990)。JVM の `-Djboss.socket.binding.port-offset` があればそちらを優先。`0` 〜 `55545` | `10000` |
+| `--log-rotation-tz-md FILE` | **`build_and_verify.sh` / `--build-only` 委譲時**。ログローテーションのタイムゾーン点検 (`--keep-container-mode logs` の操作) の結果を Markdown で出力する先を明示する。時刻設定の一覧 (OS / JVM / EAP ロギング / 実際のログファイル / CloudWatch Agent ごとの値と UTC・JST の判定)・判定・指摘と追加情報を、画面と同じ内容で残す | (`--report-dir` 配下へ自動命名。`--report-dir` も無い場合は一時ディレクトリ) |
+| `--no-log-rotation-tz-md` | **`build_and_verify.sh` / `--build-only` 委譲時**。ログローテーションのタイムゾーン点検の Markdown 出力を行わない (画面表示だけにする) | `false` |
 | `--jboss-password-param NAME` | JBoss のマスターパスワードを AWS パラメータストア (SSM Parameter Store) の指定キー `NAME` から取得し、環境変数経由の BuildKit シークレットとしてビルドに注入する (後述) | (なし) |
 | `--jboss-password VALUE` | JBoss のマスターパスワードを直接指定する (パラメータストアから取得しない場合)。`--jboss-password-param` とは同時指定不可 | (なし) |
 | `--jboss-password-env NAME` | シークレットの受け渡しに使う環境変数名。このオプションのみを指定した場合は、事前に export 済みの環境変数の値をそのまま使う | `JBOSS_MASTER_PASSWORD` |
@@ -2506,6 +2508,8 @@ CloudWatch Logs には届きません。
   JBoss EAP のコンテナ（frontend / backend）では、操作一覧の最後に `server.log の FD 点検` と
   `ログ設定の静的点検` も並びます（日付をまたいでも `server.log.<前日>` へ追記され続ける原因の切り分け
   → [server.log の FD 点検とログ設定の静的点検](#serverlog-の-fd-点検とログ設定の静的点検前日付ファイルへの追記の切り分け)）。
+  その後ろには `ログローテーションのタイムゾーン点検` も並びます（OS・JVM・EAP ロギング・CloudWatch Agent の
+  時刻設定が UTC か JST かの判定 → [ログローテーションのタイムゾーン点検](#ログローテーションのタイムゾーン点検utc--jst)）。
   valkey / redis サーバーの Compose サービスが起動していれば、**どのサービスからでも**
   `Valkey 操作` を選べます（→ [Valkey の操作と登録内容の確認](#valkey-の操作と登録内容の確認valkey-cli--openssl-代替シェル)）。
   jmeter サービスが compose に定義されていれば、**起動していなくても**サービス選択の一覧に現れ、
@@ -3249,6 +3253,88 @@ FILE ハンドラ以外の書き手（2 つ目のハンドラ・アプリ同梱�
 ログディレクトリや `server.log*` を開いているプロセスを確認できない場合、設定ファイルを読めない場合
 だけヘルパーの失敗として扱います（そこまでの内容はテキストへ残します）。どちらの点検も読むだけで、
 コンテナ内のファイルは変更しません。
+
+### ログローテーションのタイムゾーン点検（UTC / JST）
+
+JBoss EAP の `server.log` は、`periodic-rotating-file-handler` が**生成された瞬間の JVM の既定タイムゾーン**で
+日付を区切ります（ハンドラにタイムゾーンの属性はありません）。JVM が UTC のままだと切替は JST の 9:00 になり、
+`server.log.<前日>` に JST 0:00〜8:59 のログが入ります。JVM を JST にしても、OS（`TZ`・`/etc/localtime`・tzdata）や
+CloudWatch Agent（`timezone`・`timestamp_format`）が UTC のままだと、`date`・cron の時刻や CloudWatch Logs の
+イベント時刻が 9 時間ずれます。CloudWatch Agent が JST の行を UTC として読むとイベント時刻が 9 時間未来になり、
+2 時間より先のイベントは `PutLogEvents` で拒否されて CloudWatch Logs に残りません。
+
+`logs` モードでは、JBoss EAP のコンテナ（frontend / backend。JBoss モジュール一覧と同じ判定）の操作一覧の
+最後（`ログ設定の静的点検` の後ろ）に `ログローテーションのタイムゾーン点検` が並びます。既存操作の番号は変わらず、
+選択後の入力は不要です。関係する時刻設定を次の順に集め、1 件ずつ **JST / UTC / その他 / 未設定** を判定して
+画面へ表示します（観点は別プロジェクト JBossEAP_TimeSetting の「JBoss EAP server.log 日次ローテーションと
+タイムゾーン（JST）完全ガイド」と、JBossEAP_LogRotate の分析に合わせています）。
+
+| 区分 | 見るもの | 判定の考え方 |
+|------|---------|-------------|
+| 1. OS | JVM プロセスの環境変数 `TZ`（読めなければ compose / Dockerfile の `TZ`）、`/etc/localtime`（リンク先と TZif の規則 `JST-9` / `UTC0`）、tzdata（`/usr/share/zoneinfo/Asia/Tokyo`）、その `TZ` で `date` を実行したオフセット | `TZ=Asia/Tokyo` でも tzdata が無いと glibc は UTC のまま。`TZ=JST` は OS では UTC・Java では Asia/Tokyo（9 時間ずれる）。`TZ=Etc/GMT+9` は UTC−9 |
+| 2. JVM | `-Duser.timezone`（起動引数・`JDK_JAVA_OPTIONS`・`JAVA_TOOL_OPTIONS`・`_JAVA_OPTIONS` を後勝ちで求め、standalone.conf の何行目かも示す）、standalone.xml の system-property `user.timezone`、`jboss-cli.sh` の `input-arguments` と実行時の `user.timezone` | JVM の既定は `-Duser.timezone` → `TZ` → `/etc/localtime` → GMT の順に決まる。system-property は起動後に適用されるため効かない（見かけだけの値になる） |
+| 3. EAP ロギング | `server.log` を書くハンドラの種類と `suffix`（周期）、フォーマッタの `%d`（オフセットの有無と形）、json / xml フォーマッタの `zone-id`、custom-handler の `timeZone`、Undertow の access-log | 切替と行頭の時刻は JVM の既定に従う。`zone-id` だけを変えると「表示は JST・切替は UTC」の混在になる |
+| 4. 実測 | `server.log` の最終行の時刻（オフセットが無ければ更新時刻との差が 9 時間なら JST）、ローテート済みファイル（新しい順に 7 件）の最終更新と先頭行の時刻、次のローテーション予定 | 前日付ファイルの最終更新が JST の翌日 0:00〜8:59 なら UTC の区切り。区切りを過ぎても更新されていれば、改名前のファイルを開いたままの書き手（`server.log の FD 点検` で特定） |
+| 5. CloudWatch Agent | `collect_list` のうち、このサービスの `server.log` を収集するエントリ（共有ボリュームで cwagent 側のパスへ読み替えて照合）の `timezone` / `timestamp_format`、`timezone:"Local"` の解決先（cwagent の `TZ`・zoneinfo）、エージェントのログ（`are too new` / `too old` / `expired`、`Error parsing timestampFromLogLine`）、偽装 CloudWatch Logs に届いたイベントの時刻 | `%z` が無ければ `timezone` で解釈する。JST の行を UTC として読むと 9 時間未来（2 時間より先は拒否）。`%z` は `+0900` 形式だけを読み、`+09:00`（`%d` の `XXX`）は読めない |
+
+集計は「実際に効いている設定」と「明示した設定」だけを数え、次のどれかを判定として出します。
+
+| 判定 | 条件 |
+|------|------|
+| `正常` | 関係する時刻設定がすべて JST で、指摘が無い（`server.log` の切替は毎日 00:00 JST） |
+| `異常 (UTC)` | 関係する時刻設定がすべて UTC（切替は毎日 09:00 JST） |
+| `異常 (混在)` | 一部だけが JST で、UTC の設定が残っている |
+| `異常` | 時刻設定は JST だが、指摘がある（効かない system-property、CloudWatch Logs への転送のずれなど） |
+| `判定不能` | JBoss EAP の JVM が見つからない（ヘルパーの失敗として操作選択へ戻る） |
+
+CloudWatch Logs への転送で見つかった問題の件数は、判定の末尾に `CloudWatch Logs への転送の問題 N 件` として付きます。
+問題があるときだけ、指摘ごとの **影響・対処・確認** と、次の追加情報を表示します。
+
+- **UTC と JST の対応**：前日の日付を例に、JST で区切った場合と UTC で区切った場合に `server.log.<日付>` へ入る範囲と、
+  見分け方（前日付ファイルの最終更新が JST の 8:59 ごろなら UTC の区切り）
+- **推奨設定（JST にそろえる）**：`-Duser.timezone=Asia/Tokyo` を起動引数で渡す（standalone.conf の末尾 /
+  `JDK_JAVA_OPTIONS` / Red Hat 公式イメージの `JAVA_OPTS_APPEND`）、system-property を使わない、`TZ=Asia/Tokyo`・
+  tzdata・`/etc/localtime`、`%d{yyyy-MM-dd HH:mm:ss,SSSZ}`、CloudWatch Agent の `%z` など
+- **確認コマンド**：コンテナ内（`date` / `/proc/<PID>/cmdline` / `stat`）、`jboss-cli`（`input-arguments` /
+  `/system-property=user.timezone:read-resource`）、ECS Exec、`aws logs filter-log-events`、エージェントのログ
+
+```
+── 2. JVM の既定タイムゾーン (server.log の切替時刻と行頭の時刻を決める) ──
+  [JST]    -Duser.timezone (JVM の起動引数) : Asia/Tokyo
+             指定元: /opt/jboss-eap/bin/standalone.conf の 73 行目
+  [JST]    JVM の既定タイムゾーン (実効) : Asia/Tokyo
+...
+── 5. CloudWatch Logs への転送 (CloudWatch Agent) ──
+  [UTC]    collect_list[1] の timezone : UTC
+...
+判定: 異常 (混在) — 一部だけが JST で、UTC の設定が残っています (JST 6 件 / UTC 5 件)。server.log の切替: 毎日 00:00 JST。CloudWatch Logs への転送の問題 3 件
+```
+
+#### コンテナ内で行うこと
+
+- コンテナへは何も置かず、`docker exec` でプローブ（POSIX sh。bash・dash・BusyBox ash で同じ結果）を実行します。
+  `/proc/<pid>/environ` は JVM と同じユーザーでしか読めないため、**JBoss EAP の JVM と同じ uid:gid** で実行します
+  （`server.log の FD 点検` と同じ）。出力を取るだけの実行なので `-i` を付けず、ダイアログの標準入力を奪いません
+- 環境変数・起動引数・system-properties は機微な値を含み得るため、**タイムゾーンに関わる値（`TZ` と
+  `-Duser.timezone`）だけ**を取り出します。ログファイルも行頭の日時だけを読み、本文は読みません。
+  コンテナ内のファイルは変更しません
+- `jboss-cli.sh` の接続先は `ログ設定の静的点検` と同じく port-offset を考慮します（backend サービスは既定で 19990。
+  `--backend-port-offset`）。接続できなくても、起動引数・環境変数・`/etc/localtime` からの推定で判定します
+- CloudWatch Agent の公式イメージは `FROM scratch` でシェルも zoneinfo も持たないため、`TZ` は `docker inspect`、
+  zoneinfo と `/etc/localtime` は `docker cp -L` で確かめます。zoneinfo が無いと `TZ=Asia/Tokyo` でも
+  `timezone:"Local"` は UTC として扱われる見込みです（`%z` でオフセットを読む構成を推奨します）
+
+#### 結果の Markdown 出力
+
+画面と同じ内容を Markdown（`.md`）で**既定で**出力します。出力先は `--log-rotation-tz-md FILE` の明示指定 →
+`--report-dir` 配下の `build_and_verify_<日時>_log_rotation_tz_<サービス名>.md` → 一時ディレクトリの順で、
+実際のパスを画面へ表示します。同じサービスを繰り返し点検した場合は連番を付けて上書きしないため、
+設定を直す前と後の結果を見比べられます。`--no-log-rotation-tz-md` で画面表示だけにできます。
+
+Markdown には、見出し（Compose サービス・コンテナ・実行ユーザー・判定・集計）、時刻設定の一覧表
+（区分・項目・値・判定・集計対象・補足）、指摘と追加情報（問題があるときだけ）、このサービスの `server.log` 以外を
+収集する `collect_list`、点検の方法、コンテナ内で集めた値（機微な値は伏せ字）を記載します。判定不能で終わった
+場合も、そこまでに分かった内容を残します。
 
 ### EFS マウント伝播確認（偽装バッチサーバー経由）
 

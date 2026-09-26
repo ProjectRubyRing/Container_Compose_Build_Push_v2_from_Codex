@@ -1365,6 +1365,22 @@ JBOSS_MANAGEMENT_HTTP_PORT="9990"        # management-http の既定ポート
 BACKEND_PORT_OFFSET="10000"              # --backend-port-offset: backend の port-offset
 BACKEND_PORT_OFFSET_KEYWORD="backend"    # port-offset を加算するサービス名のキーワード
 
+# ---- ログローテーションのタイムゾーン点検 (UTC / JST) ---------------------------
+# JBoss EAP の server.log は、periodic-rotating-file-handler が生成された瞬間の JVM の
+# 既定タイムゾーンで日付を区切る (ハンドラにタイムゾーン属性は無い)。JVM が UTC の
+# ままだと切替は JST の 9:00 になり、server.log.<前日> に JST 0:00〜8:59 のログが入る。
+# logs モードの操作として、JBoss EAP のコンテナ (frontend / backend) で OS (TZ・
+# /etc/localtime・tzdata)・JVM (-Duser.timezone)・EAP ロギング (suffix・%d・zone-id)・
+# 実際のログファイル・CloudWatch Agent (timezone・timestamp_format) の時刻設定を集め、
+# 1 件ずつ UTC / JST を判定する。問題があれば影響・対処・確認コマンドも示す。
+# 結果は画面と同じ内容を Markdown へ既定で出力する。
+# 出力先は --log-rotation-tz-md > --report-dir 配下 > 一時ディレクトリ の順。
+LOG_ROTATION_TZ_MD=""                # Markdown の出力先。空なら自動命名する
+LOG_ROTATION_TZ_MD_SET="false"       # 出力先が明示指定されたか
+LOG_ROTATION_TZ_MD_ENABLED="true"    # false (--no-log-rotation-tz-md): 出力しない
+LOG_ROTATION_TZ_MD_OUTPUT=""         # 直近に出力した Markdown のパス
+LOG_ROTATION_TZ_ROTATED_LIMIT="7"    # 実測で読むローテート済みファイルの数 (新しい順)
+
 # ---- WAR デプロイ時 Java 例外解析 ---------------------------------------------
 # JBoss EAP は standalone/deployments 配下の WAR を展開し、記述子の解析・モジュール
 # 依存の解決・CDI / JPA / Servlet の初期化を MSC サービスとして起動する。この過程で
@@ -4421,7 +4437,29 @@ JBoss マスターパスワードの伝搬検証:
                                     出力する (--report-dir が無ければ一時
                                     ディレクトリ。繰り返すと連番を付ける)。
                                     この 2 つは既存の番号を変えないよう、
-                                    操作一覧の最後に並ぶ
+                                    操作一覧の最後に並ぶ。
+                                    同じ JBoss EAP のコンテナでは
+                                    「ログローテーションのタイムゾーン点検」
+                                    も選択でき、server.log の日次ローテー
+                                    ションに関係する時刻設定 (OS の TZ・
+                                    /etc/localtime・tzdata、JVM の
+                                    -Duser.timezone、EAP ロギングの suffix・
+                                    %d・zone-id、実際のログファイル、
+                                    CloudWatch Agent の timezone・
+                                    timestamp_format) を集めて 1 件ずつ
+                                    UTC / JST を判定し、すべて JST か・
+                                    すべて UTC か・混在かを表示する。
+                                    問題 (UTC の設定・一部だけ JST・
+                                    CloudWatch Logs への転送時のずれや拒否)
+                                    があれば、影響・対処・確認コマンドの
+                                    追加情報も表示する。結果は既定で
+                                    --report-dir 配下の build_and_verify_
+                                    <日時>_log_rotation_tz_<サービス名>.md
+                                    へ Markdown で出力する
+                                    (--log-rotation-tz-md /
+                                     --no-log-rotation-tz-md)。
+                                    ログ設定の静的点検の後ろ (操作一覧の
+                                    最後) に並ぶ
                                     偽装バッチサーバー (batch-mock) が起動して
                                     いれば、同じ EFS をマウントするサービスと
                                     偽装バッチサーバー自身で
@@ -4625,7 +4663,10 @@ JBoss マスターパスワードの伝搬検証:
                            DIR/build_and_verify_<日時>_server_log_fd_<サービス名>.txt /
                            DIR/build_and_verify_<日時>_logging_config_audit_<サービス名>.txt
                            へ出力する (こちらも --report-dir が無ければ一時
-                           ディレクトリ。繰り返すと連番を付けて上書きしない)
+                           ディレクトリ。繰り返すと連番を付けて上書きしない)。
+                           「ログローテーションのタイムゾーン点検」の結果は
+                           DIR/build_and_verify_<日時>_log_rotation_tz_<サービス名>.md
+                           (Markdown) へ既定で出力する (--no-log-rotation-tz-md で抑制)
   --cert-check-text FILE   証明書チェック (--keep-container-mode logs の操作) の
                            結果を FILE へ出力する。受領した自己証明書の詳細
                            (種別・X.509 バージョン・トラストアンカー可否・全項目) と
@@ -4677,6 +4718,20 @@ JBoss マスターパスワードの伝搬検証:
                            まま。JVM の引数に -Djboss.socket.binding.port-offset が
                            あれば、サービスによらずそちらを優先する。
                            0 を指定すると backend も 9990 へ接続する
+  --log-rotation-tz-md FILE
+                           ログローテーションのタイムゾーン点検
+                           (--keep-container-mode logs の操作) の結果を FILE へ
+                           Markdown で出力する。時刻設定の一覧 (OS / JVM /
+                           EAP ロギング / 実際のログファイル / CloudWatch Agent
+                           ごとの値と UTC・JST の判定)、判定、指摘と追加情報を、
+                           画面と同じ内容で残す。
+                           未指定時は --report-dir 配下の
+                           DIR/build_and_verify_<日時>_log_rotation_tz_<サービス名>.md、
+                           --report-dir も無い場合は一時ディレクトリへ出力し、
+                           そのパスを画面へ表示する。同じサービスを繰り返し
+                           点検したときは連番を足し、前回の結果を上書きしない
+  --no-log-rotation-tz-md  ログローテーションのタイムゾーン点検の Markdown 出力を
+                           行わない (画面表示だけにする)
 
 Valkey (Redis 互換) の操作・登録内容の確認:
   (--keep-container-mode logs の「Valkey 操作」と、同メニューの bash 接続で使う。
@@ -5344,6 +5399,9 @@ while [ $# -gt 0 ]; do
     --jboss-config-file)    need_value "$1" $#; JBOSS_CONFIG_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --jboss-cli-path)       need_value "$1" $#; JBOSS_CLI_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --backend-port-offset)  need_value "$1" $#; BACKEND_PORT_OFFSET="$2"; shift 2 ;;
+    --log-rotation-tz-md)  need_value "$1" $#; LOG_ROTATION_TZ_MD="$2"; LOG_ROTATION_TZ_MD_SET="true"; shift 2 ;;
+    --no-log-rotation-tz-md)
+                           LOG_ROTATION_TZ_MD_ENABLED="false"; shift ;;
     --jboss-elytron-tool)   need_value "$1" $#; JBOSS_ELYTRON_TOOL_PATH="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --jboss-credential-store) need_value "$1" $#; JBOSS_CREDENTIAL_STORE_FILE="$2"; VERIFY_JBOSS_PASSWORD="true"; shift 2 ;;
     --verify-startup)      VERIFY_STARTUP="true"; shift ;;
@@ -5733,6 +5791,16 @@ if [ "$TRUSTSTORE_INVENTORY_TEXT_SET" = "true" ]; then
   fi
   if [ "$TRUSTSTORE_INVENTORY_TEXT_ENABLED" != "true" ]; then
     err "--truststore-inventory-text と --no-truststore-inventory-text は同時に指定できません。"
+    exit 2
+  fi
+fi
+if [ "$LOG_ROTATION_TZ_MD_SET" = "true" ]; then
+  if [ -z "$LOG_ROTATION_TZ_MD" ] || [ "$LOG_ROTATION_TZ_MD" = "-" ]; then
+    err "--log-rotation-tz-md にはファイルパスを指定してください: $LOG_ROTATION_TZ_MD"
+    exit 2
+  fi
+  if [ "$LOG_ROTATION_TZ_MD_ENABLED" != "true" ]; then
+    err "--log-rotation-tz-md と --no-log-rotation-tz-md は同時に指定できません。"
     exit 2
   fi
 fi
@@ -21782,6 +21850,2896 @@ LOGGING_CONFIG_AUDIT_SCRIPT
   return 0
 }
 
+# ---- ログローテーションのタイムゾーン点検 (UTC / JST) --------------------------
+# JBoss EAP の server.log は、periodic-rotating-file-handler が「生成された瞬間の JVM の
+# 既定タイムゾーン」で日付を区切る (ハンドラにタイムゾーン属性は無い)。JVM が UTC の
+# ままだと切替は JST の 9:00 になり、server.log.<前日> に JST 0:00〜8:59 のログが入る。
+# JVM を JST にしても、OS (TZ・/etc/localtime・tzdata) や CloudWatch Agent (timezone・
+# timestamp_format) が UTC のままだと、date・cron の時刻や CloudWatch Logs のイベント
+# 時刻が 9 時間ずれる。JST の行を UTC として読むとイベント時刻が 9 時間未来になり、
+# 2 時間より先のイベントは PutLogEvents で拒否されて CloudWatch Logs に残らない。
+# この操作は、関係する時刻設定を OS → JVM → EAP ロギング → 実際のログファイル →
+# CloudWatch Agent の順に集めて 1 件ずつ UTC / JST を判定し、画面と Markdown へ出す。
+# 観点は別プロジェクト JBossEAP_TimeSetting の「JBoss EAP server.log 日次ローテーション
+# とタイムゾーン（JST）完全ガイド」(4 つの時計の層・設定箇所一覧・チェックリスト) と、
+# JBossEAP_LogRotate の分析 (RC-1: UTC 境界 / RC-4: CloudWatch Agent の解釈) に合わせる。
+# 対象サービスの判定は JBoss モジュール一覧と同じ (frontend / backend の JBoss EAP)。
+# コンテナ内のファイルは一切変更しない (読むだけ)。
+
+# 点検結果 (Markdown) の出力先を決める。
+#   --log-rotation-tz-md の明示指定 > --report-dir 配下 > 一時ディレクトリ
+# 日付をまたぐ前後や設定変更の前後で見比べられるよう、既存ファイルがあれば連番を足し、
+# 前回の結果を上書きしない。
+resolve_log_rotation_tz_md_path() {
+  local service_name="$1"
+  local safe_name base dir_part base_name prefix extension candidate counter=1
+
+  safe_name="$(printf '%s' "$service_name" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ "$LOG_ROTATION_TZ_MD_SET" = "true" ]; then
+    base="$LOG_ROTATION_TZ_MD"
+  elif [ -n "$BUILD_REPORT_DIR" ]; then
+    base="${BUILD_REPORT_DIR%/}/build_and_verify_${RUN_TIMESTAMP}_log_rotation_tz_${safe_name}.md"
+  else
+    # 出力先の指定が無くても、結果は設定を直した後と見比べたくなるので
+    # 一時ディレクトリへ必ず残し、そのパスを画面へ示す。
+    base="${TMPDIR:-/tmp}"
+    base="${base%/}/build_and_verify_${RUN_TIMESTAMP}_log_rotation_tz_${safe_name}.md"
+  fi
+
+  dir_part="$(dirname -- "$base")"
+  base_name="$(basename -- "$base")"
+  case "$base_name" in
+    ?*.*) prefix="${base_name%.*}"; extension=".${base_name##*.}" ;;
+    *)    prefix="$base_name";      extension="" ;;
+  esac
+  candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${dir_part%/}/${prefix}_${counter}${extension}"
+    counter=$((counter + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+# ---- 判定に使う小さな道具 (外部コマンドを使わない) ------------------------------
+# 1 件ごとに date -d や sed を起動すると Git Bash では極端に遅く、date -d の TZ の扱いも
+# 環境で揺れるため、暦の計算はシェルの算術だけで行う。
+
+# 暦日時 (UTC とみなす) を UNIX 時刻へ変換して LTZ_EPOCH へ入れる。
+#   $1 = 年 / $2 = 月 / $3 = 日 / $4 = 時 / $5 = 分 / $6 = 秒
+ltz_epoch_utc() {
+  local y=$((10#$1)) mo=$((10#$2)) d=$((10#$3)) era yoe doy doe mp
+  if [ "$mo" -le 2 ]; then
+    y=$(( y - 1 ))
+  fi
+  era=$(( (y >= 0 ? y : y - 399) / 400 ))
+  yoe=$(( y - era * 400 ))
+  mp=$(( mo > 2 ? mo - 3 : mo + 9 ))
+  doy=$(( (153 * mp + 2) / 5 + d - 1 ))
+  doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+  LTZ_EPOCH=$(( (era * 146097 + doe - 719468) * 86400 + 10#$4 * 3600 + 10#$5 * 60 + 10#$6 ))
+}
+
+# UNIX 時刻を JST の "YYYY-MM-DD HH:MM:SS JST" にして LTZ_FMT へ入れる。
+ltz_format_epoch_jst() {
+  local t=$(( $1 + 32400 )) days secs z era doe yoe doy mp d mo y
+  days=$(( t / 86400 ))
+  secs=$(( t % 86400 ))
+  if [ "$secs" -lt 0 ]; then
+    secs=$(( secs + 86400 ))
+    days=$(( days - 1 ))
+  fi
+  z=$(( days + 719468 ))
+  era=$(( (z >= 0 ? z : z - 146096) / 146097 ))
+  doe=$(( z - era * 146097 ))
+  yoe=$(( (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 ))
+  y=$(( yoe + era * 400 ))
+  doy=$(( doe - (365 * yoe + yoe / 4 - yoe / 100) ))
+  mp=$(( (5 * doy + 2) / 153 ))
+  d=$(( doy - (153 * mp + 2) / 5 + 1 ))
+  mo=$(( mp < 10 ? mp + 3 : mp - 9 ))
+  if [ "$mo" -le 2 ]; then
+    y=$(( y + 1 ))
+  fi
+  printf -v LTZ_FMT '%04d-%02d-%02d %02d:%02d:%02d JST' "$y" "$mo" "$d" \
+    $(( secs / 3600 )) $(( secs % 3600 / 60 )) $(( secs % 60 ))
+}
+
+# ログ行の日時 (yyyy-MM-dd HH:mm:ss[,SSS][ ][+09:00|+0900|Z]) を読む。
+#   LTZ_TS_NAIVE      = 行の時刻を UTC とみなした UNIX 時刻 (オフセットは足し引きしない)
+#   LTZ_TS_OFFSET     = 行に書かれたオフセット (無ければ空)
+#   LTZ_TS_OFFSET_SEC = そのオフセットの秒数 (無ければ空)
+LTZ_TS_RE='^([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})([.,][0-9]+)? ?(Z|[+-][0-9]{2}(:?[0-9]{2})?)?$'
+ltz_parse_ts() {
+  local sign digits oh om
+  LTZ_TS_NAIVE=""
+  LTZ_TS_OFFSET=""
+  LTZ_TS_OFFSET_SEC=""
+  [[ "$1" =~ $LTZ_TS_RE ]] || return 1
+  LTZ_TS_OFFSET="${BASH_REMATCH[8]:-}"
+  ltz_epoch_utc "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+    "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"
+  LTZ_TS_NAIVE="$LTZ_EPOCH"
+  case "$LTZ_TS_OFFSET" in
+    '') ;;
+    Z) LTZ_TS_OFFSET_SEC=0 ;;
+    *)
+      sign="${LTZ_TS_OFFSET:0:1}"
+      digits="${LTZ_TS_OFFSET:1}"
+      digits="${digits/:/}"
+      oh="${digits:0:2}"
+      om="${digits:2:2}"
+      LTZ_TS_OFFSET_SEC=$(( 10#$oh * 3600 + 10#${om:-0} * 60 ))
+      if [ "$sign" = "-" ]; then
+        LTZ_TS_OFFSET_SEC=$(( -LTZ_TS_OFFSET_SEC ))
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# 行の時刻を実際の時刻 (UNIX 時刻) へ直して LTZ_INSTANT へ入れる。行にオフセットが
+# あればそれを使い、無ければ $2 (JST / UTC) の時刻とみなす。分からなければ 1 を返す。
+ltz_line_instant() {
+  LTZ_INSTANT=""
+  ltz_parse_ts "$1" || return 1
+  if [ -n "$LTZ_TS_OFFSET_SEC" ]; then
+    LTZ_INSTANT=$(( LTZ_TS_NAIVE - LTZ_TS_OFFSET_SEC ))
+    return 0
+  fi
+  case "$2" in
+    JST) LTZ_INSTANT=$(( LTZ_TS_NAIVE - 32400 )) ;;
+    UTC) LTZ_INSTANT="$LTZ_TS_NAIVE" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# 秒数のオフセットを JST / UTC / OTHER へ分類して LTZ_CLASS へ入れる。
+ltz_offset_seconds_class() {
+  case "$1" in
+    32400) LTZ_CLASS="JST" ;;
+    0|-0)  LTZ_CLASS="UTC" ;;
+    '')    LTZ_CLASS="UNKNOWN" ;;
+    *)     LTZ_CLASS="OTHER" ;;
+  esac
+}
+
+# date +%z の結果 (+0900 など) を分類して LTZ_CLASS へ入れる。
+ltz_offset_class() {
+  case "$1" in
+    +0900|+09:00|+09) LTZ_CLASS="JST" ;;
+    +0000|-0000|+00:00|-00:00|+00|-00|Z) LTZ_CLASS="UTC" ;;
+    '') LTZ_CLASS="UNKNOWN" ;;
+    *) LTZ_CLASS="OTHER" ;;
+  esac
+}
+
+# TZif の末尾にある POSIX 形式の規則 (JST-9 / UTC0 / <+09>-9) を分類する。
+# POSIX 形式は UTC からの差を西向きの正で書くため、JST は -9 になる。
+ltz_posix_rule_class() {
+  local rule="$1" re='^(<[^>]*>|[A-Za-z]+)([+-]?)([0-9]+)(:[0-9]+)?' hours minutes
+  if [[ "$rule" =~ $re ]]; then
+    hours=$(( 10#${BASH_REMATCH[3]} ))
+    minutes="${BASH_REMATCH[4]:-}"
+    minutes="${minutes#:}"
+    minutes=$(( 10#${minutes:-0} ))
+    if [ "$hours" -eq 0 ] && [ "$minutes" -eq 0 ]; then
+      LTZ_CLASS="UTC"
+    elif [ "${BASH_REMATCH[2]}" = "-" ] && [ "$hours" -eq 9 ] && [ "$minutes" -eq 0 ]; then
+      LTZ_CLASS="JST"
+    else
+      LTZ_CLASS="OTHER"
+    fi
+  else
+    LTZ_CLASS="UNKNOWN"
+  fi
+}
+
+# Java (JVM) がタイムゾーン ID をどう解釈するか。LTZ_CLASS = JST / UTC / OTHER / INVALID。
+# INVALID は Java が ID を解決できない値で、JVM は OS のオフセットから GMT±hh:mm を作る
+# (例: JST-9 や UTC+9 は Java の ID ではない)。
+ltz_java_zone_class() {
+  local id="${1#:}"
+  id="${id#posix/}"
+  case "$id" in
+    Asia/Tokyo|Japan|JST|Etc/GMT-9|GMT+9|GMT+09|GMT+9:00|GMT+09:00|GMT+0900)
+      LTZ_CLASS="JST" ;;
+    UTC|Etc/UTC|UCT|Etc/UCT|GMT|Etc/GMT|GMT0|Etc/GMT0|Etc/GMT+0|Etc/GMT-0|Greenwich|Etc/Greenwich|Universal|Etc/Universal|Zulu|Etc/Zulu|GMT+0|GMT-0|GMT+00|GMT-00|GMT+0:00|GMT-0:00|GMT+00:00|GMT-00:00|GMT+0000|GMT-0000)
+      LTZ_CLASS="UTC" ;;
+    GMT[+-][0-9]*)
+      LTZ_CLASS="OTHER" ;;
+    ?*/?*)
+      LTZ_CLASS="OTHER" ;;
+    *)
+      LTZ_CLASS="INVALID" ;;
+  esac
+}
+
+# 判定の表示名。画面の見出しは桁をそろえるため、幅 8 の表記も用意する。
+ltz_class_label() {
+  case "$1" in
+    JST)     LTZ_LABEL="JST";    LTZ_TAG="[JST]   " ;;
+    UTC)     LTZ_LABEL="UTC";    LTZ_TAG="[UTC]   " ;;
+    OTHER)   LTZ_LABEL="その他"; LTZ_TAG="[その他]" ;;
+    UNSET)   LTZ_LABEL="未設定"; LTZ_TAG="[未設定]" ;;
+    UNKNOWN) LTZ_LABEL="不明";   LTZ_TAG="[不明]  " ;;
+    *)       LTZ_LABEL="-";      LTZ_TAG="[ - ]   " ;;
+  esac
+}
+
+# 引用符 ('...') で囲んだ部分 (日時の文字として扱わない文字列) を取り除く。
+ltz_strip_quoted() {
+  local s="$1" re="^([^']*)'[^']*'(.*)$"
+  while [[ "$s" =~ $re ]]; do
+    s="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  done
+  LTZ_STRIPPED="$s"
+}
+
+# suffix (SimpleDateFormat) の一番細かい文字から、ローテーションの周期を決める
+# (jboss-logmanager の PeriodicRotatingFileHandler と同じ考え方)。
+ltz_suffix_period() {
+  ltz_strip_quoted "$1"
+  case "$LTZ_STRIPPED" in
+    *m*)      LTZ_PERIOD="minute" ;;
+    *[HhkK]*) LTZ_PERIOD="hour" ;;
+    *a*)      LTZ_PERIOD="halfday" ;;
+    *[dDFE]*) LTZ_PERIOD="day" ;;
+    *[wW]*)   LTZ_PERIOD="week" ;;
+    *M*)      LTZ_PERIOD="month" ;;
+    *y*)      LTZ_PERIOD="year" ;;
+    *)        LTZ_PERIOD="none" ;;
+  esac
+  case "$LTZ_PERIOD" in
+    minute)  LTZ_PERIOD_LABEL="毎分" ;;
+    hour)    LTZ_PERIOD_LABEL="毎時" ;;
+    halfday) LTZ_PERIOD_LABEL="半日ごと" ;;
+    day)     LTZ_PERIOD_LABEL="日次" ;;
+    week)    LTZ_PERIOD_LABEL="週次" ;;
+    month)   LTZ_PERIOD_LABEL="月次" ;;
+    year)    LTZ_PERIOD_LABEL="年次" ;;
+    *)       LTZ_PERIOD_LABEL="時刻による切替なし" ;;
+  esac
+}
+
+# 周期と JVM のタイムゾーンから、切替時刻を JST で言い表す。
+ltz_boundary_text() {
+  local period="$1" zone_class="$2" zone_id="$3"
+  case "$period:$zone_class" in
+    day:JST)  LTZ_TEXT="毎日 00:00 JST" ;;
+    day:UTC)  LTZ_TEXT="毎日 09:00 JST (= 00:00 UTC)" ;;
+    day:*)    LTZ_TEXT="毎日 00:00 (${zone_id:-JVM の既定タイムゾーン})" ;;
+    hour:*)   LTZ_TEXT="毎時 00 分 (ファイル名の「時」は ${zone_id:-JVM の既定タイムゾーン} の時刻)" ;;
+    halfday:JST) LTZ_TEXT="毎日 00:00 / 12:00 JST" ;;
+    halfday:UTC) LTZ_TEXT="毎日 09:00 / 21:00 JST (= 00:00 / 12:00 UTC)" ;;
+    month:JST) LTZ_TEXT="毎月 1 日 00:00 JST" ;;
+    month:UTC) LTZ_TEXT="毎月 1 日 09:00 JST (= 00:00 UTC)" ;;
+    none:*)   LTZ_TEXT="時刻による切替なし" ;;
+    *)        LTZ_TEXT="${LTZ_PERIOD_LABEL:-周期} (${zone_id:-JVM の既定タイムゾーン} で区切る)" ;;
+  esac
+}
+
+# pattern-formatter の %d{...} の中身を取り出す (%d だけなら既定の yyyy-MM-dd HH:mm:ss,SSS)。
+ltz_date_pattern_of() {
+  local re='%[-.0-9]*d\{([^}]*)\}'
+  LTZ_DATE_PATTERN=""
+  if [[ "$1" =~ $re ]]; then
+    LTZ_DATE_PATTERN="${BASH_REMATCH[1]}"
+  elif [[ "$1" == *%d* ]]; then
+    LTZ_DATE_PATTERN="yyyy-MM-dd HH:mm:ss,SSS"
+  fi
+}
+
+# 日時の書式が行にオフセットをどう出すか (LTZ_OFFSET_STYLE / LTZ_OFFSET_STYLE_LABEL)。
+#   Z → +0900 / XX → +0900 (UTC は Z) / XXX → +09:00 (UTC は Z) / X → +09 (UTC は Z)
+#   xx → +0900 / xxx → +09:00 / x → +09 / z → JST のような略号 / none → 出さない
+ltz_offset_style() {
+  ltz_strip_quoted "$1"
+  case "$LTZ_STRIPPED" in
+    *XXX*) LTZ_OFFSET_STYLE="XXX" ;;
+    *XX*)  LTZ_OFFSET_STYLE="XX" ;;
+    *X*)   LTZ_OFFSET_STYLE="X" ;;
+    *xxx*) LTZ_OFFSET_STYLE="xxx" ;;
+    *xx*)  LTZ_OFFSET_STYLE="xx" ;;
+    *x*)   LTZ_OFFSET_STYLE="x" ;;
+    *Z*)   LTZ_OFFSET_STYLE="Z" ;;
+    *z*)   LTZ_OFFSET_STYLE="z" ;;
+    *)     LTZ_OFFSET_STYLE="none" ;;
+  esac
+  case "$LTZ_OFFSET_STYLE" in
+    Z|xx) LTZ_OFFSET_STYLE_LABEL="オフセット +0900 形式" ;;
+    XX)   LTZ_OFFSET_STYLE_LABEL="オフセット +0900 形式 (UTC は Z)" ;;
+    XXX)  LTZ_OFFSET_STYLE_LABEL="オフセット +09:00 形式 (UTC は Z)" ;;
+    xxx)  LTZ_OFFSET_STYLE_LABEL="オフセット +09:00 形式" ;;
+    X|x)  LTZ_OFFSET_STYLE_LABEL="オフセット +09 形式" ;;
+    z)    LTZ_OFFSET_STYLE_LABEL="タイムゾーンの略号 (JST など)" ;;
+    *)    LTZ_OFFSET_STYLE_LABEL="オフセット表記なし" ;;
+  esac
+}
+
+# SimpleDateFormat の日時書式を、CloudWatch Agent の timestamp_format の記法へ読み替える
+# (比べるための読み替え。%-m / %m のような桁の違いは比較の前にそろえる)。
+ltz_java_pattern_to_strftime() {
+  local p="$1" out="" ch run i=0 j n=${#1}
+  while [ "$i" -lt "$n" ]; do
+    ch="${p:i:1}"
+    if [ "$ch" = "'" ]; then
+      j=$(( i + 1 ))
+      if [ "${p:j:1}" = "'" ]; then
+        out+="'"
+        i=$(( i + 2 ))
+        continue
+      fi
+      while [ "$j" -lt "$n" ] && [ "${p:j:1}" != "'" ]; do
+        out+="${p:j:1}"
+        j=$(( j + 1 ))
+      done
+      i=$(( j + 1 ))
+      continue
+    fi
+    case "$ch" in
+      [A-Za-z])
+        run=1
+        while [ "${p:i+run:1}" = "$ch" ]; do
+          run=$(( run + 1 ))
+        done
+        case "$ch" in
+          y) if [ "$run" -eq 2 ]; then out+="%y"; else out+="%Y"; fi ;;
+          M) case "$run" in 1|2) out+="%m" ;; 3) out+="%b" ;; *) out+="%B" ;; esac ;;
+          d) out+="%d" ;;
+          H) out+="%H" ;;
+          h) out+="%I" ;;
+          m) out+="%M" ;;
+          s) out+="%S" ;;
+          S) out+="%f" ;;
+          a) out+="%p" ;;
+          E) if [ "$run" -ge 4 ]; then out+="%A"; else out+="%a"; fi ;;
+          Z|X|x) out+="%z" ;;
+          z) out+="%Z" ;;
+          *) out+="?" ;;
+        esac
+        i=$(( i + run ))
+        ;;
+      *)
+        out+="$ch"
+        i=$(( i + 1 ))
+        ;;
+    esac
+  done
+  LTZ_STRFTIME="$out"
+}
+
+# CloudWatch Agent の file_path (glob) にパスが一致するか。** は * として扱う
+# (bash の * は / も含めて一致するため、エージェントより少し広めに当たる)。
+ltz_glob_match() {
+  local pattern="${2//\*\*/*}"
+  # shellcheck disable=SC2053
+  [[ "$1" == $pattern ]]
+}
+
+# "場所=値 / 場所=値 ..." の並びに、違う値が 2 つ以上あるか。
+ltz_values_differ() {
+  local rest="$1" part value first="" seen="false"
+  while [ -n "$rest" ]; do
+    part="${rest%% / *}"
+    if [ "$part" = "$rest" ]; then
+      rest=""
+    else
+      rest="${rest#* / }"
+    fi
+    value="${part#*=}"
+    if [ "$seen" = "false" ]; then
+      first="$value"
+      seen="true"
+    elif [ "$value" != "$first" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---- 点検結果の入れ物 --------------------------------------------------------
+ltz_reset_state() {
+  declare -gA LTZ_R=()
+  LTZ_JVM_ARG_TZ=()
+  LTZ_CLI_INPUT_TZ=()
+  LTZ_CLI_ERRORS=()
+  LTZ_CONF_TZ=()
+  LTZ_SYSPROP_XML=()
+  LTZ_HANDLERS=()
+  LTZ_FORMATTERS=()
+  LTZ_CUSTOMTZ=()
+  LTZ_ACCESSLOG=()
+  LTZ_ROTATED=()
+  LTZ_ITEMS=()
+  LTZ_FINDINGS=()
+  LTZ_CW_OTHER_ENTRIES=()
+  LTZ_JVM_ZONE_ID=""
+  LTZ_JVM_ZONE_CLASS="UNKNOWN"
+  LTZ_JVM_ZONE_SOURCE=""
+  LTZ_JVM_ARG=""
+  LTZ_LINE_ZONE_CLASS="UNKNOWN"
+  LTZ_LINE_EVIDENCE_CLASS="UNKNOWN"
+  LTZ_LINE_DATE_PATTERN=""
+  LTZ_LINE_OFFSET_STYLE="none"
+  LTZ_SERVER_HANDLER=""
+  LTZ_SERVER_PERIOD=""
+  LTZ_BOUNDARY_TEXT=""
+  LTZ_OS_CLASS="UNKNOWN"
+  LTZ_TZDATA_FINDING="false"
+  LTZ_CW_STATE=""
+  LTZ_CW_NOTE=""
+  LTZ_VERDICT_STATE=""
+  LTZ_VERDICT_TEXT=""
+  LTZ_COUNT_JST=0
+  LTZ_COUNT_UTC=0
+  LTZ_COUNT_OTHER=0
+  LTZ_COUNT_UNKNOWN=0
+  LTZ_PROBLEM_COUNT=0
+  LTZ_CW_PROBLEM_COUNT=0
+  LTZ_ROTATED_UTC=""
+  LTZ_ROTATED_AFTER=""
+}
+
+# 設定 1 件を記録する。
+#   $1 = 区分 (OS / JVM / EAP / 実測 / CloudWatch) / $2 = 項目 / $3 = 値
+#   $4 = 判定 (JST / UTC / OTHER / UNSET / UNKNOWN / NA) / $5 = 集計に含めるか (1 / 0)
+#   $6 = 補足
+ltz_item() {
+  LTZ_ITEMS+=("$1"$'\037'"$2"$'\037'"$3"$'\037'"$4"$'\037'"$5"$'\037'"${6:-}")
+}
+
+# 指摘・注意・情報を 1 件記録する。
+#   $1 = 重大度 (指摘 / 注意 / 情報) / $2 = 区分 / $3 = 見出し / $4 = 影響
+#   $5 = 対処 / $6 = 確認方法
+ltz_finding() {
+  LTZ_FINDINGS+=("$1"$'\037'"$2"$'\037'"$3"$'\037'"${4:-}"$'\037'"${5:-}"$'\037'"${6:-}")
+}
+
+# コンテナ内プローブのレコード (区切りは US) を読み込む。
+ltz_load_probe() {
+  local file="$1" last joined
+  local -a f=()
+  while IFS=$'\037' read -r -a f || [ ${#f[@]} -gt 0 ]; do
+    if [ ${#f[@]} -eq 0 ]; then
+      continue
+    fi
+    last=$(( ${#f[@]} - 1 ))
+    f[last]="${f[last]%$'\r'}"
+    # awk の出力は列数をそろえるため末尾に空の列が付く。後ろの read の最後の変数へ
+    # 区切り文字ごと入らないよう、末尾の空の列を落としておく。
+    while [ "$last" -gt 0 ] && [ -z "${f[last]}" ]; do
+      unset 'f[last]'
+      last=$(( last - 1 ))
+    done
+    case "${f[0]}:${f[1]:-}" in
+      meta:now)         LTZ_R[now]="${f[2]:-}" ;;
+      meta:user)        LTZ_R[probe_user]="${f[2]:-}" ;;
+      jvm:pid)          LTZ_R[jvm_pid]="${f[2]:-}" ;;
+      jvm:arg_tz)       LTZ_JVM_ARG_TZ+=("${f[2]:-}") ;;
+      jvm:env_readable) LTZ_R[env_readable]="${f[2]:-}" ;;
+      jvmenv:*|execenv:*)
+        LTZ_R["${f[0]}.${f[1]}.state"]="${f[2]:-}"
+        LTZ_R["${f[0]}.${f[1]}"]="${f[3]:-}"
+        ;;
+      os:localtime)
+        LTZ_R[lt_type]="${f[2]:-}"
+        LTZ_R[lt_target]="${f[3]:-}"
+        LTZ_R[lt_rule]="${f[4]:-}"
+        LTZ_R[lt_readable]="${f[5]:-}"
+        ;;
+      os:zoneinfo)
+        LTZ_R[zi_dir]="${f[2]:-}"
+        LTZ_R[zi_tokyo]="${f[3]:-}"
+        LTZ_R[zi_tokyo_rule]="${f[4]:-}"
+        ;;
+      os:date)
+        LTZ_R["date.${f[2]:-}.offset"]="${f[3]:-}"
+        LTZ_R["date.${f[2]:-}.abbr"]="${f[4]:-}"
+        LTZ_R["date.${f[2]:-}.state"]="${f[5]:-}"
+        LTZ_R["date.${f[2]:-}.value"]="${f[6]:-}"
+        ;;
+      os:etc_timezone)  LTZ_R[etc_timezone]="${f[2]:-}" ;;
+      cfg:jboss_home)   LTZ_R[jboss_home]="${f[2]:-}" ;;
+      cfg:config)       LTZ_R[config]="${f[2]:-}"; LTZ_R[config_readable]="${f[3]:-}" ;;
+      cfg:standalone_conf) LTZ_R[conf]="${f[2]:-}"; LTZ_R[conf_readable]="${f[3]:-}" ;;
+      cfg:conf_tz)      LTZ_CONF_TZ+=("${f[2]:-}"$'\037'"${f[3]:-}") ;;
+      sysprop:xml)      LTZ_SYSPROP_XML+=("${f[2]:-}") ;;
+      handler:*)
+        printf -v joined '%s\037' "${f[@]:1}"
+        LTZ_HANDLERS+=("${joined%$'\037'}")
+        ;;
+      formatter:*)
+        printf -v joined '%s\037' "${f[@]:1}"
+        LTZ_FORMATTERS+=("${joined%$'\037'}")
+        ;;
+      customtz:*)
+        printf -v joined '%s\037' "${f[@]:1}"
+        LTZ_CUSTOMTZ+=("${joined%$'\037'}")
+        ;;
+      accesslog:*)
+        printf -v joined '%s\037' "${f[@]:1}"
+        LTZ_ACCESSLOG+=("${joined%$'\037'}")
+        ;;
+      cli:path)         LTZ_R[cli_path]="${f[2]:-}" ;;
+      cli:controller)   LTZ_R[cli_controller]="${f[2]:-}"; LTZ_R[cli_controller_desc]="${f[3]:-}" ;;
+      cli:status)       LTZ_R[cli_status]="${f[2]:-}"; LTZ_R[cli_outcomes]="${f[3]:-}" ;;
+      cli:input_tz)     LTZ_CLI_INPUT_TZ+=("${f[2]:-}") ;;
+      cli:runtime_tz)   LTZ_R[cli_runtime_tz]="${f[2]:-}" ;;
+      cli:sysprop)      LTZ_R[cli_sysprop]="${f[2]:-}" ;;
+      cli:error)        LTZ_CLI_ERRORS+=("${f[2]:-}") ;;
+      log:dir)          LTZ_R[log_dir]="${f[2]:-}"; LTZ_R[log_dir_source]="${f[3]:-}" ;;
+      log:file)
+        LTZ_R[log_file]="${f[2]:-}"
+        LTZ_R[log_exists]="${f[3]:-}"
+        LTZ_R[log_mtime]="${f[4]:-}"
+        LTZ_R[log_size]="${f[5]:-}"
+        LTZ_R[log_first]="${f[6]:-}"
+        LTZ_R[log_last]="${f[7]:-}"
+        ;;
+      rotated:*)
+        printf -v joined '%s\037' "${f[@]:1}"
+        LTZ_ROTATED+=("${joined%$'\037'}")
+        ;;
+      end:*)            LTZ_R[end]="${f[1]:-}" ;;
+      error:*)          LTZ_R[error]="${f[2]:-}" ;;
+    esac
+    f=()
+  done < "$file"
+}
+
+# JVM プロセスの環境変数の値 (読めなければ docker exec の環境で代用)。
+#   LTZ_ENV_STATE = set / unset、LTZ_ENV_VALUE = 値 (*_OPTIONS は -Duser.timezone の値だけ)
+ltz_jvm_env() {
+  local prefix="jvmenv"
+  [ "${LTZ_R[env_readable]:-no}" = "yes" ] || prefix="execenv"
+  LTZ_ENV_STATE="${LTZ_R[$prefix.$1.state]:-unset}"
+  LTZ_ENV_VALUE="${LTZ_R[$prefix.$1]:-}"
+}
+
+# ---- 1. OS のタイムゾーン ----------------------------------------------------
+# glibc (date・シェル・cron・ヘルスチェック・ls -l / stat の表示) の時計。JVM は
+# -Duser.timezone が無いときだけ、ここ (TZ → /etc/localtime) を材料に使う。
+ltz_analyze_os() {
+  local label="TZ (JVM プロセスの環境変数)" note="" value cls offset abbr name_class
+  local tz_state tz_value exec_state exec_value lt_type lt_target lt_rule counted=1
+
+  ltz_jvm_env TZ
+  tz_state="$LTZ_ENV_STATE"
+  tz_value="$LTZ_ENV_VALUE"
+  exec_state="${LTZ_R[execenv.TZ.state]:-unset}"
+  exec_value="${LTZ_R[execenv.TZ]:-}"
+  offset="${LTZ_R[date.jvm.offset]:-}"
+  abbr="${LTZ_R[date.jvm.abbr]:-}"
+  if [ "${LTZ_R[env_readable]:-no}" != "yes" ]; then
+    label="TZ (コンテナの環境変数)"
+    note="JVM プロセスの環境を読めないため、docker exec の環境 (compose / Dockerfile の設定) で代用"
+  fi
+
+  if [ "$tz_state" = "set" ]; then
+    if [ -n "$offset" ]; then
+      ltz_java_zone_class "$tz_value"
+      name_class="$LTZ_CLASS"
+      ltz_offset_class "$offset"
+      if [ "$name_class" = "JST" ] && [ "$LTZ_CLASS" = "UTC" ]; then
+        note="JST の名前だが、OS はこの名前を解決できず UTC で動いている${note:+。${note}}"
+      fi
+    else
+      ltz_java_zone_class "$tz_value"
+      [ "$LTZ_CLASS" = "INVALID" ] && LTZ_CLASS="UNKNOWN"
+    fi
+    ltz_item "OS" "$label" "${tz_value:-(空)}" "$LTZ_CLASS" 1 \
+      "OS (glibc) の解釈: ${offset:-?} ${abbr}${note:+。${note}}"
+    case "$tz_value" in
+      JST)
+        ltz_finding "指摘" "OS" "TZ=JST は OS と JVM で解釈が違います" \
+          "glibc は JST をオフセットの無い不正な値として UTC で扱い (略号だけ JST と表示)、Java は古い 3 文字 ID として Asia/Tokyo と解釈します。date・cron・ヘルスチェック (UTC) と JVM (JST) の時計が 9 時間ずれます。" \
+          "TZ=Asia/Tokyo を指定してください (OS 側で使うには tzdata が必要です)。" \
+          "コンテナ内で date と date -u を比べ、9 時間ずれていること"
+        ;;
+      Etc/GMT+9)
+        ltz_finding "指摘" "OS" "TZ=Etc/GMT+9 は UTC-9 です" \
+          "POSIX の慣習で符号が逆になり、Etc/GMT+9 は UTC より 9 時間遅いタイムゾーンです (JST は Etc/GMT-9)。" \
+          "TZ=Asia/Tokyo を指定してください。" ""
+        ;;
+      JST-9|:JST-9)
+        ltz_finding "注意" "OS" "TZ=${tz_value} は POSIX 形式です" \
+          "OS は +9 時間で動きますが、Java は ID として見つけられず、OS のオフセットから GMT+09:00 を作ります。動作はしますが、どこで何を決めているかが読み取りにくくなります。" \
+          "TZ=Asia/Tokyo (IANA 名) を推奨します。" ""
+        ;;
+      Asia/Tokyo|:Asia/Tokyo|Japan|:Japan)
+        if [ "${LTZ_CLASS}" = "UTC" ]; then
+          LTZ_TZDATA_FINDING="true"
+          ltz_finding "指摘" "OS" "TZ=${tz_value} を OS が解釈できず、UTC で動いています" \
+            "コンテナに tzdata (/usr/share/zoneinfo/${tz_value}) が無いため、glibc は TZ を無視して UTC を使います (UBI 9 minimal / micro は zoneinfo を削除した UTC 専用のイメージです)。JVM は内蔵のデータで ${tz_value} を解決できるため気付きにくく、date・cron・ヘルスチェックだけが 9 時間ずれます。" \
+            "Dockerfile で tzdata を入れ直し (ubi9-minimal: microdnf -y reinstall tzdata / ubi9: dnf -y reinstall tzdata)、ビルドの最後に test -f /usr/share/zoneinfo/Asia/Tokyo で存在を確かめてください。" \
+            "コンテナ内で ls -l /usr/share/zoneinfo/Asia/Tokyo"
+        fi
+        ;;
+    esac
+  else
+    ltz_item "OS" "$label" "(未設定)" "UNSET" 0 \
+      "未設定のため /etc/localtime に従う${note:+。${note}}"
+  fi
+
+  # JVM プロセスの TZ と、compose / Dockerfile の TZ (docker exec の環境) が違う場合。
+  if [ "${LTZ_R[env_readable]:-no}" = "yes" ] \
+      && { [ "$exec_state" != "$tz_state" ] || [ "$exec_value" != "$tz_value" ]; }; then
+    if [ "$exec_state" = "set" ]; then
+      ltz_offset_class "${LTZ_R[date.exec.offset]:-}"
+      ltz_item "OS" "TZ (コンテナの環境変数: compose / Dockerfile)" "${exec_value:-(空)}" "$LTZ_CLASS" 1 \
+        "JVM プロセスの TZ (${tz_value:-未設定}) と違う。起動スクリプトが TZ を変えている"
+    else
+      ltz_item "OS" "TZ (コンテナの環境変数: compose / Dockerfile)" "(未設定)" "UNSET" 0 \
+        "JVM プロセスには TZ=${tz_value} がある (起動スクリプトが設定)"
+    fi
+    ltz_finding "注意" "OS" "JVM プロセスの TZ とコンテナの環境変数 TZ が違います" \
+      "compose / Dockerfile / タスク定義の TZ (${exec_value:-未設定}) ではなく、起動スクリプトが決めた TZ (${tz_value:-未設定}) で JVM が動いています。設定ファイルだけを見ると実際のタイムゾーンを読み違えます。" \
+      "TZ は compose の environment (ECS ではタスク定義の environment) の 1 か所で決め、起動スクリプトでは変えないでください。" ""
+  fi
+
+  # /etc/localtime
+  lt_type="${LTZ_R[lt_type]:-missing}"
+  lt_target="${LTZ_R[lt_target]:-}"
+  lt_rule="${LTZ_R[lt_rule]:-}"
+  note=""
+  case "$lt_type" in
+    symlink)
+      value="→ ${lt_target}"
+      if [ -n "$lt_rule" ]; then
+        ltz_posix_rule_class "$lt_rule"
+        cls="$LTZ_CLASS"
+        note="規則 ${lt_rule}"
+      else
+        case "$lt_target" in
+          */Asia/Tokyo|*/Japan) cls="JST" ;;
+          */UTC|*/Etc/UTC|*/UCT|*/Universal|*/Zulu|*/GMT|*/Etc/GMT|*/GMT0) cls="UTC" ;;
+          *) cls="UNKNOWN" ;;
+        esac
+        if [ "${LTZ_R[lt_readable]:-no}" != "yes" ]; then
+          note="リンク先がありません (tzdata が無い)。glibc はリンク先を読めないと UTC で動く"
+        fi
+      fi
+      ;;
+    file)
+      value="通常ファイル (ホストからのマウントかコピー)"
+      ltz_posix_rule_class "$lt_rule"
+      cls="$LTZ_CLASS"
+      note="規則 ${lt_rule:-不明}"
+      ;;
+    missing)
+      value="(ありません)"
+      cls="UNSET"
+      counted=0
+      note="無い場合、glibc は UTC で動く"
+      ;;
+    *)
+      value="(通常ファイルでもリンクでもありません)"
+      cls="UNKNOWN"
+      counted=0
+      ;;
+  esac
+  ltz_item "OS" "/etc/localtime" "$value" "$cls" "$counted" "$note"
+  LTZ_R[lt_class]="$cls"
+
+  # tzdata
+  if [ "${LTZ_R[zi_tokyo]:-no}" = "yes" ]; then
+    ltz_item "OS" "tzdata (/usr/share/zoneinfo/Asia/Tokyo)" "あり" "NA" 0 \
+      "規則 ${LTZ_R[zi_tokyo_rule]:-不明}"
+  else
+    ltz_item "OS" "tzdata (/usr/share/zoneinfo/Asia/Tokyo)" "なし" "NA" 0 \
+      "UBI 9 minimal / micro は zoneinfo を削除した UTC 専用。TZ=Asia/Tokyo でも OS 側は UTC のまま (JVM は内蔵のデータで解決できる)"
+  fi
+
+  # OS の実効タイムゾーン (JVM プロセスの TZ で date を実行した結果)
+  if [ -n "$offset" ]; then
+    ltz_offset_class "$offset"
+    LTZ_OS_CLASS="$LTZ_CLASS"
+    ltz_item "OS" "OS の実効タイムゾーン (date)" "${offset} ${abbr}" "$LTZ_CLASS" 1 \
+      "date・シェル・cron・ヘルスチェック・ls -l / stat の表示が使う時計"
+  else
+    LTZ_OS_CLASS="UNKNOWN"
+    ltz_item "OS" "OS の実効タイムゾーン (date)" "(date を実行できません)" "UNKNOWN" 0 ""
+  fi
+  if [ "${LTZ_R[etc_timezone]+x}" = "x" ]; then
+    ltz_item "OS" "/etc/timezone" "${LTZ_R[etc_timezone]}" "NA" 0 \
+      "Debian 系の設定ファイル。OpenJDK 21 と glibc は参照しない"
+  fi
+}
+
+# ---- 2. JVM の既定タイムゾーン -----------------------------------------------
+# JVM は -Duser.timezone → TZ → /etc/localtime → GMT の順で既定のタイムゾーンを決め、
+# 最初の 1 回でキャッシュする。ハンドラとフォーマッタは生成の瞬間にそれをコピーする。
+ltz_analyze_jvm() {
+  local arg="" source="" detail="" n cls note value id="" id_source="" runtime rcls
+  local entry line_no conf_value sysprop_value="" sysprop_defined="false" distinct=""
+
+  # 起動引数の -Duser.timezone。後から処理されたものが有効になる
+  # (JAVA_TOOL_OPTIONS < JDK_JAVA_OPTIONS < コマンドライン < _JAVA_OPTIONS)。
+  # 指定した場所ごとの値を distinct に並べ、違う値が混ざっていれば知らせる。
+  ltz_jvm_env JAVA_TOOL_OPTIONS
+  if [ -n "$LTZ_ENV_VALUE" ]; then
+    arg="$LTZ_ENV_VALUE"; source="環境変数 JAVA_TOOL_OPTIONS"
+    distinct="JAVA_TOOL_OPTIONS=${arg}"
+  fi
+  ltz_jvm_env JDK_JAVA_OPTIONS
+  if [ -n "$LTZ_ENV_VALUE" ]; then
+    arg="$LTZ_ENV_VALUE"; source="環境変数 JDK_JAVA_OPTIONS"
+    distinct="${distinct}${distinct:+ / }JDK_JAVA_OPTIONS=${arg}"
+  fi
+  n=${#LTZ_JVM_ARG_TZ[@]}
+  if [ "$n" -gt 0 ]; then
+    arg="${LTZ_JVM_ARG_TZ[n-1]}"
+    source="JVM の起動引数"
+    detail=""
+    for entry in "${LTZ_JVM_ARG_TZ[@]}"; do
+      distinct="${distinct}${distinct:+ / }起動引数=${entry}"
+    done
+    # 起動引数へ入れている場所の見当を付ける (standalone.conf / JAVA_OPTS / JAVA_OPTS_APPEND)。
+    for entry in ${LTZ_CONF_TZ[@]+"${LTZ_CONF_TZ[@]}"}; do
+      IFS=$'\037' read -r line_no conf_value <<< "$entry"
+      if [ "$conf_value" = "$arg" ]; then
+        detail="${LTZ_R[conf]:-standalone.conf} の ${line_no} 行目"
+        break
+      fi
+    done
+    if [ -z "$detail" ]; then
+      ltz_jvm_env JAVA_OPTS_APPEND
+      if [ "$LTZ_ENV_VALUE" = "$arg" ]; then
+        detail="環境変数 JAVA_OPTS_APPEND"
+      else
+        ltz_jvm_env JAVA_OPTS
+        [ "$LTZ_ENV_VALUE" = "$arg" ] && detail="環境変数 JAVA_OPTS"
+      fi
+    fi
+    source="${detail:-起動コマンド・起動スクリプト}"
+  fi
+  ltz_jvm_env _JAVA_OPTIONS
+  if [ -n "$LTZ_ENV_VALUE" ]; then
+    arg="$LTZ_ENV_VALUE"; source="環境変数 _JAVA_OPTIONS"
+    distinct="${distinct}${distinct:+ / }_JAVA_OPTIONS=${arg}"
+  fi
+  # jboss-cli の input-arguments は JVM が実際に受け取った引数 (環境変数由来も含む)。
+  n=${#LTZ_CLI_INPUT_TZ[@]}
+  if [ "$n" -gt 0 ] && [ "${LTZ_CLI_INPUT_TZ[n-1]}" != "$arg" ]; then
+    arg="${LTZ_CLI_INPUT_TZ[n-1]}"
+    source="jboss-cli の input-arguments"
+  fi
+  LTZ_JVM_ARG="$arg"
+
+  if [ -n "$arg" ]; then
+    ltz_java_zone_class "$arg"
+    cls="$LTZ_CLASS"
+    note="指定元: ${source}"
+    if [ "$cls" = "INVALID" ]; then
+      ltz_offset_class "${LTZ_R[date.jvm.offset]:-}"
+      cls="$LTZ_CLASS"
+      note="指定元: ${source}。Java の ID ではないため、JVM は OS のオフセット (${LTZ_R[date.jvm.offset]:-?}) から GMT±hh:mm を作る"
+    fi
+    ltz_item "JVM" "-Duser.timezone (JVM の起動引数)" "$arg" "$cls" 1 "$note"
+    if ltz_values_differ "$distinct"; then
+      ltz_finding "注意" "JVM" "-Duser.timezone が複数の場所で違う値に指定されています (${distinct})" \
+        "JVM は後から処理した指定 (${arg}) を使います。どれが効いているかを読み違えやすい状態です。" \
+        "指定は 1 か所 (standalone.conf の末尾、または JDK_JAVA_OPTIONS / JAVA_OPTS_APPEND のどれか 1 つ) にまとめてください。" \
+        "jboss-cli: /core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments)"
+    fi
+  else
+    ltz_item "JVM" "-Duser.timezone (JVM の起動引数)" "(指定なし)" "UNSET" 0 \
+      "起動引数・JDK_JAVA_OPTIONS・JAVA_TOOL_OPTIONS のどれにも無い"
+  fi
+
+  # standalone.xml の system-property user.timezone (効かない設定)
+  if [ ${#LTZ_SYSPROP_XML[@]} -gt 0 ]; then
+    sysprop_value="${LTZ_SYSPROP_XML[0]}"
+    sysprop_defined="true"
+  elif [ "${LTZ_R[cli_sysprop]:-}" = "defined" ]; then
+    sysprop_value="(値は jboss-cli で確認)"
+    sysprop_defined="true"
+  fi
+  if [ "$sysprop_defined" = "true" ]; then
+    ltz_java_zone_class "$sysprop_value"
+    cls="$LTZ_CLASS"
+    [ "$cls" = "INVALID" ] && cls="UNKNOWN"
+    ltz_item "JVM" "standalone.xml の system-property user.timezone" "$sysprop_value" "$cls" 1 \
+      "JVM の起動後に適用されるため、ハンドラの時計には効かない"
+    ltz_finding "指摘" "JVM" "standalone.xml の system-property user.timezone (${sysprop_value}) は効きません" \
+      "JVM の既定タイムゾーンはロガーの生成時 (standalone.xml を読む前) に決まるため、system-property での指定は手遅れです。System.getProperty と jboss-cli の system-properties だけが指定値を返し、実際の TimeZone.getDefault() は起動時のまま、という“見かけだけの設定”になります。" \
+      "jboss-cli で /system-property=user.timezone:remove を実行し、JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してください。" \
+      "jboss-cli: /system-property=user.timezone:read-resource が失敗 (未定義) になること"
+  else
+    ltz_item "JVM" "standalone.xml の system-property user.timezone" "(定義なし)" "NA" 0 \
+      "定義しないのが正しい状態"
+  fi
+
+  # JVM の既定タイムゾーン (実効) を決める。
+  if [ -n "$arg" ]; then
+    id="$arg"
+    id_source="起動引数の -Duser.timezone (指定元: ${source})"
+  else
+    ltz_jvm_env TZ
+    if [ "$LTZ_ENV_STATE" = "set" ] && [ -n "$LTZ_ENV_VALUE" ]; then
+      id="${LTZ_ENV_VALUE#:}"
+      id="${id#posix/}"
+      id_source="環境変数 TZ"
+    else
+      case "${LTZ_R[lt_type]:-missing}" in
+        symlink)
+          case "${LTZ_R[lt_target]:-}" in
+            *zoneinfo/*)
+              id="${LTZ_R[lt_target]#*zoneinfo/}"
+              id="${id#posix/}"
+              id_source="/etc/localtime のリンク先"
+              ;;
+            *)
+              id_source="/etc/localtime (zoneinfo の外を指すリンク)"
+              ;;
+          esac
+          ;;
+        file)
+          id_source="/etc/localtime (通常ファイル。JVM は同じ内容の zoneinfo のファイルを探す)"
+          ;;
+        *)
+          id="GMT"
+          id_source="TZ も /etc/localtime も無いため既定の GMT"
+          ;;
+      esac
+    fi
+  fi
+  if [ -n "$id" ]; then
+    ltz_java_zone_class "$id"
+    cls="$LTZ_CLASS"
+    if [ "$cls" = "INVALID" ]; then
+      ltz_offset_class "${LTZ_R[date.jvm.offset]:-}"
+      cls="$LTZ_CLASS"
+      case "$cls" in
+        JST) id="${id} → GMT+09:00" ;;
+        UTC) id="${id} → GMT" ;;
+        *)   id="${id} → GMT${LTZ_R[date.jvm.offset]:+ (${LTZ_R[date.jvm.offset]})}" ;;
+      esac
+      id_source="${id_source}。Java の ID ではないため OS のオフセットから作る"
+    fi
+  else
+    ltz_posix_rule_class "${LTZ_R[lt_rule]:-}"
+    cls="$LTZ_CLASS"
+    id="(/etc/localtime の規則 ${LTZ_R[lt_rule]:-不明} 相当)"
+  fi
+
+  # jboss-cli で取れた実行時の値 (JVM が決めた ID)。standalone.xml の system-property が
+  # あると値だけ上書きされるため、その場合は推定を優先する。
+  runtime="${LTZ_R[cli_runtime_tz]:-}"
+  if [ -n "$runtime" ]; then
+    ltz_java_zone_class "$runtime"
+    rcls="$LTZ_CLASS"
+    [ "$rcls" = "INVALID" ] && rcls="UNKNOWN"
+    if [ "$sysprop_defined" = "true" ]; then
+      ltz_item "JVM" "user.timezone (jboss-cli の実行時の値)" "$runtime" "$rcls" 0 \
+        "standalone.xml の system-property で上書きされた見かけの値の可能性がある"
+      if [ "$rcls" != "$cls" ]; then
+        ltz_finding "指摘" "JVM" "jboss-cli の user.timezone (${runtime}) は見かけだけの値です" \
+          "起動時に決まった JVM の既定タイムゾーンは ${id} (${id_source}) ですが、standalone.xml の system-property が user.timezone の値だけを ${runtime} に書き換えています。System.getProperty や管理コンソールの表示だけを見ると、実際と違うタイムゾーンで動いていると誤解します。" \
+          "system-property を削除し (/system-property=user.timezone:remove)、JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してください。" \
+          "jboss-cli: /core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments)"
+      fi
+    else
+      ltz_item "JVM" "user.timezone (jboss-cli の実行時の値)" "$runtime" "$rcls" 0 \
+        "JVM が決めたタイムゾーン ID"
+      if [ "$rcls" != "$cls" ] && [ "$rcls" != "UNKNOWN" ]; then
+        ltz_finding "注意" "JVM" "実行時の user.timezone (${runtime}) と推定 (${id}) が違います" \
+          "起動引数・環境変数・/etc/localtime からの推定と、JVM が実際に決めた値が一致しません。実行時の値を正として判定します。" \
+          "起動引数 (input-arguments) と環境変数 TZ を確認してください。" ""
+        id="$runtime"
+        cls="$rcls"
+        id_source="jboss-cli の実行時の値 (user.timezone)"
+      fi
+    fi
+  else
+    case "${LTZ_R[cli_status]:-}" in
+      '')
+        if [ -z "${LTZ_R[cli_path]:-}" ]; then
+          value="(jboss-cli.sh が見つかりません)"
+        else
+          value="(JVM が見つからないため実行していません)"
+        fi
+        ;;
+      0) value="(値を取り出せませんでした)" ;;
+      *) value="(jboss-cli.sh --connect が失敗しました: exit=${LTZ_R[cli_status]})" ;;
+    esac
+    ltz_item "JVM" "user.timezone (jboss-cli の実行時の値)" "$value" "NA" 0 \
+      "${LTZ_R[cli_controller]:+接続先 ${LTZ_R[cli_controller]}}"
+    if [ -n "${LTZ_R[cli_status]:-}" ] && [ "${LTZ_R[cli_status]}" != "0" ]; then
+      ltz_finding "情報" "JVM" "jboss-cli.sh で実行時の値を確認できませんでした (exit=${LTZ_R[cli_status]})" \
+        "起動引数・環境変数・/etc/localtime からの推定だけで判定しています。${LTZ_CLI_ERRORS[*]:+jboss-cli の出力: ${LTZ_CLI_ERRORS[*]}}" \
+        "AP サーバーが起動しているか、管理インターフェース (${LTZ_R[cli_controller]:-localhost:9990}) とこのユーザーでのローカル認証を確認してください。接続先は ${LTZ_R[cli_controller_desc]:-管理ポート 9990 + port-offset} として求めています (backend サービスの port-offset は --backend-port-offset、既定 10000)。" ""
+    fi
+  fi
+
+  LTZ_JVM_ZONE_ID="$id"
+  LTZ_JVM_ZONE_CLASS="$cls"
+  LTZ_JVM_ZONE_SOURCE="$id_source"
+  if [ -z "${LTZ_R[jvm_pid]:-}" ]; then
+    ltz_item "JVM" "JVM の既定タイムゾーン (実効)" "(JBoss EAP の JVM が見つかりません)" "UNKNOWN" 0 \
+      "設定から分かる範囲だけを表示しています"
+    LTZ_JVM_ZONE_CLASS="UNKNOWN"
+    return 0
+  fi
+  ltz_item "JVM" "JVM の既定タイムゾーン (実効)" "$id" "$cls" 1 "決め方: ${id_source}"
+
+  case "$cls" in
+    UTC)
+      ltz_finding "指摘" "JVM" "JVM の既定タイムゾーンが UTC です (${id})" \
+        "server.log の日付の区切りが JST の 9:00 (= UTC 0:00) になり、server.log.<前日> に JST 0:00〜8:59 のログが入ります。行頭の時刻 (%d) も UTC で出力されます。" \
+        "JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してください (standalone.conf の末尾に JAVA_OPTS=\"\$JAVA_OPTS -Duser.timezone=Asia/Tokyo\"、または環境変数 JDK_JAVA_OPTIONS / Red Hat 公式イメージの JAVA_OPTS_APPEND)。jboss-cli の /system-property=user.timezone では効きません。" \
+        "jboss-cli: /core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments) に -Duser.timezone=Asia/Tokyo があること"
+      ;;
+    OTHER)
+      ltz_finding "指摘" "JVM" "JVM の既定タイムゾーンが JST でも UTC でもありません (${id})" \
+        "server.log は ${id} の 0:00 で切り替わり、JST の日付とずれます。" \
+        "JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してください。" \
+        "jboss-cli: /core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments)"
+      ;;
+    JST)
+      if [ -z "$arg" ]; then
+        ltz_finding "注意" "JVM" "JVM は ${id_source} から JST になっています (起動引数に -Duser.timezone がありません)" \
+          "今は JST で動いていますが、JAVA_OPTS の上書きやイメージの差し替えで TZ・/etc/localtime が外れると、JVM は黙って UTC に戻ります。" \
+          "JVM の起動引数でも -Duser.timezone=Asia/Tokyo を渡してください (standalone.conf の末尾、JDK_JAVA_OPTIONS、Red Hat 公式イメージなら JAVA_OPTS_APPEND)。" ""
+      fi
+      ;;
+    *)
+      ltz_finding "注意" "JVM" "JVM の既定タイムゾーンを判定できませんでした (${id})" \
+        "JST か UTC かを確定できないため、ローテーションの境界も確定できません。" \
+        "起動引数で -Duser.timezone=Asia/Tokyo を明示してください。" \
+        "jboss-cli: /core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments)"
+      ;;
+  esac
+}
+
+# OS と JVM の時計が違う (混在) ときの指摘。
+ltz_analyze_os_jvm_mix() {
+  # tzdata が無いため TZ=Asia/Tokyo が効かない、という具体的な指摘を既に出していれば重ねない。
+  if [ "$LTZ_JVM_ZONE_CLASS" = "JST" ] && [ "$LTZ_OS_CLASS" = "UTC" ] \
+      && [ "$LTZ_TZDATA_FINDING" != "true" ]; then
+    ltz_finding "指摘" "OS" "OS (date・シェル・cron・ヘルスチェック) は UTC で動いています (JVM は JST)" \
+      "server.log の切替は JVM の JST で正しく行われますが、コンテナ内の date・ls -l・stat・cron の時刻が 9 時間ずれ、調査のときに読み違えます。起動引数の -Duser.timezone が外れた場合の保険 (JVM が 2 番目に見る TZ) もありません。" \
+      "TZ=Asia/Tokyo を compose の environment (ECS ではタスク定義の environment) で渡し、Dockerfile で tzdata と /etc/localtime (ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime) をそろえてください。" \
+      "コンテナ内で date が JST を表示すること"
+  elif [ "$LTZ_JVM_ZONE_CLASS" = "UTC" ] && [ "$LTZ_OS_CLASS" = "JST" ]; then
+    ltz_finding "指摘" "OS" "OS は JST ですが、JVM は UTC で動いています" \
+      "date・cron は JST なのに、server.log の行の時刻と切替は UTC です。コンテナ内の時刻とログの時刻が 9 時間ずれます。" \
+      "JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してください。" ""
+  elif [ "$LTZ_OS_CLASS" = "JST" ] && [ "${LTZ_R[lt_class]:-}" = "UTC" ]; then
+    ltz_finding "注意" "OS" "/etc/localtime が UTC のままです (TZ で JST に上書きされています)" \
+      "今は TZ で JST になっていますが、TZ を渡さずに起動したコンテナ (docker run のやり直し・別のタスク定義) では UTC に戻ります。" \
+      "Dockerfile で ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime を実行してください (tzdata が必要)。" \
+      "コンテナ内で ls -l /etc/localtime"
+  fi
+}
+
+# ---- 3. EAP のロギング -------------------------------------------------------
+# ハンドラ (切替) とフォーマッタ (%d) は、生成時の JVM の既定タイムゾーンを使う。
+# 例外は json-formatter / xml-formatter の zone-id と、custom-handler の timeZone。
+ltz_analyze_logging() {
+  local entry where name type rel path suffix fk fv counted is_server
+  local fname fkind fvalue fdate fmt_found="false" zone_id cls note
+  local server_fk="" server_fv="" server_name=""
+
+  if [ "${LTZ_R[config_readable]:-no}" != "yes" ]; then
+    ltz_item "EAP" "設定ファイル" "${LTZ_R[config]:-(不明)}" "UNKNOWN" 0 \
+      "読めないため、ハンドラとフォーマッタを点検できません"
+    ltz_finding "注意" "EAP" "設定ファイルを読めませんでした (${LTZ_R[config]:-不明})" \
+      "ハンドラの suffix とフォーマッタの %d を点検できていません。" \
+      "--jboss-config-file で standalone.xml のパスを指定してください。" ""
+    return 0
+  fi
+
+  for entry in ${LTZ_HANDLERS[@]+"${LTZ_HANDLERS[@]}"}; do
+    IFS=$'\037' read -r where name type rel path suffix fk fv <<< "$entry"
+    is_server="false"
+    if [ -z "$where" ] && [ "${path##*/}" = "$SERVER_LOG_CHECK_BASENAME" ]; then
+      is_server="true"
+    fi
+    counted=0
+    [ "$is_server" = "true" ] && counted=1
+    case "$type" in
+      periodic-rotating-file-handler|periodic-size-rotating-file-handler)
+        ltz_suffix_period "$suffix"
+        ltz_boundary_text "$LTZ_PERIOD" "$LTZ_JVM_ZONE_CLASS" "$LTZ_JVM_ZONE_ID"
+        ltz_item "EAP" "${name} (${type}${where:+ / ${where}}) の切替" \
+          "suffix=${suffix:-(なし)} (${LTZ_PERIOD_LABEL})" "$LTZ_JVM_ZONE_CLASS" "$counted" \
+          "ハンドラにタイムゾーン属性は無く、JVM の既定 (${LTZ_JVM_ZONE_ID:-不明}) で区切る → ${LTZ_TEXT}${path:+。出力先 ${rel:+${rel}/}${path}}"
+        if [ "$is_server" = "true" ] && [ -z "$LTZ_SERVER_HANDLER" ]; then
+          LTZ_SERVER_HANDLER="$name"
+          LTZ_SERVER_PERIOD="$LTZ_PERIOD"
+          LTZ_BOUNDARY_TEXT="$LTZ_TEXT"
+          server_fk="$fk"; server_fv="$fv"; server_name="$name"
+          case "$LTZ_PERIOD" in
+            day) ;;
+            none)
+              ltz_finding "注意" "EAP" "${name} の suffix (${suffix:-なし}) には日付がありません" \
+                "時刻によるローテーションが行われません。" \
+                "suffix=.yyyy-MM-dd を指定してください。" \
+                "jboss-cli: /subsystem=logging/${type}=${name}:read-attribute(name=suffix)"
+              ;;
+            *)
+              ltz_finding "情報" "EAP" "${name} の suffix (${suffix}) は ${LTZ_PERIOD_LABEL} のローテーションです" \
+                "日次 (.yyyy-MM-dd) ではありません。周期は suffix の一番細かい文字で決まります。" \
+                "日次にする場合は suffix=.yyyy-MM-dd を指定してください。" ""
+              ;;
+          esac
+        fi
+        ;;
+      size-rotating-file-handler)
+        ltz_item "EAP" "${name} (${type}${where:+ / ${where}})" "サイズだけで切替" "NA" 0 \
+          "時刻に依存しない"
+        if [ "$is_server" = "true" ] && [ -z "$LTZ_SERVER_HANDLER" ]; then
+          LTZ_SERVER_HANDLER="$name"; LTZ_SERVER_PERIOD="none"
+          LTZ_BOUNDARY_TEXT="サイズだけで切替 (時刻に依存しない)"
+          server_fk="$fk"; server_fv="$fv"; server_name="$name"
+        fi
+        ;;
+      file-handler)
+        ltz_item "EAP" "${name} (${type}${where:+ / ${where}})" "ローテーションしない" "NA" 0 ""
+        if [ "$is_server" = "true" ] && [ -z "$LTZ_SERVER_HANDLER" ]; then
+          LTZ_SERVER_HANDLER="$name"; LTZ_SERVER_PERIOD="none"
+          LTZ_BOUNDARY_TEXT="ローテーションしない"
+          server_fk="$fk"; server_fv="$fv"; server_name="$name"
+        fi
+        ;;
+      *)
+        ltz_item "EAP" "${name} (${type}${where:+ / ${where}})" "(時刻の設定なし)" "NA" 0 ""
+        ;;
+    esac
+  done
+  if [ -z "$LTZ_SERVER_HANDLER" ]; then
+    ltz_finding "注意" "EAP" "${SERVER_LOG_CHECK_BASENAME} を書くハンドラが ${LTZ_R[config]:-standalone.xml} に見つかりません" \
+      "ローテーションの周期と行頭の書式を点検できていません。" \
+      "logging subsystem の FILE ハンドラ (periodic-rotating-file-handler) の file / suffix を確認してください。" \
+      "jboss-cli: /subsystem=logging:read-resource(recursive=true)"
+  fi
+
+  # server.log の行頭の時刻 (フォーマッタ)。
+  fkind=""; fvalue=""; fdate=""; fname="$server_fk"
+  case "$server_fk" in
+    named)
+      fname="$server_fv"
+      for entry in ${LTZ_FORMATTERS[@]+"${LTZ_FORMATTERS[@]}"}; do
+        IFS=$'\037' read -r name fkind fvalue fdate <<< "$entry"
+        if [ "$name" = "$server_fv" ]; then
+          fmt_found="true"
+          break
+        fi
+      done
+      [ "$fmt_found" = "true" ] || { fkind=""; fvalue=""; fdate=""; }
+      ;;
+    inline)
+      fname="(ハンドラ内の pattern-formatter)"
+      fkind="pattern"; fvalue="$server_fv"; fmt_found="true"
+      ;;
+  esac
+  LTZ_LINE_ZONE_CLASS="$LTZ_JVM_ZONE_CLASS"
+  if [ -n "$server_name" ]; then
+    case "$fkind" in
+      pattern)
+        ltz_date_pattern_of "$fvalue"
+        LTZ_LINE_DATE_PATTERN="$LTZ_DATE_PATTERN"
+        if [ -n "$LTZ_DATE_PATTERN" ]; then
+          ltz_offset_style "$LTZ_DATE_PATTERN"
+          LTZ_LINE_OFFSET_STYLE="$LTZ_OFFSET_STYLE"
+          ltz_item "EAP" "${fname} の %d (${SERVER_LOG_CHECK_BASENAME} の行頭の時刻)" \
+            "%d{${LTZ_DATE_PATTERN}} (${LTZ_OFFSET_STYLE_LABEL})" "$LTZ_JVM_ZONE_CLASS" 1 \
+            "行頭の時刻は JVM の既定 (${LTZ_JVM_ZONE_ID:-不明}) で出力"
+          if [ "$LTZ_OFFSET_STYLE" = "none" ]; then
+            ltz_finding "注意" "EAP" "${fname} の %d にオフセットがありません (%d{${LTZ_DATE_PATTERN}})" \
+              "行を見ただけでは JST か UTC か分からず、CloudWatch Agent は timezone の設定に頼って時刻を解釈します (解釈を誤るとイベント時刻が 9 時間ずれます)。" \
+              "%d の末尾に Z を付けてください (例: %d{yyyy-MM-dd HH:mm:ss,SSSZ} → +0900)。CloudWatch Agent の %z は -0700 形式だけを解釈するため、XXX (+09:00) より Z を推奨します。行の形が変わるので、メトリクスフィルターやパーサーの正規表現も合わせて直してください。" \
+              "${SERVER_LOG_CHECK_BASENAME} の行頭が +0900 になること"
+          fi
+        else
+          ltz_item "EAP" "${fname} の書式 (${SERVER_LOG_CHECK_BASENAME} の行頭)" "$fvalue" "NA" 0 \
+            "%d (日時) がありません"
+        fi
+        ;;
+      json|xml)
+        zone_id="$fvalue"
+        if [ -n "$zone_id" ]; then
+          ltz_java_zone_class "$zone_id"
+          cls="$LTZ_CLASS"
+          [ "$cls" = "INVALID" ] && cls="UNKNOWN"
+          LTZ_LINE_ZONE_CLASS="$cls"
+          ltz_item "EAP" "${fname} (${fkind}-formatter) の zone-id" "$zone_id" "$cls" 1 \
+            "${SERVER_LOG_CHECK_BASENAME} の時刻の表示だけに効く (切替は JVM の既定)"
+          if [ "$cls" != "$LTZ_JVM_ZONE_CLASS" ]; then
+            ltz_finding "指摘" "EAP" "${fname} の zone-id (${zone_id}) と JVM の既定 (${LTZ_JVM_ZONE_ID}) が違います" \
+              "行の時刻は ${zone_id}、切替は JVM の既定で行われる“混在”です。行の時刻が JST に見えても、切替は JST の 0:00 とは限りません。" \
+              "zone-id は指定せず、JVM の既定タイムゾーン (起動引数の -Duser.timezone) を JST にしてください。" ""
+          else
+            ltz_finding "注意" "EAP" "${fname} に zone-id (${zone_id}) が指定されています" \
+              "今は JVM の既定と同じですが、zone-id だけを JST にすると「表示は JST・切替は UTC」の混在を隠してしまいます。" \
+              "zone-id は指定せず、JVM の既定タイムゾーンに任せることを推奨します。" ""
+          fi
+        else
+          ltz_item "EAP" "${fname} (${fkind}-formatter) の zone-id" "(指定なし)" "$LTZ_JVM_ZONE_CLASS" 1 \
+            "JVM の既定 (${LTZ_JVM_ZONE_ID:-不明}) で出力"
+        fi
+        if [ -n "$fdate" ]; then
+          ltz_offset_style "$fdate"
+          LTZ_LINE_OFFSET_STYLE="$LTZ_OFFSET_STYLE"
+          LTZ_LINE_DATE_PATTERN="$fdate"
+        else
+          # 構造化フォーマッタの既定は ISO-8601 (オフセット付き)。
+          LTZ_LINE_OFFSET_STYLE="XXX"
+        fi
+        ;;
+      '')
+        ltz_item "EAP" "${server_name} の書式" "(見つかりません: ${fname:-未指定})" "NA" 0 \
+          "既定の書式 (%d{HH:mm:ss,SSS} ...) では行に日付が出ない"
+        ;;
+      *)
+        ltz_item "EAP" "${fname} (${fkind}-formatter)" "(独自の書式)" "UNKNOWN" 0 \
+          "時刻の出し方は実装しだい"
+        ;;
+    esac
+  fi
+
+  # server.log 以外で zone-id を指定している構造化フォーマッタ。
+  for entry in ${LTZ_FORMATTERS[@]+"${LTZ_FORMATTERS[@]}"}; do
+    IFS=$'\037' read -r name fkind fvalue fdate <<< "$entry"
+    [ "$server_fk" = "named" ] && [ "$name" = "$server_fv" ] && continue
+    case "$fkind" in
+      json|xml) ;;
+      *) continue ;;
+    esac
+    [ -n "$fvalue" ] || continue
+    ltz_java_zone_class "$fvalue"
+    cls="$LTZ_CLASS"
+    [ "$cls" = "INVALID" ] && cls="UNKNOWN"
+    ltz_item "EAP" "${name} (${fkind}-formatter) の zone-id" "$fvalue" "$cls" 1 \
+      "${SERVER_LOG_CHECK_BASENAME} 以外のハンドラが使う書式"
+    if [ "$cls" != "$LTZ_JVM_ZONE_CLASS" ]; then
+      ltz_finding "注意" "EAP" "${name} の zone-id (${fvalue}) が JVM の既定 (${LTZ_JVM_ZONE_ID}) と違います" \
+        "このフォーマッタを使うログ (コンソール / awslogs など) の時刻だけが別のタイムゾーンになり、${SERVER_LOG_CHECK_BASENAME} と突き合わせるときに読み違えます。" \
+        "zone-id は指定せず、JVM の既定タイムゾーンに任せてください。" ""
+    fi
+  done
+
+  # custom-handler / custom-formatter の timeZone プロパティ。
+  for entry in ${LTZ_CUSTOMTZ[@]+"${LTZ_CUSTOMTZ[@]}"}; do
+    IFS=$'\037' read -r name fkind fvalue <<< "$entry"
+    ltz_java_zone_class "$fvalue"
+    cls="$LTZ_CLASS"
+    [ "$cls" = "INVALID" ] && cls="UNKNOWN"
+    ltz_item "EAP" "${name} の ${fkind} (独自プロパティ)" "${fvalue:-(空)}" "$cls" 1 \
+      "custom-handler / custom-formatter に渡したタイムゾーン"
+    ltz_finding "注意" "EAP" "${name} に ${fkind}=${fvalue} が指定されています" \
+      "標準の管理属性ではなく、プロパティを設定する順番に依存します (PeriodicRotatingFileHandler の setTimeZone は書式や切替時刻を計算し直しません)。壊れやすい設定です。" \
+      "JVM の既定タイムゾーン (起動引数の -Duser.timezone) を JST にしてください。" ""
+  done
+
+  # Undertow の access-log (rotate=true の日付の区切りも JVM の既定に従う)。
+  local access_host access_prefix access_suffix access_rotate access_pattern
+  for entry in ${LTZ_ACCESSLOG[@]+"${LTZ_ACCESSLOG[@]}"}; do
+    IFS=$'\037' read -r access_host access_prefix access_suffix access_rotate access_pattern <<< "$entry"
+    [ "$access_rotate" = "false" ] && continue
+    ltz_item "EAP" "Undertow access-log (${access_host:-host})" \
+      "prefix=${access_prefix:-access} suffix=${access_suffix:-.log} rotate=${access_rotate:-true}" \
+      "$LTZ_JVM_ZONE_CLASS" 0 "access_log の日付の区切りも JVM の既定に従う"
+  done
+}
+
+# ---- 4. 実際のログファイル (実測) --------------------------------------------
+# 行の時刻と最終更新時刻から、実際にどのタイムゾーンで書かれ、どこで区切られたかを見る。
+ltz_analyze_files() {
+  local now="${LTZ_R[now]:-}" last mtime delta cls note entry name size first rlast
+  local suffix_part re period_len start in_jst in_utc hour_part counted evidence_label
+  local rotated_utc_count=0 rotated_after_count=0 rotated_jst_count=0 next off
+  local line_zone first_instant
+
+  if [ "${LTZ_R[log_exists]:-no}" = "yes" ]; then
+    last="${LTZ_R[log_last]:-}"
+    mtime="${LTZ_R[log_mtime]:-}"
+    if ltz_parse_ts "$last"; then
+      if [ -n "$LTZ_TS_OFFSET" ]; then
+        ltz_offset_seconds_class "$LTZ_TS_OFFSET_SEC"
+        cls="$LTZ_CLASS"
+        note="行にオフセット ${LTZ_TS_OFFSET} がある"
+      elif [[ "$mtime" =~ ^[0-9]+$ ]]; then
+        delta=$(( LTZ_TS_NAIVE - mtime ))
+        if [ "$delta" -ge $(( 32400 - 900 )) ] && [ "$delta" -le $(( 32400 + 900 )) ]; then
+          cls="JST"
+          note="オフセット表記なし。行の時刻が更新時刻 (UTC) より 9 時間進んでいる → JST で書かれている"
+        elif [ "$delta" -ge -900 ] && [ "$delta" -le 900 ]; then
+          cls="UTC"
+          note="オフセット表記なし。行の時刻が更新時刻 (UTC) と一致 → UTC で書かれている"
+        else
+          cls="UNKNOWN"
+          note="オフセット表記なし。最終行の時刻と更新時刻が 15 分以上離れているため推定できません (差 ${delta} 秒)"
+        fi
+      else
+        cls="UNKNOWN"
+        note="更新時刻を取得できないため推定できません"
+      fi
+      LTZ_LINE_EVIDENCE_CLASS="$cls"
+      case "$cls" in
+        JST|UTC|OTHER) counted=1 ;;
+        *) counted=0 ;;
+      esac
+      ltz_item "実測" "${SERVER_LOG_CHECK_BASENAME} の最終行の時刻" "$last" "$cls" "$counted" "$note"
+      if { [ "$cls" = "JST" ] || [ "$cls" = "UTC" ]; } \
+          && { [ "$LTZ_JVM_ZONE_CLASS" = "JST" ] || [ "$LTZ_JVM_ZONE_CLASS" = "UTC" ]; } \
+          && [ "$cls" != "$LTZ_LINE_ZONE_CLASS" ]; then
+        ltz_finding "指摘" "実測" "${SERVER_LOG_CHECK_BASENAME} の行の時刻 (${cls}) と、設定から求めたタイムゾーン (${LTZ_LINE_ZONE_CLASS}) が違います" \
+          "ハンドラ・フォーマッタが生成された時点の JVM のタイムゾーンと、今の設定が違う可能性があります (起動後に TimeZone.setDefault() を呼ぶアプリ、実行中の書式変更、前回の起動の設定のまま追記されたファイルなど)。行の時刻と切替が別の時計になる“混在”の状態です。" \
+          "アプリで TimeZone.setDefault() を呼ばず、JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してコンテナを起動し直してください。" \
+          "${SERVER_LOG_CHECK_BASENAME} の行頭の時刻と date の時刻を見比べる"
+      fi
+    else
+      ltz_item "実測" "${SERVER_LOG_CHECK_BASENAME} の最終行の時刻" "(日時のある行がありません)" "UNKNOWN" 0 \
+        "${LTZ_R[log_file]:-}"
+    fi
+  else
+    ltz_item "実測" "${SERVER_LOG_CHECK_BASENAME}" "(ありません)" "NA" 0 "${LTZ_R[log_file]:-}"
+  fi
+
+  # ローテート済みファイル: 最終更新時刻がファイル名の日付のどこに入るかで、区切りの
+  # タイムゾーンを見分ける (JST の日付 D のファイルは JST D 23:59 までに書き終わる。
+  # UTC で区切ると JST D+1 08:59 まで書かれる。両方を過ぎても更新されていれば、
+  # 改名前のファイルを開いたままの書き手がいる)。
+  re='^([0-9]{4})-([0-9]{2})-([0-9]{2})(-([0-9]{2}))?([.-][0-9]+)?(\.[A-Za-z0-9]+)?$'
+  # オフセットの無い行は、実測 (server.log の最終行) か設定から求めたタイムゾーンで読む。
+  line_zone="$LTZ_LINE_ZONE_CLASS"
+  case "$LTZ_LINE_EVIDENCE_CLASS" in
+    JST|UTC) line_zone="$LTZ_LINE_EVIDENCE_CLASS" ;;
+  esac
+  for entry in ${LTZ_ROTATED[@]+"${LTZ_ROTATED[@]}"}; do
+    IFS=$'\037' read -r name mtime size first rlast <<< "$entry"
+    # 圧縮済み (.gz など) は回転のときに作られ、書き手が追記しないため判定に使わない。
+    case "$name" in
+      *.gz|*.zip|*.bz2|*.xz) continue ;;
+    esac
+    suffix_part="${name#"${SERVER_LOG_CHECK_BASENAME}".}"
+    # 先に更新時刻を確かめる (後の =~ が BASH_REMATCH を上書きするため、日付の照合を最後にする)。
+    if ! [[ "$mtime" =~ ^[0-9]+$ ]] || ! [[ "$suffix_part" =~ $re ]]; then
+      continue
+    fi
+    hour_part="${BASH_REMATCH[5]:-}"
+    if [ -n "$hour_part" ] && [ "$LTZ_SERVER_PERIOD" = "hour" ]; then
+      ltz_epoch_utc "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$hour_part" 0 0
+      period_len=3600
+    else
+      ltz_epoch_utc "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" 0 0 0
+      period_len=86400
+    fi
+    start=$(( LTZ_EPOCH - 32400 ))
+    # 先頭の行の時刻 (実際の時刻) と最終更新時刻が、JST / UTC どちらの 1 日に収まるか。
+    first_instant=""
+    if ltz_line_instant "$first" "$line_zone"; then
+      first_instant="$LTZ_INSTANT"
+    fi
+    in_jst="false"; in_utc="false"
+    if [ "$mtime" -ge "$start" ] && [ "$mtime" -lt $(( start + period_len )) ] \
+        && { [ -z "$first_instant" ] || [ "$first_instant" -ge "$start" ]; }; then
+      in_jst="true"
+    fi
+    if [ "$mtime" -ge $(( start + 32400 )) ] && [ "$mtime" -lt $(( start + 32400 + period_len )) ] \
+        && { [ -z "$first_instant" ] || [ "$first_instant" -ge $(( start + 32400 )) ]; }; then
+      in_utc="true"
+    fi
+    ltz_format_epoch_jst "$mtime"
+    if [ "$in_jst" = "true" ] && [ "$in_utc" != "true" ]; then
+      cls="JST"; counted=1
+      evidence_label="JST の 1 日の範囲に収まっている (UTC で区切ると起こらない時刻の行・更新がある)"
+      rotated_jst_count=$(( rotated_jst_count + 1 ))
+    elif [ "$in_utc" = "true" ] && [ "$in_jst" != "true" ]; then
+      cls="UTC"; counted=1
+      evidence_label="JST の翌日 0:00〜8:59 まで書かれている → UTC の 0:00 で区切られた"
+      rotated_utc_count=$(( rotated_utc_count + 1 ))
+      LTZ_ROTATED_UTC="${LTZ_ROTATED_UTC}${LTZ_ROTATED_UTC:+, }${name}"
+    elif [ "$in_jst" = "true" ]; then
+      cls="UNKNOWN"; counted=0
+      evidence_label="JST の 9:00〜23:59 の範囲だけに書かれているため、どちらの区切りでも起こり得る"
+    elif [ "$mtime" -ge $(( start + 32400 + period_len )) ] \
+        || { [ "$mtime" -ge $(( start + period_len )) ] && [ -n "$first_instant" ] \
+             && [ "$first_instant" -lt $(( start + 32400 )) ]; }; then
+      cls="UNKNOWN"; counted=0
+      evidence_label="区切りを過ぎた後も更新されている → 改名後も書き続けている書き手がいる"
+      rotated_after_count=$(( rotated_after_count + 1 ))
+      LTZ_ROTATED_AFTER="${LTZ_ROTATED_AFTER}${LTZ_ROTATED_AFTER:+, }${name}"
+    elif [ -n "$first_instant" ] && [ "$first_instant" -lt "$start" ]; then
+      cls="UNKNOWN"; counted=0
+      evidence_label="ファイル名の日付より前の行から始まっている (rotate-on-boot の起動時の退避か、前回の起動のまま追記されたファイル)"
+    else
+      cls="UNKNOWN"; counted=0
+      evidence_label="ファイル名の日付と更新時刻の関係から区切りを判定できません"
+    fi
+    ltz_item "実測" "ローテート済み ${name}" "最終更新 ${LTZ_FMT}" "$cls" "$counted" \
+      "${evidence_label}${first:+。先頭 ${first}}${rlast:+ / 末尾 ${rlast}}"
+  done
+  if [ "$rotated_utc_count" -gt 0 ]; then
+    ltz_finding "指摘" "実測" "ローテート済みファイルが UTC の 0:00 で区切られています (${LTZ_ROTATED_UTC})" \
+      "前日付ファイルに JST 0:00〜8:59 のログが入っています。前日付ファイルの最終更新が JST の 8:59 ごろなのは UTC 境界の典型です。" \
+      "JVM の起動引数で -Duser.timezone=Asia/Tokyo を渡してコンテナを起動し直してください (既にあるファイルの名前は変わりません)。" \
+      "stat -c '%y  %s  %n' ${LTZ_R[log_dir]:-<ログディレクトリ>}/${SERVER_LOG_CHECK_BASENAME}*"
+  fi
+  if [ "$rotated_after_count" -gt 0 ]; then
+    ltz_finding "指摘" "実測" "ローテート済みファイルが区切りの後も更新されています (${LTZ_ROTATED_AFTER})" \
+      "改名前のファイル (inode) を開いたままの書き手 (stdout のリダイレクト・同じファイルを開く別のハンドラ・アプリ同梱のロガーなど) が、前日付ファイルへ書き続けています。タイムゾーンとは別の原因です。" \
+      "同じサービスの「server.log の FD 点検」と「ログ設定の静的点検」で書き手を特定してください。" \
+      "for fd in /proc/[0-9]*/fd/*; do t=\$(readlink \"\$fd\" 2>/dev/null) || continue; case \"\$t\" in *${SERVER_LOG_CHECK_BASENAME}*) echo \"\$fd -> \$t\";; esac; done"
+  fi
+
+  # 次のローテーション予定。ログを書く直前に判定する (遅延ローテーション) ため、
+  # その時刻にログが無ければ、次のログを書くときに切り替わる。
+  if [[ "$now" =~ ^[0-9]+$ ]]; then
+    case "$LTZ_JVM_ZONE_CLASS" in
+      JST) off=32400 ;;
+      UTC) off=0 ;;
+      *) off="" ;;
+    esac
+    case "$LTZ_SERVER_PERIOD" in
+      day) period_len=86400 ;;
+      hour) period_len=3600 ;;
+      *) period_len="" ;;
+    esac
+    if [ -n "$off" ] && [ -n "$period_len" ]; then
+      next=$(( ((now + off) / period_len + 1) * period_len - off ))
+      ltz_format_epoch_jst "$next"
+      ltz_item "実測" "次のローテーション予定" "${LTZ_FMT} 以降の最初のログ" "NA" 0 \
+        "ログを書く直前に判定するため、その時刻にログが無ければ次のログを書くときに切り替わる"
+    fi
+  fi
+}
+
+# ---- 5. CloudWatch Logs への転送 (cwagent) -----------------------------------
+# コンテナの環境変数を「1 変数 = 開始行 + 本文 + 終了行」で返す (改行を含む値に備える)。
+# 偽 docker の inspect は書式の部分一致で分岐するため、専用の目印を付けて問い合わせる。
+ltz_container_env_records() {
+  docker inspect \
+    -f '{{range .Config.Env}}ltz-env-begin:{{.}}{{"\n"}}ltz-env-end:{{"\n"}}{{end}}' \
+    "$1" 2>/dev/null
+}
+
+# 環境変数を 1 つ取り出す。LTZ_ENV_SET = true / false、LTZ_ENV_VALUE = 値
+ltz_container_env_value() {
+  local cid="$1" name="$2" line collecting="false" target
+  target="ltz-env-begin:${name}="
+  LTZ_ENV_SET="false"
+  LTZ_ENV_VALUE=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    if [ "$line" = "ltz-env-end:" ]; then
+      [ "$collecting" = "true" ] && break
+      continue
+    fi
+    case "$line" in
+      "$target"*)
+        collecting="true"
+        LTZ_ENV_SET="true"
+        LTZ_ENV_VALUE="${line#"$target"}"
+        continue
+        ;;
+      ltz-env-begin:*)
+        continue
+        ;;
+    esac
+    if [ "$collecting" = "true" ]; then
+      LTZ_ENV_VALUE+=$'\n'"$line"
+    fi
+  done < <(ltz_container_env_records "$cid")
+}
+
+# コンテナ内の TZif ファイルを docker cp -L で取り出し、末尾の規則を LTZ_RULE へ入れる。
+# 公式の CloudWatch Agent イメージは FROM scratch でシェルも cat も無いため docker cp を使う。
+# 戻り値: 0 = ファイルがある / 1 = 無い
+ltz_container_tzif_rule() {
+  local cid="$1" path="$2" tmp_dir status=1
+  LTZ_RULE=""
+  tmp_dir="$(mktemp -d 2>/dev/null)" || return 1
+  if docker cp -L "${cid}:${path}" "${tmp_dir}/tzif" >/dev/null 2>&1 && [ -f "${tmp_dir}/tzif" ]; then
+    status=0
+    if [ "$(head -c 4 "${tmp_dir}/tzif" 2>/dev/null)" = "TZif" ]; then
+      LTZ_RULE="$(tail -n 1 "${tmp_dir}/tzif" 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9<>+,.:/-' | head -c 64)"
+    fi
+  fi
+  rm -rf -- "$tmp_dir"
+  return "$status"
+}
+
+# CloudWatch Agent (Go) の timezone:"Local" が実際にどのタイムゾーンになるか。
+# Go は TZ が無ければ /etc/localtime、TZ が名前なら zoneinfo のファイルを探し、
+# 見つからなければ黙って UTC にする。公式イメージ (FROM scratch) は zoneinfo を持たない。
+ltz_cwagent_local_zone() {
+  local cid="$1" tz dir
+  LTZ_CW_LOCAL_CLASS="UNKNOWN"
+  LTZ_CW_LOCAL_DESC=""
+  LTZ_CW_LOCAL_UNCERTAIN="false"
+  ltz_container_env_value "$cid" TZ
+  LTZ_CW_TZ_SET="$LTZ_ENV_SET"
+  LTZ_CW_TZ_VALUE="$LTZ_ENV_VALUE"
+  if [ "$LTZ_ENV_SET" != "true" ]; then
+    if ltz_container_tzif_rule "$cid" /etc/localtime; then
+      ltz_posix_rule_class "$LTZ_RULE"
+      LTZ_CW_LOCAL_CLASS="$LTZ_CLASS"
+      LTZ_CW_LOCAL_DESC="TZ 未設定 → /etc/localtime (規則 ${LTZ_RULE:-不明})"
+    else
+      LTZ_CW_LOCAL_CLASS="UTC"
+      LTZ_CW_LOCAL_DESC="TZ 未設定・/etc/localtime なし → UTC"
+    fi
+    return 0
+  fi
+  tz="${LTZ_CW_TZ_VALUE#:}"
+  case "$tz" in
+    '')
+      LTZ_CW_LOCAL_CLASS="UTC"
+      LTZ_CW_LOCAL_DESC="TZ が空 → UTC"
+      ;;
+    UTC)
+      LTZ_CW_LOCAL_CLASS="UTC"
+      LTZ_CW_LOCAL_DESC="TZ=UTC"
+      ;;
+    /*)
+      if ltz_container_tzif_rule "$cid" "$tz"; then
+        ltz_posix_rule_class "$LTZ_RULE"
+        LTZ_CW_LOCAL_CLASS="$LTZ_CLASS"
+        LTZ_CW_LOCAL_DESC="TZ=${tz} (規則 ${LTZ_RULE:-不明})"
+      else
+        LTZ_CW_LOCAL_CLASS="UTC"
+        LTZ_CW_LOCAL_DESC="TZ=${tz} のファイルが無い → UTC"
+      fi
+      ;;
+    *)
+      for dir in /usr/share/zoneinfo /usr/share/lib/zoneinfo /usr/lib/locale/TZ /etc/zoneinfo; do
+        if ltz_container_tzif_rule "$cid" "${dir}/${tz}"; then
+          ltz_posix_rule_class "$LTZ_RULE"
+          LTZ_CW_LOCAL_CLASS="$LTZ_CLASS"
+          LTZ_CW_LOCAL_DESC="TZ=${tz} → ${dir}/${tz} (規則 ${LTZ_RULE:-不明})"
+          return 0
+        fi
+      done
+      LTZ_CW_LOCAL_CLASS="UTC"
+      LTZ_CW_LOCAL_UNCERTAIN="true"
+      LTZ_CW_LOCAL_DESC="TZ=${tz} ですが、cwagent のイメージに zoneinfo (/usr/share/zoneinfo/${tz}) がありません → UTC の見込み (エージェントが tzdata を組み込んでいる場合だけ ${tz})"
+      ;;
+  esac
+}
+
+# cwagent が読んでいる設定 JSON を取り出す (LTZ_CW_CONFIG_JSON / LTZ_CW_CONFIG_SOURCE)。
+# ECS では CW_CONFIG_CONTENT (シークレット) で渡すことが多く、compose では
+# /etc/cwagentconfig へマウントする。起動後の送信状況チェックで取り出した値も使う。
+ltz_cwagent_config_json() {
+  local cid="$1" path spec source target mode content
+  local -a candidates=()
+
+  LTZ_CW_CONFIG_JSON=""
+  LTZ_CW_CONFIG_SOURCE=""
+  ltz_container_env_value "$cid" CW_CONFIG_CONTENT
+  if [ "$LTZ_ENV_SET" = "true" ] && [ -n "$LTZ_ENV_VALUE" ]; then
+    LTZ_CW_CONFIG_JSON="$LTZ_ENV_VALUE"
+    LTZ_CW_CONFIG_SOURCE="環境変数 CW_CONFIG_CONTENT"
+    return 0
+  fi
+  if [ -n "$CWAGENT_CONTAINER_CONFIG_JSON" ]; then
+    LTZ_CW_CONFIG_JSON="$CWAGENT_CONTAINER_CONFIG_JSON"
+    LTZ_CW_CONFIG_SOURCE="${CWAGENT_CONTAINER_CONFIG_FILE:-コンテナ内の設定ファイル} (送信状況チェックで取得)"
+    return 0
+  fi
+  [ -n "$CWAGENT_CONTAINER_CONFIG_FILE" ] && candidates+=("$CWAGENT_CONTAINER_CONFIG_FILE")
+  for spec in ${CWAGENT_VOLUME_SPECS[@]+"${CWAGENT_VOLUME_SPECS[@]}"}; do
+    IFS="$COMPOSE_YAML_SEPARATOR" read -r source target mode < <(cwagent_split_volume_spec "$spec")
+    case "$target" in
+      "${CWAGENT_CONFIG_DIR%/}"/*.json|"$CWAGENT_CONFIG_FALLBACK_PATH") candidates+=("$target") ;;
+    esac
+  done
+  candidates+=("${CWAGENT_CONFIG_DIR%/}/cwagent-config.json" "$CWAGENT_CONFIG_FALLBACK_PATH")
+  for path in "${candidates[@]}"; do
+    if content="$(docker exec "$cid" cat "$path" 2>/dev/null < /dev/null)" && [ -n "$content" ]; then
+      LTZ_CW_CONFIG_JSON="$content"
+      LTZ_CW_CONFIG_SOURCE="コンテナ内の ${path}"
+      return 0
+    fi
+    if content="$(read_container_file_via_cp "$cid" "$path" 2>/dev/null)" && [ -n "$content" ]; then
+      LTZ_CW_CONFIG_JSON="$content"
+      LTZ_CW_CONFIG_SOURCE="コンテナ内の ${path} (docker cp)"
+      return 0
+    fi
+  done
+  if [ -n "$CWAGENT_HOST_CONFIG_FILE" ] && [ -r "$CWAGENT_HOST_CONFIG_FILE" ]; then
+    LTZ_CW_CONFIG_JSON="$(cat "$CWAGENT_HOST_CONFIG_FILE" 2>/dev/null)"
+    LTZ_CW_CONFIG_SOURCE="ホストの ${CWAGENT_HOST_CONFIG_FILE}"
+    [ -n "$LTZ_CW_CONFIG_JSON" ] && return 0
+  fi
+  return 1
+}
+
+# コンテナのマウント ("種類|ボリューム名|ホスト側|コンテナ側" の行)。
+ltz_container_mounts() {
+  docker inspect \
+    -f '{{range .Mounts}}ltz-mount:{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}{{println}}{{end}}' \
+    "$1" 2>/dev/null | sed -n 's/^ltz-mount://p'
+}
+
+# JBoss のコンテナのファイルパスを、同じボリュームを共有する cwagent 側のパスへ読み替える
+# (LTZ_MAPPED_PATH)。共有していなければ 1 を返す。
+ltz_map_to_container() {
+  local from_cid="$1" to_cid="$2" path="$3" type name source dest best_dest="" best_key="" key rel
+  while IFS='|' read -r type name source dest; do
+    dest="${dest%$'\r'}"
+    [ -n "$dest" ] || continue
+    case "$path" in
+      "$dest"|"${dest%/}"/*)
+        if [ ${#dest} -gt ${#best_dest} ]; then
+          best_dest="$dest"
+          if [ "$type" = "volume" ]; then key="volume:${name}"; else key="bind:${source}"; fi
+          best_key="$key"
+        fi
+        ;;
+    esac
+  done < <(ltz_container_mounts "$from_cid")
+  [ -n "$best_key" ] || return 1
+  rel="${path#"$best_dest"}"
+  while IFS='|' read -r type name source dest; do
+    dest="${dest%$'\r'}"
+    [ -n "$dest" ] || continue
+    if [ "$type" = "volume" ]; then key="volume:${name}"; else key="bind:${source}"; fi
+    if [ "$key" = "$best_key" ]; then
+      LTZ_MAPPED_PATH="${dest%/}${rel}"
+      return 0
+    fi
+  done < <(ltz_container_mounts "$to_cid")
+  return 1
+}
+
+# 偽装 CloudWatch Logs (WireMock) に届いたイベントについて、イベント時刻 (timestamp) と
+# メッセージ先頭の時刻を突き合わせ、エージェントが行の時刻をどう解釈したかを数える。
+#   $1 = request journal (JSON) / $2 以降 = 対象のロググループ名
+# ロググループ名は / で始まるため、引数で渡すと Git Bash が Windows 版 Python 向けに
+# パスとして書き換えてしまう。JSON の配列にして標準入力で渡す。
+#   出力: 種別<US>件数<US>例の行の時刻<US>例のイベント時刻 (UNIX 秒)<US>差 (秒)
+#   種別: utc (行の時刻を UTC として取り込み) / jst (JST として取り込み) /
+#         offset_ok (オフセットどおり) / offset_shift (オフセットと食い違い) / other
+ltz_mock_event_stats() {
+  local journal_json="$1" program group groups_json="" escaped
+  shift
+  for group in "$@"; do
+    escaped="${group//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    groups_json="${groups_json}${groups_json:+,}\"${escaped}\""
+  done
+  groups_json="[${groups_json}]"
+  program="$(cat <<'PY'
+import datetime
+import re
+import sys
+
+SEP = "\x1f"
+journal, group_list = load_json_documents(["WireMock request journal", "ロググループ"])
+groups = set(str(group) for group in group_list if group) if isinstance(group_list, list) else set()
+pattern = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?(?: ?(Z|[+-]\d{2}(?::?\d{2})?)(?![A-Za-z]))?"
+)
+kinds = ("utc", "jst", "offset_ok", "offset_shift", "other")
+counts = dict((kind, 0) for kind in kinds)
+samples = {}
+for body in put_log_events_requests(journal):
+    group = str(body.get("logGroupName") or "")
+    if groups and group not in groups:
+        continue
+    events = body.get("logEvents")
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        match = pattern.search(str(event.get("message") or ""))
+        if not match:
+            continue
+        try:
+            stamp = float(event.get("timestamp")) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        naive = datetime.datetime(
+            *[int(match.group(index)) for index in range(1, 7)],
+            tzinfo=datetime.timezone.utc,
+        ).timestamp()
+        offset_text = match.group(7) or ""
+        if offset_text:
+            if offset_text == "Z":
+                offset = 0
+            else:
+                digits = offset_text[1:].replace(":", "")
+                offset = int(digits[:2]) * 3600 + int(digits[2:4] or 0) * 60
+                if offset_text[0] == "-":
+                    offset = -offset
+            diff = stamp - (naive - offset)
+            kind = "offset_ok" if abs(diff) <= 600 else "offset_shift"
+        else:
+            diff = stamp - naive
+            if abs(diff) <= 600:
+                kind = "utc"
+            elif abs(diff + 32400) <= 600:
+                kind = "jst"
+            else:
+                kind = "other"
+        counts[kind] += 1
+        samples.setdefault(kind, (match.group(0), int(stamp), int(round(diff))))
+for kind in kinds:
+    sample = samples.get(kind, ("", 0, 0))
+    print(SEP.join([kind, str(counts[kind]), sample[0], str(sample[1]), str(sample[2])]))
+PY
+)"
+  run_observability_python \
+    "${OBSERVABILITY_PYTHON_JSON_LOADER}${OBSERVABILITY_PYTHON_WIREMOCK_LOADER}${program}" \
+    2 "$journal_json" "$groups_json"
+}
+
+ltz_analyze_cloudwatch() {
+  local jboss_cid="$1" cw_cid facts kind a b c d e f g endpoint="" cw_path="" index=0
+  local file_path group ts_fmt tz_setting relevant how has_z has_upper_z interp interp_desc
+  local cls counted line_zone expected expected_head fmt_head fmt_norm rotated_probe
+  local agent_logs reject_new reject_old reject_expired parse_errors sample_lines
+  local host port hostport service journal stats mcount msample mstamp mdiff note
+  local mock_utc=0 mock_jst=0 mock_ok=0 mock_shift=0 mock_other=0 mock_sample="" local_used="false"
+  local style_sample
+  local -a cw_ids=() entries=() relevant_groups=()
+
+  mapfile -t cw_ids < <(compose_container_ids "$CWAGENT_SERVICE" 2>/dev/null)
+  if [ ${#cw_ids[@]} -eq 0 ] || [ -z "${cw_ids[0]}" ]; then
+    LTZ_CW_STATE="absent"
+    ltz_item "CloudWatch" "CloudWatch Agent (${CWAGENT_SERVICE})" "(起動していません)" "NA" 0 \
+      "転送設定は点検していません (サービス名は --cwagent-service で変えられます)"
+    return 0
+  fi
+  cw_cid="${cw_ids[0]}"
+  LTZ_CW_STATE="present"
+
+  ltz_cwagent_local_zone "$cw_cid"
+
+  if [ "$LTZ_CW_TZ_SET" = "true" ]; then
+    note="TZ=${LTZ_CW_TZ_VALUE}"
+  else
+    note="TZ 未設定"
+  fi
+  if ! ltz_cwagent_config_json "$cw_cid"; then
+    LTZ_CW_STATE="noconfig"
+    ltz_item "CloudWatch" "cwagent の timezone:\"Local\" の解決先" "$note" "$LTZ_CW_LOCAL_CLASS" 0 \
+      "$LTZ_CW_LOCAL_DESC"
+    ltz_finding "注意" "CloudWatch" "cwagent の設定 (JSON) を取り出せませんでした" \
+      "collect_list の timezone / timestamp_format を点検できていません。" \
+      "--cwagent-config-dir でコンテナ内の設定ディレクトリを指定するか、CW_CONFIG_CONTENT を確認してください。" ""
+    return 0
+  fi
+  if ! resolve_observability_python >/dev/null 2>&1; then
+    LTZ_CW_STATE="nopython"
+    ltz_finding "注意" "CloudWatch" "Python 3 が無いため cwagent の設定 (JSON) を解析できません" \
+      "collect_list の timezone / timestamp_format を点検できていません。" \
+      "python3 を利用可能にしてください。" ""
+    return 0
+  fi
+  if ! facts="$(cwagent_config_facts "$LTZ_CW_CONFIG_JSON" 2>/dev/null)"; then
+    LTZ_CW_STATE="noconfig"
+    ltz_finding "注意" "CloudWatch" "cwagent の設定 (JSON) を解析できませんでした (${LTZ_CW_CONFIG_SOURCE})" \
+      "collect_list の timezone / timestamp_format を点検できていません。" \
+      "設定 JSON の文法を確認してください。" ""
+    return 0
+  fi
+  LTZ_CW_NOTE="設定: ${LTZ_CW_CONFIG_SOURCE}"
+  while IFS=$'\037' read -r kind a b c d e f g; do
+    case "$kind" in
+      collect) entries+=("$a"$'\037'"$b"$'\037'"$e"$'\037'"$f") ;;
+      endpoint_override) endpoint="$a" ;;
+    esac
+  done <<< "$facts"
+
+  # この JBoss の server.log が cwagent からどう見えるか (同じボリュームの読み替え)。
+  if [ -n "${LTZ_R[log_file]:-}" ] && ltz_map_to_container "$jboss_cid" "$cw_cid" "${LTZ_R[log_file]}"; then
+    cw_path="$LTZ_MAPPED_PATH"
+  fi
+  line_zone="$LTZ_LINE_ZONE_CLASS"
+  case "$LTZ_LINE_EVIDENCE_CLASS" in
+    JST|UTC) line_zone="$LTZ_LINE_EVIDENCE_CLASS" ;;
+  esac
+  if [ -n "$LTZ_LINE_DATE_PATTERN" ]; then
+    ltz_java_pattern_to_strftime "$LTZ_LINE_DATE_PATTERN"
+    expected="$LTZ_STRFTIME"
+  else
+    expected=""
+  fi
+
+  for a in ${entries[@]+"${entries[@]}"}; do
+    index=$(( index + 1 ))
+    IFS=$'\037' read -r file_path group ts_fmt tz_setting <<< "$a"
+    relevant="false"; how=""
+    if [ -n "$cw_path" ]; then
+      if ltz_glob_match "$cw_path" "$file_path"; then
+        relevant="true"
+        how="このサービスの ${SERVER_LOG_CHECK_BASENAME} (cwagent から ${cw_path}) を収集"
+      fi
+    elif ltz_glob_match "$SERVER_LOG_CHECK_BASENAME" "${file_path##*/}"; then
+      relevant="true"
+      how="ファイル名が ${SERVER_LOG_CHECK_BASENAME} に一致 (共有ボリュームで対応を確認できないため名前で照合)"
+    fi
+    if [ "$relevant" != "true" ]; then
+      LTZ_CW_OTHER_ENTRIES+=("${index}"$'\037'"${file_path}"$'\037'"${ts_fmt}"$'\037'"${tz_setting}")
+      continue
+    fi
+    relevant_groups+=("$group")
+    has_z="false"; has_upper_z="false"
+    [[ "$ts_fmt" == *%z* ]] && has_z="true"
+    [[ "$ts_fmt" == *%Z* ]] && has_upper_z="true"
+
+    if [ -z "$ts_fmt" ]; then
+      ltz_item "CloudWatch" "collect_list[${index}] の timezone" "${tz_setting:-(未指定 = Local)}" "NA" 0 \
+        "${file_path}。timestamp_format が無いため使われない (イベント時刻は取り込んだ時刻)"
+      ltz_finding "情報" "CloudWatch" "collect_list[${index}] (${file_path}) に timestamp_format がありません" \
+        "イベント時刻はログ行の時刻ではなく、エージェントが取り込んだ時刻になります (timezone は使われません)。時刻のずれは起きませんが、取り込みが遅れるとその分だけずれます。" \
+        "行の時刻を使うなら timestamp_format を指定し、ログ行にオフセットを出して %z で読ませてください (例: \"%Y-%m-%d %H:%M:%S,%f%z\")。" ""
+      continue
+    fi
+    if [ "$tz_setting" = "UTC" ]; then
+      interp="UTC"
+      interp_desc="UTC"
+    else
+      interp="$LTZ_CW_LOCAL_CLASS"
+      interp_desc="Local → ${LTZ_CW_LOCAL_DESC}"
+      [ "$has_z" = "true" ] || local_used="true"
+    fi
+    counted=0
+    if [ "$tz_setting" = "UTC" ] || [ "$has_z" != "true" ]; then
+      counted=1
+    fi
+    note="${file_path}。${how}。行の時刻の解釈: ${interp_desc}"
+    [ "$has_z" = "true" ] && note="${note} (%z があるため通常は使われない)"
+    ltz_item "CloudWatch" "collect_list[${index}] の timezone" "${tz_setting:-(未指定 = Local)}" "$interp" "$counted" "$note"
+    if [ "$has_z" = "true" ]; then
+      ltz_item "CloudWatch" "collect_list[${index}] の timestamp_format" "$ts_fmt" "NA" 0 \
+        "行のオフセット (%z) で時刻を解釈する"
+    else
+      ltz_item "CloudWatch" "collect_list[${index}] の timestamp_format" "$ts_fmt" "NA" 0 \
+        "オフセットを読まない (timezone の設定で解釈する)"
+    fi
+
+    # 行の書式 (EAP の %d) との突き合わせ。
+    if [ "$has_z" = "true" ]; then
+      case "$LTZ_LINE_OFFSET_STYLE" in
+        Z|xx) ;;
+        XX)
+          if [ "$LTZ_JVM_ZONE_CLASS" = "UTC" ]; then
+            ltz_finding "指摘" "CloudWatch" "collect_list[${index}] の %z は、UTC の行に付く Z を解釈できません" \
+              "%d の XX は UTC のときオフセットではなく Z を出すため、%z (-0700 形式だけ) で日時を取り出せません。エージェントのログに Error parsing timestampFromLogLine が出て、行の時刻がイベント時刻に使われません。" \
+              "%d を Z (例: %d{yyyy-MM-dd HH:mm:ss,SSSZ}) にしてください。" ""
+          fi
+          ;;
+        XXX|xxx|X|x)
+          case "$LTZ_LINE_OFFSET_STYLE" in
+            X|x) style_sample="+09" ;;
+            *)   style_sample="+09:00" ;;
+          esac
+          ltz_finding "指摘" "CloudWatch" "collect_list[${index}] の %z は、ログ行の ${style_sample} 形式のオフセットを解釈できません (%z は +0900 形式だけを読む)" \
+            "CloudWatch Agent の %z は -0700 形式 (+0900) だけを解釈し、+09:00 や +09 は解釈できません。日時を取り出せず (エージェントのログに Error parsing timestampFromLogLine)、行の時刻がイベント時刻に使われません。multi_line_start_pattern に {timestamp_format} を使っていれば、スタックトレースの区切りも崩れます。" \
+            "%d のオフセットを Z にしてください (例: %d{yyyy-MM-dd HH:mm:ss,SSSZ} → +0900)。" \
+            "docker compose logs ${CWAGENT_SERVICE} に Error parsing timestampFromLogLine が無いこと"
+          ;;
+        z)
+          ltz_finding "指摘" "CloudWatch" "collect_list[${index}] の %z は、行のタイムゾーンの略号を解釈できません" \
+            "%d の z は JST のような略号を出し、%z (+0900 形式) では日時を取り出せません。" \
+            "%d のオフセットを Z にしてください (例: %d{yyyy-MM-dd HH:mm:ss,SSSZ})。" ""
+          ;;
+        *)
+          ltz_finding "指摘" "CloudWatch" "collect_list[${index}] は %z を使いますが、行にオフセットがありません" \
+            "timestamp_format の %z に当たる部分が行に無いため日時を取り出せず (エージェントのログに Error parsing timestampFromLogLine)、行の時刻がイベント時刻に使われません。" \
+            "%d の末尾に Z を付けてください (例: %d{yyyy-MM-dd HH:mm:ss,SSSZ})。" \
+            "docker compose logs ${CWAGENT_SERVICE} に Error parsing timestampFromLogLine が無いこと"
+          ;;
+      esac
+      if [ "$tz_setting" = "UTC" ]; then
+        ltz_finding "注意" "CloudWatch" "collect_list[${index}] の timezone が UTC です (今は %z で解釈)" \
+          "今は行のオフセットで正しく解釈されますが、誰かがログの書式からオフセットを外すと、JST の行を UTC として読み 9 時間ずれます。" \
+          "timezone は \"Local\" にし、cwagent に TZ=Asia/Tokyo を渡しておくと、フォールバックも JST 側に倒れます。" ""
+      fi
+    elif [ "$has_upper_z" = "true" ]; then
+      ltz_finding "注意" "CloudWatch" "collect_list[${index}] の timestamp_format が %Z (略号) を使っています" \
+        "JST のような略号は、エージェントの Local が JST でないと正しいオフセットに結び付かず、UTC (オフセット 0) として解釈されることがあります。" \
+        "ログ行に +0900 形式のオフセットを出し、%z で解釈させてください。" ""
+    else
+      # Local の解決先が「zoneinfo が無いので UTC の見込み」のときは断定せず、下の注意で知らせる。
+      if [ "$line_zone" = "JST" ] && [ "$interp" = "UTC" ] \
+          && ! { [ "$tz_setting" != "UTC" ] && [ "$LTZ_CW_LOCAL_UNCERTAIN" = "true" ]; }; then
+        ltz_finding "指摘" "CloudWatch" "collect_list[${index}] が JST のログ行を UTC として解釈します (timezone=${tz_setting:-Local} / ${interp_desc})" \
+          "CloudWatch Logs のイベント時刻が 9 時間未来になります。PutLogEvents は 2 時間より先の未来のイベントを拒否するため、実 CloudWatch Logs では大半のイベントが残りません (エージェントのログに \"log events for log ... are too new\")。残ったイベントもコンソールや Logs Insights で 9 時間ずれて見えます。" \
+          "ログ行にオフセットを出して %z で読ませる (%d{yyyy-MM-dd HH:mm:ss,SSSZ} と timestamp_format \"%Y-%m-%d %H:%M:%S,%f%z\") か、timezone を \"Local\" にして cwagent に TZ=Asia/Tokyo を渡してください (Local は cwagent のイメージに zoneinfo が無いと UTC のままになるため、%z を推奨します)。" \
+          "aws logs filter-log-events --log-group-name ${group:-<ロググループ>} --limit 5 --query 'events[].[timestamp,message]' --output text で、timestamp (UTC のミリ秒) と行の時刻が 9 時間ずれていないこと"
+      elif [ "$line_zone" = "UTC" ] && [ "$interp" = "JST" ]; then
+        ltz_finding "指摘" "CloudWatch" "collect_list[${index}] が UTC のログ行を JST として解釈します" \
+          "CloudWatch Logs のイベント時刻が 9 時間過去にずれて記録されます (14 日より古くなるイベントは拒否されます)。" \
+          "JVM を JST (-Duser.timezone=Asia/Tokyo) にしたうえで、ログ行にオフセットを出して %z で読ませてください。" ""
+      elif [ "$interp" = "UNKNOWN" ] || { [ "$LTZ_CW_LOCAL_UNCERTAIN" = "true" ] && [ "$tz_setting" != "UTC" ]; }; then
+        ltz_finding "注意" "CloudWatch" "collect_list[${index}] の timezone:\"Local\" が実際にどのタイムゾーンになるか確定できません" \
+          "${LTZ_CW_LOCAL_DESC}。Local が UTC のままだと、JST のログ行を UTC として読み、イベント時刻が 9 時間未来になります (2 時間より先は拒否されます)。" \
+          "ログ行にオフセットを出し (%d{yyyy-MM-dd HH:mm:ss,SSSZ})、timestamp_format に %z を入れて、Local に頼らない構成にしてください。" \
+          "docker compose logs ${CWAGENT_SERVICE} に \"are too new\" が無いこと"
+      elif [ "$line_zone" = "$interp" ] && { [ "$line_zone" = "JST" ] || [ "$line_zone" = "UTC" ]; }; then
+        ltz_finding "情報" "CloudWatch" "collect_list[${index}] はログ行と同じ ${interp} で時刻を解釈します (オフセットは使っていません)" \
+          "今は一致していますが、ログ行・JVM・cwagent のどれかの設定が変わると、黙って 9 時間ずれます。" \
+          "ログ行にオフセットを出し、timestamp_format に %z を入れると、設定の変化に強くなります。" ""
+      fi
+    fi
+    # 日時の並びと、秒の小数の区切り (",SSS" と ".%f") の食い違い。
+    if [ -n "$expected" ]; then
+      expected="${expected//%-/%}"
+      fmt_norm="${ts_fmt//%-/%}"
+      expected_head="${expected%%%S*}"
+      fmt_head="${fmt_norm%%%S*}"
+      if [[ "$expected" == *%S* ]] && [[ "$fmt_norm" == *%S* ]] && [ "$expected_head" != "$fmt_head" ]; then
+        ltz_finding "指摘" "CloudWatch" "collect_list[${index}] の timestamp_format (${ts_fmt}) がログ行の書式 (%d{${LTZ_LINE_DATE_PATTERN}}) と一致しません" \
+          "日時を取り出せず (エージェントのログに Error parsing timestampFromLogLine)、行の時刻がイベント時刻に使われません。" \
+          "timestamp_format をログ行に合わせてください (読み替えの目安: ${expected})。" ""
+      elif [[ "$expected" == *%S?%f* ]] && [[ "$fmt_norm" == *%S?%f* ]]; then
+        expected_head="${expected#*%S}"
+        fmt_head="${fmt_norm#*%S}"
+        if [ "${expected_head:0:1}" != "${fmt_head:0:1}" ]; then
+          ltz_finding "指摘" "CloudWatch" "collect_list[${index}] の秒の小数の区切りがログ行と違います (行: ${expected_head:0:1} / 設定: ${fmt_head:0:1})" \
+            "JBoss の %d は ,SSS (カンマ)、Logback などは .SSS (ドット) です。区切りが違うと日時を取り出せず、行の時刻がイベント時刻に使われません。" \
+            "timestamp_format の %f の前をログ行と同じ区切りにしてください (JBoss なら \"%Y-%m-%d %H:%M:%S,%f%z\")。" ""
+        fi
+      fi
+    fi
+    # ローテート済みのファイルにも一致する glob。
+    if [ -n "$cw_path" ]; then
+      rotated_probe="${cw_path}.2000-01-01"
+    else
+      rotated_probe="${SERVER_LOG_CHECK_BASENAME}.2000-01-01"
+      file_path="${file_path##*/}"
+    fi
+    if ltz_glob_match "$rotated_probe" "$file_path"; then
+      ltz_finding "注意" "CloudWatch" "collect_list[${index}] の file_path (${file_path}) はローテート済みのファイルにも一致します" \
+        "エージェントは一致したファイルのうち更新時刻が一番新しいものだけを読みます。改名後も前日付ファイルへ書き続ける書き手がいると、そちらへ切り替わって先頭から送り直すことがあり、イベントが重複します。" \
+        "ローテート済みのファイルに一致しない書き方 (例: /mnt/logs/front/*/${SERVER_LOG_CHECK_BASENAME}) にしてください。" ""
+    fi
+  done
+
+  if [ ${#entries[@]} -gt 0 ] && [ ${#relevant_groups[@]} -eq 0 ]; then
+    ltz_finding "情報" "CloudWatch" "このサービスの ${SERVER_LOG_CHECK_BASENAME} を収集する collect_list がありません" \
+      "${cw_path:+cwagent から見たパスは ${cw_path} です。}collect_list の file_path がこのファイルに一致しないため、${SERVER_LOG_CHECK_BASENAME} は CloudWatch Logs へ転送されていません。" \
+      "転送する場合は collect_list に ${SERVER_LOG_CHECK_BASENAME} のエントリを追加してください。" ""
+  elif [ ${#entries[@]} -eq 0 ]; then
+    ltz_finding "情報" "CloudWatch" "cwagent の設定に collect_list がありません" \
+      "ログファイルは CloudWatch Logs へ転送されていません。" "" ""
+  fi
+
+  # cwagent の Local の解決先 (Local を使うエントリがあるときだけ集計に含める)。
+  if [ "$LTZ_CW_TZ_SET" = "true" ]; then
+    note="TZ=${LTZ_CW_TZ_VALUE}"
+  else
+    note="TZ 未設定"
+  fi
+  if [ "$local_used" = "true" ]; then
+    ltz_item "CloudWatch" "cwagent の timezone:\"Local\" の解決先" "$note" "$LTZ_CW_LOCAL_CLASS" 1 "$LTZ_CW_LOCAL_DESC"
+  else
+    ltz_item "CloudWatch" "cwagent の timezone:\"Local\" の解決先" "$note" "$LTZ_CW_LOCAL_CLASS" 0 \
+      "${LTZ_CW_LOCAL_DESC} (このサービスの ${SERVER_LOG_CHECK_BASENAME} の転送では使われない)"
+  fi
+
+  # エージェント自身のログ (CloudWatch Logs に拒否されたイベント・日時の解析エラー)。
+  if agent_logs="$(compose_logs "$CWAGENT_SERVICE" 2>/dev/null)"; then
+    agent_logs="$(printf '%s\n' "$agent_logs" | strip_ansi_codes)"
+    reject_new="$(printf '%s\n' "$agent_logs" | grep -cE "log events for log .* are too new" || true)"
+    reject_old="$(printf '%s\n' "$agent_logs" | grep -cE "log events for log .* are too old" || true)"
+    reject_expired="$(printf '%s\n' "$agent_logs" | grep -cE "log events for log .* are expired" || true)"
+    parse_errors="$(printf '%s\n' "$agent_logs" | grep -cF "Error parsing timestampFromLogLine" || true)"
+    ltz_item "CloudWatch" "cwagent のログ (拒否・日時の解析エラー)" \
+      "too new ${reject_new:-0} 件 / too old ${reject_old:-0} 件 / expired ${reject_expired:-0} 件 / 解析エラー ${parse_errors:-0} 件" \
+      "NA" 0 "docker compose logs ${CWAGENT_SERVICE} から数えた件数"
+    if [ "${reject_new:-0}" -gt 0 ] || [ "${reject_old:-0}" -gt 0 ] || [ "${reject_expired:-0}" -gt 0 ]; then
+      sample_lines="$(printf '%s\n' "$agent_logs" | grep -E "log events for log .* are (too new|too old|expired)" | tail -n 3 | cwagent_redact_text | tr '\n' ' ')"
+      ltz_finding "指摘" "CloudWatch" "CloudWatch Logs が時刻の範囲外としてイベントを拒否しています (too new ${reject_new} / too old ${reject_old} / expired ${reject_expired})" \
+        "拒否されたイベントは CloudWatch Logs に残りません。too new は JST の行を UTC として読んだとき (9 時間未来) の典型です。例: ${sample_lines}" \
+        "上の collect_list の timezone / timestamp_format の指摘を直してください。" \
+        "docker compose logs ${CWAGENT_SERVICE} | grep -E 'are (too new|too old|expired)'"
+    fi
+    if [ "${parse_errors:-0}" -gt 0 ]; then
+      sample_lines="$(printf '%s\n' "$agent_logs" | grep -F "Error parsing timestampFromLogLine" | tail -n 2 | cwagent_redact_text | tr '\n' ' ')"
+      ltz_finding "指摘" "CloudWatch" "cwagent がログ行の日時を解析できていません (${parse_errors} 件)" \
+        "timestamp_format がログ行の書式と合っていないため、行の時刻がイベント時刻に使われていません。例: ${sample_lines}" \
+        "timestamp_format をログ行に合わせてください (オフセットは +0900 形式にして %z で読む)。" \
+        "docker compose logs ${CWAGENT_SERVICE} | grep 'Error parsing timestampFromLogLine'"
+    fi
+  fi
+
+  # 偽装 CloudWatch Logs (WireMock) へ届いたイベントの時刻 (実測)。
+  if [ -n "$endpoint" ] && [ ${#relevant_groups[@]} -gt 0 ] && command -v curl >/dev/null 2>&1; then
+    hostport="${endpoint#*://}"
+    hostport="${hostport%%/*}"
+    host="${hostport%%:*}"
+    port="8080"
+    case "$hostport" in
+      *:*) port="${hostport##*:}" ;;
+    esac
+    service="${CWAGENT_MOCK_SERVICE:-$host}"
+    [ -n "$CWAGENT_MOCK_PORT" ] && port="$CWAGENT_MOCK_PORT"
+    if [ -n "$service" ] && resolve_compose_service_http_endpoint "$service" "$port" >/dev/null 2>&1 \
+        && journal="$(observability_http_get "${OBSERVABILITY_HTTP_BASE_URL}/__admin/requests?limit=${OBSERVABILITY_WIREMOCK_REQUEST_LIMIT}" 2>/dev/null)" \
+        && stats="$(ltz_mock_event_stats "$journal" "${relevant_groups[@]}" 2>/dev/null)"; then
+      while IFS=$'\037' read -r kind mcount msample mstamp mdiff; do
+        mcount="${mcount%$'\r'}"
+        case "$kind" in
+          utc) mock_utc="$mcount" ;;
+          jst) mock_jst="$mcount" ;;
+          offset_ok) mock_ok="$mcount" ;;
+          offset_shift) mock_shift="$mcount" ;;
+          other) mock_other="$mcount" ;;
+        esac
+        if [ -z "$mock_sample" ] && [ "${mcount:-0}" -gt 0 ] 2>/dev/null && [[ "${mstamp:-}" =~ ^[0-9]+$ ]]; then
+          ltz_format_epoch_jst "$mstamp"
+          mock_sample="行 ${msample} → イベント時刻 ${LTZ_FMT}"
+        fi
+      done <<< "$stats"
+      if [ $(( mock_utc + mock_jst + mock_ok + mock_shift + mock_other )) -gt 0 ]; then
+        cls="NA"; counted=0
+        if [ "$mock_shift" -gt 0 ]; then
+          cls="UNKNOWN"
+        elif [ "$mock_utc" -gt 0 ] && [ "$mock_jst" -eq 0 ]; then
+          cls="UTC"; counted=1
+        elif [ "$mock_jst" -gt 0 ] && [ "$mock_utc" -eq 0 ]; then
+          cls="JST"; counted=1
+        fi
+        ltz_item "CloudWatch" "偽装 CloudWatch Logs に届いたイベントの時刻 (実測)" \
+          "行の時刻を UTC として取り込み ${mock_utc} 件 / JST として ${mock_jst} 件 / オフセットどおり ${mock_ok} 件 / オフセットと食い違い ${mock_shift} 件 / その他 ${mock_other} 件" \
+          "$cls" "$counted" "${service} の request journal (直近 ${OBSERVABILITY_WIREMOCK_REQUEST_LIMIT} リクエスト)。${mock_sample}"
+        if [ "$line_zone" = "JST" ] && [ "$mock_utc" -gt 0 ]; then
+          ltz_finding "指摘" "CloudWatch" "偽装 CloudWatch Logs に、行の時刻より 9 時間未来のイベントが届いています (${mock_utc} 件)" \
+            "JST のログ行を UTC として取り込んでいます (実測)。実 CloudWatch Logs では 2 時間より先の未来のイベントは PutLogEvents で拒否され、残りません。${mock_sample}" \
+            "collect_list の timezone / timestamp_format の指摘を直してください (推奨: 行に +0900 を出して %z で読む)。" ""
+        elif [ "$line_zone" = "UTC" ] && [ "$mock_jst" -gt 0 ]; then
+          ltz_finding "指摘" "CloudWatch" "偽装 CloudWatch Logs に、行の時刻より 9 時間過去のイベントが届いています (${mock_jst} 件)" \
+            "UTC のログ行を JST として取り込んでいます (実測)。${mock_sample}" \
+            "JVM を JST にしたうえで、行に +0900 を出して %z で読ませてください。" ""
+        fi
+        if [ "$mock_shift" -gt 0 ]; then
+          ltz_finding "指摘" "CloudWatch" "偽装 CloudWatch Logs に、行のオフセットと食い違う時刻のイベントが届いています (${mock_shift} 件)" \
+            "行にオフセットがあるのに、エージェントがそれを使わずに時刻を解釈しています。${mock_sample}" \
+            "timestamp_format に %z を入れ、オフセットを +0900 形式にしてください。" ""
+        fi
+      fi
+    fi
+  fi
+}
+
+# ---- 判定 --------------------------------------------------------------------
+ltz_decide_verdict() {
+  local entry layer name value cls counted note severity category
+  local boundary="" other
+
+  LTZ_COUNT_JST=0; LTZ_COUNT_UTC=0; LTZ_COUNT_OTHER=0; LTZ_COUNT_UNKNOWN=0
+  for entry in ${LTZ_ITEMS[@]+"${LTZ_ITEMS[@]}"}; do
+    IFS=$'\037' read -r layer name value cls counted note <<< "$entry"
+    [ "$counted" = "1" ] || continue
+    case "$cls" in
+      JST) LTZ_COUNT_JST=$(( LTZ_COUNT_JST + 1 )) ;;
+      UTC) LTZ_COUNT_UTC=$(( LTZ_COUNT_UTC + 1 )) ;;
+      OTHER) LTZ_COUNT_OTHER=$(( LTZ_COUNT_OTHER + 1 )) ;;
+      *) LTZ_COUNT_UNKNOWN=$(( LTZ_COUNT_UNKNOWN + 1 )) ;;
+    esac
+  done
+  LTZ_PROBLEM_COUNT=0; LTZ_CW_PROBLEM_COUNT=0
+  for entry in ${LTZ_FINDINGS[@]+"${LTZ_FINDINGS[@]}"}; do
+    IFS=$'\037' read -r severity category name <<< "$entry"
+    [ "$severity" = "指摘" ] || continue
+    LTZ_PROBLEM_COUNT=$(( LTZ_PROBLEM_COUNT + 1 ))
+    [ "$category" = "CloudWatch" ] && LTZ_CW_PROBLEM_COUNT=$(( LTZ_CW_PROBLEM_COUNT + 1 ))
+  done
+
+  [ -n "$LTZ_BOUNDARY_TEXT" ] && boundary="。${SERVER_LOG_CHECK_BASENAME} の切替: ${LTZ_BOUNDARY_TEXT}"
+  other=""
+  [ "$LTZ_COUNT_OTHER" -gt 0 ] && other=" / その他 ${LTZ_COUNT_OTHER} 件"
+  if [ -z "${LTZ_R[jvm_pid]:-}" ]; then
+    LTZ_VERDICT_STATE="判定不能"
+    LTZ_VERDICT_TEXT="判定不能 — JBoss EAP の JVM が見つからないため、実際に効いているタイムゾーンを確定できません (設定から分かる範囲を表示しています)"
+  elif [ "$LTZ_PROBLEM_COUNT" -eq 0 ] && [ "$LTZ_COUNT_UTC" -eq 0 ] && [ "$LTZ_COUNT_OTHER" -eq 0 ]; then
+    LTZ_VERDICT_STATE="正常"
+    LTZ_VERDICT_TEXT="正常 — 関係する時刻設定はすべて JST です (JST ${LTZ_COUNT_JST} 件)${boundary}"
+  elif [ "$LTZ_COUNT_JST" -eq 0 ] && [ "$LTZ_COUNT_UTC" -gt 0 ]; then
+    LTZ_VERDICT_STATE="異常 (UTC)"
+    LTZ_VERDICT_TEXT="異常 (UTC) — 関係する時刻設定がすべて UTC です (UTC ${LTZ_COUNT_UTC} 件${other})${boundary}"
+  elif [ "$LTZ_COUNT_JST" -eq 0 ] && [ "$LTZ_COUNT_OTHER" -gt 0 ]; then
+    LTZ_VERDICT_STATE="異常 (その他)"
+    LTZ_VERDICT_TEXT="異常 (その他) — 関係する時刻設定が JST でも UTC でもありません (その他 ${LTZ_COUNT_OTHER} 件)${boundary}"
+  elif [ "$LTZ_COUNT_UTC" -gt 0 ] || [ "$LTZ_COUNT_OTHER" -gt 0 ]; then
+    LTZ_VERDICT_STATE="異常 (混在)"
+    LTZ_VERDICT_TEXT="異常 (混在) — 一部だけが JST で、UTC の設定が残っています (JST ${LTZ_COUNT_JST} 件 / UTC ${LTZ_COUNT_UTC} 件${other})${boundary}"
+  else
+    LTZ_VERDICT_STATE="異常"
+    LTZ_VERDICT_TEXT="異常 — 時刻設定は JST ですが、指摘が ${LTZ_PROBLEM_COUNT} 件あります${boundary}"
+  fi
+  if [ "$LTZ_CW_PROBLEM_COUNT" -gt 0 ]; then
+    LTZ_VERDICT_TEXT="${LTZ_VERDICT_TEXT}。CloudWatch Logs への転送の問題 ${LTZ_CW_PROBLEM_COUNT} 件"
+  fi
+}
+
+# ---- 追加情報 (問題があるときだけ画面と Markdown へ出す) -------------------------
+# UTC と JST の対応を今日の日付で示し、推奨設定と確認コマンドを並べる。
+ltz_build_additional_info() {
+  local now="${LTZ_R[now]:-}" day example_day next_day log_dir pid
+  LTZ_EXTRA_MAPPING=()
+  LTZ_EXTRA_RECOMMEND=()
+  LTZ_EXTRA_COMMANDS=()
+
+  if ! [[ "$now" =~ ^[0-9]+$ ]]; then
+    now="$(date '+%s' 2>/dev/null)"
+  fi
+  if [[ "$now" =~ ^[0-9]+$ ]]; then
+    # 前日 (JST) を例にする。
+    day=$(( (now + 32400) / 86400 - 1 ))
+    ltz_format_epoch_jst $(( day * 86400 - 32400 ))
+    example_day="${LTZ_FMT:0:10}"
+    ltz_format_epoch_jst $(( (day + 1) * 86400 - 32400 ))
+    next_day="${LTZ_FMT:0:10}"
+  else
+    example_day="2026-09-16"
+    next_day="2026-09-17"
+  fi
+  LTZ_EXTRA_MAPPING+=("${SERVER_LOG_CHECK_BASENAME} の日付の区切りは、JVM の既定タイムゾーンの 0:00 です (ハンドラにタイムゾーン属性は無い)。")
+  LTZ_EXTRA_MAPPING+=("JST で区切る場合: ${SERVER_LOG_CHECK_BASENAME}.${example_day} = JST ${example_day} 00:00:00 〜 ${example_day} 23:59:59")
+  LTZ_EXTRA_MAPPING+=("UTC で区切る場合: ${SERVER_LOG_CHECK_BASENAME}.${example_day} = JST ${example_day} 09:00:00 〜 ${next_day} 08:59:59 (JST ${next_day} の 0:00〜8:59 のログが前日付ファイルに入る)")
+  LTZ_EXTRA_MAPPING+=("見分け方: 前日付ファイルの最終更新が JST の 8:59 ごろなら UTC の区切り。JST の 0:00 を過ぎても前日付ファイルが増え続けるなら、改名前のファイルを開いたままの書き手 (同じメニューの「server.log の FD 点検」で特定)。")
+  LTZ_EXTRA_MAPPING+=("切替はログを書く直前に判定します (遅延ローテーション)。0:00 ちょうどにログが無ければ、0:00 を過ぎた最初のログで切り替わります。")
+  LTZ_EXTRA_MAPPING+=("CloudWatch Logs のイベント時刻は UTC の epoch ミリ秒です。CloudWatch Agent が JST の行を UTC として読むと 9 時間未来になり、2 時間より先のイベントは PutLogEvents で拒否されて残りません。")
+
+  LTZ_EXTRA_RECOMMEND+=("★必須"$'\037'"JVM の起動引数"$'\037'"-Duser.timezone=Asia/Tokyo (standalone.conf の末尾に JAVA_OPTS=\"\$JAVA_OPTS -Duser.timezone=Asia/Tokyo\"、または JDK_JAVA_OPTIONS / Red Hat 公式イメージの JAVA_OPTS_APPEND。JAVA_OPTS を環境変数で丸ごと渡さない)")
+  LTZ_EXTRA_RECOMMEND+=("★必須"$'\037'"jboss-cli"$'\037'"system-property の user.timezone を使わない (あれば /system-property=user.timezone:remove)")
+  LTZ_EXTRA_RECOMMEND+=("★必須"$'\037'"起動スクリプト"$'\037'"stdout / stderr を ${SERVER_LOG_CHECK_BASENAME} へリダイレクトしない (awslogs / FireLens へ流す)")
+  LTZ_EXTRA_RECOMMEND+=("推奨"$'\037'"compose / タスク定義の environment"$'\037'"TZ=Asia/Tokyo (frontend・backend と CloudWatch Agent のサイドカー)")
+  LTZ_EXTRA_RECOMMEND+=("推奨"$'\037'"Dockerfile"$'\037'"tzdata の再インストール (microdnf -y reinstall tzdata) と ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime、ENV TZ=Asia/Tokyo")
+  LTZ_EXTRA_RECOMMEND+=("推奨"$'\037'"EAP の pattern-formatter"$'\037'"%d にオフセットを付ける: %d{yyyy-MM-dd HH:mm:ss,SSSZ} (+0900。CloudWatch Agent の %z は +09:00 を読めないため XXX ではなく Z)")
+  LTZ_EXTRA_RECOMMEND+=("推奨"$'\037'"CloudWatch Agent の collect_list"$'\037'"timestamp_format に %z (例: \"%Y-%m-%d %H:%M:%S,%f%z\")、timezone は \"Local\"、file_path はローテート済みファイルに一致させない")
+  LTZ_EXTRA_RECOMMEND+=("確認"$'\037'"アプリ"$'\037'"TimeZone.setDefault() を呼ばない / 独自のロガーで ${SERVER_LOG_CHECK_BASENAME} を書かない")
+
+  log_dir="${LTZ_R[log_dir]:-<ログディレクトリ>}"
+  pid="${LTZ_R[jvm_pid]:-<PID>}"
+  LTZ_EXTRA_COMMANDS+=("コンテナ内"$'\037'"date; date -u; echo \"TZ=\${TZ:-未設定}\"; ls -l /etc/localtime; ls -l /usr/share/zoneinfo/Asia/Tokyo")
+  LTZ_EXTRA_COMMANDS+=("コンテナ内"$'\037'"tr '\\0' '\\n' < /proc/${pid}/cmdline | grep -E 'user\\.timezone'")
+  LTZ_EXTRA_COMMANDS+=("コンテナ内"$'\037'"tr '\\0' '\\n' < /proc/${pid}/environ | grep -E '^(TZ|JAVA_OPTS|JAVA_OPTS_APPEND|JDK_JAVA_OPTIONS|JAVA_TOOL_OPTIONS)='")
+  LTZ_EXTRA_COMMANDS+=("jboss-cli"$'\037'"/core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments)")
+  LTZ_EXTRA_COMMANDS+=("jboss-cli"$'\037'"/system-property=user.timezone:read-resource   (失敗 = 未定義が正しい)")
+  LTZ_EXTRA_COMMANDS+=("jboss-cli"$'\037'"/subsystem=logging/periodic-rotating-file-handler=FILE:read-resource")
+  LTZ_EXTRA_COMMANDS+=("コンテナ内"$'\037'"stat -c '%y  %s  %n' ${log_dir}/${SERVER_LOG_CHECK_BASENAME}*")
+  LTZ_EXTRA_COMMANDS+=("コンテナ内"$'\037'"head -n 1 ${log_dir}/${SERVER_LOG_CHECK_BASENAME}.${example_day}; tail -n 1 ${log_dir}/${SERVER_LOG_CHECK_BASENAME}.${example_day}")
+  LTZ_EXTRA_COMMANDS+=("ECS"$'\037'"aws ecs execute-command --cluster <クラスター> --task <タスク ID> --container <コンテナ名> --interactive --command /bin/bash")
+  LTZ_EXTRA_COMMANDS+=("CloudWatch Logs"$'\037'"aws logs filter-log-events --log-group-name <ロググループ> --limit 5 --query 'events[].[timestamp,message]' --output text   (timestamp は UTC の epoch ミリ秒。行の時刻と 9 時間ずれていないか)")
+  LTZ_EXTRA_COMMANDS+=("CloudWatch Agent"$'\037'"docker compose logs ${CWAGENT_SERVICE} | grep -E 'are (too new|too old|expired)|Error parsing timestampFromLogLine'")
+}
+
+# 問題 (指摘、または UTC / その他の設定) があるか。
+ltz_has_problem() {
+  [ "$LTZ_PROBLEM_COUNT" -gt 0 ] || [ "$LTZ_COUNT_UTC" -gt 0 ] || [ "$LTZ_COUNT_OTHER" -gt 0 ]
+}
+
+# ---- 画面への表示 ------------------------------------------------------------
+ltz_render_screen() {
+  local entry layer name value cls counted note current="" severity category title impact fix check
+  local index=0 wanted problem="false" row priority place setting unknown
+  local -A layer_titles=(
+    [OS]="1. OS のタイムゾーン (date・シェル・cron・ヘルスチェック・ls -l / stat の表示)"
+    [JVM]="2. JVM の既定タイムゾーン (server.log の切替時刻と行頭の時刻を決める)"
+    [EAP]="3. EAP のロギング (ハンドラ・フォーマッタは生成時の JVM の既定を使う)"
+    [実測]="4. 実際のログファイル (実測)"
+    [CloudWatch]="5. CloudWatch Logs への転送 (CloudWatch Agent)"
+  )
+
+  for entry in ${LTZ_ITEMS[@]+"${LTZ_ITEMS[@]}"}; do
+    IFS=$'\037' read -r layer name value cls counted note <<< "$entry"
+    if [ "$layer" != "$current" ]; then
+      current="$layer"
+      diag ""
+      diag "── ${layer_titles[$layer]:-$layer} ──"
+    fi
+    ltz_class_label "$cls"
+    diag "  ${LTZ_TAG} ${name} : ${value}"
+    if [ -n "$note" ]; then
+      diag "             ${note}"
+    fi
+  done
+  if [ -n "$LTZ_CW_NOTE" ]; then
+    diag "             (cwagent の${LTZ_CW_NOTE})"
+  fi
+  if [ ${#LTZ_CW_OTHER_ENTRIES[@]} -gt 0 ]; then
+    diag "             このサービスの ${SERVER_LOG_CHECK_BASENAME} 以外を収集する collect_list: ${#LTZ_CW_OTHER_ENTRIES[@]} 件 (Markdown に一覧)"
+  fi
+
+  unknown=""
+  [ "$LTZ_COUNT_UNKNOWN" -gt 0 ] && unknown=" / 不明 ${LTZ_COUNT_UNKNOWN} 件"
+  diag ""
+  diag "── 集計 (関係する時刻設定) ──"
+  diag "  JST ${LTZ_COUNT_JST} 件 / UTC ${LTZ_COUNT_UTC} 件 / その他 ${LTZ_COUNT_OTHER} 件${unknown}"
+  diag "  ([JST] / [UTC] などの見出しのうち、集計に含めるのは実際に効いている設定と明示した設定です)"
+  diag ""
+  diag "判定: ${LTZ_VERDICT_TEXT}"
+
+  ltz_has_problem && problem="true"
+  if [ ${#LTZ_FINDINGS[@]} -gt 0 ]; then
+    diag ""
+    if [ "$problem" = "true" ]; then
+      diag "── 指摘と追加情報 ──"
+    else
+      diag "── 補足 ──"
+    fi
+    for wanted in 指摘 注意 情報; do
+      for entry in "${LTZ_FINDINGS[@]}"; do
+        IFS=$'\037' read -r severity category title impact fix check <<< "$entry"
+        [ "$severity" = "$wanted" ] || continue
+        index=$(( index + 1 ))
+        diag "  [${severity} ${index}] (${category}) ${title}"
+        if [ "$problem" = "true" ] || [ "$severity" = "指摘" ]; then
+          [ -n "$impact" ] && diag "      影響: ${impact}"
+          [ -n "$fix" ] && diag "      対処: ${fix}"
+          [ -n "$check" ] && diag "      確認: ${check}"
+        elif [ "$severity" = "注意" ] && [ -n "$fix" ]; then
+          diag "      対処: ${fix}"
+        fi
+      done
+    done
+  fi
+
+  if [ "$problem" = "true" ]; then
+    ltz_build_additional_info
+    diag ""
+    diag "── 追加情報: UTC と JST の対応 (${SERVER_LOG_CHECK_BASENAME} の見え方) ──"
+    for row in "${LTZ_EXTRA_MAPPING[@]}"; do
+      diag "  - ${row}"
+    done
+    diag ""
+    diag "── 追加情報: 推奨設定 (JST にそろえる) ──"
+    for row in "${LTZ_EXTRA_RECOMMEND[@]}"; do
+      IFS=$'\037' read -r priority place setting <<< "$row"
+      diag "  [${priority}] ${place}: ${setting}"
+    done
+    diag ""
+    diag "── 追加情報: 確認コマンド ──"
+    for row in "${LTZ_EXTRA_COMMANDS[@]}"; do
+      IFS=$'\037' read -r place setting <<< "$row"
+      diag "  (${place}) ${setting}"
+    done
+  fi
+}
+
+# ---- Markdown への出力 -------------------------------------------------------
+# 表のセルへ入れるため、改行を <br>、| を \| にする (LTZ_CELL)。
+ltz_md_escape() {
+  local s="$1"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/<br>}"
+  s="${s//|/\\|}"
+  LTZ_CELL="$s"
+}
+
+# 値をコードとして見せる (括弧書きの説明と、` を含む値はそのまま)。
+ltz_md_code() {
+  ltz_md_escape "$1"
+  case "$1" in
+    ''|'('*|*'`'*) ;;
+    *) LTZ_CELL="\`${LTZ_CELL}\`" ;;
+  esac
+}
+
+ltz_md_row() {
+  local key="$1" value="$2"
+  ltz_md_escape "$value"
+  printf '| %s | %s |\n' "$key" "$LTZ_CELL"
+}
+
+# 画面へ出したものと同じ内容を、Markdown の表と見出しで残す。設定の値や起動引数の
+# 一部を含むため、他ユーザーからは読めない権限で作る。
+#   $1 = 出力先 / $2 = コンテナ内プローブの出力 (付録として伏せ字にして残す)
+write_log_rotation_tz_md() {
+  local path="$1" capture_file="$2" dir_path entry layer name value cls counted note
+  local severity category title impact fix check index=0 wanted problem="false"
+  local row priority place setting mark cell_name cell_value cell_note entry_index cw_state
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "ログローテーションのタイムゾーン点検の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "ログローテーションのタイムゾーン点検の Markdown を作成できませんでした: ${path}"
+    return 1
+  fi
+  ltz_has_problem && problem="true"
+  {
+    printf '# ログローテーションのタイムゾーン点検 (UTC / JST)\n\n'
+    printf '> build_and_verify.sh の `--keep-container-mode logs` の操作「ログローテーションのタイムゾーン点検」の結果です。\n'
+    printf '> %s の日次ローテーションに関係する時刻設定を、OS → JVM → EAP ロギング → 実際のログファイル → CloudWatch Agent の順に集め、1 件ずつ UTC / JST を判定しています。\n\n' \
+      "$SERVER_LOG_CHECK_BASENAME"
+    ltz_md_escape "$LTZ_VERDICT_TEXT"
+    printf '**判定: %s**\n\n' "$LTZ_CELL"
+    printf '| 項目 | 内容 |\n| --- | --- |\n'
+    ltz_md_row "出力日時" "$(now_display_time)"
+    ltz_md_row "Compose サービス" "$LTZ_SERVICE"
+    ltz_md_row "コンテナ" "$LTZ_CONTAINER"
+    ltz_md_row "compose ファイル" "$COMPOSE_FILE"
+    ltz_md_row "実行ユーザー" "$LTZ_EXEC_NOTE"
+    if [ -n "${LTZ_R[jvm_pid]:-}" ]; then
+      ltz_md_row "JBoss EAP の JVM" "pid ${LTZ_R[jvm_pid]}"
+    else
+      ltz_md_row "JBoss EAP の JVM" "(見つかりません)"
+    fi
+    ltz_md_row "設定ファイル" "${LTZ_R[config]:-(不明)}"
+    ltz_md_row "ログディレクトリ" "${LTZ_R[log_dir]:-(不明)}${LTZ_R[log_dir_source]:+ (${LTZ_R[log_dir_source]})}"
+    ltz_md_row "jboss-cli.sh の接続先" "${LTZ_R[cli_controller]:-(実行していません)}${LTZ_R[cli_controller_desc]:+ (${LTZ_R[cli_controller_desc]})}"
+    case "$LTZ_CW_STATE" in
+      absent)   cw_state="起動していません" ;;
+      present)  cw_state="点検しました" ;;
+      noconfig) cw_state="設定を取り出せないため未確認" ;;
+      nopython) cw_state="Python 3 が無いため未確認" ;;
+      *)        cw_state="未確認" ;;
+    esac
+    ltz_md_row "CloudWatch Agent" "${CWAGENT_SERVICE} (${cw_state})${LTZ_CW_NOTE:+ / ${LTZ_CW_NOTE}}"
+    ltz_md_row "集計" "JST ${LTZ_COUNT_JST} 件 / UTC ${LTZ_COUNT_UTC} 件 / その他 ${LTZ_COUNT_OTHER} 件 / 不明 ${LTZ_COUNT_UNKNOWN} 件"
+    ltz_md_row "期待する状態" "関係する時刻設定がすべて JST (Asia/Tokyo)。${SERVER_LOG_CHECK_BASENAME} は毎日 00:00 JST に切り替わる"
+
+    printf '\n## 時刻設定の一覧\n\n'
+    printf '| 区分 | 項目 | 値 | 判定 | 集計 | 補足 |\n| --- | --- | --- | --- | --- | --- |\n'
+    for entry in ${LTZ_ITEMS[@]+"${LTZ_ITEMS[@]}"}; do
+      IFS=$'\037' read -r layer name value cls counted note <<< "$entry"
+      ltz_class_label "$cls"
+      mark="-"
+      [ "$counted" = "1" ] && mark="○"
+      ltz_md_escape "$name"; cell_name="$LTZ_CELL"
+      ltz_md_code "$value"; cell_value="$LTZ_CELL"
+      ltz_md_escape "$note"; cell_note="$LTZ_CELL"
+      if [ "$cls" = "UTC" ] || [ "$cls" = "OTHER" ]; then
+        printf '| %s | %s | %s | **%s** | %s | %s |\n' "$layer" "$cell_name" "$cell_value" "$LTZ_LABEL" "$mark" "$cell_note"
+      else
+        printf '| %s | %s | %s | %s | %s | %s |\n' "$layer" "$cell_name" "$cell_value" "$LTZ_LABEL" "$mark" "$cell_note"
+      fi
+    done
+    printf '\n「集計」が ○ の設定 (実際に効いている設定と、明示した設定) だけを UTC / JST の件数に数えます。- は参考です。\n'
+
+    if [ ${#LTZ_FINDINGS[@]} -gt 0 ]; then
+      if [ "$problem" = "true" ]; then
+        printf '\n## 指摘と追加情報\n'
+      else
+        printf '\n## 補足\n'
+      fi
+      for wanted in 指摘 注意 情報; do
+        for entry in "${LTZ_FINDINGS[@]}"; do
+          IFS=$'\037' read -r severity category title impact fix check <<< "$entry"
+          [ "$severity" = "$wanted" ] || continue
+          index=$(( index + 1 ))
+          printf '\n### [%s %s] (%s) %s\n\n' "$severity" "$index" "$category" "$title"
+          [ -n "$impact" ] && printf -- '- **影響**: %s\n' "$impact"
+          [ -n "$fix" ] && printf -- '- **対処**: %s\n' "$fix"
+          if [ -n "$check" ]; then
+            case "$check" in
+              *'`'*) printf -- '- **確認**: %s\n' "$check" ;;
+              *)     printf -- '- **確認**: `%s`\n' "$check" ;;
+            esac
+          fi
+        done
+      done
+    fi
+
+    if [ "$problem" = "true" ]; then
+      ltz_build_additional_info
+      printf '\n## 追加情報: UTC と JST の対応 (%s の見え方)\n\n' "$SERVER_LOG_CHECK_BASENAME"
+      for row in "${LTZ_EXTRA_MAPPING[@]}"; do
+        printf -- '- %s\n' "$row"
+      done
+      printf '\n## 追加情報: 推奨設定 (JST にそろえる)\n\n'
+      printf '| 優先度 | 場所 | 設定 |\n| --- | --- | --- |\n'
+      for row in "${LTZ_EXTRA_RECOMMEND[@]}"; do
+        IFS=$'\037' read -r priority place setting <<< "$row"
+        ltz_md_escape "$setting"
+        printf '| %s | %s | %s |\n' "$priority" "$place" "$LTZ_CELL"
+      done
+      printf '\n## 追加情報: 確認コマンド\n\n'
+      printf '| 場所 | コマンド |\n| --- | --- |\n'
+      for row in "${LTZ_EXTRA_COMMANDS[@]}"; do
+        IFS=$'\037' read -r place setting <<< "$row"
+        ltz_md_code "$setting"
+        printf '| %s | %s |\n' "$place" "$LTZ_CELL"
+      done
+    fi
+
+    if [ ${#LTZ_CW_OTHER_ENTRIES[@]} -gt 0 ]; then
+      printf '\n## 参考: このサービスの %s 以外を収集する collect_list\n\n' "$SERVER_LOG_CHECK_BASENAME"
+      printf '| # | file_path | timestamp_format | timezone |\n| --- | --- | --- | --- |\n'
+      for entry in "${LTZ_CW_OTHER_ENTRIES[@]}"; do
+        IFS=$'\037' read -r entry_index name value note <<< "$entry"
+        ltz_md_code "$name"; cell_name="$LTZ_CELL"
+        ltz_md_code "${value:-(なし)}"; cell_value="$LTZ_CELL"
+        ltz_md_escape "${note:-(未指定 = Local)}"; cell_note="$LTZ_CELL"
+        printf '| %s | %s | %s | %s |\n' "$entry_index" "$cell_name" "$cell_value" "$cell_note"
+      done
+    fi
+
+    printf '\n## 点検の方法\n\n'
+    printf -- '- **OS**: JVM プロセスの環境変数 TZ、/etc/localtime (リンク先と TZif の規則)、tzdata の有無、その TZ で date を実行したオフセットを見ます。\n'
+    printf -- '- **JVM**: -Duser.timezone を起動引数・JDK_JAVA_OPTIONS・JAVA_TOOL_OPTIONS・_JAVA_OPTIONS から後勝ちで求め、無ければ TZ → /etc/localtime → GMT の順に JVM の既定を推定します。jboss-cli.sh で input-arguments と実行時の user.timezone を確かめ、standalone.xml の system-property も確認します。\n'
+    printf -- '- **EAP ロギング**: %s を書くハンドラの suffix (周期) と、フォーマッタの %%d (オフセットの有無)・zone-id を standalone.xml から読みます。ハンドラにタイムゾーン属性は無く、切替は JVM の既定に従います。\n' "$SERVER_LOG_CHECK_BASENAME"
+    printf -- '- **実測**: %s の最終行の時刻と更新時刻の差 (9 時間なら JST)、ローテート済みファイルの最終更新時刻 (JST の翌日 0:00〜8:59 なら UTC の区切り) を見ます。行の本文は読みません。\n' "$SERVER_LOG_CHECK_BASENAME"
+    printf -- '- **CloudWatch Agent**: collect_list の timezone / timestamp_format をログ行の書式と突き合わせ、timezone:"Local" の解決先 (cwagent の TZ・zoneinfo) と、エージェントのログ (too new / too old / expired / Error parsing timestampFromLogLine)、偽装 CloudWatch Logs に届いたイベントの時刻を確認します。\n'
+    printf -- '- 観点は JBossEAP_TimeSetting の「JBoss EAP server.log 日次ローテーションとタイムゾーン（JST）完全ガイド」と JBossEAP_LogRotate の分析 (RC-1 / RC-4) に合わせています。コンテナ内のファイルは変更しません。\n'
+
+    printf '\n## 参考: コンテナ内で集めた値\n\n'
+    printf '<details><summary>プローブの出力 (機微な値は伏せ字)</summary>\n\n'
+    printf '```text\n'
+    redact_healthcheck_text < "$capture_file" | tr '\037' '|'
+    printf '```\n\n</details>\n'
+  } >> "$path" 2>/dev/null || {
+    warn "ログローテーションのタイムゾーン点検の Markdown を出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
+# ---- 入口 --------------------------------------------------------------------
+# JBoss EAP のコンテナで時刻設定を集め、UTC / JST を判定して画面と Markdown へ出す。
+# 追加の入力は不要 (JBOSS_HOME・設定ファイル・ログディレクトリはコンテナから求める)。
+run_interactive_compose_log_rotation_tz_check() {
+  local service_name="$1" container_id container_name probe_script jvm_user="" exec_note
+  local capture_file="" error_file="" exec_status=0 md_path="" line
+  local port_offset_line port_offset port_offset_source
+  local -a container_ids=() exec_args=()
+
+  mapfile -t container_ids < <(compose_container_ids "$service_name")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "Compose サービス '${service_name}' の実行中コンテナが見つかりません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${service_name}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  # /proc/<pid>/environ は JVM と同じユーザーでしか読めないため、その uid:gid で実行する
+  # (Docker の既定の権限では root でも別ユーザーの environ は読めない)。
+  jvm_user="$(server_log_fd_jvm_user "$container_id" || true)"
+  case "$jvm_user" in
+    [0-9]*:[0-9]*)
+      exec_args=(-u "$jvm_user")
+      exec_note="JBoss EAP の JVM と同じ uid:gid (${jvm_user})"
+      ;;
+    *)
+      exec_note="コンテナの既定ユーザー (JBoss EAP の JVM を検出できなかったため)"
+      ;;
+  esac
+  port_offset_line="$(logging_config_audit_port_offset "$service_name")"
+  port_offset="${port_offset_line%%$'\t'*}"
+  port_offset_source="${port_offset_line#*$'\t'}"
+
+  probe_script="$(cat <<'LOG_ROTATION_TZ_PROBE'
+set -u
+# log-rotation-tz-probe: JBoss EAP の server.log のローテーションに関わる時刻設定を集め、
+# 1 行 1 件のレコード (区切りは US = \037) で返す。UTC / JST の判定と、画面・Markdown
+# への整形は build_and_verify.sh 側で行う。
+#   $1      = --jboss-config-file の指定 (空文字可)
+#   $2      = --jboss-cli-path の指定 (空文字可)
+#   $3      = 点検対象のファイル名 (既定 server.log)
+#   $4      = jboss-cli.sh の管理ポートへ加算する port-offset の既定値
+#   $5      = $4 の決め方の説明
+#   $6      = 読むローテート済みファイルの数 (新しい順)
+#   $7 以降 = JBOSS_HOME の候補
+# 環境変数・起動引数・system-properties は機微な値を含み得るため、タイムゾーンに関わる
+# 値 (TZ と -Duser.timezone) だけを取り出して返す。ログファイルも行頭の日時だけを読み、
+# 本文は返さない。コンテナ内のファイルは一切変更しない。
+# 終了コード: 0 = 収集できた / 2 = 前提不足 (/proc が見えない)
+
+LTZ_CONFIG_HINT="${1:-}"
+LTZ_CLI_HINT="${2:-}"
+LTZ_BASE="${3:-server.log}"
+LTZ_OFFSET_DEFAULT="${4:-0}"
+LTZ_OFFSET_DEFAULT_SOURCE="${5:-既定}"
+LTZ_ROTATED_LIMIT="${6:-7}"
+if [ "$#" -ge 6 ]; then
+  shift 6
+else
+  set --
+fi
+LTZ_NL='
+'
+LTZ_US="$(printf '\037')"
+LTZ_TAB="$(printf '\t')"
+LTZ_CR="$(printf '\r')"
+
+# 1 レコードを出す。値の中の区切り文字・タブ・改行は空白へ置き換える。
+ltz_rec() {
+  ltz_out=''
+  ltz_sep=''
+  for ltz_field in "$@"; do
+    case "$ltz_field" in
+      *"$LTZ_US"*|*"$LTZ_TAB"*|*"$LTZ_NL"*|*"$LTZ_CR"*)
+        ltz_field="$(printf '%s' "$ltz_field" | tr '\037\t\r\n' '    ')"
+        ;;
+    esac
+    ltz_out="${ltz_out}${ltz_sep}${ltz_field}"
+    ltz_sep="$LTZ_US"
+  done
+  printf '%s\n' "$ltz_out"
+}
+
+ltz_yesno() {
+  if "$@"; then printf 'yes'; else printf 'no'; fi
+}
+
+# TZif (zoneinfo の形式) の末尾には、そのゾーンの POSIX 形式の規則 (Asia/Tokyo なら
+# JST-9、UTC なら UTC0) が 1 行で入る。zoneinfo の名前を引けないファイル (ホストから
+# マウントした /etc/localtime など) でも、この規則で JST か UTC かを判定できる。
+ltz_tzif_rule() {
+  [ -r "$1" ] || return 0
+  [ "$(head -c 4 "$1" 2>/dev/null)" = "TZif" ] || return 0
+  tail -n 1 "$1" 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9<>+,.:/-' | head -c 64
+}
+
+ltz_mtime() {
+  stat -c '%Y' "$1" 2>/dev/null || date -r "$1" '+%s' 2>/dev/null
+}
+ltz_size() {
+  stat -c '%s' "$1" 2>/dev/null || { wc -c < "$1"; } 2>/dev/null | tr -d ' '
+}
+
+# 行の中の最初の日時 (yyyy-MM-dd HH:mm:ss[,SSS][ ][+09:00|+0900|Z]) だけを取り出す。
+# awk の正規表現は、回数指定 ({4}) を持たない実装もあるため文字を並べて書く。
+ltz_extract_ts() {
+  awk '{
+    if (match($0, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]([.,][0-9]+)?( ?(Z|[+-][0-9][0-9](:?[0-9][0-9])?))?/))
+      print substr($0, RSTART, RLENGTH)
+  }'
+}
+
+# 値 ($1) の中の -Duser.timezone=... を取り出す (複数あれば最後の指定が有効)。
+ltz_opt_tz() {
+  printf '%s\n' "$1" | tr ' ' '\n' | tr -d "\"'" | sed -n 's/^-Duser\.timezone=//p' | tail -n 1
+}
+
+# 環境変数の一覧 ($2: NAME=値 の行) から、タイムゾーンに関わる値だけを返す。
+# JAVA_OPTS などは値全体を返さず、-Duser.timezone の指定だけを取り出す。
+ltz_env_scan() {
+  for ltz_name in TZ JAVA_OPTS JAVA_OPTS_APPEND JDK_JAVA_OPTIONS JAVA_TOOL_OPTIONS _JAVA_OPTIONS; do
+    if printf '%s\n' "$2" | grep -q "^${ltz_name}="; then
+      ltz_val="$(printf '%s\n' "$2" | sed -n "s/^${ltz_name}=//p" | head -n 1)"
+      if [ "$ltz_name" = TZ ]; then
+        ltz_rec "$1" "$ltz_name" set "$ltz_val"
+      else
+        ltz_rec "$1" "$ltz_name" set "$(ltz_opt_tz "$ltz_val")"
+      fi
+    else
+      ltz_rec "$1" "$ltz_name" unset ''
+    fi
+  done
+}
+
+# 指定した TZ の値で date が返すオフセットと略号 (glibc / musl の解釈そのもの)。
+ltz_os_date() {
+  if [ "$2" = set ]; then
+    ltz_d="$(TZ="$3" date '+%z %Z' 2>/dev/null)"
+  else
+    ltz_d="$( (unset TZ; date '+%z %Z') 2>/dev/null)"
+  fi
+  ltz_rec os date "$1" "${ltz_d%% *}" "${ltz_d#* }" "$2" "$3"
+}
+
+if [ ! -d /proc/self ]; then
+  ltz_rec error proc '/proc が見えません (Linux のコンテナ内で実行してください)'
+  exit 2
+fi
+
+ltz_rec meta now "$(date '+%s' 2>/dev/null)"
+ltz_rec meta user "$(awk '/^Uid:/ { u = $2 } /^Gid:/ { g = $2 } END { print u ":" g }' /proc/self/status 2>/dev/null)"
+
+# ---- JBoss EAP の JVM を特定する ---------------------------------------------
+# argv[0] が java で、jboss-modules.jar か -Djboss.home.dir を持つプロセス。
+# (このスクリプト自身の引数にも同じ文字列が含まれるため、argv[0] で絞る)
+ltz_jvm_pid=''
+ltz_jvm_args=''
+for ltz_proc in /proc/[0-9]*; do
+  [ "${ltz_proc#/proc/}" = "$$" ] && continue
+  [ -r "$ltz_proc/cmdline" ] || continue
+  ltz_args="$(tr '\0' '\n' < "$ltz_proc/cmdline" 2>/dev/null)"
+  case "${ltz_args%%"$LTZ_NL"*}" in
+    java|*/java) ;;
+    *) continue ;;
+  esac
+  case "$ltz_args" in
+    *jboss-modules.jar*|*-Djboss.home.dir=*) ;;
+    *) continue ;;
+  esac
+  ltz_jvm_pid="${ltz_proc#/proc/}"
+  ltz_jvm_args="$ltz_args"
+  break
+done
+
+# JVM の引数から -D<名前>= の値を取り出す ($1 は sed の正規表現。. はエスケープ済み)。
+ltz_dvalue() {
+  printf '%s\n' "$ltz_jvm_args" | sed -n "s/^-D$1=//p" | head -n 1
+}
+
+ltz_rec jvm pid "$ltz_jvm_pid"
+if [ -n "$ltz_jvm_pid" ]; then
+  printf '%s\n' "$ltz_jvm_args" | sed -n 's/^-Duser\.timezone=//p' | tr -d "\"'" \
+    | while IFS= read -r ltz_v; do
+        ltz_rec jvm arg_tz "$ltz_v"
+      done
+fi
+
+# ---- 環境変数 (JVM プロセスと docker exec の環境) -----------------------------
+# /proc/<pid>/environ は、そのプロセスと同じユーザーか CAP_SYS_PTRACE でしか読めない。
+# 読めないときは、docker exec の環境 (compose / Dockerfile の環境変数) で代用する。
+ltz_environ=''
+ltz_env_readable=no
+if [ -n "$ltz_jvm_pid" ]; then
+  ltz_environ="$( { tr '\0' '\n' < "/proc/$ltz_jvm_pid/environ"; } 2>/dev/null )"
+  [ -n "$ltz_environ" ] && ltz_env_readable=yes
+fi
+ltz_rec jvm env_readable "$ltz_env_readable"
+[ "$ltz_env_readable" = yes ] && ltz_env_scan jvmenv "$ltz_environ"
+ltz_exec_env="$(env 2>/dev/null)"
+ltz_env_scan execenv "$ltz_exec_env"
+
+# ---- OS のタイムゾーン (TZ・/etc/localtime・tzdata) ---------------------------
+if [ -L /etc/localtime ]; then
+  ltz_lt_type=symlink
+  ltz_lt_target="$(readlink /etc/localtime 2>/dev/null)"
+elif [ -f /etc/localtime ]; then
+  ltz_lt_type=file
+  ltz_lt_target=''
+elif [ -e /etc/localtime ]; then
+  ltz_lt_type=other
+  ltz_lt_target=''
+else
+  ltz_lt_type=missing
+  ltz_lt_target=''
+fi
+ltz_rec os localtime "$ltz_lt_type" "$ltz_lt_target" "$(ltz_tzif_rule /etc/localtime)" \
+  "$(ltz_yesno test -r /etc/localtime)"
+ltz_rec os zoneinfo "$(ltz_yesno test -d /usr/share/zoneinfo)" \
+  "$(ltz_yesno test -f /usr/share/zoneinfo/Asia/Tokyo)" \
+  "$(ltz_tzif_rule /usr/share/zoneinfo/Asia/Tokyo)"
+if [ "$ltz_env_readable" = yes ]; then
+  ltz_tz_source="$ltz_environ"
+else
+  ltz_tz_source="$ltz_exec_env"
+fi
+if printf '%s\n' "$ltz_tz_source" | grep -q '^TZ='; then
+  ltz_os_date jvm set "$(printf '%s\n' "$ltz_tz_source" | sed -n 's/^TZ=//p' | head -n 1)"
+else
+  ltz_os_date jvm unset ''
+fi
+if printf '%s\n' "$ltz_exec_env" | grep -q '^TZ='; then
+  ltz_os_date exec set "$(printf '%s\n' "$ltz_exec_env" | sed -n 's/^TZ=//p' | head -n 1)"
+else
+  ltz_os_date exec unset ''
+fi
+if [ -f /etc/timezone ]; then
+  ltz_rec os etc_timezone "$(head -n 1 /etc/timezone 2>/dev/null)"
+fi
+
+# ---- JBOSS_HOME・設定ファイル・standalone.conf -------------------------------
+LTZ_HOME="$(ltz_dvalue 'jboss\.home\.dir')"
+if [ -z "$LTZ_HOME" ] || [ ! -d "$LTZ_HOME" ]; then
+  LTZ_HOME=''
+  for ltz_cand in "${JBOSS_HOME:-}" "${JBOSS_EAP_HOME:-}" "$@"; do
+    [ -n "$ltz_cand" ] || continue
+    if [ -d "$ltz_cand/standalone" ] || [ -f "$ltz_cand/bin/standalone.sh" ]; then
+      LTZ_HOME="$ltz_cand"
+      break
+    fi
+  done
+fi
+LTZ_BASE_DIR="$(ltz_dvalue 'jboss\.server\.base\.dir')"
+[ -n "$LTZ_BASE_DIR" ] || LTZ_BASE_DIR="${LTZ_HOME:-/opt/jboss}/standalone"
+LTZ_CONFIG_DIR="$(ltz_dvalue 'jboss\.server\.config\.dir')"
+[ -n "$LTZ_CONFIG_DIR" ] || LTZ_CONFIG_DIR="$LTZ_BASE_DIR/configuration"
+
+# 起動中サーバーの設定ファイル名 (-c NAME / -c=NAME / --server-config=NAME)。
+ltz_config_name=''
+ltz_prev=''
+while IFS= read -r ltz_arg; do
+  if [ "$ltz_prev" = '-c' ]; then
+    ltz_config_name="$ltz_arg"
+    break
+  fi
+  case "$ltz_arg" in
+    --server-config=*) ltz_config_name="${ltz_arg#--server-config=}"; break ;;
+    -c=*)              ltz_config_name="${ltz_arg#-c=}"; break ;;
+  esac
+  ltz_prev="$ltz_arg"
+done <<LTZ_ARGS_EOF
+$ltz_jvm_args
+LTZ_ARGS_EOF
+
+if [ -n "$LTZ_CONFIG_HINT" ]; then
+  LTZ_CONFIG="$LTZ_CONFIG_HINT"
+elif [ -n "$ltz_config_name" ]; then
+  case "$ltz_config_name" in
+    /*) LTZ_CONFIG="$ltz_config_name" ;;
+    *)  LTZ_CONFIG="$LTZ_CONFIG_DIR/$ltz_config_name" ;;
+  esac
+else
+  LTZ_CONFIG="$LTZ_CONFIG_DIR/standalone.xml"
+  if [ ! -r "$LTZ_CONFIG" ]; then
+    for ltz_name in standalone-full.xml standalone-ha.xml standalone-full-ha.xml; do
+      if [ -r "$LTZ_CONFIG_DIR/$ltz_name" ]; then
+        LTZ_CONFIG="$LTZ_CONFIG_DIR/$ltz_name"
+        break
+      fi
+    done
+  fi
+fi
+ltz_rec cfg jboss_home "$LTZ_HOME"
+ltz_rec cfg config "$LTZ_CONFIG" "$(ltz_yesno test -r "$LTZ_CONFIG")"
+
+LTZ_CONF="${LTZ_HOME:-/opt/jboss}/bin/standalone.conf"
+if [ -r "$LTZ_CONF" ]; then
+  ltz_rec cfg standalone_conf "$LTZ_CONF" yes
+  grep -n 'user\.timezone' "$LTZ_CONF" 2>/dev/null | grep -v '^[0-9]*:[[:space:]]*#' | head -n 5 \
+    | while IFS= read -r ltz_l; do
+        ltz_rec cfg conf_tz "${ltz_l%%:*}" "$(ltz_opt_tz "${ltz_l#*:}")"
+      done
+else
+  ltz_rec cfg standalone_conf "$LTZ_CONF" no
+fi
+
+# ---- standalone.xml (system-properties / logging / undertow の access-log) -------
+# WildFly が書き出す standalone.xml は 1 要素 1 行なので、行単位で読む。
+if [ -r "$LTZ_CONFIG" ]; then
+  awk -v us="$LTZ_US" '
+    function attr(line, name,   re, start) {
+      re = "[ \t]" name "=\"[^\"]*\""
+      if (!match(line, re)) return ""
+      start = RSTART + length(name) + 3
+      return substr(line, start, RLENGTH - length(name) - 4)
+    }
+    function unesc(s) {
+      gsub(/&apos;/, "\047", s); gsub(/&quot;/, "\"", s)
+      gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+      return s
+    }
+    function out(a, b, c, d, e, f, g, h, i) {
+      print a us b us c us d us e us f us g us h us i
+    }
+    function emit_handler() {
+      out("handler", (prof == "" ? "" : prof), h, htype, hrel, hpath, hsuffix, hfk, hfv)
+    }
+    /<system-properties>/   { insys = 1 }
+    /<\/system-properties>/ { insys = 0 }
+    insys && /<property / && attr($0, "name") == "user.timezone" {
+      out("sysprop", "xml", unesc(attr($0, "value")))
+    }
+    /<subsystem xmlns="urn:jboss:domain:undertow:/ { inund = 1 }
+    inund && /<\/subsystem>/ { inund = 0 }
+    inund && /<host / { uhost = attr($0, "name") }
+    inund && /<access-log/ {
+      out("accesslog", uhost, attr($0, "prefix"), attr($0, "suffix"), attr($0, "rotate"),
+          unesc(attr($0, "pattern")))
+    }
+    /<subsystem xmlns="urn:jboss:domain:logging:/ { inlog = 1; next }
+    inlog && /<\/subsystem>/ { inlog = 0 }
+    !inlog { next }
+    /<logging-profile / { prof = attr($0, "name") }
+    /<\/logging-profile>/ { prof = "" }
+    /<(periodic-rotating-file-handler|size-rotating-file-handler|periodic-size-rotating-file-handler|file-handler|custom-handler)[ >]/ {
+      match($0, /<[a-z-]+/)
+      htype = substr($0, RSTART + 1, RLENGTH - 1)
+      h = attr($0, "name"); hrel = ""; hpath = ""; hsuffix = ""; hfk = ""; hfv = ""
+      if ($0 ~ /\/>[ \t]*$/) { emit_handler(); h = "" }
+      next
+    }
+    h != "" && /<file / { hrel = attr($0, "relative-to"); hpath = attr($0, "path") }
+    h != "" && /<suffix / { hsuffix = attr($0, "value") }
+    h != "" && /<named-formatter / { hfk = "named"; hfv = attr($0, "name") }
+    h != "" && /<pattern-formatter / { hfk = "inline"; hfv = unesc(attr($0, "pattern")) }
+    h != "" && /<property / && tolower(attr($0, "name")) ~ /zone/ {
+      out("customtz", h, attr($0, "name"), attr($0, "value"))
+    }
+    h != "" && /<\/(periodic-rotating-file-handler|size-rotating-file-handler|periodic-size-rotating-file-handler|file-handler|custom-handler)>/ {
+      emit_handler(); h = ""; next
+    }
+    h == "" && /<formatter name=/ { fmt = attr($0, "name") }
+    fmt != "" && /<pattern-formatter / { out("formatter", fmt, "pattern", unesc(attr($0, "pattern")), "") }
+    fmt != "" && /<json-formatter/ { out("formatter", fmt, "json", attr($0, "zone-id"), unesc(attr($0, "date-format"))) }
+    fmt != "" && /<xml-formatter/ { out("formatter", fmt, "xml", attr($0, "zone-id"), unesc(attr($0, "date-format"))) }
+    fmt != "" && /<custom-formatter / { out("formatter", fmt, "custom", "", "") }
+    fmt != "" && /<property / && tolower(attr($0, "name")) ~ /zone/ {
+      out("customtz", fmt, attr($0, "name"), attr($0, "value"))
+    }
+    h == "" && /<\/formatter>/ { fmt = "" }
+  ' "$LTZ_CONFIG" 2>/dev/null
+fi
+
+# ---- 稼働中サーバーの実行時の値 (jboss-cli.sh) ------------------------------
+# input-arguments は、起動引数・JDK_JAVA_OPTIONS・JAVA_TOOL_OPTIONS から JVM が実際に
+# 受け取った引数。system-properties の user.timezone は JVM が決めたタイムゾーン ID
+# (standalone.xml の system-property があると、その値で見かけだけ上書きされる)。
+# どちらも機微な値を含むため、タイムゾーンに関わる行だけを取り出す。
+LTZ_CLI=''
+if [ -n "$LTZ_CLI_HINT" ] && [ -f "$LTZ_CLI_HINT" ]; then
+  LTZ_CLI="$LTZ_CLI_HINT"
+elif [ -n "$LTZ_HOME" ] && [ -f "$LTZ_HOME/bin/jboss-cli.sh" ]; then
+  LTZ_CLI="$LTZ_HOME/bin/jboss-cli.sh"
+fi
+ltz_rec cli path "$LTZ_CLI"
+if [ -n "$LTZ_CLI" ] && [ -n "$ltz_jvm_pid" ]; then
+  # 管理ポートは management-http (9990) + port-offset (backend は 10000 = 19990)。
+  ltz_is_number() {
+    case "$1" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    return 0
+  }
+  LTZ_MGMT_BASE_PORT=9990
+  LTZ_MGMT_BASE_SOURCE='management-http の既定'
+  ltz_v="$(ltz_dvalue 'jboss\.management\.http\.port')"
+  if ltz_is_number "$ltz_v"; then
+    LTZ_MGMT_BASE_PORT="$ltz_v"
+    LTZ_MGMT_BASE_SOURCE='JVM の -Djboss.management.http.port'
+  fi
+  LTZ_PORT_OFFSET="$LTZ_OFFSET_DEFAULT"
+  LTZ_PORT_OFFSET_SOURCE="$LTZ_OFFSET_DEFAULT_SOURCE"
+  ltz_v="$(ltz_dvalue 'jboss\.socket\.binding\.port-offset')"
+  if ltz_is_number "$ltz_v"; then
+    LTZ_PORT_OFFSET="$ltz_v"
+    LTZ_PORT_OFFSET_SOURCE='JVM の -Djboss.socket.binding.port-offset'
+  fi
+  ltz_is_number "$LTZ_PORT_OFFSET" || LTZ_PORT_OFFSET=0
+  # 加算は awk で行う (sh の算術は先頭が 0 の値を 8 進として読むため)。
+  LTZ_MGMT_PORT="$(awk -v p="$LTZ_MGMT_BASE_PORT" -v o="$LTZ_PORT_OFFSET" 'BEGIN { printf "%d", p + o }')"
+  ltz_rec cli controller "localhost:${LTZ_MGMT_PORT}" \
+    "管理ポート ${LTZ_MGMT_BASE_PORT} [${LTZ_MGMT_BASE_SOURCE}] + port-offset ${LTZ_PORT_OFFSET} [${LTZ_PORT_OFFSET_SOURCE}]"
+  LTZ_CLI_COMMANDS='/core-service=platform-mbean/type=runtime:read-attribute(name=input-arguments),/core-service=platform-mbean/type=runtime:read-attribute(name=system-properties),:read-children-names(child-type=system-property)'
+  ltz_cli_run() {
+    if [ -x "$LTZ_CLI" ]; then
+      "$LTZ_CLI" "$@"
+    else
+      sh "$LTZ_CLI" "$@"
+    fi
+  }
+  ltz_cli_status=0
+  if [ "$LTZ_MGMT_PORT" != 9990 ]; then
+    ltz_cli_out="$(ltz_cli_run --connect --controller="localhost:${LTZ_MGMT_PORT}" --commands="$LTZ_CLI_COMMANDS" 2>&1)" || ltz_cli_status=$?
+  else
+    ltz_cli_out="$(ltz_cli_run --connect --commands="$LTZ_CLI_COMMANDS" 2>&1)" || ltz_cli_status=$?
+  fi
+  ltz_rec cli status "$ltz_cli_status" \
+    "$(printf '%s\n' "$ltz_cli_out" | grep -c '"outcome" => "success"')"
+  printf '%s\n' "$ltz_cli_out" | sed -n 's/.*"-Duser\.timezone=\([^"]*\)".*/\1/p' \
+    | while IFS= read -r ltz_v; do
+        ltz_rec cli input_tz "$ltz_v"
+      done
+  ltz_v="$(printf '%s\n' "$ltz_cli_out" | sed -n 's/.*"user\.timezone" => "\([^"]*\)".*/\1/p' | head -n 1)"
+  [ -n "$ltz_v" ] && ltz_rec cli runtime_tz "$ltz_v"
+  if printf '%s\n' "$ltz_cli_out" | grep -Eq '^[[:space:]]*"user\.timezone",?[[:space:]]*$'; then
+    ltz_rec cli sysprop defined
+  fi
+  if [ "$ltz_cli_status" -ne 0 ]; then
+    printf '%s\n' "$ltz_cli_out" | grep -v '=>' | grep -v '^[[:space:]]*[][{}(),]*[[:space:]]*$' \
+      | head -n 5 | while IFS= read -r ltz_l; do
+          ltz_rec cli error "$ltz_l"
+        done
+  fi
+fi
+
+# ---- ログディレクトリと、実際のログファイルの日時 -------------------------------
+# standalone.sh は -Djboss.server.log.dir を自分では付けないので、指定が無ければ
+# サーバーの既定 (jboss.server.base.dir/log) になる。
+LTZ_LOG_DIR=''
+LTZ_LOG_DIR_SOURCE=''
+ltz_v="$(ltz_dvalue 'jboss\.server\.log\.dir')"
+if [ -n "$ltz_v" ]; then
+  LTZ_LOG_DIR="$ltz_v"
+  LTZ_LOG_DIR_SOURCE='JVM の -Djboss.server.log.dir'
+fi
+if [ -z "$LTZ_LOG_DIR" ]; then
+  ltz_v="$(ltz_dvalue 'jboss\.server\.base\.dir')"
+  if [ -n "$ltz_v" ]; then
+    LTZ_LOG_DIR="$ltz_v/log"
+    LTZ_LOG_DIR_SOURCE='JVM の -Djboss.server.base.dir 配下の log'
+  fi
+fi
+if [ -z "$LTZ_LOG_DIR" ] && [ -n "$LTZ_HOME" ]; then
+  LTZ_LOG_DIR="$LTZ_HOME/standalone/log"
+  LTZ_LOG_DIR_SOURCE='JBOSS_HOME 配下の standalone/log'
+fi
+ltz_rec log dir "$LTZ_LOG_DIR" "$LTZ_LOG_DIR_SOURCE"
+LTZ_LOG_FILE="${LTZ_LOG_DIR%/}/$LTZ_BASE"
+if [ -n "$LTZ_LOG_DIR" ] && [ -f "$LTZ_LOG_FILE" ]; then
+  ltz_rec log file "$LTZ_LOG_FILE" yes "$(ltz_mtime "$LTZ_LOG_FILE")" "$(ltz_size "$LTZ_LOG_FILE")" \
+    "$(head -n 200 "$LTZ_LOG_FILE" 2>/dev/null | ltz_extract_ts | head -n 1)" \
+    "$(tail -n 200 "$LTZ_LOG_FILE" 2>/dev/null | ltz_extract_ts | tail -n 1)"
+else
+  ltz_rec log file "$LTZ_LOG_FILE" no
+fi
+if [ -n "$LTZ_LOG_DIR" ] && [ -d "$LTZ_LOG_DIR" ]; then
+  LTZ_BASE_RE="$(printf '%s' "$LTZ_BASE" | sed 's/\./\\./g')"
+  ls -1 "$LTZ_LOG_DIR" 2>/dev/null | grep "^${LTZ_BASE_RE}\." | sort -r | head -n "$LTZ_ROTATED_LIMIT" \
+    | while IFS= read -r ltz_n; do
+        ltz_f="${LTZ_LOG_DIR%/}/$ltz_n"
+        [ -f "$ltz_f" ] || continue
+        ltz_rec rotated "$ltz_n" "$(ltz_mtime "$ltz_f")" "$(ltz_size "$ltz_f")" \
+          "$(head -n 200 "$ltz_f" 2>/dev/null | ltz_extract_ts | head -n 1)" \
+          "$(tail -n 200 "$ltz_f" 2>/dev/null | ltz_extract_ts | tail -n 1)"
+      done
+fi
+ltz_rec end ok
+exit 0
+LOG_ROTATION_TZ_PROBE
+)"
+
+  diag ""
+  diag "════════════ ログローテーションのタイムゾーン点検 (UTC / JST) ════════════"
+  diag "Compose サービス : ${service_name}"
+  diag "コンテナ         : ${container_name}"
+  diag "実行ユーザー     : ${exec_note}"
+  diag "${SERVER_LOG_CHECK_BASENAME} の日次ローテーションが JST の 00:00 で切り替わるかを、OS (TZ・/etc/localtime・tzdata)・"
+  diag "JVM (-Duser.timezone)・EAP ロギング (suffix・%d・zone-id)・実際のログファイル・CloudWatch Agent"
+  diag "(timezone・timestamp_format) の順に確かめ、関係する時刻設定がすべて JST かどうかを判定します。"
+  diag "jboss-cli.sh の起動を含むため、完了まで十数秒かかることがあります (追加の入力は不要)。"
+  diag "jboss-cli.sh の接続先 : 管理ポート ${JBOSS_MANAGEMENT_HTTP_PORT} + port-offset ${port_offset} (${port_offset_source}) = $((JBOSS_MANAGEMENT_HTTP_PORT + port_offset))"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "ログローテーションのタイムゾーン点検の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  if ! error_file="$(mktemp 2>/dev/null)"; then
+    rm -f -- "$capture_file"
+    err "ログローテーションのタイムゾーン点検の保存用一時ファイルを作成できませんでした。"
+    return 1
+  fi
+  # 出力を取るだけの実行なので -i を付けない (ダイアログの標準入力を奪わない)。
+  docker exec ${exec_args[@]+"${exec_args[@]}"} "$container_id" /bin/sh -c "$probe_script" \
+    _ "$JBOSS_CONFIG_FILE" "$JBOSS_CLI_PATH" "$SERVER_LOG_CHECK_BASENAME" \
+    "$port_offset" "$port_offset_source" "$LOG_ROTATION_TZ_ROTATED_LIMIT" \
+    "${JBOSS_HOME_CANDIDATES[@]}" \
+    < /dev/null > "$capture_file" 2> "$error_file" || exec_status=$?
+
+  ltz_reset_state
+  LTZ_SERVICE="$service_name"
+  LTZ_CONTAINER="$container_name"
+  LTZ_EXEC_NOTE="$exec_note"
+  ltz_load_probe "$capture_file"
+  if [ -z "${LTZ_R[end]:-}" ]; then
+    err "Compose サービス '${service_name}' でログローテーションのタイムゾーン点検を最後まで実行できませんでした (exit=${exec_status}): ${container_name}"
+    if [ -s "$error_file" ]; then
+      head -n 5 "$error_file" | redact_healthcheck_text >&2
+    fi
+    [ -n "${LTZ_R[error]:-}" ] && diag "  ${LTZ_R[error]}"
+    rm -f -- "$capture_file" "$error_file"
+    diag "════════════════════════════════════════════════"
+    return 1
+  fi
+
+  ltz_analyze_os
+  ltz_analyze_jvm
+  ltz_analyze_os_jvm_mix
+  ltz_analyze_logging
+  ltz_analyze_files
+  ltz_analyze_cloudwatch "$container_id"
+  ltz_decide_verdict
+  ltz_render_screen
+
+  # 判定不能で終わった場合も、そこまでに分かった内容は残す。
+  if [ "$LOG_ROTATION_TZ_MD_ENABLED" = "true" ]; then
+    md_path="$(resolve_log_rotation_tz_md_path "$service_name")"
+    if [ -n "$md_path" ] && write_log_rotation_tz_md "$md_path" "$capture_file"; then
+      LOG_ROTATION_TZ_MD_OUTPUT="$md_path"
+      diag ""
+      diag "ログローテーションのタイムゾーン点検の Markdown : ${md_path}"
+      if [ "$LOG_ROTATION_TZ_MD_SET" != "true" ] && [ -z "$BUILD_REPORT_DIR" ]; then
+        diag "  (--report-dir または --log-rotation-tz-md を指定すると出力先を変えられます)"
+      fi
+    fi
+  else
+    diag ""
+    diag "ログローテーションのタイムゾーン点検の Markdown : 出力しません (--no-log-rotation-tz-md)"
+  fi
+  rm -f -- "$capture_file" "$error_file"
+
+  if [ "$LTZ_VERDICT_STATE" = "判定不能" ]; then
+    warn "JBoss EAP の JVM が見つからないため、実際に効いているタイムゾーンを判定できませんでした。"
+    diag "════════════════════════════════════════════════"
+    return 1
+  fi
+  diag "ログローテーションのタイムゾーン点検 : ${LTZ_VERDICT_STATE}"
+  diag "════════════════════════════════════════════════"
+  return 0
+}
+
 # ---- ALB ヘルスチェック確認 (偽装サービス経由) --------------------------------
 # ALB ヘルスチェック偽装サービスのコンテナ内 CLI を実行する共通経路。
 # CLI のパスとインタプリタはコンテナ内で解決するため、ホスト側に Python は不要。
@@ -28972,7 +31930,7 @@ run_interactive_compose_service_actions() {
   local valkey_action=0
   local truststore_inventory_action=0
   local jmeter_run_action=0 jmeter_status_action=0
-  local server_log_fd_action=0 logging_audit_action=0
+  local server_log_fd_action=0 logging_audit_action=0 log_rotation_tz_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -29045,6 +32003,10 @@ run_interactive_compose_service_actions() {
     server_log_fd_action="$max_action"
     max_action=$(( max_action + 1 ))
     logging_audit_action="$max_action"
+    # ログローテーションのタイムゾーン点検 (UTC / JST) も同じ JBoss EAP のコンテナで
+    # 選べる。後から加わった操作なので、既存の番号を動かさないよう最後へ採番する。
+    max_action=$(( max_action + 1 ))
+    log_rotation_tz_action="$max_action"
   fi
   while :; do
     diag ""
@@ -29099,6 +32061,9 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$logging_audit_action" -gt 0 ]; then
       diag "  ${logging_audit_action}) ログ設定の静的点検 (server.log を開く・rename する主体を standalone.xml / WAR・EAR / logrotate・cron / 起動コマンドから特定 / audit-logging-config.sh 相当)"
+    fi
+    if [ "$log_rotation_tz_action" -gt 0 ]; then
+      diag "  ${log_rotation_tz_action}) ログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・CloudWatch Agent の時刻設定が UTC か JST かを判定 / 結果を Markdown へ出力)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -29212,6 +32177,11 @@ run_interactive_compose_service_actions() {
             warn "ログ設定の静的点検に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
+        elif [ "$log_rotation_tz_action" -gt 0 ] && [ "$action" = "$log_rotation_tz_action" ]; then
+          if ! run_interactive_compose_log_rotation_tz_check "$service_name"; then
+            warn "ログローテーションのタイムゾーン点検に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -29304,7 +32274,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、同じ JBoss EAP コンテナの server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の check-server-log-fd.sh / audit-logging-config.sh と同じ判定で、結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力)、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、同じ JBoss EAP コンテナの server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の check-server-log-fd.sh / audit-logging-config.sh と同じ判定で、結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力)、同じ JBoss EAP コンテナのログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定が UTC か JST かを判定し、問題があれば追加情報を表示。結果は既定で --report-dir 配下 (未指定なら一時ディレクトリ) の Markdown へ出力)、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

@@ -1,0 +1,25 @@
+{
+  "requests": [
+    {
+      "url": "/",
+      "method": "POST",
+      "headers": {
+        "X-Amz-Target": ["Logs_20140328.PutLogEvents"]
+      },
+      "loggedDate": 1790392795000,
+      "body": {
+        "logGroupName": "/local/myapp/efs/server-front",
+        "logStreamName": "front-local",
+        "logEvents": [
+          {
+            "timestamp": 1790392790123,
+            "message": "2026-09-26 12:19:50,123+0900 INFO  [org.jboss.as] (Controller Boot Thread) WFLYSRV0025: started"
+          }
+        ]
+      }
+    }
+  ],
+  "meta": {
+    "total": 1
+  }
+}

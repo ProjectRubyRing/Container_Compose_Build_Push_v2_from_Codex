@@ -605,7 +605,7 @@ compose down (削除)
 | `--directory-tree-depth N\|all` | 1 以上の整数または `all` | `all` | 不可 | コンテナ内ツリーの最大深さ (`/` 直下を 1 とする)。指定すると画面表示を自動で有効化 |
 | `--directory-file-limit N\|all` | 1 以上の整数または `all` | (ファイル非表示) | 不可 | 通常ファイルの表示を有効化。N 件超過時は拡張子別件数を表示。指定すると画面表示を自動で有効化 |
 | `--deployment-dir-env NAME` | 環境変数名 | (なし) | **可** | ディレクトリパスを値に持つ環境変数。その配下を階層表示。指定すると画面表示を自動で有効化 |
-| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。サービス別ビルドログ (`..._build_log_<サービス名>.txt`) と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。`logs` モードの server.log の FD 点検 / ログ設定の静的点検の結果 (`..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt`) も同じディレクトリへ出力。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリ構成のツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
+| `--report-dir DIR` | ディレクトリパス | (なし) | 不可 | 全量レポートを `DIR/build_and_verify_<日時>.txt` へ保存。サービス別ビルドログ (`..._build_log_<サービス名>.txt`) と読み取り専用ファイルシステム分析の Excel / テキストも同じディレクトリへ追加出力。`logs` モードの server.log の FD 点検 / ログ設定の静的点検の結果 (`..._server_log_fd_<サービス名>.txt` / `..._logging_config_audit_<サービス名>.txt`) も同じディレクトリへ出力。ログローテーションのタイムゾーン点検の結果 (`..._log_rotation_tz_<サービス名>.md`) も既定で同じディレクトリへ出力 (`--no-log-rotation-tz-md` で抑制)。Java 例外解析の Excel / テキストは `--deploy-exception-excel` / `--deploy-exception-text` 指定時のみ。ディレクトリ構成のツリー Excel は `--directory-tree-excel` 指定時のみ。ツリーとデプロイ構造は `--directory-tree-report`、`[10]` は `--deploy-exception-report`、`[11]` は `--readonly-analysis-report` 併用時のみ保存 |
 | `--deploy-exception-display` | フラグ | `false` (非表示) | 不可 | WAR デプロイ時 Java 例外解析の結果を画面へ表示する。既定では表示しない。`--no-deploy-exception-analysis` とは排他 |
 | `--no-deploy-exception-display` | フラグ | — | 不可 | 画面表示を行わない (既定と同じ。`--deploy-exception-display` を打ち消す) |
 | `--deploy-exception-report` | フラグ | `false` (非出力) | 不可 | `--report-dir` の全量レポート `[10]` へ解析結果を出力する。既定では出力せず、見出しの下に未出力である旨だけを残す。`--no-deploy-exception-analysis` とは排他 |
@@ -636,6 +636,8 @@ compose down (削除)
 | `--truststore-inventory-text FILE` | ファイルパス | (なし) | 不可 | トラストストア一覧 (`--keep-container-mode logs` の操作) の結果テキストの出力先。`--no-truststore-inventory-text` とは排他 |
 | `--no-truststore-inventory-text` | フラグ | `false` | 不可 | トラストストア一覧のテキスト出力を行わない (画面表示だけにする) |
 | `--backend-port-offset N` | 0〜55545 の整数 | `10000` | 不可 | ログ設定の静的点検 (`--keep-container-mode logs` の操作) で `jboss-cli.sh --connect` の管理ポート 9990 へ加算する backend の port-offset。サービス名に `backend` を含むサービスは `--controller=localhost:<9990 + N>` (既定 19990) で接続し、それ以外は 0 (9990)。JVM の `-Djboss.socket.binding.port-offset` があればそちらを優先 |
+| `--log-rotation-tz-md FILE` | ファイルパス | (なし) | 不可 | ログローテーションのタイムゾーン点検 (`--keep-container-mode logs` の操作) の結果を Markdown で出力する先。未指定時は `--report-dir` 配下 (無ければ一時ディレクトリ) へ `build_and_verify_<日時>_log_rotation_tz_<サービス名>.md` として自動命名。`--no-log-rotation-tz-md` とは排他 |
+| `--no-log-rotation-tz-md` | フラグ | `false` | 不可 | ログローテーションのタイムゾーン点検の Markdown 出力を行わない (画面表示だけにする) |
 
 ### 4.8 終了時のクリーンアップ
 
@@ -1144,7 +1146,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・server.log の FD 点検とログ設定の静的点検・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -1234,8 +1236,9 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | root ユーザで bash へ接続 | bash 接続と同じ対話セッションを `docker exec -u 0:0` で開く。コンテナの既定ユーザーが非 root (JBoss EAP の `jboss` ユーザー等) で、権限不足により読めないファイルの確認やパッケージ導入を調べたいときに使う | 接続先に対話シェル (root 実行を禁止する設定では接続できない) |
 | server.log の FD 点検 | 日付をまたいでも `server.log.<前日>` へ追記され続ける原因を、`/proc/*/fd` から `server.log*` を指す FD の本数・FD 番号・inode を集めて判定する (Log4j_EFS_Rolling の `check-server-log-fd.sh` と同じ判定。原因候補 1/1b・2・3)。結果をテキストへも出力 | JBoss モジュール一覧と同じ (frontend / backend の JBoss EAP)。コンテナ内の `awk` / `ls` / `stat` ほか |
 | ログ設定の静的点検 | `server.log` を開く／rename する主体を、standalone.xml・logging.properties・WAR / EAR 内のログ設定・logrotate / cron・起動コマンド・jboss-cli.sh の実行時設定から特定する (Log4j_EFS_Rolling の `audit-logging-config.sh` と同じ点検)。結果をテキストへも出力 | 同上。WAR / EAR を読むのに `unzip` / `python3` / `jar` / `bsdtar` / `busybox unzip` のいずれか |
+| ログローテーションのタイムゾーン点検 | `server.log` の日次ローテーションに関係する時刻設定 (OS の TZ・/etc/localtime・tzdata、JVM の -Duser.timezone・system-property、EAP ロギングの suffix・%d・zone-id、実際のログファイル、CloudWatch Agent の timezone・timestamp_format) を集め、1 件ずつ UTC / JST を判定する。すべて JST か・すべて UTC か・混在かを表示し、問題があれば影響・対処・確認コマンドの追加情報も表示する。結果を Markdown へも出力 | 同上 (JBoss モジュール一覧と同じ判定)。CloudWatch Agent の設定 JSON の解析にホストの Python 3 |
 
-証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろに並びます。後から加わった Valkey 操作・JMeter の操作・server.log の FD 点検とログ設定の静的点検は、既存の番号 (`root ユーザで bash へ接続` まで) を動かさないよう、さらに後ろ (**操作一覧の最後**) に並びます。
+証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろに並びます。後から加わった Valkey 操作・JMeter の操作・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検は、既存の番号 (`root ユーザで bash へ接続` まで) を動かさないよう、さらに後ろ (**操作一覧の最後**) に並びます。
 
 bash 接続と root ユーザでの bash 接続は、接続先に `/bin/bash` が無ければ `/bin/sh` (POSIX シェル) へ自動で切り替えます。詳細は「[bash を持たないコンテナへの接続](#bash-を持たないコンテナへの接続)」を参照してください。
 
@@ -1633,6 +1636,39 @@ port-offset を考慮して決めます。backend の JBoss EAP は `port-offset
 
 管理ポート自体を `-Djboss.management.http.port` で変えている場合は、その値へ port-offset を加算します。
 実際の接続先は出力の `0. 実行環境` の `jboss-cli.sh 接続先` と、`6.` の `接続先` に表示します。
+
+#### ログローテーションのタイムゾーン点検 (UTC / JST)
+
+JBoss EAP の `server.log` は、`periodic-rotating-file-handler` が生成された瞬間の JVM の既定タイムゾーンで日付を区切ります
+(ハンドラにタイムゾーンの属性はありません)。JVM が UTC だと切替は JST の 9:00 になり、`server.log.<前日>` に
+JST 0:00〜8:59 のログが入ります。この操作は、関係する時刻設定を集めて 1 件ずつ UTC / JST を判定し、
+すべて JST か・すべて UTC か・混在かを表示します。選択後の入力はありません (観点は別プロジェクト
+JBossEAP_TimeSetting の「JBoss EAP server.log 日次ローテーションとタイムゾーン（JST）完全ガイド」と
+JBossEAP_LogRotate の分析)。
+
+| 区分 | 見るもの |
+| --- | --- |
+| OS | JVM プロセスの `TZ` (読めなければ compose / Dockerfile の `TZ`)、`/etc/localtime` (リンク先と TZif の規則 `JST-9` / `UTC0`)、tzdata の有無、その `TZ` で `date` を実行したオフセット |
+| JVM | `-Duser.timezone` (起動引数・`JDK_JAVA_OPTIONS`・`JAVA_TOOL_OPTIONS`・`_JAVA_OPTIONS`。後勝ち)、standalone.xml の system-property、jboss-cli.sh の `input-arguments` と実行時の `user.timezone`。実効値は `-Duser.timezone` → `TZ` → `/etc/localtime` → GMT の順に決める |
+| EAP ロギング | `server.log` を書くハンドラの `suffix` (周期)、フォーマッタの `%d` (オフセットの有無と形)、json / xml フォーマッタの `zone-id`、custom-handler の `timeZone`、Undertow の access-log |
+| 実測 | `server.log` の最終行の時刻 (オフセットが無ければ更新時刻との差で判定)、ローテート済みファイル (新しい順に 7 件) の最終更新と先頭行の時刻、次のローテーション予定 |
+| CloudWatch Agent | このサービスの `server.log` を収集する `collect_list` (共有ボリュームで cwagent 側のパスへ読み替えて照合) の `timezone` / `timestamp_format`、`timezone:"Local"` の解決先 (cwagent の `TZ`・zoneinfo を `docker inspect` / `docker cp -L` で確認)、エージェントのログ (`are too new` / `too old` / `expired`・`Error parsing timestampFromLogLine`)、偽装 CloudWatch Logs に届いたイベントの時刻 |
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | JBoss モジュール一覧と同じ (frontend / backend の JBoss EAP)。ログ設定の静的点検の後ろ (操作一覧の最後) に並ぶ |
+| 実行ユーザー | JBoss EAP の JVM と同じ uid:gid (`/proc/<pid>/environ` を読むため)。検出できなければコンテナの既定ユーザー |
+| jboss-cli.sh の接続先 | ログ設定の静的点検と同じく port-offset を考慮 (backend サービスは既定で 19990。`--backend-port-offset`)。接続できなくても推定で判定する |
+| 判定 | `正常` (すべて JST・指摘なし) / `異常 (UTC)` (すべて UTC) / `異常 (混在)` (一部だけ JST) / `異常` (JST だが指摘あり) / `判定不能` (JVM が見つからない)。CloudWatch Logs への転送の問題は件数を付記 |
+| 集計の対象 | 実際に効いている設定と、明示した設定 (効かない system-property や、%z があっても `timezone: "UTC"` と書いた設定も数える) |
+| 追加情報 | 問題があるときだけ、指摘ごとの影響・対処・確認と、UTC と JST の対応 (前日の日付の例)・推奨設定・確認コマンドを表示 |
+| ファイル出力 | 既定で `--report-dir` 配下の `build_and_verify_<日時>_log_rotation_tz_<サービス名>.md` → 一時ディレクトリ (`--log-rotation-tz-md` で明示、`--no-log-rotation-tz-md` で抑制。繰り返すと連番) |
+| 終了扱い | `異常` は診断結果として操作選択へ戻る。`判定不能` とコンテナ内で実行できない場合だけヘルパー失敗 (Markdown はそれでも残す) |
+| 機微情報 | 環境変数・起動引数・system-properties からはタイムゾーンに関わる値だけを取り出し、ログファイルは行頭の日時だけを読む。コンテナ内のファイルは変更しない |
+
+CloudWatch Agent の `%z` は `+0900` 形式だけを読み、`%d` の `XXX` が出す `+09:00` は読めません。JST の行を
+UTC として読むとイベント時刻が 9 時間未来になり、2 時間より先のイベントは `PutLogEvents` で拒否されます。
+ログ行にオフセットを出すなら、`%d{yyyy-MM-dd HH:mm:ss,SSSZ}` と `timestamp_format` の `%z` の組み合わせを推奨します。
 
 ### 5.4-2 デプロイエラー時の調査モード (既定) / `--exit-on-deploy-error`
 
@@ -2727,6 +2763,8 @@ ECS のデプロイサーキットブレーカはデプロイ中にだけ働き�
 | `--cert-check-text` / `--jboss-module-list-text` / `--truststore-inventory-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
 | `--report-dir/build_and_verify_<日時>_server_log_fd_<サービス名>.txt` | `--keep-container-mode logs` で server.log の FD 点検を実行したとき (`--report-dir` が無ければ一時ディレクトリ。繰り返すと連番) | `server.log*` を開いている FD の一覧 (PID / COMM / FD / inode / 指している名前) と原因候補の判定 |
 | `--report-dir/build_and_verify_<日時>_logging_config_audit_<サービス名>.txt` | `--keep-container-mode logs` でログ設定の静的点検を実行したとき (同上) | ファイル系ハンドラの一覧、起動時ログ設定、WAR / EAR 内のログ設定の分類と有効性、logrotate / cron、起動コマンドのリダイレクト、jboss-cli.sh の実行時設定と `[指摘]` |
+| `--report-dir/build_and_verify_<日時>_log_rotation_tz_<サービス名>.md` | `--keep-container-mode logs` でログローテーションのタイムゾーン点検を実行したとき (既定。`--no-log-rotation-tz-md` で抑制。`--report-dir` が無ければ一時ディレクトリ。繰り返すと連番) | 時刻設定の一覧 (区分・項目・値・UTC / JST の判定・集計対象・補足)、判定と集計、指摘と追加情報 (UTC と JST の対応・推奨設定・確認コマンド)、点検の方法、コンテナ内で集めた値 (機微な値は伏せ字) |
+| `--log-rotation-tz-md` のパス | 指定時 | 同上 (出力先を明示した場合) |
 | `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker.txt` | ECS サーキットブレーカ再現を実行したとき (`--no-ecs-circuit-breaker-text` で抑制) | 再現結果 (契機・停止手順・reload の結果・切断の判定と根拠・logging subsystem の設定・対処) |
 | `--report-dir/build_and_verify_<日時>_ecs_circuit_breaker_<サービス名>_<回数>.log` | 同上 (`--no-ecs-circuit-breaker-save-server-log` で抑制) | 停止直後に取り出した `server.log` そのもの (切れたままの状態) |
 | `--ecs-circuit-breaker-text` のパス | 指定時 | 同上 (出力先を明示した場合) |
