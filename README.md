@@ -274,7 +274,7 @@ ECR / Docker の規則により、**リポジトリ名 (`--repository`) には�
 | `--startup-log-lines N\|all` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。検証対象のコンテナ起動ログ、同時に起動した他 Compose サービスのログ、`--keep-container-mode logs` で選択したログについて、サービスごとの画面表示行数を指定する。`N` は末尾 `N` 行、`all` は全行を表示する | `50` |
 | `--shutdown-timeout SEC` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時に ECS のタスク停止と同じく SIGTERM でコンテナを終了させる際、SIGKILL へ切り替えるまでの猶予秒数。この停止を挟むことで、adot collector などサイドカーの終了処理ログまで画面と全量レポートへ残す | `30` |
 | `--no-shutdown-logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。エラー終了時の SIGTERM 停止と終了ログ取得を行わず、従来どおり `docker compose down` でまとめて削除する | `false` |
-| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、同じコンテナでは server.log の FD 点検とログ設定の静的点検 (日付をまたいでも `server.log.<前日>` へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の `check-server-log-fd.sh` / `audit-logging-config.sh` と同じ判定で、結果は `--report-dir` 配下へも出力)、同じコンテナではログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定を 1 件ずつ UTC / JST で判定し、すべて JST か・すべて UTC か・混在かを表示。問題があれば影響・対処・確認コマンドの追加情報も表示し、結果は既定で `--report-dir` 配下の Markdown へ出力)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド)、valkey / redis サーバーのサービスがあれば Valkey 操作 (選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは使い捨てコンテナか `openssl` / bash の代替シェルを使い、確認対象コンテナへはインストールしない) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
+| `--keep-container-mode bash\|http\|logs` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。JBoss EAP の起動確認後もコンテナを残し、検証対象へ `/bin/bash` で直接接続するか、対話式 HTTP 通信、起動中 Compose サービスを選択したログ閲覧・bash・healthcheck・MySQL 操作を行う。`logs` では cwagent / CloudWatch Logs モックおよび OTel / Jaeger の送達診断 (トレースは X-Ray コンソールの項目に寄せて表示)、ADOT Collector の設定チェック (有効な設定と送信先が実 AWS X-Ray か Compose 内 Jaeger かの判定)、Jaeger トレースの HTML 出力 (別端末へコピーしてブラウザで開ける形式)、JVM トラストストアを持つコンテナ (front / back 等) の証明書チェック、ALB ヘルスチェック偽装サービスがあれば ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、frontend 向け ALB の偽装 (`alb-front`) を選べば Location ヘッダ確認 (偽装 ALB の HTTPS リスナー経由で frontend の API を http で呼び、`X-Forwarded-Proto` の連携と `Location` が https で返るかを区間ごとに判定。結果は `--report-dir` 配下へも出力)、JBoss EAP のコンテナ (frontend / backend) では `jboss-cli.sh -c` による JBoss モジュール一覧 (`module-info` が `success` となったモジュール名と jar ファイル名)、同じコンテナでは server.log の FD 点検とログ設定の静的点検 (日付をまたいでも `server.log.<前日>` へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の `check-server-log-fd.sh` / `audit-logging-config.sh` と同じ判定で、結果は `--report-dir` 配下へも出力)、同じコンテナではログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定を 1 件ずつ UTC / JST で判定し、すべて JST か・すべて UTC か・混在かを表示。問題があれば影響・対処・確認コマンドの追加情報も表示し、結果は既定で `--report-dir` 配下の Markdown へ出力)、証明書チェックと同じコンテナではトラストストア一覧 (JBoss EAP 上の Java アプリから有効なストアのフルパスと登録証明書の種別・ドメイン URL、カスタム証明書の強調、追加された証明書のドメインから組み立てた接続確認 `curl` コマンド)、valkey / redis サーバーのサービスがあれば Valkey 操作 (選んだサービスのコンテナから valkey へ接続し、キーの一覧・型・TTL・値を確認する。`valkey-cli` が無いコンテナでは使い捨てコンテナか `openssl` / bash の代替シェルを使い、確認対象コンテナへはインストールしない) も選択できる。`--verify-startup` と `--keep-container` を暗黙に有効化する | (なし) |
 | `--valkey-service NAME` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作 (`--keep-container-mode logs` の操作) の接続先となる valkey サーバーの Compose サービス名。未指定時は起動中サービスを順に調べ、`valkey-server` / `redis-server` を持つコンテナのサービスを自動検出する | (自動検出) |
 | `--valkey-port PORT` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の接続先ポート (コンテナ側)。未指定時は valkey コンテナの環境変数・`valkey.conf` / `redis.conf`・起動コマンドから検出する | (自動検出。既定 `6379`) |
 | `--valkey-tls` / `--no-valkey-tls` | **`build_and_verify.sh` / `--build-only` 委譲時のみ**。Valkey 操作の通信を TLS (`openssl s_client`) か平文 (bash の `/dev/tcp`) に固定する | (自動判定) |
@@ -2516,6 +2516,9 @@ CloudWatch Logs には届きません。
   `JMeter 性能試験を実行`（テスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きして実行）と
   `JMeter 実行状況を確認` を選べます
   （→ [JMeter で性能試験を行う](#jmeter-で性能試験を行うテスト計画のスレッド数--ramp-up--ループ回数の上書き)）。
+  frontend 向け ALB の偽装（`alb-front`）を選んだときは `Location ヘッダ確認` も選べます
+  （ALB 経由のリダイレクトで `Location` が https で返るかの確認
+  → [Location ヘッダ確認](#location-ヘッダ確認frontend-向け-alb-の偽装経由)）。
   **最後の操作番号**には、どのサービスでも選べる `root ユーザで bash へ接続` が並びます。
   `2` と同じ対話 bash を `docker exec -u 0:0` で開くため、コンテナの既定ユーザーが
   非 root（JBoss EAP の `jboss` ユーザー等）で権限不足になるファイル参照やパッケージ導入も
@@ -3093,6 +3096,57 @@ ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でもも�
 ホスト側に Python は不要です（CLI のパスとインタプリタはコンテナ内で解決します）。
 偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
 `ALB_HEALTHCHECK_SERVICE`（既定 `alb-healthcheck`）を合わせてください。
+
+### Location ヘッダ確認（frontend 向け ALB の偽装経由）
+
+本番は**ブラウザ → ALB が HTTPS、ALB → コンテナ（JBoss EAP）が HTTP** です。ALB は元の scheme を
+`X-Forwarded-Proto: https` でターゲットへ伝えますが、JBoss EAP の http-listener がそれを反映して
+いない（`proxy-address-forwarding=false`）と、アプリのリダイレクト（`sendRedirect`）の
+**`Location` が `http://...` になります**。
+
+ローカルでは参照先 Compose の **`alb-front`**（frontend 向け ALB の偽装。実装は
+`Container_Compose_file/compose/alb-front/`）が ALB の「HTTPS リスナー → HTTP ターゲットグループ」の
+転送を同じ規則で再現します。`logs` モードで `alb-front` を選ぶと、操作一覧の**最後**に
+`Location ヘッダ確認` が追加されます（ターゲット側の `frontend` には出ません。既存操作の番号は変わりません）。
+
+```
+Compose サービス 'alb-front' で実行する操作を選択してください:
+  1) ログを表示
+  2) bash へ接続 (cd・tree・任意コマンドを実行可能)
+  3) healthcheck 設定・実行履歴・通信を確認
+  4) root ユーザで bash へ接続 (2 と同じ接続を uid/gid 0 で行う)
+  5) Location ヘッダ確認 (偽装 ALB から frontend の API を http で呼び、X-Forwarded-Proto の連携と Location が https で返るかを判定)
+  0) Compose サービスの選択へ戻る
+選択番号 [0-5]: 5
+確認する API のパス (Enter で既定: /iwinmichl/api/redirect-check/redirect):
+```
+
+確認する API のパスを入力します（Enter で既定。既定値は偽装 ALB の `ALB_FRONT_CHECK_PATH`。
+`/` で始まらない入力は聞き直します）。偽装 ALB のコンテナがクライアント役になり、自身の HTTPS
+リスナー経由でその API を呼び、次を順に表示します。
+
+1. **偽装 ALB の状態** — 起動状態・自身の `healthcheck`・再起動回数・起動時刻と、ホストから
+   同じ確認をするときの URL（`curl -sk -D - -o /dev/null https://localhost:8443/...`）・転送記録 API の URL
+2. **区間ごとのレポート**（偽装 ALB のコンテナ内 CLI が出力）
+   - [1] クライアント → 偽装 ALB が **https**（TLS バージョン・暗号スイート・サーバ証明書の検証結果）
+   - [2] 偽装 ALB → frontend が **http**（転送先・接続先 IP:ポート・付与した `X-Forwarded-For` /
+     `X-Forwarded-Proto` / `X-Forwarded-Port` / `X-Amzn-Trace-Id`・ターゲットの応答）
+   - [3] JBoss EAP が受け取ったヘッダと認識した scheme（dhapp の `/api/redirect-check/redirect` が返す
+     `X-Redirect-Check-*` 診断ヘッダ。`proxy-address-forwarding` の設定値も出る）
+   - [4] クライアントへ返った `Location`（ALB は書き換えない）。https なら辿ってリダイレクト先まで確認
+   - [5] 対照実験（偽装 ALB を通さず frontend へ直接 http。ヘッダ無しなら http に戻るか）
+   - [6] JBoss EAP 自身のリダイレクト（コンテキストルート `/iwinmichl` → `/iwinmichl/`）
+3. **判定** — `Location ヘッダ判定 : OK / NG / 判定保留`
+
+`NG` と `判定保留`（リダイレクトが返らない = パス違い・未デプロイ）は診断結果として操作選択へ戻ります。
+偽装 ALB から確認できない場合（常駐プロセス停止・ターゲットへ届かない 502 / 503 / 504）だけヘルパーの
+失敗として扱います。画面と同じ内容は `--report-dir` 配下（未指定なら一時ディレクトリ）の
+`build_and_verify_<日時>_location_header_<サービス名>.txt` へも出力します。
+
+`NG` のときの対処は JBoss EAP の http-listener の `proxy-address-forwarding=true` です
+（レポートの「対処」に jboss-cli のコマンドが出ます）。ホスト側に Python は不要です
+（CLI のパスとインタプリタはコンテナ内で解決します）。偽装 ALB の Compose サービス名を変えている場合は、
+スクリプト冒頭の `ALB_FRONT_SERVICE`（既定 `alb-front`）を合わせてください。
 
 ### JBoss モジュール一覧（`module-loading` の `module-info`）
 

@@ -777,6 +777,25 @@ ALB_HEALTHCHECK_CLI_DEFAULT="/opt/alb-healthcheck/healthcheck.py"
 # 案内にだけ使う (コンテナの ALB_HEALTHCHECK_LISTEN_PORT があればそちらを優先)。
 ALB_HEALTHCHECK_API_PORT="8080"
 
+# ---- Location ヘッダ確認 (frontend 向け ALB の偽装経由) ------------------------
+# 本番はブラウザ → ALB が HTTPS、ALB → コンテナ (JBoss EAP) が HTTP。ALB は元の
+# scheme を X-Forwarded-Proto: https で伝えるが、JBoss EAP の http-listener が
+# それを反映していない (proxy-address-forwarding=false) と、アプリのリダイレクトの
+# Location が http:// になる。ローカル構成では ALB の「HTTPS リスナー → HTTP
+# ターゲットグループ」の転送を偽装する Compose サービスを立て、そのコンテナから
+# frontend の API を呼んで、区間ごとの通信 (https / http) と Location を確認する。
+ALB_FRONT_SERVICE="alb-front"   # frontend 向け ALB の偽装の Compose サービス名
+# 偽装 ALB のコンテナ内 CLI。コンテナの環境変数 ALB_FRONT_CLI があればそちらを
+# 優先し、無い場合にこの既定パスを使う。
+ALB_FRONT_CLI_DEFAULT="/opt/alb-front/alb-front.py"
+# 確認する API のパスの既定値。偽装 ALB の CLI (default-path = コンテナの
+# ALB_FRONT_CHECK_PATH) を優先し、取得できない場合だけこの値を使う。
+ALB_FRONT_CHECK_PATH_DEFAULT="/iwinmichl/api/redirect-check/redirect"
+# 偽装 ALB の HTTPS リスナー / 転送記録 API のコンテナ側ポート。ホストから叩く URL の
+# 案内にだけ使う (コンテナの ALB_FRONT_HTTPS_PORT / ALB_FRONT_ADMIN_PORT を優先)。
+ALB_FRONT_HTTPS_PORT_DEFAULT="8443"
+ALB_FRONT_ADMIN_PORT_DEFAULT="8081"
+
 # ---- ECS サーキットブレーカによるタスク停止の再現 ------------------------------
 # ECS/Fargate では、タスク定義の healthCheck が retries 回続けて失敗すると、その
 # コンテナは UNHEALTHY になる。essential=true (必須コンテナ) が UNHEALTHY になった
@@ -4397,6 +4416,21 @@ JBoss マスターパスワードの伝搬検証:
                                     選択でき、ALB から見たステータスコード・
                                     成功失敗判定・initial/healthy/unhealthy を
                                     確認する。
+                                    frontend 向け ALB の偽装 (alb-front) が
+                                    起動していれば、偽装 ALB 自身を選んだときに
+                                    「Location ヘッダ確認」も選択でき、偽装 ALB の
+                                    HTTPS リスナー経由で frontend の API
+                                    (入力したパス。Enter で既定の
+                                    /iwinmichl/api/redirect-check/redirect) を
+                                    呼び、クライアント → ALB が https・ALB →
+                                    frontend が http で通信していること、ALB が
+                                    付けた X-Forwarded-Proto: https が JBoss EAP に
+                                    連携されていること、リダイレクトの Location が
+                                    https で返ることを区間ごとに判定する。結果は
+                                    --report-dir 配下 (無ければ一時ディレクトリ)
+                                    の build_and_verify_<日時>_location_header_
+                                    <サービス名>.txt へも出力する。既存の番号を
+                                    変えないよう、操作一覧の最後に並ぶ。
                                     jboss-cli.sh と modules を持つコンテナ
                                     (frontend / backend の JBoss EAP) では
                                     「JBoss モジュール一覧」も選択でき、
@@ -20500,7 +20534,8 @@ JBOSS_MODULE_LIST_SCRIPT
 # 点検結果テキストの出力先を決める。--report-dir 配下 > 一時ディレクトリ。
 # 日付をまたぐ前後で同じサービスを繰り返し点検して見比べられるよう、既存ファイルが
 # あれば連番を足し、直前の結果を上書きしない。
-#   $1 = Compose サービス名 / $2 = 種別 (server_log_fd / logging_config_audit)
+#   $1 = Compose サービス名 / $2 = 種別 (server_log_fd / logging_config_audit /
+#        location_header = Location ヘッダ確認)
 resolve_server_log_check_path() {
   local service_name="$1" kind="$2"
   local safe_name base dir_part prefix candidate counter=1
@@ -24906,6 +24941,298 @@ run_interactive_compose_alb_healthcheck() {
       ;;
   esac
   diag "注意: その場のチェックは ALB の状態機械 (連続回数) には反映しません。"
+  diag "════════════════════════════════════════════════════════"
+  return 0
+}
+
+# ---- Location ヘッダ確認 (frontend 向け ALB の偽装経由) ------------------------
+# 偽装 ALB のコンテナ内 CLI を実行する共通経路 (ALB ヘルスチェック偽装と同じ考え方)。
+# CLI のパスとインタプリタはコンテナ内で解決するため、ホスト側に Python は不要。
+# docker のコマンドラインへ渡すのはサブコマンドと API のパスだけ (機微情報を載せない)。
+alb_front_exec() {
+  local container_id="$1"
+  shift
+  docker exec "$container_id" /bin/sh -c '
+    # alb-front-cli: 偽装 ALB の CLI をコンテナ内で解決して実行する
+    alb_front_cli="${ALB_FRONT_CLI:-'"$ALB_FRONT_CLI_DEFAULT"'}"
+    if [ ! -f "$alb_front_cli" ]; then
+      printf "偽装 ALB の CLI が見つかりません: %s\n" "$alb_front_cli" >&2
+      exit 2
+    fi
+    for alb_front_python in python3 python; do
+      if command -v "$alb_front_python" >/dev/null 2>&1; then
+        exec "$alb_front_python" "$alb_front_cli" "$@"
+      fi
+    done
+    printf "python3 がコンテナ内に見つかりません。\n" >&2
+    exit 2
+  ' alb-front-cli "$@"
+}
+
+# Location ヘッダ確認は、偽装 ALB のサービス自身を選んだときだけ出す。ALB の位置から
+# ターゲット (frontend) を呼ぶ確認のため、ターゲット側のサービスには出さない。
+compose_service_supports_location_check() {
+  local service_name="$1"
+  local -a container_ids=()
+
+  [ "$service_name" = "$ALB_FRONT_SERVICE" ] || return 1
+  mapfile -t container_ids < <(compose_container_ids "$ALB_FRONT_SERVICE")
+  [ ${#container_ids[@]} -gt 0 ]
+}
+
+# 偽装 ALB のコンテナ状態 (Docker から見た起動状態と自身の healthcheck) と、
+# ホストから同じ確認をするときの URL を表示する。
+#   $1 = コンテナ ID / $2 = コンテナ名 / $3 = 確認する API のパス
+print_alb_front_service_state() {
+  local container_id="$1" container_name="$2" api_path="$3"
+  local state_line="" state_status="" health_status="" failing_streak=""
+  local restart_count="" started_at="" ports="" https_port="" admin_port=""
+  local mapping="" mapped_host="" mapped_port=""
+
+  if state_line="$(
+    docker inspect -f \
+      '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{else}}(healthcheck なし)|-{{end}}|{{.RestartCount}}|{{.State.StartedAt}}' \
+      "$container_id" 2>/dev/null
+  )"; then
+    state_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    health_status="${state_line%%|*}"; state_line="${state_line#*|}"
+    failing_streak="${state_line%%|*}"; state_line="${state_line#*|}"
+    restart_count="${state_line%%|*}"; started_at="${state_line#*|}"
+  fi
+
+  diag ""
+  diag "[偽装 ALB の状態 (これが健全でないと Location の判定も当てにならない)]"
+  diag "コンテナ           : ${container_name}"
+  diag "起動状態           : ${state_status:-取得できず}"
+  diag "自身の healthcheck : ${health_status:-取得できず} (連続失敗 ${failing_streak:--})"
+  diag "再起動回数         : ${restart_count:-取得できず}"
+  if [ -n "$started_at" ]; then
+    diag "起動時刻           : $(to_jst_display_time "$started_at")"
+  fi
+
+  # 待ち受けポートはコンテナの環境変数を優先する (compose 側で変えても追従する)。
+  ports="$(
+    docker exec "$container_id" /bin/sh -c 'printf "%s|%s" "${ALB_FRONT_HTTPS_PORT:-}" "${ALB_FRONT_ADMIN_PORT:-}"' 2>/dev/null || true
+  )"
+  https_port="${ports%%|*}"
+  admin_port="${ports#*|}"
+  case "$https_port" in
+    ''|*[!0-9]*) https_port="$ALB_FRONT_HTTPS_PORT_DEFAULT" ;;
+  esac
+  case "$admin_port" in
+    ''|*[!0-9]*) admin_port="$ALB_FRONT_ADMIN_PORT_DEFAULT" ;;
+  esac
+
+  mapping="$(docker port "$container_id" "${https_port}/tcp" 2>/dev/null | sed -n '1p' || true)"
+  mapped_port="${mapping##*:}"
+  mapped_host="${mapping%:*}"
+  mapped_host="${mapped_host#[}"
+  mapped_host="${mapped_host%]}"
+  case "$mapped_host" in
+    ""|0.0.0.0|::) mapped_host="localhost" ;;
+  esac
+  case "$mapped_port" in
+    ''|*[!0-9]*)
+      diag "HTTPS リスナー     : ホストへ未公開 (コンテナ内 :${https_port})"
+      ;;
+    *)
+      diag "HTTPS リスナー     : https://${mapped_host}:${mapped_port} (コンテナ内 :${https_port})"
+      diag "                     ホストから試す: curl -sk -D - -o /dev/null https://${mapped_host}:${mapped_port}${api_path}"
+      ;;
+  esac
+  mapping="$(docker port "$container_id" "${admin_port}/tcp" 2>/dev/null | sed -n '1p' || true)"
+  mapped_port="${mapping##*:}"
+  case "$mapped_port" in
+    ''|*[!0-9]*) diag "転送記録 API       : ホストへ未公開 (コンテナ内 :${admin_port})" ;;
+    *)           diag "転送記録 API       : http://localhost:${mapped_port}/exchanges" ;;
+  esac
+  if [ "$state_status" != "running" ] || [ "$health_status" = "unhealthy" ]; then
+    warn "frontend 向け ALB の偽装が健全ではありません。docker compose logs ${ALB_FRONT_SERVICE} を確認してください。"
+  fi
+}
+
+# 確認する API のパスを対話で受け取る。Enter で既定値。/ で始まらない入力は聞き直す。
+# 結果は ALB_FRONT_SELECTED_PATH へ入れる (標準出力はプロンプトと混ざるため使わない)。
+ALB_FRONT_SELECTED_PATH=""
+read_alb_front_api_path() {
+  local default_path="$1" answer="" attempt=0
+
+  ALB_FRONT_SELECTED_PATH=""
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$(( attempt + 1 ))
+    printf '確認する API のパス (Enter で既定: %s): ' "$default_path" >&2
+    if ! IFS= read -r answer; then
+      err "確認する API のパスを読み取れませんでした。対話可能な端末から実行してください。"
+      return 1
+    fi
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    if [ -z "$answer" ]; then
+      ALB_FRONT_SELECTED_PATH="$default_path"
+      return 0
+    fi
+    case "$answer" in
+      *[[:space:]]*|*[[:cntrl:]]*)
+        warn "API のパスに空白・制御文字は使えません: ${answer}"
+        ;;
+      /*)
+        ALB_FRONT_SELECTED_PATH="$answer"
+        return 0
+        ;;
+      http://*|https://*)
+        warn "URL ではなく、/ で始まるパスを入力してください (例: ${default_path})。"
+        ;;
+      *)
+        warn "/ で始まるパスを入力してください (例: ${default_path})。"
+        ;;
+    esac
+  done
+  err "API のパスの入力が 3 回とも不正だったため、Location ヘッダ確認を中止します。"
+  return 1
+}
+
+# Location ヘッダ確認の結果を、どの構成に対する結果かが分かる見出しを付けて残す。
+#   $1 = 出力先 / $2 = サービス名 / $3 = コンテナ名 / $4 = 確認した API のパス
+#   $5 = 取得した出力 / $6 = 判定
+write_location_check_text() {
+  local path="$1" service_name="$2" container_name="$3" api_path="$4" capture_file="$5"
+  local verdict="$6" dir_path
+
+  dir_path="$(dirname -- "$path")"
+  if ! mkdir -p -- "$dir_path" 2>/dev/null; then
+    warn "Location ヘッダ確認の出力先を作成できませんでした: ${dir_path}"
+    return 1
+  fi
+  if ! ( umask 077; : > "$path" ) 2>/dev/null; then
+    warn "Location ヘッダ確認のテキストを作成できませんでした: ${path}"
+    return 1
+  fi
+  {
+    printf 'Location ヘッダ確認 (build_and_verify.sh)\n'
+    printf '===================================================================\n'
+    printf '出力日時         : %s\n' "$(now_display_time)"
+    printf 'Compose サービス : %s\n' "$service_name"
+    printf 'コンテナ         : %s\n' "$container_name"
+    printf 'compose ファイル : %s\n' "$COMPOSE_FILE"
+    printf '確認した API     : GET %s\n' "$api_path"
+    printf '判定             : %s\n' "$verdict"
+    printf '確認内容         : 偽装 ALB (HTTPS リスナー) のコンテナをクライアント役にして API を呼び、\n'
+    printf '                   [1] クライアント → 偽装 ALB が https / [2] 偽装 ALB → frontend が http と\n'
+    printf '                   付与したヘッダ / [3] JBoss EAP が受け取ったヘッダと認識した scheme /\n'
+    printf '                   [4] 返った Location / [5] 対照実験 (ヘッダ無しで直接) /\n'
+    printf '                   [6] JBoss EAP 自身のリダイレクト を並べて判定する\n'
+    printf '対策             : JBoss EAP の http-listener の proxy-address-forwarding=true\n'
+    printf '                   (Container_Compose_file の docs/ALB-FRONT-LOCATION.md)\n'
+    printf '===================================================================\n'
+    redact_healthcheck_text < "$capture_file"
+  } >> "$path" 2>/dev/null || {
+    warn "Location ヘッダ確認のテキストを出力できませんでした: ${path}"
+    return 1
+  }
+  return 0
+}
+
+# frontend 向け ALB の偽装から frontend の API を呼び、Location ヘッダを確認する。
+# 表示する内容は 3 つ:
+#   (1) 偽装 ALB 自身の状態 … 判定元が生きているか / ホストから試す URL
+#   (2) 区間ごとのレポート … クライアント →https→ 偽装 ALB →http→ frontend の各区間、
+#                             JBoss EAP が受け取った X-Forwarded-Proto と認識した scheme、
+#                             返った Location、対照実験、JBoss EAP 自身のリダイレクト
+#   (3) 判定               … OK / NG / 判定保留
+# (2) の本文は偽装 ALB のコンテナ内 CLI が出力する (判定規則を 1 か所に集約する)。
+# 同じ内容は --report-dir 配下 (未指定なら一時ディレクトリ) のテキストへも残す。
+run_interactive_compose_location_check() {
+  local service_name="$1" container_id container_name capture_file="" exec_status=0
+  local default_path="" api_path="" text_path="" verdict_text=""
+  local -a container_ids=()
+
+  mapfile -t container_ids < <(compose_container_ids "$ALB_FRONT_SERVICE")
+  if [ ${#container_ids[@]} -eq 0 ]; then
+    err "frontend 向け ALB の偽装の Compose サービス '${ALB_FRONT_SERVICE}' が実行中ではありません。"
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  container_name="$(normalize_container_name "$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")")"
+  if [ ${#container_ids[@]} -gt 1 ]; then
+    warn "Compose サービス '${ALB_FRONT_SERVICE}' は複数コンテナで実行中のため、先頭のコンテナを使用します: ${container_name}"
+  fi
+
+  # 既定のパスは偽装 ALB の設定 (ALB_FRONT_CHECK_PATH) を唯一の情報源にする。
+  default_path="$(alb_front_exec "$container_id" default-path 2>/dev/null | tr -d '\r' | sed -n '1p' || true)"
+  case "$default_path" in
+    /*) ;;
+    *) default_path="$ALB_FRONT_CHECK_PATH_DEFAULT" ;;
+  esac
+
+  diag ""
+  diag "════════════════ Location ヘッダ確認 (frontend 向け ALB の偽装経由) ════════════════"
+  diag "確認対象           : ${service_name}"
+  diag "位置づけ           : ALB (HTTPS リスナー) が TLS を終端して frontend へ HTTP で転送する構成で、"
+  diag "                     ALB が付ける X-Forwarded-Proto: https が JBoss EAP に連携され、"
+  diag "                     リダイレクトの Location が https で返るかを確認する。"
+  diag "                     偽装 ALB のコンテナがクライアント役になり、自身の HTTPS リスナー経由で"
+  diag "                     frontend の API を呼ぶ (偽装 ALB → frontend の区間は http)。"
+
+  if ! read_alb_front_api_path "$default_path"; then
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  api_path="$ALB_FRONT_SELECTED_PATH"
+  diag "確認する API       : GET ${api_path}"
+
+  print_alb_front_service_state "$container_id" "$container_name" "$api_path"
+
+  if ! capture_file="$(mktemp 2>/dev/null)"; then
+    err "Location ヘッダ確認の保存用一時ファイルを作成できませんでした。"
+    diag "════════════════════════════════════════════════════════"
+    return 1
+  fi
+  alb_front_exec "$container_id" report "$api_path" > "$capture_file" 2>&1 || exec_status=$?
+  print_healthcheck_capture "$capture_file" "(Location ヘッダ確認の出力がありません)"
+
+  case "$exec_status" in
+    0) verdict_text="OK (Location は https で返り、X-Forwarded-Proto が JBoss EAP に連携されている)" ;;
+    1) verdict_text="NG (Location が https で返らない / X-Forwarded-Proto が連携されていない)" ;;
+    3) verdict_text="判定保留 (リダイレクトが返らなかった)" ;;
+    2) verdict_text="実行不能 (偽装 ALB から確認できなかった)" ;;
+    *) verdict_text="エラー (exit=${exec_status})" ;;
+  esac
+  # 実行不能・エラーで終わった場合も、そこまでに出た内容は残す。
+  text_path="$(resolve_server_log_check_path "$service_name" location_header)"
+  if [ -n "$text_path" ] \
+      && write_location_check_text "$text_path" "$service_name" "$container_name" \
+           "$api_path" "$capture_file" "$verdict_text"; then
+    diag "Location ヘッダ確認のテキスト : ${text_path}"
+    if [ -z "$BUILD_REPORT_DIR" ]; then
+      diag "  (--report-dir を指定すると、その配下へ出力します)"
+    fi
+  fi
+  rm -f -- "$capture_file"
+
+  case "$exec_status" in
+    0)
+      diag "Location ヘッダ判定 : ${verdict_text}"
+      ;;
+    1)
+      diag "Location ヘッダ判定 : ${verdict_text}"
+      diag "上のレポートの [3] (JBoss EAP が認識した scheme) と「対処」を確認してください。"
+      ;;
+    3)
+      diag "Location ヘッダ判定 : ${verdict_text}"
+      diag "API のパスと、frontend へ WAR がデプロイされているかを確認してください。"
+      ;;
+    2)
+      warn "偽装 ALB から Location ヘッダを確認できませんでした。"
+      diag "docker compose logs ${ALB_FRONT_SERVICE} と、frontend の起動状態を確認してください。"
+      diag "════════════════════════════════════════════════════════"
+      return 1
+      ;;
+    *)
+      err "Compose サービス '${service_name}' の Location ヘッダ確認を実行できませんでした (exit=${exec_status}): ${container_name}"
+      diag "════════════════════════════════════════════════════════"
+      return 1
+      ;;
+  esac
   diag "════════════════════════════════════════════════════════"
   return 0
 }
@@ -31904,8 +32231,9 @@ jmeter_wait_background_runs() {
 }
 
 # 選択済み Compose サービスについて、ログ表示、対話式 bash / root bash / MySQL 接続、
-# healthcheck 診断、対応サービスのローカル可観測性診断、ALB ヘルスチェック確認を
-# 繰り返す。0 を選択すると、起動中 Compose サービスの選択へ戻る。
+# healthcheck 診断、対応サービスのローカル可観測性診断、ALB ヘルスチェック確認、
+# frontend 向け ALB の偽装での Location ヘッダ確認などを繰り返す。
+# 0 を選択すると、起動中 Compose サービスの選択へ戻る。
 compose_service_observability_helper_kind() {
   case "$1" in
     cwagent|cloudwatch-logs-mock) printf 'cloudwatch\n' ;;
@@ -31931,6 +32259,7 @@ run_interactive_compose_service_actions() {
   local truststore_inventory_action=0
   local jmeter_run_action=0 jmeter_status_action=0
   local server_log_fd_action=0 logging_audit_action=0 log_rotation_tz_action=0
+  local location_check_action=0
 
   helper_kind="$(compose_service_observability_helper_kind "$service_name" || true)"
   if compose_service_supports_mysql_client "$service_name"; then
@@ -32008,6 +32337,12 @@ run_interactive_compose_service_actions() {
     max_action=$(( max_action + 1 ))
     log_rotation_tz_action="$max_action"
   fi
+  # Location ヘッダ確認 (frontend 向け ALB の偽装経由) は、偽装 ALB のサービスを選んだ
+  # ときだけ出す。後から加わった操作なので、既存の番号を動かさないよう最後へ採番する。
+  if compose_service_supports_location_check "$service_name"; then
+    max_action=$(( max_action + 1 ))
+    location_check_action="$max_action"
+  fi
   while :; do
     diag ""
     diag "Compose サービス '${service_name}' で実行する操作を選択してください:"
@@ -32064,6 +32399,9 @@ run_interactive_compose_service_actions() {
     fi
     if [ "$log_rotation_tz_action" -gt 0 ]; then
       diag "  ${log_rotation_tz_action}) ログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・CloudWatch Agent の時刻設定が UTC か JST かを判定 / 結果を Markdown へ出力)"
+    fi
+    if [ "$location_check_action" -gt 0 ]; then
+      diag "  ${location_check_action}) Location ヘッダ確認 (偽装 ALB から frontend の API を http で呼び、X-Forwarded-Proto の連携と Location が https で返るかを判定)"
     fi
     diag "  0) Compose サービスの選択へ戻る"
     printf '選択番号 [0-%s]: ' "$max_action" >&2
@@ -32182,6 +32520,11 @@ run_interactive_compose_service_actions() {
             warn "ログローテーションのタイムゾーン点検に失敗しました。サービス操作の選択へ戻ります。"
           fi
           pause_compose_service_actions || return 1
+        elif [ "$location_check_action" -gt 0 ] && [ "$action" = "$location_check_action" ]; then
+          if ! run_interactive_compose_location_check "$service_name"; then
+            warn "Location ヘッダ確認に失敗しました。サービス操作の選択へ戻ります。"
+          fi
+          pause_compose_service_actions || return 1
         else
           warn "0 から ${max_action} の番号を入力してください。"
         fi
@@ -32274,7 +32617,7 @@ run_keep_container_interaction() {
         log "[DRY-RUN] JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・GET/POST・POST ボディ形式の対話入力後に curl を実行します。"
         ;;
       logs)
-        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、同じ JBoss EAP コンテナの server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の check-server-log-fd.sh / audit-logging-config.sh と同じ判定で、結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力)、同じ JBoss EAP コンテナのログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定が UTC か JST かを判定し、問題があれば追加情報を表示。結果は既定で --report-dir 配下 (未指定なら一時ディレクトリ) の Markdown へ出力)、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力) を繰り返し実行します。"
+        log "[DRY-RUN] 起動中の Compose サービスを番号で選択し、ログ表示、対話式 bash 接続 (root ユーザでの接続も選択可)、MySQL 接続、healthcheck 設定・実行履歴・通信確認、cwagent / OTel のローカル送達診断、トラストストア構成コンテナの証明書チェック、ALB ヘルスチェック偽装サービス経由の ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)、JBoss EAP コンテナの jboss-cli.sh -c による module-info モジュール一覧、同じ JBoss EAP コンテナの server.log の FD 点検とログ設定の静的点検 (日付をまたいでも server.log.<前日> へ追記され続ける原因の切り分け。Log4j_EFS_Rolling の check-server-log-fd.sh / audit-logging-config.sh と同じ判定で、結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力)、同じ JBoss EAP コンテナのログローテーションのタイムゾーン点検 (OS・JVM・EAP ロギング・実際のログファイル・CloudWatch Agent の時刻設定が UTC か JST かを判定し、問題があれば追加情報を表示。結果は既定で --report-dir 配下 (未指定なら一時ディレクトリ) の Markdown へ出力)、偽装バッチサーバー経由の EFS マウント伝播確認 (作成・書き換え・削除が全コンテナへ反映されるか)、トラストストア構成コンテナのトラストストア一覧 (有効なストアと登録証明書 / カスタム証明書の強調 / 接続確認コマンドの組み立て)、valkey サーバーが起動していれば選択したサービスのコンテナからの Valkey 操作 (valkey-cli または openssl / bash による代替シェルでの対話接続・キー一覧・型 / TTL / 値の確認・疎通確認。確認対象コンテナへはインストールしません)、jmeter サービスが定義されていればテスト計画のスレッド数 / Ramp-Up 期間 / ループ回数を上書きした JMeter 性能試験の実行とその実行状況の確認 (結果と HTML レポートはレポートファイルと同じディレクトリへ出力)、frontend 向け ALB の偽装 (alb-front) を選べば Location ヘッダ確認 (偽装 ALB の HTTPS リスナー経由で frontend の API を http で呼び、X-Forwarded-Proto の連携と Location が https で返るかを区間ごとに判定。結果は --report-dir 配下 (未指定なら一時ディレクトリ) へも出力) を繰り返し実行します。"
         # 対話操作を最後まで終えた場合の既定の後始末も、実行予定として示す。
         INTERACTION_FINISHED="true"
         ;;

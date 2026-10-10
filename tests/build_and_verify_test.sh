@@ -55,7 +55,8 @@ assert_matches() {
 # トラストストア一覧
 # (build_and_verify_<日時>_truststore_inventory_<サービス名>.txt)、server.log の
 # FD 点検 (_server_log_fd_<サービス名>.txt) とログ設定の静的点検
-# (_logging_config_audit_<サービス名>.txt) も出力される (ログローテーションの
+# (_logging_config_audit_<サービス名>.txt)、Location ヘッダ確認
+# (_location_header_<サービス名>.txt) も出力される (ログローテーションの
 # タイムゾーン点検は _log_rotation_tz_<サービス名>.md で、この glob には掛からない)
 # ため、素の glob では件数が増えてしまう。サービス別ビルドログ
 # (build_and_verify_<日時>_build_log_<サービス名>.txt) はビルドを実行した
@@ -75,6 +76,7 @@ collect_report_files() {
       *_jboss_modules_*.txt) continue ;;
       *_truststore_inventory_*.txt) continue ;;
       *_server_log_fd_*.txt|*_logging_config_audit_*.txt) continue ;;
+      *_location_header_*.txt) continue ;;
       *_build_log_*.txt) continue ;;
       *_deployed_class_*.txt) continue ;;
     esac
@@ -3876,6 +3878,188 @@ unset FAKE_COMPOSE_PS_SERVICES
 
 assert_not_contains "$alb_healthcheck_absent_output" "ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)"
 assert_not_contains "$FAKE_DOCKER_CALLS" "alb-healthcheck-cli"
+
+# --- Location ヘッダ確認 (frontend 向け ALB の偽装経由) -------------------------
+# 偽装 ALB (alb-front) を選んだときだけ操作が末尾に増え、既定の API のパスは
+# 偽装 ALB の CLI (default-path) から取ること。ターゲット側の frontend には出さない。
+location_check_output="$TEST_TMP/keep-mode-location-check.out"
+location_check_report_dir="$TEST_TMP/location-check-report"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="frontend alb-front"
+if ! printf '2\n5\n\n\n0\n1\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh \
+    --compose-service frontend,alb-front \
+    --startup-service frontend \
+    --keep-container-mode logs \
+    --report-dir "$location_check_report_dir" \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$location_check_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES
+  cat "$location_check_output" >&2
+  fail "Location header check helper returned a non-zero status"
+fi
+unset FAKE_COMPOSE_PS_SERVICES
+
+location_check_menu_line="  5) Location ヘッダ確認 (偽装 ALB から frontend の API を http で呼び、X-Forwarded-Proto の連携と Location が https で返るかを判定)"
+assert_contains "$location_check_output" "$location_check_menu_line"
+# alb-front のメニューは操作の前後で 2 回出る。frontend のメニューには出ない (3 回にならない)。
+assert_occurrences "$location_check_output" "$location_check_menu_line" 2
+assert_contains "$location_check_output" "Compose サービス 'frontend' で実行する操作を選択してください:"
+assert_contains "$location_check_output" "Location ヘッダ確認 (frontend 向け ALB の偽装経由)"
+assert_contains "$location_check_output" "確認対象           : alb-front"
+assert_contains "$location_check_output" \
+  "確認する API のパス (Enter で既定: /iwinmichl/api/redirect-check/redirect): "
+assert_contains "$location_check_output" "確認する API       : GET /iwinmichl/api/redirect-check/redirect"
+# 偽装 ALB 自身の状態 (判定元が生きているか) とホストから試す URL を先に出す。
+assert_contains "$location_check_output" "コンテナ           : alb-front"
+assert_contains "$location_check_output" "起動状態           : running"
+assert_contains "$location_check_output" "自身の healthcheck : healthy (連続失敗 0)"
+assert_contains "$location_check_output" "HTTPS リスナー     : https://localhost:8443 (コンテナ内 :8443)"
+assert_contains "$location_check_output" \
+  "ホストから試す: curl -sk -D - -o /dev/null https://localhost:8443/iwinmichl/api/redirect-check/redirect"
+assert_contains "$location_check_output" "転送記録 API       : http://localhost:8581/exchanges"
+# 偽装 ALB のコンテナ内 CLI が出したレポート本文と、終了コードからの判定。
+assert_contains "$location_check_output" "確認対象 API       : GET /iwinmichl/api/redirect-check/redirect"
+assert_contains "$location_check_output" "  [OK] Location は https で返却 (偽装 ALB は書き換えていない)"
+assert_contains "$location_check_output" \
+  "Location ヘッダ判定 : OK (Location は https で返り、X-Forwarded-Proto が JBoss EAP に連携されている)"
+assert_before "$location_check_output" "起動状態           : running" "Location ヘッダ判定 : OK"
+assert_contains "$location_check_output" "Location ヘッダ確認のテキスト : $location_check_report_dir/"
+assert_not_contains "$location_check_output" "Location ヘッダ確認に失敗しました。"
+assert_contains "$FAKE_DOCKER_CALLS" "alb-front-cli default-path"
+assert_contains "$FAKE_DOCKER_CALLS" "alb-front-cli report /iwinmichl/api/redirect-check/redirect"
+assert_contains "$FAKE_DOCKER_CALLS" "exec cid-alb-front /bin/sh -c"
+# 画面と同じ内容を、どの構成に対する結果かが分かる見出し付きでテキストへ残す。
+location_check_text=""
+for location_check_candidate in "$location_check_report_dir"/build_and_verify_*_location_header_alb-front.txt; do
+  [ -f "$location_check_candidate" ] && location_check_text="$location_check_candidate"
+done
+[ -n "$location_check_text" ] || fail "Location header check text was not written to the report dir"
+assert_contains "$location_check_text" "Location ヘッダ確認 (build_and_verify.sh)"
+assert_contains "$location_check_text" "Compose サービス : alb-front"
+assert_contains "$location_check_text" "確認した API     : GET /iwinmichl/api/redirect-check/redirect"
+assert_contains "$location_check_text" \
+  "判定             : OK (Location は https で返り、X-Forwarded-Proto が JBoss EAP に連携されている)"
+assert_contains "$location_check_text" "判定結果           : OK (ALB の X-Forwarded-Proto: https が JBoss EAP に連携され、Location は https で返る)"
+
+# NG は「診断結果」でありヘルパーの失敗ではない。/ で始まらない入力は聞き直し、
+# 入力したパス (クエリ付き) をそのまま CLI へ渡すこと。
+location_check_ng_output="$TEST_TMP/keep-mode-location-check-ng.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_COMPOSE_PS_SERVICES="alb-front"
+export FAKE_ALB_FRONT_RESULT="ng"
+if ! printf '1\n5\nabc\n/iwinmichl/custom/redirect?x=1\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service alb-front \
+    --startup-service alb-front \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$location_check_ng_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_FRONT_RESULT
+  cat "$location_check_ng_output" >&2
+  fail "NG Location header check did not return to the service action menu"
+fi
+unset FAKE_ALB_FRONT_RESULT
+
+assert_contains "$location_check_ng_output" \
+  "/ で始まるパスを入力してください (例: /iwinmichl/api/redirect-check/redirect)。"
+assert_contains "$location_check_ng_output" "確認する API       : GET /iwinmichl/custom/redirect?x=1"
+assert_contains "$location_check_ng_output" "  [NG] Location が http で返却 (ブラウザは http へ遷移する)"
+assert_contains "$location_check_ng_output" \
+  "Location ヘッダ判定 : NG (Location が https で返らない / X-Forwarded-Proto が連携されていない)"
+assert_contains "$location_check_ng_output" \
+  "上のレポートの [3] (JBoss EAP が認識した scheme) と「対処」を確認してください。"
+assert_not_contains "$location_check_ng_output" "Location ヘッダ確認に失敗しました。"
+assert_occurrences "$location_check_ng_output" "Compose サービス 'alb-front' で実行する操作を選択してください:" 2
+assert_contains "$FAKE_DOCKER_CALLS" "alb-front-cli report /iwinmichl/custom/redirect?x=1"
+assert_not_contains "$FAKE_DOCKER_CALLS" "alb-front-cli report abc"
+
+# リダイレクトが返らない (API のパス違い・未デプロイ) は判定保留として扱い、失敗にはしない。
+location_check_pending_output="$TEST_TMP/keep-mode-location-check-pending.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_ALB_FRONT_RESULT="pending"
+if ! printf '1\n5\n\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service alb-front \
+    --startup-service alb-front \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$location_check_pending_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_FRONT_RESULT
+  cat "$location_check_pending_output" >&2
+  fail "pending Location header check did not return to the service action menu"
+fi
+unset FAKE_ALB_FRONT_RESULT
+
+assert_contains "$location_check_pending_output" "Location ヘッダ判定 : 判定保留 (リダイレクトが返らなかった)"
+assert_contains "$location_check_pending_output" \
+  "API のパスと、frontend へ WAR がデプロイされているかを確認してください。"
+assert_not_contains "$location_check_pending_output" "Location ヘッダ確認に失敗しました。"
+
+# 偽装 ALB から確認できない (常駐プロセス停止など) 場合はヘルパーの失敗として扱い、
+# メニューへ戻る。そこまでの出力はテキストへ残す。
+location_check_unavailable_output="$TEST_TMP/keep-mode-location-check-unavailable.out"
+: > "$FAKE_DOCKER_CALLS"
+export FAKE_ALB_FRONT_RESULT="unavailable"
+export FAKE_ALB_FRONT_SERVICE_DOWN="true"
+if ! printf '1\n5\n\n\n0\n0\n' | (
+  cd "$REPO_ROOT"
+  TMPDIR="$TEST_TMP" bash ./build_and_verify.sh \
+    --compose-service alb-front \
+    --startup-service alb-front \
+    --keep-container-mode logs \
+    --suppress-startup-logs \
+    --env-list-limit 1 \
+    --directory-tree-depth 1 \
+    --suppress-removed-logs
+) >"$location_check_unavailable_output" 2>&1; then
+  unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_FRONT_RESULT FAKE_ALB_FRONT_SERVICE_DOWN
+  cat "$location_check_unavailable_output" >&2
+  fail "unavailable Location header check did not return to the service action menu"
+fi
+unset FAKE_COMPOSE_PS_SERVICES FAKE_ALB_FRONT_RESULT FAKE_ALB_FRONT_SERVICE_DOWN
+
+assert_contains "$location_check_unavailable_output" "起動状態           : restarting"
+assert_contains "$location_check_unavailable_output" "frontend 向け ALB の偽装が健全ではありません。"
+assert_contains "$location_check_unavailable_output" "偽装 ALB から Location ヘッダを確認できませんでした。"
+assert_contains "$location_check_unavailable_output" "Location ヘッダ確認に失敗しました。サービス操作の選択へ戻ります。"
+assert_contains "$location_check_unavailable_output" "Location ヘッダ確認のテキスト : $TEST_TMP/"
+assert_contains "$location_check_unavailable_output" "Compose サービスの対話操作を終了しました。"
+
+# DRY-RUN の案内と --help にも Location ヘッダ確認を含める。
+location_check_dryrun_output="$TEST_TMP/location-check-dry-run.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --dry-run --keep-container-mode logs
+) >"$location_check_dryrun_output" 2>&1; then
+  cat "$location_check_dryrun_output" >&2
+  fail "dry-run logs mode returned a non-zero status"
+fi
+assert_contains "$location_check_dryrun_output" \
+  "frontend 向け ALB の偽装 (alb-front) を選べば Location ヘッダ確認 (偽装 ALB の HTTPS リスナー経由で frontend の API を http で呼び、X-Forwarded-Proto の連携と Location が https で返るかを区間ごとに判定。"
+
+location_check_usage_output="$TEST_TMP/location-check-usage.out"
+if ! (
+  cd "$REPO_ROOT"
+  bash ./build_and_verify.sh --help
+) >"$location_check_usage_output" 2>&1; then
+  cat "$location_check_usage_output" >&2
+  fail "--help returned a non-zero status"
+fi
+assert_contains "$location_check_usage_output" "frontend 向け ALB の偽装 (alb-front) が"
+assert_contains "$location_check_usage_output" "「Location ヘッダ確認」も選択でき、偽装 ALB の"
 
 # --- bash を持たないコンテナ (偽装 EFS など) への対話接続 --------------------
 # alpine ベースの efs-mock には /bin/bash が無く、/bin/bash 決め打ちの接続では

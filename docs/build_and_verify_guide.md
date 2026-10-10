@@ -1146,7 +1146,7 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | --- | --- |
 | `bash` | 検証対象コンテナへ `docker exec -it <container> /bin/bash` で直接接続。終了してもコンテナは残る。接続前に `tree` を使える状態にする (→ 5.4-3) |
 | `http` | JBoss EAP のコンテキストルートと HTTP ポートを解決し、パス・メソッド・ボディを対話入力して `curl` を実行 |
-| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
+| `logs` | 起動中の Compose サービスを番号で選択し、ログ表示・bash 接続 (root ユーザでの接続も選べる)・healthcheck 調査・MySQL 実行・送達診断・証明書チェック・ALB ヘルスチェック確認・JBoss モジュール一覧・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検・Location ヘッダ確認 (frontend 向け ALB の偽装を選んだとき)・Valkey 操作 (→ 5.4-4)・JMeter 性能試験の実行と実行状況の確認 (→ 5.4-5) を繰り返す |
 
 いずれも `--verify-startup` と `--keep-container` を暗黙に有効化します。
 対象が複数ある場合は番号選択ダイアログが表示されます。
@@ -1237,8 +1237,9 @@ SIGKILL となり、上記の「壊れたボリューム」を自分で作って
 | server.log の FD 点検 | 日付をまたいでも `server.log.<前日>` へ追記され続ける原因を、`/proc/*/fd` から `server.log*` を指す FD の本数・FD 番号・inode を集めて判定する (Log4j_EFS_Rolling の `check-server-log-fd.sh` と同じ判定。原因候補 1/1b・2・3)。結果をテキストへも出力 | JBoss モジュール一覧と同じ (frontend / backend の JBoss EAP)。コンテナ内の `awk` / `ls` / `stat` ほか |
 | ログ設定の静的点検 | `server.log` を開く／rename する主体を、standalone.xml・logging.properties・WAR / EAR 内のログ設定・logrotate / cron・起動コマンド・jboss-cli.sh の実行時設定から特定する (Log4j_EFS_Rolling の `audit-logging-config.sh` と同じ点検)。結果をテキストへも出力 | 同上。WAR / EAR を読むのに `unzip` / `python3` / `jar` / `bsdtar` / `busybox unzip` のいずれか |
 | ログローテーションのタイムゾーン点検 | `server.log` の日次ローテーションに関係する時刻設定 (OS の TZ・/etc/localtime・tzdata、JVM の -Duser.timezone・system-property、EAP ロギングの suffix・%d・zone-id、実際のログファイル、CloudWatch Agent の timezone・timestamp_format) を集め、1 件ずつ UTC / JST を判定する。すべて JST か・すべて UTC か・混在かを表示し、問題があれば影響・対処・確認コマンドの追加情報も表示する。結果を Markdown へも出力 | 同上 (JBoss モジュール一覧と同じ判定)。CloudWatch Agent の設定 JSON の解析にホストの Python 3 |
+| Location ヘッダ確認 | frontend 向け ALB の偽装 (`alb-front`) のコンテナから、偽装 ALB の HTTPS リスナー経由で frontend の API (対話入力。Enter で既定 `/iwinmichl/api/redirect-check/redirect`) を呼び、**クライアント → ALB が https・ALB → frontend が http** で通信していること、ALB が付けた `X-Forwarded-Proto: https` が JBoss EAP に**連携**されていること、リダイレクトの **`Location` が https** で返ることを区間ごとに判定する。結果をテキストへも出力 | 偽装 ALB (`alb-front`) 自身を選んだときだけ。偽装 ALB のコンテナ内に `python3` |
 
-証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろに並びます。後から加わった Valkey 操作・JMeter の操作・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検は、既存の番号 (`root ユーザで bash へ接続` まで) を動かさないよう、さらに後ろ (**操作一覧の最後**) に並びます。
+証明書チェック・ALB ヘルスチェック確認・ADOT Collector 設定チェック・JBoss モジュール一覧・EFS マウント伝播確認・トラストストア一覧は常に**末尾**へ追加されるため、既存操作の番号は変わりません。どのサービスでも選べる `root ユーザで bash へ接続` は、そのさらに後ろに並びます。後から加わった Valkey 操作・JMeter の操作・server.log の FD 点検とログ設定の静的点検・ログローテーションのタイムゾーン点検・Location ヘッダ確認は、既存の番号 (`root ユーザで bash へ接続` まで) を動かさないよう、さらに後ろ (**操作一覧の最後**) に並びます。
 
 bash 接続と root ユーザでの bash 接続は、接続先に `/bin/bash` が無ければ `/bin/sh` (POSIX シェル) へ自動で切り替えます。詳細は「[bash を持たないコンテナへの接続](#bash-を持たないコンテナへの接続)」を参照してください。
 
@@ -1491,6 +1492,31 @@ ECS 構成のヘルスチェックは 2 系統あり、**片方が OK でもも�
 
 偽装サービスの Compose サービス名を変えている場合は、スクリプト冒頭の
 `ALB_HEALTHCHECK_SERVICE` (既定 `alb-healthcheck`) を合わせてください。
+
+#### Location ヘッダ確認 (frontend 向け ALB の偽装経由)
+
+本番は**ブラウザ → ALB が HTTPS、ALB → コンテナ (JBoss EAP) が HTTP** です。ALB は元の scheme を
+`X-Forwarded-Proto: https` で伝えますが、JBoss EAP の http-listener がそれを反映していない
+(`proxy-address-forwarding=false`) と、アプリのリダイレクトの **`Location` が `http://...`** になります。
+ローカルでは**偽装 ALB** (姉妹構成の `alb-front` サービス。実装は
+`Container_Compose_file/compose/alb-front/`) が ALB の「HTTPS リスナー → HTTP ターゲットグループ」の
+転送を同じ規則 (TLS 終端 / `X-Forwarded-For` 追記 / `X-Forwarded-Proto: https` / `X-Forwarded-Port` /
+`X-Amzn-Trace-Id` / Host は透過 / Location は書き換えない) で再現します。
+
+| 項目 | 内容 |
+| --- | --- |
+| 表示条件 | 偽装 ALB (`alb-front`) が起動しており、偽装 ALB 自身を選んだとき。ターゲット側 (`frontend`) には出さない |
+| 入力 | 確認する API のパス。Enter で既定 (偽装 ALB の `ALB_FRONT_CHECK_PATH` を CLI の `default-path` で取得。取れなければ `/iwinmichl/api/redirect-check/redirect`)。`/` で始まらない入力・空白を含む入力は聞き直す (3 回まで) |
+| CLI の解決 | コンテナの環境変数 `ALB_FRONT_CLI` → 既定 `/opt/alb-front/alb-front.py`。インタプリタ (`python3` / `python`) もコンテナ内で解決するため、ホスト側に Python は不要 |
+| (1) 偽装 ALB の状態 | 起動状態・自身の `healthcheck`・連続失敗回数・再起動回数・起動時刻、ホストから試す `curl` と転送記録 API の URL。`running` でない / `unhealthy` のときは警告を出す |
+| (2) 区間ごとのレポート | [1] クライアント → 偽装 ALB が https (TLS・証明書) / [2] 偽装 ALB → frontend が http (転送先・接続先・付与ヘッダ・ターゲットの応答) / [3] JBoss EAP が受け取った `X-Forwarded-Proto` と認識した scheme (dhapp の `X-Redirect-Check-*` 診断ヘッダ) / [4] 返った `Location` (ALB は書き換えない。https なら辿る) / [5] 対照実験 (ヘッダ無しで直接 http) / [6] JBoss EAP 自身のリダイレクト (コンテキストルート) |
+| 判定表示 | `OK` (Location が https で返り、X-Forwarded-Proto が連携されている) / `NG` (Location が https で返らない / 連携されていない) / `判定保留` (リダイレクトが返らない) |
+| 終了扱い | `NG` と `判定保留` は診断結果としてそのまま操作選択へ戻る。偽装 ALB から確認できない場合 (常駐プロセス停止・ターゲットへ届かない 502 / 503 / 504) のみヘルパー失敗として扱う |
+| 出力 | `--report-dir` 配下 (未指定なら一時ディレクトリ) の `build_and_verify_<日時>_location_header_<サービス名>.txt`。繰り返すと連番を付ける |
+
+`NG` のときの対処は JBoss EAP の http-listener の `proxy-address-forwarding=true` です (レポートの
+「対処」に jboss-cli のコマンドが出ます)。偽装 ALB の Compose サービス名を変えている場合は、
+スクリプト冒頭の `ALB_FRONT_SERVICE` (既定 `alb-front`) を合わせてください。
 
 #### EFS マウント伝播確認 (偽装バッチサーバー経由)
 
